@@ -63,18 +63,16 @@ COPY ./ OrcaSlicer
 WORKDIR OrcaSlicer
 
 # These can run together, but we run them separate for podman caching
-# Update System dependencies
-RUN ./build_linux.sh -u
+# Update system dependencies
+RUN UPDATE_LIB=1 bash ./scripts/linux.d/debian
 
-# Build dependencies in ./deps
-RUN ./build_linux.sh -dr
-
-# Build slic3r
-RUN ./build_linux.sh -sr
+# Configure and build slicer. Dependency fetching happens during configure.
+RUN cmake --preset linux-release -DORCA_TOOLS=ON
+RUN cmake --build --preset linux-release --target OrcaSlicer OrcaSlicer_profile_validator
 
 # Build AppImage
 ENV container podman
-RUN ./build_linux.sh -ir
+RUN cmake --build --preset linux-release --target package_linux_appimage
 
 # It's easier to run Orca Slicer as the same username,
 # UID and GID as your workstation.  Since we bind mount

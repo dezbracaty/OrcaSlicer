@@ -45,6 +45,25 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_VERSION VERSION_LESS "3.25")
     set(LINUX ON CACHE BOOL "" FORCE)
 endif ()
 
+# Default cache directory for fetched third-party sources/builds.
+# Priority: -DCMAKE_FETCH_CACHE=... > existing env var > platform default.
+# The value is also exported to the environment so fetch scripts that read
+# $ENV{CMAKE_FETCH_CACHE} work without the user having to export it manually.
+if (NOT DEFINED CMAKE_FETCH_CACHE OR CMAKE_FETCH_CACHE STREQUAL "")
+    if (DEFINED ENV{CMAKE_FETCH_CACHE} AND NOT "$ENV{CMAKE_FETCH_CACHE}" STREQUAL "")
+        set(_default_fetch_cache "$ENV{CMAKE_FETCH_CACHE}")
+    elseif (WIN32)
+        set(_default_fetch_cache "$ENV{USERPROFILE}/.orca_fetch_cache")
+    else ()
+        set(_default_fetch_cache "$ENV{HOME}/.orca_fetch_cache")
+    endif ()
+    set(CMAKE_FETCH_CACHE "${_default_fetch_cache}" CACHE PATH "Cache directory for fetched third-party dependencies")
+    unset(_default_fetch_cache)
+endif ()
+file(TO_CMAKE_PATH "${CMAKE_FETCH_CACHE}" CMAKE_FETCH_CACHE)
+set(ENV{CMAKE_FETCH_CACHE} "${CMAKE_FETCH_CACHE}")
+message(STATUS "Fetch cache directory: ${CMAKE_FETCH_CACHE}")
+
 include(ExternalProject)
 include(ProcessorCount)
 
@@ -166,18 +185,11 @@ function(orcaslicer_add_cmake_project projectname)
         endif ()
     endif ()
 
+    set(_gen "")
+    set(_build_j "-j${NPROC}")
     if (MSVC)
-      set(_gen CMAKE_GENERATOR "${DEP_MSVC_GEN}" CMAKE_GENERATOR_PLATFORM "${DEP_PLATFORM}")
-    else()
-      set(_gen "")
-    endif()
-
-    if ($ENV{CMAKE_BUILD_PARALLEL_LEVEL})
-      set(_build_j "")  # assume environment will control --build parallel setting
-    elseif(MSVC)
-      set(_build_j "/m")
-    else()
-      set(_build_j "-j${NPROC}")
+        set(_gen CMAKE_GENERATOR "${DEP_MSVC_GEN}" CMAKE_GENERATOR_PLATFORM "${DEP_PLATFORM}")
+        set(_build_j "/m")
     endif ()
 
 if (NOT IS_CROSS_COMPILE OR NOT APPLE)
@@ -196,8 +208,6 @@ if (NOT IS_CROSS_COMPILE OR NOT APPLE)
             -DCMAKE_DEBUG_POSTFIX:STRING=d
             -DCMAKE_C_COMPILER:STRING=${CMAKE_C_COMPILER}
             -DCMAKE_CXX_COMPILER:STRING=${CMAKE_CXX_COMPILER}
-            -DCMAKE_C_COMPILER_LAUNCHER:STRING=${CMAKE_C_COMPILER_LAUNCHER}
-            -DCMAKE_CXX_COMPILER_LAUNCHER:STRING=${CMAKE_CXX_COMPILER_LAUNCHER}
             -DCMAKE_TOOLCHAIN_FILE:STRING=${CMAKE_TOOLCHAIN_FILE}
             -DCMAKE_EXE_LINKER_FLAGS:STRING=${CMAKE_EXE_LINKER_FLAGS}
             -DCMAKE_SHARED_LINKER_FLAGS:STRING=${CMAKE_SHARED_LINKER_FLAGS}
@@ -243,8 +253,6 @@ else()
             -DCMAKE_INSTALL_PREFIX:STRING=${DESTDIR}
             -DCMAKE_PREFIX_PATH:STRING=${DESTDIR}
             -DCMAKE_IGNORE_PREFIX_PATH:STRING=${CMAKE_IGNORE_PREFIX_PATH}
-            -DCMAKE_C_COMPILER_LAUNCHER:STRING=${CMAKE_C_COMPILER_LAUNCHER}
-            -DCMAKE_CXX_COMPILER_LAUNCHER:STRING=${CMAKE_CXX_COMPILER_LAUNCHER}
             -DBUILD_SHARED_LIBS:BOOL=OFF
             ${_cmake_osx_arch}
             "${_configs_line}"
@@ -261,20 +269,26 @@ endfunction(orcaslicer_add_cmake_project)
 
 
 if (MSVC)
-    if ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "AMD64")
+    if ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "AMD64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "x86_64"
+        OR "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}" STREQUAL "x64")
         message(STATUS "\nDetected X64 compiler => building X64 deps bundle\n")
         set(DEPS_ARCH "x64")
         include("deps-windows.cmake")
-    elseif ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "X86")
+    elseif ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "X86"
+            OR "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}" STREQUAL "X86")
         message(STATUS "\nDetected X86 compiler => building X86 deps bundle\n")
         set(DEPS_ARCH "x86")
         include("deps-windows.cmake")
-    elseif ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "ARM64")
-        message(STATUS "\nDetected ARM64 compiler => building ARM64 deps bundle\n")
-        set(DEPS_ARCH "arm64")
+    elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(STATUS "\nDetected X64 compiler (via pointer size) => building X64 deps bundle\n")
+        set(DEPS_ARCH "x64")
+        include("deps-windows.cmake")
+    elseif (CMAKE_SIZEOF_VOID_P EQUAL 4)
+        message(STATUS "\nDetected X86 compiler (via pointer size) => building X86 deps bundle\n")
+        set(DEPS_ARCH "x86")
         include("deps-windows.cmake")
     else ()
-        message(FATAL_ERROR "Unable to detect architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+        message(FATAL_ERROR "Unable to detect architecture (CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}, ARCH_ID=${CMAKE_CXX_COMPILER_ARCHITECTURE_ID})")
     endif ()
 elseif (APPLE)
     message("OS X SDK Path: ${CMAKE_OSX_SYSROOT}")
@@ -332,10 +346,10 @@ if (NOT EXPAT_FOUND)
     set(EXPAT_PKG dep_EXPAT)
 endif ()
 
-# The order of includes respects the dependencies between libraries
 set(DEP_Boost_COMPONENTS system iostreams filesystem thread log locale regex date_time)
 include(Boost/Boost.cmake)
 
+# The order of includes respects the dependencies between libraries
 include(Cereal/Cereal.cmake)
 include(Qhull/Qhull.cmake)
 include(GLEW/GLEW.cmake)
@@ -351,7 +365,6 @@ include(OpenVDB/OpenVDB.cmake)
 
 include(GMP/GMP.cmake)
 include(MPFR/MPFR.cmake)
-include(Eigen/Eigen.cmake)
 include(CGAL/CGAL.cmake)
 
 include(NLopt/NLopt.cmake)
@@ -427,7 +440,6 @@ set(_dep_list
     dep_OpenVDB
     dep_OpenCSG
     dep_OpenCV
-    dep_Eigen
     dep_CGAL
     dep_GLFW
     dep_OCCT

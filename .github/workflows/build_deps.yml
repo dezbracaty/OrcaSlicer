@@ -151,9 +151,8 @@ jobs:
             if [ -z "${{ vars.SELF_HOSTED }}" ]; then
               brew install automake texinfo libtool
             fi
-            ./build_release_macos.sh -dx ${{ !vars.SELF_HOSTED && '-1' || '' }} -a ${{ inputs.arch }} -t 10.15
-            (cd "${{ github.workspace }}/deps/build/${{ inputs.arch }}" && \
-            find . -mindepth 1 -maxdepth 1 ! -name 'OrcaSlicer_dep' -exec rm -rf {} +)
+            cmake --preset macos-${{ inputs.arch }}-release \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
 
 
       - name: Apt-Install Dependencies
@@ -164,10 +163,13 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: ${{ github.workspace }}
         run: |
-            mkdir -p ${{ github.workspace }}/deps/build/destdir
-            ./build_linux.sh -drlL
-            cd deps/build
-            tar -czvf OrcaSlicer_dep_ubuntu_$(date +"%Y%m%d").tar.gz destdir
+            cmake --preset linux-release \
+              -DCMAKE_C_COMPILER=/usr/bin/clang \
+              -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+              -DCMAKE_LINKER="$(command -v ld.lld)" \
+              -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
+              -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld \
+              -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld
 
 
       # Upload Artifacts

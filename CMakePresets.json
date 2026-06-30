@@ -1,0 +1,136 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 19, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "default",
+            "hidden": true,
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "TRUE",
+                "WX_VERSION": "v3.3.2",
+                "ORCA_TOOLS": "ON"
+            }
+        },
+
+        {
+            "name": "windows-x64-release",
+            "inherits": "default",
+            "displayName": "Windows · x64 · Ninja · Release",
+            "binaryDir": "${sourceDir}/build-release/x64",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "cl.exe",
+                "CMAKE_CXX_COMPILER": "cl.exe",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/build-release/x64/OrcaSlicer"
+            },
+            "architecture": { "value": "x64", "strategy": "external" },
+            "toolset":      { "value": "host=x64", "strategy": "external" }
+        },
+        {
+            "name": "windows-x64-debug",
+            "inherits": "windows-x64-release",
+            "displayName": "Windows · x64 · Ninja · Debug",
+            "binaryDir": "${sourceDir}/build-debug/x64",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/build-debug/x64/OrcaSlicer"
+            }
+        },
+
+        {
+            "name": "linux-release",
+            "inherits": "default",
+            "displayName": "Linux · Ninja · Release",
+            "binaryDir": "${sourceDir}/build",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "linux-debug",
+            "inherits": "linux-release",
+            "displayName": "Linux · Ninja · Debug",
+            "binaryDir": "${sourceDir}/build-dbg",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "linux-relwithdebinfo",
+            "inherits": "linux-release",
+            "displayName": "Linux · Ninja · RelWithDebInfo",
+            "binaryDir": "${sourceDir}/build-dbginfo",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+        },
+
+        {
+            "name": "linux-x86_64-release",
+            "inherits": "default",
+            "displayName": "Linux · x86_64 · Ninja · Release",
+            "binaryDir": "${sourceDir}/build-release/x86_64",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "linux-x86_64-debug",
+            "inherits": "linux-x86_64-release",
+            "displayName": "Linux · x86_64 · Ninja · Debug",
+            "binaryDir": "${sourceDir}/build-debug/x86_64",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+
+        {
+            "name": "macos-arm64-release",
+            "inherits": "default",
+            "displayName": "macOS · arm64 · Ninja · Release",
+            "binaryDir": "${sourceDir}/build-release/arm64",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "11.3",
+                "CMAKE_IGNORE_PREFIX_PATH": "/opt/local;/usr/local;/opt/homebrew"
+            }
+        },
+        {
+            "name": "macos-arm64-debug",
+            "inherits": "macos-arm64-release",
+            "displayName": "macOS · arm64 · Ninja · Debug",
+            "binaryDir": "${sourceDir}/build-debug/arm64",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+
+        {
+            "name": "macos-x86_64-release",
+            "inherits": "default",
+            "displayName": "macOS · x86_64 · Ninja · Release",
+            "binaryDir": "${sourceDir}/build-release/x86_64",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_OSX_ARCHITECTURES": "x86_64",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "11.3",
+                "CMAKE_IGNORE_PREFIX_PATH": "/opt/local;/usr/local;/opt/homebrew"
+            }
+        },
+        {
+            "name": "macos-x86_64-debug",
+            "inherits": "macos-x86_64-release",
+            "displayName": "macOS · x86_64 · Ninja · Debug",
+            "binaryDir": "${sourceDir}/build-debug/x86_64",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        }
+    ],
+    "buildPresets": [
+        { "name": "windows-x64-release",   "configurePreset": "windows-x64-release" },
+        { "name": "windows-x64-debug",     "configurePreset": "windows-x64-debug" },
+        { "name": "linux-release",         "configurePreset": "linux-release" },
+        { "name": "linux-debug",           "configurePreset": "linux-debug" },
+        { "name": "linux-relwithdebinfo",  "configurePreset": "linux-relwithdebinfo" },
+        { "name": "linux-x86_64-release",  "configurePreset": "linux-x86_64-release" },
+        { "name": "linux-x86_64-debug",    "configurePreset": "linux-x86_64-debug" },
+        { "name": "macos-arm64-release",   "configurePreset": "macos-arm64-release" },
+        { "name": "macos-arm64-debug",     "configurePreset": "macos-arm64-debug" },
+        { "name": "macos-x86_64-release",  "configurePreset": "macos-x86_64-release" },
+        { "name": "macos-x86_64-debug",    "configurePreset": "macos-x86_64-debug" }
+    ]
+}

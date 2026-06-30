@@ -78,6 +78,24 @@ if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type (default Release)" FORCE)
 endif()
 
+if (NOT DEFINED CMAKE_FETCH_CACHE OR CMAKE_FETCH_CACHE STREQUAL "")
+    if (DEFINED ENV{CMAKE_FETCH_CACHE} AND NOT "$ENV{CMAKE_FETCH_CACHE}" STREQUAL "")
+        set(_default_fetch_cache "$ENV{CMAKE_FETCH_CACHE}")
+    elseif (WIN32)
+        set(_default_fetch_cache "$ENV{USERPROFILE}/.cmake_fetch_cache")
+    else ()
+        set(_default_fetch_cache "$ENV{HOME}/.cmake_fetch_cache")
+    endif ()
+    set(CMAKE_FETCH_CACHE "${_default_fetch_cache}" CACHE PATH "Cache directory for fetched third-party dependencies")
+    unset(_default_fetch_cache)
+endif ()
+file(TO_CMAKE_PATH "${CMAKE_FETCH_CACHE}" CMAKE_FETCH_CACHE)
+set(ENV{CMAKE_FETCH_CACHE} "${CMAKE_FETCH_CACHE}")
+message(STATUS "Fetch cache directory: ${CMAKE_FETCH_CACHE}")
+
+set(ORCA_DEPS_INSTALL_PATHS "" CACHE INTERNAL "Per-dep install roots for runtime DLL lookup")
+include("${CMAKE_CURRENT_SOURCE_DIR}/deps/fetch_deps.cmake")
+
 if (DEFINED BBL_RELEASE_TO_PUBLIC)
     add_compile_definitions("BBL_RELEASE_TO_PUBLIC=${BBL_RELEASE_TO_PUBLIC}")
 else ()
@@ -781,14 +799,18 @@ endif()
 
 set(TOP_LEVEL_PROJECT_DIR ${PROJECT_SOURCE_DIR})
 function(orcaslicer_copy_dlls target config postfix output_dlls)
-    if ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "AMD64")
+    if ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "AMD64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "x86_64"
+        OR "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}" STREQUAL "x64")
         set(_arch "x64")
-    elseif ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "X86")
+    elseif ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "X86"
+            OR "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}" STREQUAL "X86")
         set(_arch "x86")
-    elseif ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "ARM64")
-        set(_arch "arm64")
+    elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(_arch "x64")
+    elseif (CMAKE_SIZEOF_VOID_P EQUAL 4)
+        set(_arch "x86")
     else ()
-        message(FATAL_ERROR "Unable to detect architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+        message(FATAL_ERROR "Unable to detect architecture (CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}, ARCH_ID=${CMAKE_CXX_COMPILER_ARCHITECTURE_ID})")
     endif ()
 
     get_property(_is_multi GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -810,34 +832,49 @@ function(orcaslicer_copy_dlls target config postfix output_dlls)
             ${TOP_LEVEL_PROJECT_DIR}/deps/WebView2/lib/win-${_arch}/WebView2Loader.dll
         DESTINATION ${_out_dir})
 
-    file(COPY ${CMAKE_PREFIX_PATH}/bin/occt/TKBO.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKBRep.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKCAF.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKCDF.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKernel.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKG2d.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKG3d.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKGeomAlgo.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKGeomBase.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKHLR.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKLCAF.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKMath.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKMesh.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKPrim.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKService.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKShHealing.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKSTEP.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKSTEP209.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKSTEPAttr.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKSTEPBase.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKTopAlgo.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKV3d.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKVCAF.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKXCAF.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKXDESTEP.dll
-            ${CMAKE_PREFIX_PATH}/bin/occt/TKXSBase.dll
-            ${CMAKE_PREFIX_PATH}/bin/freetype.dll
-         DESTINATION ${_out_dir})
+    set(_dep_runtime_dlls
+        bin/occt/TKBO.dll
+        bin/occt/TKBRep.dll
+        bin/occt/TKCAF.dll
+        bin/occt/TKCDF.dll
+        bin/occt/TKernel.dll
+        bin/occt/TKG2d.dll
+        bin/occt/TKG3d.dll
+        bin/occt/TKGeomAlgo.dll
+        bin/occt/TKGeomBase.dll
+        bin/occt/TKHLR.dll
+        bin/occt/TKLCAF.dll
+        bin/occt/TKMath.dll
+        bin/occt/TKMesh.dll
+        bin/occt/TKPrim.dll
+        bin/occt/TKService.dll
+        bin/occt/TKShHealing.dll
+        bin/occt/TKSTEP.dll
+        bin/occt/TKSTEP209.dll
+        bin/occt/TKSTEPAttr.dll
+        bin/occt/TKSTEPBase.dll
+        bin/occt/TKTopAlgo.dll
+        bin/occt/TKV3d.dll
+        bin/occt/TKVCAF.dll
+        bin/occt/TKXCAF.dll
+        bin/occt/TKXDESTEP.dll
+        bin/occt/TKXSBase.dll
+        bin/freetype.dll
+    )
+    foreach(_rel IN LISTS _dep_runtime_dlls)
+        set(_found_path "")
+        foreach(_root IN LISTS ORCA_DEPS_INSTALL_PATHS)
+            if(EXISTS "${_root}/${_rel}")
+                set(_found_path "${_root}/${_rel}")
+                break()
+            endif()
+        endforeach()
+        if(_found_path)
+            file(COPY "${_found_path}" DESTINATION ${_out_dir})
+        else()
+            message(WARNING "Runtime DLL not found in any dep root: ${_rel}")
+        endif()
+    endforeach()
 
     set(${output_dlls}
         ${_out_dir}/libgmp-10.dll
@@ -894,9 +931,35 @@ if(BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
+if(APPLE AND CMAKE_MACOSX_BUNDLE)
+    add_custom_target(stage_macos_bundle
+        COMMAND ${CMAKE_COMMAND}
+            -DORCA_MACOS_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DORCA_MACOS_CONFIG=$<CONFIG>
+            -DORCA_MACOS_STAGE_DIR=${CMAKE_BINARY_DIR}/OrcaSlicer
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos_stage_bundle.cmake
+        DEPENDS OrcaSlicer
+        COMMENT "Stage macOS app bundle"
+        VERBATIM
+    )
+    if(TARGET OrcaSlicer_profile_validator)
+        add_dependencies(stage_macos_bundle OrcaSlicer_profile_validator)
+    endif()
+endif()
+
 if (NOT WIN32 AND NOT APPLE)
     set(SLIC3R_APP_CMD "orca-slicer")
     configure_file(${LIBDIR}/dev-utils/platform/unix/build_appimage.sh.in ${CMAKE_CURRENT_BINARY_DIR}/build_appimage.sh USE_SOURCE_PERMISSIONS @ONLY)
+    add_custom_target(package_linux_appimage
+        COMMAND "${CMAKE_BINARY_DIR}/src/build_linux_image.sh" -i -R "$<CONFIG>"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        DEPENDS OrcaSlicer
+        COMMENT "Package Linux AppImage"
+        VERBATIM
+    )
+    if(TARGET OrcaSlicer_profile_validator)
+        add_dependencies(package_linux_appimage OrcaSlicer_profile_validator)
+    endif()
 endif()
 
 
