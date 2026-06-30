@@ -534,7 +534,14 @@ endif ()
 encoding_check(libslic3r)
 
 target_compile_definitions(libslic3r PUBLIC -DUSE_TBB -DTBB_USE_CAPTURED_EXCEPTION=0)
-target_include_directories(libslic3r PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(libslic3r
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    PUBLIC
+        $<BUILD_INTERFACE:${LIBSLICER_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
 target_include_directories(libslic3r SYSTEM PUBLIC ${EXPAT_INCLUDE_DIRS})
 
 # Find the OCCT and related libraries
@@ -578,18 +585,21 @@ target_link_libraries(libslic3r
     PUBLIC
         Eigen3::Eigen
         admesh
-        libigl
-        libnest2d
-        miniz
-        opencv_world
-    PRIVATE
-        ${CMAKE_DL_LIBS}
-        ${EXPAT_LIBRARIES}
-        ${OCCT_LIBS}
         boost_libs
         cereal::cereal
         clipper
         Clipper2
+        libigl
+        libnest2d
+        miniz
+        nlohmann_json
+        opencv_world
+        OpenSSL::Crypto
+        TBB::tbb
+    PRIVATE
+        ${CMAKE_DL_LIBS}
+        ${EXPAT_LIBRARIES}
+        ${OCCT_LIBS}
         draco::draco
         glu-libtess
         JPEG::JPEG
@@ -600,10 +610,8 @@ target_link_libraries(libslic3r
         qhull
         qoi
         semver
-        TBB::tbb
         TBB::tbbmalloc
         ZLIB::ZLIB
-        OpenSSL::Crypto
     )
 
 if(NOT WIN32)

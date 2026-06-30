@@ -1,0 +1,62 @@
+set(_source_dir "@CMAKE_CURRENT_SOURCE_DIR@/cmake/add_subdirectory")
+set(_build_dir "@CMAKE_CURRENT_BINARY_DIR@/cmake/add_subdirectory-build")
+
+if(NOT DEFINED LIBSLICER_SMOKE_CONFIG OR LIBSLICER_SMOKE_CONFIG STREQUAL "")
+    set(LIBSLICER_SMOKE_CONFIG "@CMAKE_BUILD_TYPE@")
+endif()
+
+set(_configure_args
+    -S "${_source_dir}"
+    -B "${_build_dir}"
+    -G "@CMAKE_GENERATOR@"
+    "-DLIBSLICER_BUILD_TESTS=OFF"
+    "-DCMAKE_C_COMPILER=@CMAKE_C_COMPILER@"
+    "-DCMAKE_CXX_COMPILER=@CMAKE_CXX_COMPILER@"
+    "-DCMAKE_FETCH_CACHE=@CMAKE_FETCH_CACHE@"
+)
+
+if(NOT "@CMAKE_BUILD_TYPE@" STREQUAL "")
+    list(APPEND _configure_args "-DCMAKE_BUILD_TYPE=@CMAKE_BUILD_TYPE@")
+endif()
+
+if(NOT "@CMAKE_OSX_ARCHITECTURES@" STREQUAL "")
+    list(APPEND _configure_args "-DCMAKE_OSX_ARCHITECTURES=@CMAKE_OSX_ARCHITECTURES@")
+endif()
+
+if(NOT "@CMAKE_OSX_DEPLOYMENT_TARGET@" STREQUAL "")
+    list(APPEND _configure_args "-DCMAKE_OSX_DEPLOYMENT_TARGET=@CMAKE_OSX_DEPLOYMENT_TARGET@")
+endif()
+
+if(NOT "@CMAKE_OSX_SYSROOT@" STREQUAL "")
+    list(APPEND _configure_args "-DCMAKE_OSX_SYSROOT=@CMAKE_OSX_SYSROOT@")
+endif()
+
+set(_ignore_prefix_path "@CMAKE_IGNORE_PREFIX_PATH@")
+if(NOT _ignore_prefix_path STREQUAL "")
+    string(REPLACE ";" "\\;" _ignore_prefix_path_arg "${_ignore_prefix_path}")
+    list(APPEND _configure_args "-DCMAKE_IGNORE_PREFIX_PATH=${_ignore_prefix_path_arg}")
+endif()
+
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" ${_configure_args}
+    RESULT_VARIABLE _configure_result
+)
+if(NOT _configure_result EQUAL 0)
+    message(FATAL_ERROR "libslicer add_subdirectory smoke configure failed")
+endif()
+
+set(_build_args
+    --build "${_build_dir}"
+    --target run_libslicer_consumer_smoke
+)
+if(NOT LIBSLICER_SMOKE_CONFIG STREQUAL "")
+    list(APPEND _build_args --config "${LIBSLICER_SMOKE_CONFIG}")
+endif()
+
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" ${_build_args}
+    RESULT_VARIABLE _build_result
+)
+if(NOT _build_result EQUAL 0)
+    message(FATAL_ERROR "libslicer add_subdirectory smoke build/run failed")
+endif()

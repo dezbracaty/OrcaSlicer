@@ -7,6 +7,13 @@ cmake_minimum_required(VERSION 3.13)
 project(libslicer LANGUAGES C CXX)
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+set(LIBSLICER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(LIBSLICER_IS_TOP_LEVEL ON)
+else()
+    set(LIBSLICER_IS_TOP_LEVEL OFF)
+endif()
 
 include("version.inc")
 include(GNUInstallDirs)
@@ -76,7 +83,7 @@ endif()
 option(SLIC3R_STATIC "Link fetched dependencies statically where supported" ${SLIC3R_STATIC_INITIAL})
 option(SLIC3R_PCH "Use precompiled headers" ON)
 option(SLIC3R_ASAN "Enable ASan on Clang and GCC" OFF)
-option(LIBSLICER_BUILD_TESTS "Build libslicer tests" ON)
+option(LIBSLICER_BUILD_TESTS "Build libslicer tests" ${LIBSLICER_IS_TOP_LEVEL})
 
 if (APPLE)
     set(CMAKE_FIND_FRAMEWORK LAST)
@@ -254,6 +261,7 @@ add_subdirectory(deps_src)
 add_subdirectory(src/libslic3r)
 
 set_target_properties(libslic3r PROPERTIES OUTPUT_NAME libslicer)
+add_library(libslicer::libslicer ALIAS libslic3r)
 add_custom_target(libslicer DEPENDS libslic3r)
 
 if(LIBSLICER_BUILD_TESTS)

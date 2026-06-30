@@ -32,6 +32,24 @@ cmake --build --preset macos-arm64-release --target libslic3r_tests
 ctest --test-dir build-libslicer/release/arm64 --output-on-failure
 ```
 
+When consumed from another CMake project with `add_subdirectory`, tests are
+disabled by default. Link against the namespaced target:
+
+```cmake
+set(LIBSLICER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/libslicer)
+
+target_link_libraries(my_app PRIVATE libslicer::libslicer)
+```
+
+Applications using profile or resource-backed APIs must initialize runtime
+paths before loading presets or related data:
+
+```cpp
+Slic3r::set_resources_dir("/path/to/libslicer/resources");
+Slic3r::set_data_dir("/path/to/app-data");
+```
+
 ## Kept Runtime Data
 
 The following resource groups are intentionally retained because they are used
