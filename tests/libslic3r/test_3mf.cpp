@@ -2,12 +2,18 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Format/3mf.hpp"
 #include "libslic3r/Format/STL.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/Print.hpp"
+#include "libslic3r/Utils.hpp"
+#include "../test_utils.hpp"
 
 #include <boost/filesystem/operations.hpp>
 
 #include <catch2/catch_tostring.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <fstream>
+#include <iterator>
 #include <type_traits> // for std::enable_if_t
 #include <typeinfo>    // for typeid
 
@@ -128,6 +134,64 @@ SCENARIO("Export+Import geometry to/from 3mf file cycle", "[3mf]") {
             }
             THEN("world vertices coordinates after load match") {
                 REQUIRE(res);
+            }
+        }
+    }
+}
+
+SCENARIO("Slice 3mf file to G-code", "[3mf][gcode]") {
+    GIVEN("a model loaded through 3mf") {
+        boost::filesystem::path resources_dir =
+            boost::filesystem::path(TEST_DATA_DIR).parent_path().parent_path() / "resources";
+        Slic3r::set_resources_dir(resources_dir.string());
+        Slic3r::set_data_dir(boost::filesystem::temp_directory_path().string());
+
+        Model src_model;
+        std::string src_file = std::string(TEST_DATA_DIR) + "/test_3mf/Prusa.stl";
+        REQUIRE(load_stl(src_file.c_str(), &src_model));
+        REQUIRE(src_model.add_default_instances());
+
+        ScopedTemporaryFile temp_3mf(".3mf");
+        REQUIRE(store_3mf(temp_3mf.string().c_str(), &src_model, nullptr, false));
+
+        Model model;
+        DynamicPrintConfig loaded_config;
+        ConfigSubstitutionContext ctxt{ ForwardCompatibilitySubstitutionRule::Disable };
+        REQUIRE(load_3mf(temp_3mf.string().c_str(), loaded_config, ctxt, &model, false));
+        REQUIRE(model.add_default_instances());
+        model.center_instances_around_point({ 100.0, 100.0 });
+
+        DynamicPrintConfig full_config = DynamicPrintConfig::full_print_config();
+        full_config.apply(loaded_config, true);
+        full_config.set_key_value("layer_change_gcode", new ConfigOptionString("G92 E0"));
+
+        WHEN("the model is applied to a Print and exported") {
+            Print print;
+            print.apply(model, full_config);
+
+            StringObjectException warning;
+            StringObjectException error = print.validate(&warning);
+            CAPTURE(error.string);
+            CAPTURE(warning.string);
+            REQUIRE(error.string.empty());
+
+            print.process();
+
+            ScopedTemporaryFile temp_gcode(".gcode");
+            GCodeProcessorResult result;
+            std::string output_path = print.export_gcode(temp_gcode.string(), &result);
+
+            THEN("a non-empty G-code file is generated") {
+                REQUIRE(output_path == temp_gcode.string());
+                REQUIRE(boost::filesystem::exists(temp_gcode.path()));
+                REQUIRE(boost::filesystem::file_size(temp_gcode.path()) > 0);
+
+                std::ifstream gcode(temp_gcode.string());
+                REQUIRE(gcode.good());
+
+                std::string content((std::istreambuf_iterator<char>(gcode)), std::istreambuf_iterator<char>());
+                CHECK(content.find("G1") != std::string::npos);
+                CHECK(content.find("; filament used") != std::string::npos);
             }
         }
     }
