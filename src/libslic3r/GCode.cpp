@@ -67,8 +67,6 @@
     using slic3r_tbb_filtermode = tbb::filter;
 #endif
 
-#include <Shiny/Shiny.h>
-
 #include "miniz_extension.hpp"
 
 using namespace std::literals::string_view_literals;

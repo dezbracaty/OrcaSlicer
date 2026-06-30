@@ -133,7 +133,7 @@ if (APPLE)
 endif ()
 
 # CMAKE_IGNORE_PREFIX_PATH：阻止子 cmake 的 find_package 解析到 /opt/homebrew
-# 之类宿主目录（boost / wxWidgets 这种会 find_package(ZLIB/PNG/...) 的 dep 受影响）。
+# 之类宿主目录（例如 boost 这类会 find_package(ZLIB/PNG/...) 的 dep 受影响）。
 if (CMAKE_IGNORE_PREFIX_PATH)
     string(REPLACE ";" "\\;" _ignore_prefix_escaped "${CMAKE_IGNORE_PREFIX_PATH}")
     list(APPEND FETCH_DEPS_FORWARD_ARGS
@@ -182,9 +182,6 @@ include(${_deps_root}/Eigen/Eigen.cmake)
 include(${_deps_root}/Cereal/Cereal.cmake)
 
 include(${_deps_root}/Qhull/Qhull.cmake)
-include(${_deps_root}/GLEW/GLEW.cmake)
-include(${_deps_root}/GLFW/GLFW.cmake)
-include(${_deps_root}/OpenCSG/OpenCSG.cmake)
 include(${_deps_root}/TBB/TBB.cmake)
 include(${_deps_root}/Blosc/Blosc.cmake)
 include(${_deps_root}/OpenEXR/OpenEXR.cmake)
@@ -196,10 +193,7 @@ include(${_deps_root}/NLopt/NLopt.cmake)
 include(${_deps_root}/libnoise/libnoise.cmake)
 include(${_deps_root}/Draco/Draco.cmake)
 include(${_deps_root}/OpenSSL/OpenSSL.cmake)
-include(${_deps_root}/CURL/CURL.cmake)
 include(${_deps_root}/JPEG/JPEG.cmake)
-include(${_deps_root}/wxWidgets/wxWidgets.cmake)
-include(${_deps_root}/NanoSVG/NanoSVG.cmake)
 include(${_deps_root}/FREETYPE/FREETYPE.cmake)
 include(${_deps_root}/OCCT/OCCT.cmake)
 include(${_deps_root}/OpenCV/OpenCV.cmake)

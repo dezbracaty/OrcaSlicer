@@ -195,7 +195,6 @@ void trace(unsigned int level, const char *message)
 
 void disable_multi_threading()
 {
-    // Disable parallelization so the Shiny profiler works
 #ifdef TBB_HAS_GLOBAL_CONTROL
     tbb::global_control(tbb::global_control::max_allowed_parallelism, 1);
 #else // TBB_HAS_GLOBAL_CONTROL

@@ -34,10 +34,6 @@
 // Mark string for localization and translate.
 #define L(s) Slic3r::I18N::translate(s)
 
-// Store the print/filament/printer presets into a "presets" subdirectory of the Slic3rPE config dir.
-// This breaks compatibility with the upstream Slic3r if the --datadir is used to switch between the two versions.
-//#define SLIC3R_PROFILE_USE_PRESETS_SUBDIR
-
 namespace Slic3r {
 
 static std::vector<std::string> s_project_options {

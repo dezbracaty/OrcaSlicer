@@ -8,16 +8,8 @@
 #include "SVG.hpp"
 #endif /* CLIPPER_UTILS_DEBUG */
 
-// Profiling support using the Shiny intrusive profiler
-//#define CLIPPER_UTILS_PROFILE
-#if defined(SLIC3R_PROFILE) && defined(CLIPPER_UTILS_PROFILE)
-	#include <Shiny/Shiny.h>
-	#define CLIPPERUTILS_PROFILE_FUNC() PROFILE_FUNC()
-	#define CLIPPERUTILS_PROFILE_BLOCK(name) PROFILE_BLOCK(name)
-#else
-	#define CLIPPERUTILS_PROFILE_FUNC()
-	#define CLIPPERUTILS_PROFILE_BLOCK(name)
-#endif
+#define CLIPPERUTILS_PROFILE_FUNC()
+#define CLIPPERUTILS_PROFILE_BLOCK(name)
 
 namespace Slic3r {
 

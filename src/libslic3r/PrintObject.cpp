@@ -42,8 +42,6 @@
 #include <tbb/spin_mutex.h>
 #include <tbb/concurrent_unordered_set.h>
 
-#include <Shiny/Shiny.h>
-
 using namespace std::literals;
 
 //! macro used to mark string used at localization,

@@ -35,6 +35,12 @@
 #include "Technologies.hpp"
 #include "Semver.hpp"
 
+#define PROFILE_FUNC()
+#define PROFILE_BLOCK(name)
+#define PROFILE_UPDATE()
+#define PROFILE_CLEAR()
+#define PROFILE_OUTPUT(path)
+
 #if 0
 // Saves around 32% RAM after slicing step, 6.7% after G-code export (tested on PrusaSlicer 2.2.0 final).
 using coord_t = int32_t;

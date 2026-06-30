@@ -1,6 +1,6 @@
+#include <algorithm>
 #include <cmath>
 #include <assert.h>
-#include "slic3r/Utils/ColorSpaceConvert.hpp"
 #include "Utils.hpp"
 #include "FlushVolCalc.hpp"
 
@@ -22,6 +22,25 @@ static float to_radians(float degree)
 static float get_luminance(float r, float g, float b)
 {
     return r * 0.3 + g * 0.59 + b * 0.11;
+}
+
+static void rgb_to_hsv(float r, float g, float b, float* h, float* s, float* v)
+{
+    float cmax = std::max(std::max(r, g), b);
+    float cmin = std::min(std::min(r, g), b);
+    float delta = cmax - cmin;
+
+    if (std::abs(delta) < 0.001f)
+        *h = 0.f;
+    else if (cmax == r)
+        *h = 60.f * std::fmod((g - b) / delta, 6.f);
+    else if (cmax == g)
+        *h = 60.f * ((b - r) / delta + 2.f);
+    else
+        *h = 60.f * ((r - g) / delta + 4.f);
+
+    *s = std::abs(cmax) < 0.001f ? 0.f : delta / cmax;
+    *v = cmax;
 }
 
 static float calc_triangle_3rd_edge(float edge_a, float edge_b, float degree_ab)
@@ -73,8 +92,8 @@ int FlushVolCalculator::calc_flush_vol_rgb(unsigned char src_r, unsigned char sr
     dst_b_f = (float)dst_b / 255.f;
 
     // Calculate color distance in HSV color space
-    RGB2HSV(src_r_f, src_g_f, src_b_f, &from_hsv_h, &from_hsv_s, &from_hsv_v);
-    RGB2HSV(dst_r_f, dst_g_f, dst_b_f, &to_hsv_h, &to_hsv_s, &to_hsv_v);
+    rgb_to_hsv(src_r_f, src_g_f, src_b_f, &from_hsv_h, &from_hsv_s, &from_hsv_v);
+    rgb_to_hsv(dst_r_f, dst_g_f, dst_b_f, &to_hsv_h, &to_hsv_s, &to_hsv_v);
     float hs_dist = DeltaHS_BBS(from_hsv_h, from_hsv_s, from_hsv_v, to_hsv_h, to_hsv_s, to_hsv_v);
 
     // 1. Color difference is more obvious if the dest color has high luminance
