@@ -1,5 +1,3 @@
-# Add individual tests as executables in separate directories at the bottom of this file
-
 add_subdirectory(catch2)
 
 # The top-level project defines _UNICODE globally, which makes Catch2's bundled
@@ -52,10 +50,4 @@ function(orcaslicer_discover_tests TARGET)
     catch_discover_tests(${TARGET} ADD_TAGS_AS_LABELS)
 endfunction()
 
-add_subdirectory(libnest2d)
 add_subdirectory(libslic3r)
-add_subdirectory(slic3rutils)
-add_subdirectory(fff_print)
-add_subdirectory(sla_print)
-
-

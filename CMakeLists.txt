@@ -76,6 +76,7 @@ endif()
 option(SLIC3R_STATIC "Link fetched dependencies statically where supported" ${SLIC3R_STATIC_INITIAL})
 option(SLIC3R_PCH "Use precompiled headers" ON)
 option(SLIC3R_ASAN "Enable ASan on Clang and GCC" OFF)
+option(LIBSLICER_BUILD_TESTS "Build libslicer tests" ON)
 
 if (APPLE)
     set(CMAKE_FIND_FRAMEWORK LAST)
@@ -213,7 +214,20 @@ if(NOT SLIC3R_STATIC)
 endif()
 
 target_include_directories(boost_headeronly SYSTEM INTERFACE ${Boost_INCLUDE_DIRS})
-target_link_libraries(boost_libs INTERFACE boost_headeronly ${Boost_LIBRARIES})
+target_link_libraries(boost_libs INTERFACE
+    boost_headeronly
+    Boost::atomic
+    Boost::chrono
+    Boost::date_time
+    Boost::filesystem
+    Boost::iostreams
+    Boost::locale
+    Boost::log
+    Boost::log_setup
+    Boost::nowide
+    Boost::program_options
+    Boost::thread
+)
 
 if (NOT TARGET cereal::cereal)
     set_target_properties(cereal PROPERTIES IMPORTED_GLOBAL TRUE)
@@ -241,3 +255,8 @@ add_subdirectory(src/libslic3r)
 
 set_target_properties(libslic3r PROPERTIES OUTPUT_NAME libslicer)
 add_custom_target(libslicer DEPENDS libslic3r)
+
+if(LIBSLICER_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

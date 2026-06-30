@@ -32,12 +32,23 @@ The macOS arm64 release artifact is:
 build-libslicer/release/arm64/src/libslic3r/liblibslicer.a
 ```
 
+## Tests
+
+Only the `tests/libslic3r` Catch2 suite is connected to the top-level CMake
+project.
+
+```bash
+cmake --build --preset macos-arm64-release --target libslic3r_tests
+ctest --test-dir build-libslicer/release/arm64 --output-on-failure
+```
+
 ## Scope
 
 - Primary target: `libslicer`
 - Core source: `src/libslic3r/`
 - Bundled source dependencies: `deps_src/`
 - Fetched dependencies: managed by `deps/fetch_deps.cmake`
+- Tests: `tests/libslic3r`, `tests/catch2`, `tests/data`, and shared helpers
 - No GUI/app/package targets are expected in this branch.
 
 ## Code Style
