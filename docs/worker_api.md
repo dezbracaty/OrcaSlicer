@@ -119,6 +119,11 @@ Supported `input.type` values:
 - `orca_3mf_project`: OrcaSlicer project 3MF that carries embedded project
   config.
 
+`3mf` and `orca_3mf_project` intentionally use different loaders. Use `3mf`
+for generic 3MF geometry plus an external resolved config. Use
+`orca_3mf_project` for Orca/Bambu project files that rely on Orca-specific 3MF
+extensions such as project config, plates, object paths, and embedded metadata.
+
 Supported `config.type` values:
 
 - `resolved_orca_json`: requires `config.path`. The worker loads the input
@@ -180,6 +185,15 @@ Rules:
 - Missing required keys are errors.
 - Values must be schema-coerced before slicing.
 - Multi-material arrays must preserve slot order.
+- Enum values may be submitted as Orca enum strings or integer enum values.
+- Nullable per-filament/per-extruder arrays may use `"nil"` only when the Orca
+  config schema marks that option as nullable.
+- `flush_volumes_matrix`, `flush_volumes_vector`, and `flush_multiplier` are
+  normalized to the current `filament_colour`/`filament_diameter` count and
+  `nozzle_diameter` count before slicing, matching Orca's profile resize
+  behavior when filament slots change.
+- Layer G-code keys are the Orca config keys `before_layer_change_gcode` and
+  `layer_change_gcode`. `layer_gcode` is not a worker request key.
 - The config must be resolved before submission; the worker should not depend on
   host application DB state.
 

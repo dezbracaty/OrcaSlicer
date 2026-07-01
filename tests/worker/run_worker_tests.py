@@ -17,9 +17,30 @@ def write_json(path, payload):
 
 def worker_config():
     return {
+        "extruder_type": ["Direct Drive"],
+        "filament_retract_lift_enforce": ["nil"],
         "gcode_comments": True,
         "layer_change_gcode": "G92 E0",
     }
+
+
+def worker_config_with_oversized_flush_matrix():
+    config = worker_config()
+    config.update({
+        "worker_test_unknown_key": True,
+        "filament_colour": ["#26A69A", "#26A69A", "#26A69A", "#26A69A"],
+        "filament_diameter": [1.75, 1.75, 1.75, 1.75],
+        "filament_settings_id": ["Test PLA", "Test PLA", "Test PLA", "Test PLA"],
+        "filament_type": ["PLA", "PLA", "PLA", "PLA"],
+        "flush_multiplier": [0.3],
+        "flush_volumes_vector": [140, 140, 140, 140, 140, 140, 140, 140],
+        "flush_volumes_matrix": [
+            0 if row == col else 280
+            for row in range(8)
+            for col in range(8)
+        ],
+    })
+    return config
 
 
 def test_3mf_path(source_root):
@@ -29,9 +50,22 @@ def test_3mf_path(source_root):
     return matches[0]
 
 
+def orca_project_3mf_path(source_root):
+    path = source_root / "resources" / "calib" / "pressure_advance" / "pa_pattern.3mf"
+    if not path.exists():
+        raise AssertionError(f"Orca project 3MF fixture not found: {path}")
+    return path
+
+
 def worker_request(source_root, work_dir, job_id, output_name, input_type="stl", input_path=None, config_type="resolved_orca_json"):
     if input_path is None:
         input_path = source_root / "tests" / "data" / "test_3mf" / "Prusa.stl"
+    config = {
+        "type": config_type,
+    }
+    if config_type == "resolved_orca_json":
+        config["path"] = str(work_dir / "config.json")
+
     return {
         "version": 1,
         "job_id": job_id,
@@ -43,10 +77,7 @@ def worker_request(source_root, work_dir, job_id, output_name, input_type="stl",
             "type": input_type,
             "path": str(input_path),
         },
-        "config": {
-            "type": config_type,
-            "path": str(work_dir / "config.json"),
-        },
+        "config": config,
         "output": {
             "gcode": str(work_dir / output_name),
             "artifacts_dir": str(work_dir / "artifacts"),
@@ -197,6 +228,54 @@ def run_cli(worker, source_root, root_work_dir):
     if proc.returncode != 0:
         raise AssertionError(f"worker CLI 3MF failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
     assert_gcode(work_dir / "cli-3mf-output.gcode")
+    assert_intermediates_cleaned(work_dir)
+
+    request_orca_project = worker_request(
+        source_root,
+        work_dir,
+        "worker-cli-orca-project-3mf",
+        "cli-orca-project-output.gcode",
+        input_type="orca_3mf_project",
+        input_path=orca_project_3mf_path(source_root),
+        config_type="project_embedded",
+    )
+    write_json(work_dir / "request-orca-project.json", request_orca_project)
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-orca-project.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"worker CLI Orca project 3MF failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    assert_gcode(work_dir / "cli-orca-project-output.gcode")
+    assert_intermediates_cleaned(work_dir)
+
+    write_json(work_dir / "config-oversized-flush.json", worker_config_with_oversized_flush_matrix())
+    request_oversized_flush = worker_request(
+        source_root,
+        work_dir,
+        "worker-cli-oversized-flush-matrix",
+        "cli-oversized-flush-output.gcode",
+    )
+    request_oversized_flush["config"]["path"] = str(work_dir / "config-oversized-flush.json")
+    write_json(work_dir / "request-oversized-flush.json", request_oversized_flush)
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-oversized-flush.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"worker CLI oversized flush matrix failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+    if not any(event.get("code") == "unknown_config_key" for event in events):
+        raise AssertionError(f"worker did not report unknown key warning for oversized flush matrix test:\n{proc.stdout}")
+    assert_gcode(work_dir / "cli-oversized-flush-output.gcode")
     assert_intermediates_cleaned(work_dir)
 
 

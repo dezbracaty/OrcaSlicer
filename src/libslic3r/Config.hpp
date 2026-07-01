@@ -2075,6 +2075,8 @@ public:
 
     std::string serialize() const override
     {
+        if (this->keys_map == nullptr)
+            return std::string();
         for (const auto &kvp : *this->keys_map)
             if (kvp.second == this->value)
                 return kvp.first;
@@ -2084,6 +2086,8 @@ public:
     bool deserialize(const std::string &str, bool append = false) override
     {
         UNUSED(append);
+        if (this->keys_map == nullptr)
+            return false;
         auto it = this->keys_map->find(str);
         if (it == this->keys_map->end())
             return false;
@@ -2155,6 +2159,8 @@ public:
 
     bool deserialize(const std::string& str, bool append = false) override
     {
+        if (this->keys_map == nullptr)
+            return false;
         if (!append)
             this->values.clear();
         std::istringstream is(str);

@@ -6,8 +6,10 @@
 #include "libslic3r/Format/STL.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/Preset.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/Semver.hpp"
 #include "libslic3r/Utils.hpp"
 
 #include <boost/filesystem/operations.hpp>
@@ -15,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -110,6 +113,97 @@ std::string json_array_to_config_string(const nlohmann::json& value, Slic3r::Con
     return out.str();
 }
 
+bool config_enum_value_from_json(const nlohmann::json& value,
+                                 const Slic3r::t_config_enum_values& enum_values,
+                                 bool allow_nil,
+                                 int& enum_value,
+                                 std::string& error)
+{
+    if (value.is_number_integer()) {
+        enum_value = value.get<int>();
+        return true;
+    }
+
+    if (!value.is_string()) {
+        error = "enum value must be a string or integer";
+        return false;
+    }
+
+    const std::string text = value.get<std::string>();
+    if (text == "nil" && allow_nil) {
+        enum_value = Slic3r::ConfigOptionInts::nil_value();
+        return true;
+    }
+
+    const auto it = enum_values.find(text);
+    if (it == enum_values.end()) {
+        error = "unknown enum value '" + text + "'";
+        return false;
+    }
+
+    enum_value = it->second;
+    return true;
+}
+
+bool apply_enum_config_value(const std::string& key,
+                             const nlohmann::json& value_json,
+                             const Slic3r::ConfigOptionDef& option_def,
+                             Slic3r::DynamicPrintConfig& config,
+                             std::string& error)
+{
+    if (option_def.enum_keys_map == nullptr) {
+        error = "Config option " + key + " has no enum value map";
+        return false;
+    }
+
+    if (option_def.type == Slic3r::coEnum) {
+        const nlohmann::json& scalar = value_json.is_array() && !value_json.empty() ? value_json.front() : value_json;
+        int enum_value = 0;
+        if (!config_enum_value_from_json(scalar, *option_def.enum_keys_map, false, enum_value, error)) {
+            error = "Invalid config value for " + key + ": " + error;
+            return false;
+        }
+
+        Slic3r::ConfigOption* option = config.option(key, true);
+        auto* enum_option = dynamic_cast<Slic3r::ConfigOptionEnumGeneric*>(option);
+        if (enum_option != nullptr)
+            enum_option->keys_map = option_def.enum_keys_map;
+        option->setInt(enum_value);
+        return true;
+    }
+
+    if (!value_json.is_array()) {
+        error = "Invalid config value for " + key + ": enum array value must be an array";
+        return false;
+    }
+
+    Slic3r::ConfigOption* option = config.option(key, true);
+    auto* enum_option = dynamic_cast<Slic3r::ConfigOptionEnumsGeneric*>(option);
+    if (enum_option != nullptr)
+        enum_option->keys_map = option_def.enum_keys_map;
+    if (auto* enum_nullable_option = dynamic_cast<Slic3r::ConfigOptionEnumsGenericNullable*>(option); enum_nullable_option != nullptr)
+        enum_nullable_option->keys_map = option_def.enum_keys_map;
+
+    std::vector<int> enum_values;
+    enum_values.reserve(value_json.size());
+    for (const nlohmann::json& item : value_json) {
+        int enum_value = 0;
+        if (!config_enum_value_from_json(item, *option_def.enum_keys_map, option->nullable(), enum_value, error)) {
+            error = "Invalid config value for " + key + ": " + error;
+            return false;
+        }
+        enum_values.push_back(enum_value);
+    }
+
+    auto* int_values = dynamic_cast<Slic3r::ConfigOptionInts*>(option);
+    if (int_values == nullptr) {
+        error = "Invalid config value for " + key + ": enum option storage is not an integer vector";
+        return false;
+    }
+    int_values->values = std::move(enum_values);
+    return true;
+}
+
 bool apply_resolved_config(const std::filesystem::path& config_path,
                            Slic3r::DynamicPrintConfig& config,
                            const EventCallback& events,
@@ -150,6 +244,12 @@ bool apply_resolved_config(const std::filesystem::path& config_path,
             continue;
         }
 
+        if (option_def->type == Slic3r::coEnum || option_def->type == Slic3r::coEnums) {
+            if (!apply_enum_config_value(key, it.value(), *option_def, config, error))
+                return false;
+            continue;
+        }
+
         std::string value;
         if (it.value().is_array())
             value = json_array_to_config_string(it.value(), option_def->type);
@@ -167,6 +267,111 @@ bool apply_resolved_config(const std::filesystem::path& config_path,
     return true;
 }
 
+void normalize_flush_volumes_config(Slic3r::DynamicPrintConfig& config)
+{
+    auto* matrix = config.option<Slic3r::ConfigOptionFloats>("flush_volumes_matrix", true);
+    auto* vector = config.option<Slic3r::ConfigOptionFloats>("flush_volumes_vector", true);
+    auto* multiplier = config.option<Slic3r::ConfigOptionFloats>("flush_multiplier", true);
+    auto* filament_colours = config.option<Slic3r::ConfigOptionStrings>("filament_colour", true);
+    auto* filament_diameters = config.option<Slic3r::ConfigOptionFloats>("filament_diameter", true);
+    auto* nozzle_diameters = config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter", true);
+
+    size_t filament_count = filament_colours->values.size();
+    if (filament_count == 0)
+        filament_count = filament_diameters->values.size();
+    if (filament_count <= 1)
+        return;
+
+    const std::vector<double> old_matrix = matrix->values;
+    const size_t old_nozzle_count = std::max<size_t>(1, multiplier->values.size());
+    const size_t nozzle_count = std::max<size_t>(1, nozzle_diameters->values.size());
+    const size_t old_matrix_size = old_matrix.size() / old_nozzle_count;
+    const size_t old_filament_count = size_t(std::sqrt(double(old_matrix_size)) + EPSILON);
+    const size_t new_matrix_size = filament_count * filament_count;
+
+    if (multiplier->values.size() != nozzle_count)
+        multiplier->values.resize(nozzle_count, 1.0);
+
+    while (vector->values.size() < 2 * filament_count) {
+        vector->values.push_back(vector->values.size() > 1 ? vector->values[0] : 140.0);
+        vector->values.push_back(vector->values.size() > 1 ? vector->values[1] : 140.0);
+    }
+    while (vector->values.size() > 2 * filament_count)
+        vector->values.pop_back();
+
+    if (old_matrix.size() == new_matrix_size * nozzle_count)
+        return;
+
+    std::vector<double> new_matrix(new_matrix_size * nozzle_count, 0.0);
+    for (size_t i = 0; i < filament_count; ++i) {
+        for (size_t j = 0; j < filament_count; ++j) {
+            for (size_t nozzle_id = 0; nozzle_id < nozzle_count; ++nozzle_id) {
+                const size_t new_index = i * filament_count + j + new_matrix_size * nozzle_id;
+                const size_t old_index = i * old_filament_count + j + old_matrix_size * nozzle_id;
+                if (i < old_filament_count && j < old_filament_count &&
+                    nozzle_id < old_nozzle_count && old_index < old_matrix.size()) {
+                    new_matrix[new_index] = old_matrix[old_index];
+                } else {
+                    new_matrix[new_index] = i == j ? 0.0 : vector->values[2 * i] + vector->values[2 * j + 1];
+                }
+            }
+        }
+    }
+    matrix->values = std::move(new_matrix);
+}
+
+void release_project_presets(std::vector<Slic3r::Preset*>& project_presets)
+{
+    for (Slic3r::Preset* preset : project_presets)
+        delete preset;
+    project_presets.clear();
+}
+
+bool load_orca_project_3mf(const std::string& input,
+                           const std::filesystem::path& data_dir,
+                           Slic3r::Model& model,
+                           Slic3r::DynamicPrintConfig& loaded_config,
+                           std::string& error)
+{
+    Slic3r::ConfigSubstitutionContext ctxt { Slic3r::ForwardCompatibilitySubstitutionRule::Enable };
+    Slic3r::PlateDataPtrs plate_data;
+    std::vector<Slic3r::Preset*> project_presets;
+    Slic3r::Semver file_version;
+    bool is_bbl_3mf = false;
+    bool is_orca_3mf = false;
+
+    model.set_backup_path((data_dir / "orca_3mf_model").string());
+
+    try {
+        if (!Slic3r::load_bbs_3mf(input.c_str(),
+                                  &loaded_config,
+                                  &ctxt,
+                                  &model,
+                                  &plate_data,
+                                  &project_presets,
+                                  &is_bbl_3mf,
+                                  &is_orca_3mf,
+                                  &file_version,
+                                  nullptr,
+                                  Slic3r::LoadStrategy::LoadModel | Slic3r::LoadStrategy::LoadConfig)) {
+            error = "Failed to load Orca 3MF project: " + input;
+            Slic3r::release_PlateData_list(plate_data);
+            release_project_presets(project_presets);
+            return false;
+        }
+    } catch (const std::exception& e) {
+        error = std::string("Failed to load Orca 3MF project: ") + input + ": " + e.what();
+        Slic3r::release_PlateData_list(plate_data);
+        release_project_presets(project_presets);
+        return false;
+    }
+
+    Slic3r::release_PlateData_list(plate_data);
+    release_project_presets(project_presets);
+    model.set_backup_path("detach");
+    return true;
+}
+
 bool load_model(const JobRequest& request, Slic3r::Model& model, Slic3r::DynamicPrintConfig& loaded_config, std::string& error)
 {
     const std::string input = request.input_path.string();
@@ -175,12 +380,15 @@ bool load_model(const JobRequest& request, Slic3r::Model& model, Slic3r::Dynamic
             error = "Failed to load STL: " + input;
             return false;
         }
-    } else if (request.input_type == "3mf" || request.input_type == "orca_3mf_project") {
+    } else if (request.input_type == "3mf") {
         Slic3r::ConfigSubstitutionContext ctxt { Slic3r::ForwardCompatibilitySubstitutionRule::Disable };
         if (!Slic3r::load_3mf(input.c_str(), loaded_config, ctxt, &model, false)) {
             error = "Failed to load 3MF: " + input;
             return false;
         }
+    } else if (request.input_type == "orca_3mf_project") {
+        if (!load_orca_project_3mf(input, request.data_dir, model, loaded_config, error))
+            return false;
     } else {
         error = "Unsupported input type: " + request.input_type;
         return false;
@@ -346,7 +554,7 @@ void remove_directory_tree_if_safe(const std::filesystem::path& working_dir,
     if (!std::filesystem::exists(directory, ec))
         return;
 
-    boost::filesystem::remove_all(directory.string());
+    std::filesystem::remove_all(directory, ec);
 }
 
 void remove_empty_directory_if_safe(const std::filesystem::path& working_dir,
@@ -364,7 +572,7 @@ void remove_empty_directory_if_safe(const std::filesystem::path& working_dir,
     if (!std::filesystem::exists(directory, ec) || !std::filesystem::is_empty(directory, ec))
         return;
 
-    boost::filesystem::remove(directory.string());
+    std::filesystem::remove(directory, ec);
 }
 
 class JobIntermediateCleanup {
@@ -462,6 +670,7 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
         emit_result(events, job_id, false, "invalid_config", error, {}, started);
         return 4;
     }
+    normalize_flush_volumes_config(config);
 
     if (cancellation.cancelled()) {
         emit_result(events, job_id, false, "cancelled", "Job was cancelled", {}, started);
