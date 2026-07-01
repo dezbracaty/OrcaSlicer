@@ -115,14 +115,20 @@ should print the selected port as a JSON event on stdout:
 Supported `input.type` values:
 
 - `stl`
-- `3mf`
+- `3mf`: 3MF geometry/project input with an external resolved Orca config.
+- `orca_3mf_project`: OrcaSlicer project 3MF that carries embedded project
+  config.
 
 Supported `config.type` values:
 
-- `resolved_orca_json`
+- `resolved_orca_json`: requires `config.path`. The worker loads the input
+  model/project, then applies the resolved config JSON.
+- `project_embedded`: does not use `config.path`. This is accepted only with
+  `input.type=orca_3mf_project`; the worker uses the config loaded from the
+  OrcaSlicer 3MF project plus slicer defaults.
 
-The worker may later add `ini`, `preset_bundle`, or `project_embedded` config
-types, but the first implementation should accept only resolved full config
+The worker does not resolve preset bundles or host application database state.
+Hosts that do not submit `project_embedded` must submit a fully resolved config
 JSON.
 
 ### File Ownership and Cleanup
@@ -407,6 +413,11 @@ public:
     explicit WorkerClient(EventCallback on_event);
     ~WorkerClient();
 
+    WorkerClient(const WorkerClient&) = delete;
+    WorkerClient& operator=(const WorkerClient&) = delete;
+    WorkerClient(WorkerClient&& other) noexcept;
+    WorkerClient& operator=(WorkerClient&& other) noexcept;
+
     bool start(const WorkerOptions& options);
     bool connect();
     bool submit(const SliceJob& job);
@@ -423,11 +434,18 @@ public:
 
 API rules:
 
+- `WorkerClient` is move-only because it owns a process, socket, and I/O thread.
+  Store it by value, `std::unique_ptr`, or another single-owner wrapper; do not
+  copy it between adapters.
 - `start()` starts the external `orcaslicer-worker serve` process.
 - `connect()` connects to the worker socket and performs `hello`.
 - `submit()` sends `start_job`.
 - Event callbacks are invoked from the client's I/O thread unless a host
   adapter marshals them to another thread.
+- Host adapters must not update UI state directly from the callback. Marshal the
+  event to the UI/main thread first.
+- Do not destroy the `WorkerClient` from inside its own callback. Schedule
+  shutdown onto the owning thread instead.
 - `stop()` requests graceful server shutdown.
 - `kill()` terminates the external process and is safe to call during cleanup.
 
@@ -503,7 +521,10 @@ Rules:
 - Clients must ignore unknown event fields.
 - Servers must reject unsupported protocol versions with
   `unsupported_protocol_version`.
-- Job request `version` follows the same rule.
+- Job request `version` follows the same rule. The current implementation
+  rejects any request version other than `1`.
+- Socket `start_job` is rejected with `bad_protocol` until a valid `hello`
+  handshake has completed.
 
 ## Test Plan
 
@@ -512,7 +533,15 @@ Required initial tests:
 - `orcaslicer-worker slice --job ...` succeeds on a minimal STL.
 - One-shot mode writes a non-empty G-code file.
 - Socket `hello` succeeds.
+- Socket `hello` rejects unsupported protocol versions.
 - Socket `start_job` emits `accepted`, `progress`, `artifact`, and `result`.
 - `cancel` produces a terminal cancelled result.
+- Unsupported job request versions emit `unsupported_protocol_version`.
+- Client disconnect after `hello` does not terminate the worker process.
 - Invalid request emits a structured error.
 - Unknown config keys produce warnings, not crashes.
+- The worker slices an STL input with resolved config JSON.
+- The worker slices a 3MF input with resolved config JSON.
+- Host CMake smoke tests prove `WorkerClient` is move-only and installable with
+  both `find_package(libslicer CONFIG REQUIRED)` and source-tree
+  `add_subdirectory`.

@@ -1,5 +1,6 @@
 #include <filesystem>
 #include <iostream>
+#include <type_traits>
 
 #include <libslicer_worker/WorkerClient.hpp>
 #include <libslicer_worker/WorkerEvent.hpp>
@@ -7,6 +8,11 @@
 
 int main()
 {
+    static_assert(!std::is_copy_constructible_v<libslicer::worker::WorkerClient>);
+    static_assert(!std::is_copy_assignable_v<libslicer::worker::WorkerClient>);
+    static_assert(std::is_move_constructible_v<libslicer::worker::WorkerClient>);
+    static_assert(std::is_move_assignable_v<libslicer::worker::WorkerClient>);
+
     libslicer::worker::WorkerEvent event;
     event.type = libslicer::worker::WorkerEventType::Progress;
     event.job_id = "find-package-smoke";

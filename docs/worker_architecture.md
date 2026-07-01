@@ -147,7 +147,7 @@ The worker process should own:
 Host application
   |
   | create job directory
-  | write request.json, config.json, input.stl or input.3mf
+  | write request.json, input.stl/input.3mf, and optional config.json
   v
 libslicer worker client
   |
@@ -159,7 +159,7 @@ orcaslicer-worker
   | load request
   | initialize resources/data dir
   | load model/project
-  | resolve config
+  | apply resolved config or project-embedded config
   | slice
   | write output.gcode and optional artifacts
   v
@@ -182,7 +182,7 @@ job/
   request.json
   input.3mf
   input.stl
-  config.json
+  config.json              # omitted for project_embedded jobs
   output.gcode
   artifacts/
     stats.json
@@ -200,24 +200,37 @@ Ownership is split deliberately:
 - The worker owns scratch paths such as `data/`.
 - `output.gcode` and non-empty artifacts are final outputs and are preserved.
 - Empty scratch artifact directories are removed by default.
+- `config.json` is required for `config.type=resolved_orca_json` and omitted for
+  `config.type=project_embedded`.
 
 `options.keep_intermediate_files=true` disables worker scratch cleanup for
 debugging.
 
-## Initial Slicing Scope
+## Current Slicing Scope
 
-Phase 1 should support:
+The current worker supports:
 
-- One input STL or one input 3MF.
-- Plate index selection for 3MF projects.
+- One input STL.
+- One input 3MF with external resolved Orca config.
+- OrcaSlicer project 3MF request semantics through
+  `input.type=orca_3mf_project` and `config.type=project_embedded`.
 - One output G-code file.
 - Resolved full print config JSON.
 - Resource and data directory initialization.
 - Progress events.
 - Cancellation request.
 - Structured error reporting.
+- Protocol and request version rejection.
+- Client disconnect protection for Unix socket writes.
 - CLI one-shot tests.
 - Socket smoke tests.
+- Install-tree and source-tree CMake smoke tests.
+
+Coverage still needs to improve for:
+
+- Native OrcaSlicer 3MF fixtures with embedded printer/print/filament config.
+- Plate index selection for multi-plate 3MF projects.
+- Cancellation inside long-running slicer stages.
 
 Phase 2 should add:
 
@@ -225,7 +238,7 @@ Phase 2 should add:
 - More complete multi-plate 3MF fixture coverage.
 - Multi-material and multi-nozzle validation through worker tests.
 - Intermediate preview/stat artifacts.
-- Stronger protocol version negotiation.
+- Stronger protocol capability negotiation.
 
 Phase 3 should add:
 

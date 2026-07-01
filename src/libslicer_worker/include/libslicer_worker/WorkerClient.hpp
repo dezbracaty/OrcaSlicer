@@ -21,6 +21,11 @@ public:
     explicit WorkerClient(EventCallback on_event);
     ~WorkerClient();
 
+    WorkerClient(const WorkerClient&) = delete;
+    WorkerClient& operator=(const WorkerClient&) = delete;
+    WorkerClient(WorkerClient&& other) noexcept;
+    WorkerClient& operator=(WorkerClient&& other) noexcept;
+
     bool start(const WorkerOptions& options);
     bool connect();
     bool submit(const SliceJob& job);
@@ -37,4 +42,3 @@ private:
 };
 
 } // namespace libslicer::worker
-

@@ -22,7 +22,16 @@ def worker_config():
     }
 
 
-def worker_request(source_root, work_dir, job_id, output_name):
+def test_3mf_path(source_root):
+    matches = sorted((source_root / "tests" / "data" / "test_3mf").rglob("*.3mf"))
+    if not matches:
+        raise AssertionError("No 3MF fixture found")
+    return matches[0]
+
+
+def worker_request(source_root, work_dir, job_id, output_name, input_type="stl", input_path=None, config_type="resolved_orca_json"):
+    if input_path is None:
+        input_path = source_root / "tests" / "data" / "test_3mf" / "Prusa.stl"
     return {
         "version": 1,
         "job_id": job_id,
@@ -31,11 +40,11 @@ def worker_request(source_root, work_dir, job_id, output_name):
         "resources_dir": str(source_root / "resources"),
         "data_dir": str(work_dir / "data"),
         "input": {
-            "type": "stl",
-            "path": str(source_root / "tests" / "data" / "test_3mf" / "Prusa.stl"),
+            "type": input_type,
+            "path": str(input_path),
         },
         "config": {
-            "type": "resolved_orca_json",
+            "type": config_type,
             "path": str(work_dir / "config.json"),
         },
         "output": {
@@ -88,6 +97,56 @@ def assert_overwrite_false_rejected(worker, source_root, work_dir):
         raise AssertionError(f"worker did not report output_exists for overwrite=false:\n{proc.stdout}\n{proc.stderr}")
 
 
+def assert_bad_request_version_rejected(worker, source_root, work_dir):
+    request = worker_request(source_root, work_dir, "worker-cli-bad-version", "bad-version.gcode")
+    request["version"] = 999
+    write_json(work_dir / "request-bad-version.json", request)
+
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-bad-version.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    if proc.returncode == 0:
+        raise AssertionError("worker accepted an unsupported request version")
+
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+    if not any(event.get("code") == "unsupported_protocol_version" for event in events):
+        raise AssertionError(f"worker did not report unsupported request version:\n{proc.stdout}\n{proc.stderr}")
+
+
+def assert_project_embedded_requires_orca_project(worker, source_root, work_dir):
+    request = worker_request(
+        source_root,
+        work_dir,
+        "worker-cli-bad-project-config",
+        "bad-project-config.gcode",
+        input_type="3mf",
+        input_path=test_3mf_path(source_root),
+        config_type="project_embedded",
+    )
+    request["config"] = {"type": "project_embedded"}
+    write_json(work_dir / "request-bad-project-config.json", request)
+
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-bad-project-config.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    if proc.returncode == 0:
+        raise AssertionError("worker accepted project_embedded config for a generic 3MF request")
+
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+    if not any(event.get("code") == "invalid_request" for event in events):
+        raise AssertionError(f"worker did not reject invalid project_embedded request:\n{proc.stdout}\n{proc.stderr}")
+
+
 def run_cli(worker, source_root, root_work_dir):
     work_dir = root_work_dir / "cli"
     shutil.rmtree(work_dir, ignore_errors=True)
@@ -115,6 +174,30 @@ def run_cli(worker, source_root, root_work_dir):
     assert_gcode(work_dir / "cli-output.gcode")
     assert_intermediates_cleaned(work_dir)
     assert_overwrite_false_rejected(worker, source_root, work_dir)
+    assert_bad_request_version_rejected(worker, source_root, work_dir)
+    assert_project_embedded_requires_orca_project(worker, source_root, work_dir)
+
+    request_3mf = worker_request(
+        source_root,
+        work_dir,
+        "worker-cli-3mf",
+        "cli-3mf-output.gcode",
+        input_type="3mf",
+        input_path=test_3mf_path(source_root),
+    )
+    write_json(work_dir / "request-3mf.json", request_3mf)
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-3mf.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"worker CLI 3MF failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    assert_gcode(work_dir / "cli-3mf-output.gcode")
+    assert_intermediates_cleaned(work_dir)
 
 
 def recv_json_line(sock, timeout_at):
@@ -148,7 +231,14 @@ def run_socket(worker, source_root, root_work_dir):
     write_json(work_dir / "config.json", worker_config())
     request = worker_request(source_root, work_dir, "worker-socket-stl", "socket-output.gcode")
     write_json(work_dir / "request.json", request)
-    second_request = worker_request(source_root, work_dir, "worker-socket-stl-2", "socket-output-2.gcode")
+    second_request = worker_request(
+        source_root,
+        work_dir,
+        "worker-socket-3mf",
+        "socket-output-2.gcode",
+        input_type="3mf",
+        input_path=test_3mf_path(source_root),
+    )
     write_json(work_dir / "request-2.json", second_request)
 
     proc = subprocess.Popen(
@@ -168,10 +258,34 @@ def run_socket(worker, source_root, root_work_dir):
                 raise AssertionError("timed out waiting for worker socket")
             time.sleep(0.05)
 
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as disconnected:
+            disconnected.settimeout(10)
+            disconnected.connect(str(socket_path))
+            disconnected.sendall(json.dumps({"type": "hello", "protocol": 1}).encode("utf-8") + b"\n")
+        time.sleep(0.1)
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate(timeout=5)
+            raise AssertionError(f"worker server exited after client disconnect with {proc.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as bad_client:
+            bad_client.settimeout(30)
+            bad_client.connect(str(socket_path))
+            bad_client.sendall(json.dumps({"type": "start_job", "request_path": str(work_dir / "request.json")}).encode("utf-8") + b"\n")
+            event = recv_json_line(bad_client, time.monotonic() + 30)
+            if event.get("code") != "bad_protocol":
+                raise AssertionError(f"worker accepted start_job before hello: {event}")
+
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(120)
             client.connect(str(socket_path))
+            client.sendall(json.dumps({"type": "hello", "protocol": 999}).encode("utf-8") + b"\n")
+            event = recv_json_line(client, time.monotonic() + 30)
+            if event.get("code") != "unsupported_protocol_version":
+                raise AssertionError(f"worker accepted unsupported protocol version: {event}")
             client.sendall(json.dumps({"type": "hello", "protocol": 1}).encode("utf-8") + b"\n")
+            event = recv_json_line(client, time.monotonic() + 30)
+            if event.get("type") != "hello" or event.get("protocol") != 1:
+                raise AssertionError(f"worker did not return a versioned hello: {event}")
             client.sendall(json.dumps({"type": "start_job", "request_path": str(work_dir / "request.json")}).encode("utf-8") + b"\n")
 
             result = None

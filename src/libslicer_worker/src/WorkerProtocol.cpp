@@ -45,6 +45,12 @@ std::string event_to_json_line(const WorkerEvent& event)
 {
     nlohmann::json json;
     json["type"] = type_to_string(event.type);
+    if (event.type == WorkerEventType::Hello) {
+        json["protocol"] = WORKER_PROTOCOL_VERSION;
+        json["server"] = event.message.empty() ? "orcaslicer-worker" : event.message;
+        json["version"] = "0.1.0";
+        json["capabilities"] = nlohmann::json::array({ "slice", "cancel", "artifacts" });
+    }
     if (!event.job_id.empty()) json["job_id"] = event.job_id;
     if (event.percent >= 0) json["percent"] = event.percent;
     if (!event.stage.empty()) json["stage"] = event.stage;

@@ -1,4 +1,5 @@
 #include "libslicer_worker/WorkerServer.hpp"
+#include "libslicer_worker/WorkerProtocol.hpp"
 
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Format/3mf.hpp"
@@ -33,6 +34,7 @@ struct JobRequest {
     std::string input_type;
     std::filesystem::path input_path;
     int plate_index { -1 };
+    std::string config_type;
     std::filesystem::path config_path;
     std::filesystem::path output_gcode;
     std::filesystem::path artifacts_dir;
@@ -173,7 +175,7 @@ bool load_model(const JobRequest& request, Slic3r::Model& model, Slic3r::Dynamic
             error = "Failed to load STL: " + input;
             return false;
         }
-    } else if (request.input_type == "3mf") {
+    } else if (request.input_type == "3mf" || request.input_type == "orca_3mf_project") {
         Slic3r::ConfigSubstitutionContext ctxt { Slic3r::ForwardCompatibilitySubstitutionRule::Disable };
         if (!Slic3r::load_3mf(input.c_str(), loaded_config, ctxt, &model, false)) {
             error = "Failed to load 3MF: " + input;
@@ -210,8 +212,9 @@ Slic3r::Vec2d bed_center_from_config(const Slic3r::DynamicPrintConfig& config)
     return { (min_x + max_x) * 0.5, (min_y + max_y) * 0.5 };
 }
 
-bool parse_request(const std::filesystem::path& request_path, JobRequest& request, std::string& error)
+bool parse_request(const std::filesystem::path& request_path, JobRequest& request, std::string& error_code, std::string& error)
 {
+    error_code = "invalid_request";
     std::ifstream input(request_path);
     if (!input.good()) {
         error = "Request file not found: " + request_path.string();
@@ -223,6 +226,23 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
         input >> json;
     } catch (const std::exception& e) {
         error = std::string("Failed to parse request JSON: ") + e.what();
+        return false;
+    }
+    if (!json.is_object()) {
+        error = "Request JSON must be an object";
+        return false;
+    }
+
+    const int version = json.value("version", -1);
+    if (version != WORKER_JOB_REQUEST_VERSION) {
+        error_code = "unsupported_protocol_version";
+        error = "Unsupported job request version: " + std::to_string(version);
+        return false;
+    }
+
+    const std::string kind = json.value("kind", "");
+    if (kind != "slice") {
+        error = "Unsupported job kind: " + kind;
         return false;
     }
 
@@ -239,11 +259,19 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
     request.input_type = input_json.value("type", "");
     request.input_path = resolve_path(request.working_dir, input_json.value("path", ""));
     request.plate_index = input_json.value("plate_index", -1);
+    if (request.input_type != "stl" && request.input_type != "3mf" && request.input_type != "orca_3mf_project") {
+        error = "Unsupported input type: " + request.input_type;
+        return false;
+    }
 
     const nlohmann::json config_json = json.value("config", nlohmann::json::object());
-    const std::string config_type = config_json.value("type", "");
-    if (config_type != "resolved_orca_json") {
-        error = "Unsupported config type: " + config_type;
+    request.config_type = config_json.value("type", "");
+    if (request.config_type != "resolved_orca_json" && request.config_type != "project_embedded") {
+        error = "Unsupported config type: " + request.config_type;
+        return false;
+    }
+    if (request.config_type == "project_embedded" && request.input_type != "orca_3mf_project") {
+        error = "config.type=project_embedded requires input.type=orca_3mf_project";
         return false;
     }
     request.config_path = resolve_path(request.working_dir, config_json.value("path", ""));
@@ -264,7 +292,7 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
         error = "input.type and input.path are required";
         return false;
     }
-    if (request.config_path.empty()) {
+    if (request.config_type == "resolved_orca_json" && request.config_path.empty()) {
         error = "config.path is required";
         return false;
     }
@@ -387,10 +415,11 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
 {
     const Clock::time_point started = Clock::now();
     JobRequest request;
+    std::string error_code;
     std::string error;
-    if (!parse_request(request_path, request, error)) {
-        emit_event(events, { WorkerEventType::Error, "", -1, "", "", "invalid_request", error });
-        emit_result(events, "", false, "invalid_request", error, {}, started);
+    if (!parse_request(request_path, request, error_code, error)) {
+        emit_event(events, { WorkerEventType::Error, "", -1, "", "", error_code, error });
+        emit_result(events, "", false, error_code, error, {}, started);
         return 3;
     }
 
@@ -428,7 +457,7 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
     emit_event(events, { WorkerEventType::Progress, job_id, 20, "loading_config", "", "", "Loading config" });
     Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
     config.apply(loaded_config, true);
-    if (!apply_resolved_config(request.config_path, config, events, job_id, error)) {
+    if (request.config_type == "resolved_orca_json" && !apply_resolved_config(request.config_path, config, events, job_id, error)) {
         emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "invalid_config", error });
         emit_result(events, job_id, false, "invalid_config", error, {}, started);
         return 4;

@@ -1,5 +1,6 @@
 #include <iostream>
 #include <string>
+#include <type_traits>
 
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/Utils.hpp>
@@ -9,6 +10,11 @@
 
 int main()
 {
+    static_assert(!std::is_copy_constructible_v<libslicer::worker::WorkerClient>);
+    static_assert(!std::is_copy_assignable_v<libslicer::worker::WorkerClient>);
+    static_assert(std::is_move_constructible_v<libslicer::worker::WorkerClient>);
+    static_assert(std::is_move_assignable_v<libslicer::worker::WorkerClient>);
+
     Slic3r::set_resources_dir(TEST_LIBSLICER_RESOURCES_DIR);
     Slic3r::set_data_dir(".");
 

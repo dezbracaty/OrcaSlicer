@@ -20,12 +20,31 @@ namespace libslicer::worker {
 namespace {
 
 #ifndef _WIN32
+int socket_send_flags()
+{
+#ifdef MSG_NOSIGNAL
+    return MSG_NOSIGNAL;
+#else
+    return 0;
+#endif
+}
+
+void disable_sigpipe(int fd)
+{
+#ifdef SO_NOSIGPIPE
+    int value = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &value, sizeof(value));
+#else
+    (void)fd;
+#endif
+}
+
 bool send_all(int fd, const std::string& message)
 {
     const char* data = message.data();
     size_t left = message.size();
     while (left > 0) {
-        const ssize_t written = ::send(fd, data, left, 0);
+        const ssize_t written = ::send(fd, data, left, socket_send_flags());
         if (written <= 0)
             return false;
         data += written;
@@ -82,6 +101,7 @@ int run_worker_server(const ServerOptions& options)
         std::cerr << "Failed to create socket\n";
         return 70;
     }
+    disable_sigpipe(server_fd);
 
     sockaddr_un addr {};
     addr.sun_family = AF_UNIX;
@@ -105,6 +125,7 @@ int run_worker_server(const ServerOptions& options)
         const int client_fd = ::accept(server_fd, nullptr, nullptr);
         if (client_fd < 0)
             continue;
+        disable_sigpipe(client_fd);
 
         std::atomic_bool job_active { false };
         CancellationToken cancellation;
@@ -112,6 +133,7 @@ int run_worker_server(const ServerOptions& options)
         std::mutex send_mutex;
         std::string recv_buffer;
         std::string active_job_id;
+        bool handshake_complete = false;
 
         auto emit_to_client = [&](const WorkerEvent& event) {
             std::lock_guard<std::mutex> lock(send_mutex);
@@ -130,11 +152,22 @@ int run_worker_server(const ServerOptions& options)
 
             const std::string type = message.value("type", "");
             if (type == "hello") {
+                const int protocol = message.value("protocol", -1);
+                if (protocol != WORKER_PROTOCOL_VERSION) {
+                    emit_to_client({ WorkerEventType::Error, "", -1, "", "", "unsupported_protocol_version",
+                                     "Unsupported worker protocol version: " + std::to_string(protocol) });
+                    continue;
+                }
+                handshake_complete = true;
                 WorkerEvent hello;
                 hello.type = WorkerEventType::Hello;
                 hello.message = "orcaslicer-worker";
                 emit_to_client(hello);
             } else if (type == "start_job") {
+                if (!handshake_complete) {
+                    emit_to_client({ WorkerEventType::Error, "", -1, "", "", "bad_protocol", "hello is required before start_job" });
+                    continue;
+                }
                 if (job_thread.joinable() && !job_active.load())
                     job_thread.join();
                 if (job_active.load()) {
