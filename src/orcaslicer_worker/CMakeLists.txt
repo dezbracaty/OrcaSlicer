@@ -11,8 +11,10 @@ target_link_libraries(orcaslicer-worker
 
 set_target_properties(orcaslicer-worker PROPERTIES
     OUTPUT_NAME orcaslicer-worker
+    EXPORT_NAME orcaslicer_worker
 )
 
 install(TARGETS orcaslicer-worker
+    EXPORT libslicerTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )

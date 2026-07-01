@@ -12,8 +12,10 @@
 #include <boost/filesystem/operations.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <system_error>
 
@@ -189,6 +191,25 @@ bool load_model(const JobRequest& request, Slic3r::Model& model, Slic3r::Dynamic
     return true;
 }
 
+Slic3r::Vec2d bed_center_from_config(const Slic3r::DynamicPrintConfig& config)
+{
+    const Slic3r::ConfigOptionPoints* printable_area = config.opt<Slic3r::ConfigOptionPoints>("printable_area");
+    if (printable_area == nullptr || printable_area->values.empty())
+        return { 100.0, 100.0 };
+
+    double min_x = std::numeric_limits<double>::max();
+    double min_y = std::numeric_limits<double>::max();
+    double max_x = std::numeric_limits<double>::lowest();
+    double max_y = std::numeric_limits<double>::lowest();
+    for (const Slic3r::Vec2d& point : printable_area->values) {
+        min_x = std::min(min_x, point.x());
+        min_y = std::min(min_y, point.y());
+        max_x = std::max(max_x, point.x());
+        max_y = std::max(max_y, point.y());
+    }
+    return { (min_x + max_x) * 0.5, (min_y + max_y) * 0.5 };
+}
+
 bool parse_request(const std::filesystem::path& request_path, JobRequest& request, std::string& error)
 {
     std::ifstream input(request_path);
@@ -245,6 +266,10 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
     }
     if (request.config_path.empty()) {
         error = "config.path is required";
+        return false;
+    }
+    if (request.plate_index < -1) {
+        error = "input.plate_index must be -1 or greater";
         return false;
     }
     return true;
@@ -371,6 +396,13 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
 
     const std::string job_id = request.job_id;
     JobIntermediateCleanup cleanup(request);
+    if (!request.overwrite && boost::filesystem::exists(request.output_gcode.string())) {
+        error = "Output G-code already exists: " + request.output_gcode.string();
+        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "output_exists", error });
+        emit_result(events, job_id, false, "output_exists", error, request.output_gcode, started);
+        return 3;
+    }
+
     emit_event(events, { WorkerEventType::Progress, job_id, 0, "initializing", "", "", "Initializing" });
 
     if (cancellation.cancelled()) {
@@ -408,11 +440,15 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
     }
 
     if (request.input_type == "stl")
-        model.center_instances_around_point({ 100.0, 100.0 });
+        model.center_instances_around_point(bed_center_from_config(config));
+    if (request.plate_index >= 0)
+        model.curr_plate_index = request.plate_index;
 
     emit_event(events, { WorkerEventType::Progress, job_id, 35, "preparing_model", "", "", "Preparing model" });
     Slic3r::Print print;
     try {
+        if (request.plate_index >= 0)
+            print.set_plate_index(request.plate_index);
         print.apply(model, config);
         Slic3r::StringObjectException warning;
         Slic3r::StringObjectException validation_error = print.validate(&warning);

@@ -67,6 +67,27 @@ def assert_intermediates_cleaned(work_dir):
         raise AssertionError(f"empty worker artifacts_dir was not cleaned: {artifacts_dir}")
 
 
+def assert_overwrite_false_rejected(worker, source_root, work_dir):
+    request = worker_request(source_root, work_dir, "worker-cli-no-overwrite", "cli-output.gcode")
+    request["options"]["overwrite"] = False
+    write_json(work_dir / "request-no-overwrite.json", request)
+
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-no-overwrite.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    if proc.returncode == 0:
+        raise AssertionError("worker overwrote an existing G-code file with overwrite=false")
+
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+    if not any(event.get("code") == "output_exists" for event in events):
+        raise AssertionError(f"worker did not report output_exists for overwrite=false:\n{proc.stdout}\n{proc.stderr}")
+
+
 def run_cli(worker, source_root, root_work_dir):
     work_dir = root_work_dir / "cli"
     shutil.rmtree(work_dir, ignore_errors=True)
@@ -93,6 +114,7 @@ def run_cli(worker, source_root, root_work_dir):
         raise AssertionError(f"worker CLI did not emit a successful result: {proc.stdout}")
     assert_gcode(work_dir / "cli-output.gcode")
     assert_intermediates_cleaned(work_dir)
+    assert_overwrite_false_rejected(worker, source_root, work_dir)
 
 
 def recv_json_line(sock, timeout_at):
@@ -126,6 +148,8 @@ def run_socket(worker, source_root, root_work_dir):
     write_json(work_dir / "config.json", worker_config())
     request = worker_request(source_root, work_dir, "worker-socket-stl", "socket-output.gcode")
     write_json(work_dir / "request.json", request)
+    second_request = worker_request(source_root, work_dir, "worker-socket-stl-2", "socket-output-2.gcode")
+    write_json(work_dir / "request-2.json", second_request)
 
     proc = subprocess.Popen(
         [str(worker), "serve", "--socket", str(socket_path)],
@@ -158,9 +182,19 @@ def run_socket(worker, source_root, root_work_dir):
                     result = event
             if not result.get("success"):
                 raise AssertionError(f"worker socket returned failure result: {result}")
+            client.sendall(json.dumps({"type": "start_job", "request_path": str(work_dir / "request-2.json")}).encode("utf-8") + b"\n")
+            second_result = None
+            timeout_at = time.monotonic() + 120
+            while second_result is None:
+                event = recv_json_line(client, timeout_at)
+                if event.get("type") == "result":
+                    second_result = event
+            if not second_result.get("success"):
+                raise AssertionError(f"worker socket returned failure result for second job: {second_result}")
             client.sendall(json.dumps({"type": "stop", "force": True}).encode("utf-8") + b"\n")
 
         assert_gcode(work_dir / "socket-output.gcode")
+        assert_gcode(work_dir / "socket-output-2.gcode")
         assert_intermediates_cleaned(work_dir)
     finally:
         try:

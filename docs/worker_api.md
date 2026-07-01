@@ -1,9 +1,38 @@
 # libslicer Worker API and Protocol
 
-This document defines the planned public API and socket protocol for the
+This document defines the public API and socket protocol for the
 `orcaslicer-worker` executable and its host-side client library.
 
-It is a design contract for implementation.
+The command-line worker and Unix domain socket worker are implemented in this
+branch. The install package currently exposes the host-side worker client API
+and the worker executable; it does not export the full in-process `libslic3r`
+slicing engine as a stable install-tree SDK yet.
+
+## CMake Integration
+
+After installing OrcaSlicer, external projects can consume the worker package
+with CMake:
+
+```cmake
+find_package(libslicer CONFIG REQUIRED)
+
+add_executable(host_app main.cpp)
+target_link_libraries(host_app PRIVATE libslicer::worker_client)
+```
+
+The package exports:
+
+- `libslicer::worker_client`: host-side process/socket client library.
+- `libslicer::orcaslicer_worker`: imported executable target for the installed
+  `orcaslicer-worker` binary.
+- `LIBSLICER_ORCASLICER_WORKER_EXECUTABLE`: absolute path to the installed
+  worker executable.
+- `LIBSLICER_WORKER_EXECUTABLE`: compatibility alias for the same executable
+  path.
+
+When the repository is embedded from source with `add_subdirectory`, the build
+tree also provides `libslicer::libslicer` and `libslicer::worker_runtime` for
+internal development and tests.
 
 ## Command Line
 
@@ -41,14 +70,10 @@ Exit codes:
 orcaslicer-worker serve --socket /tmp/orcaslicer-worker.sock
 ```
 
-TCP fallback:
-
-```bash
-orcaslicer-worker serve --tcp 127.0.0.1:0 --auth-token-file /tmp/token.txt
-```
-
-If `--tcp 127.0.0.1:0` is used, the worker prints the selected port as a JSON
-event on stdout:
+The current implementation supports Unix domain sockets. Future Windows support
+should use named pipes, and a future TCP fallback may bind to `127.0.0.1` with a
+per-session auth token. If a future TCP mode uses an ephemeral port, the worker
+should print the selected port as a JSON event on stdout:
 
 ```json
 {"type":"listening","transport":"tcp","host":"127.0.0.1","port":49152}

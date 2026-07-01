@@ -59,6 +59,12 @@ configure_file(
     @ONLY
 )
 
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/find_package/run_smoke.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/cmake/find_package/run_smoke.cmake
+    @ONLY
+)
+
 add_test(
     NAME cmake_add_subdirectory_smoke
     COMMAND ${CMAKE_COMMAND}
@@ -66,3 +72,11 @@ add_test(
         -P ${CMAKE_CURRENT_BINARY_DIR}/cmake/add_subdirectory/run_smoke.cmake
 )
 set_tests_properties(cmake_add_subdirectory_smoke PROPERTIES LABELS "CMake")
+
+add_test(
+    NAME cmake_find_package_smoke
+    COMMAND ${CMAKE_COMMAND}
+        "-DLIBSLICER_SMOKE_CONFIG=$<CONFIG>"
+        -P ${CMAKE_CURRENT_BINARY_DIR}/cmake/find_package/run_smoke.cmake
+)
+set_tests_properties(cmake_find_package_smoke PROPERTIES LABELS "CMake")

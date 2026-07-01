@@ -17,6 +17,7 @@ endif()
 
 include("version.inc")
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 if (APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "11.3" CACHE STRING "Minimum macOS deployment version" FORCE)
@@ -265,6 +266,32 @@ add_library(libslicer::libslicer ALIAS libslic3r)
 add_custom_target(libslicer DEPENDS libslic3r)
 add_subdirectory(src/libslicer_worker)
 add_subdirectory(src/orcaslicer_worker)
+
+set(LIBSLICER_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/libslicer")
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/libslicerConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfig.cmake"
+    INSTALL_DESTINATION "${LIBSLICER_CMAKE_INSTALL_DIR}"
+    PATH_VARS CMAKE_INSTALL_BINDIR
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfigVersion.cmake"
+    VERSION "${SoftFever_VERSION}"
+    COMPATIBILITY SameMajorVersion
+)
+
+install(EXPORT libslicerTargets
+    NAMESPACE libslicer::
+    DESTINATION "${LIBSLICER_CMAKE_INSTALL_DIR}"
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfigVersion.cmake"
+    DESTINATION "${LIBSLICER_CMAKE_INSTALL_DIR}"
+)
 
 if(LIBSLICER_BUILD_TESTS)
     enable_testing()

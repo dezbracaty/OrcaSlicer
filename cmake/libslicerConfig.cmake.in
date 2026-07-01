@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/libslicerTargets.cmake")
+
+set_and_check(LIBSLICER_ORCASLICER_WORKER_EXECUTABLE
+    "@PACKAGE_CMAKE_INSTALL_BINDIR@/orcaslicer-worker")
+
+set(LIBSLICER_WORKER_EXECUTABLE "${LIBSLICER_ORCASLICER_WORKER_EXECUTABLE}")
+
+check_required_components(libslicer)

@@ -135,6 +135,8 @@ int run_worker_server(const ServerOptions& options)
                 hello.message = "orcaslicer-worker";
                 emit_to_client(hello);
             } else if (type == "start_job") {
+                if (job_thread.joinable() && !job_active.load())
+                    job_thread.join();
                 if (job_active.load()) {
                     emit_to_client({ WorkerEventType::Error, "", -1, "", "", "job_active", "A job is already active" });
                     continue;
@@ -158,6 +160,8 @@ int run_worker_server(const ServerOptions& options)
                 emit_to_client({ WorkerEventType::CancelAccepted, message.value("job_id", active_job_id) });
             } else if (type == "stop") {
                 const bool force = message.value("force", false);
+                if (job_thread.joinable() && !job_active.load())
+                    job_thread.join();
                 if (job_active.load() && !force) {
                     emit_to_client({ WorkerEventType::Error, active_job_id, -1, "", "", "job_active", "Job is active" });
                     continue;

@@ -1,7 +1,8 @@
 # libslicer Worker Architecture
 
-This document describes the planned worker/runtime layer around `libslicer`.
-It is an architecture target, not a statement that the worker already exists.
+This document describes the worker/runtime layer around `libslicer`.
+It documents the current worker boundary and the remaining architecture targets
+needed before treating the package as a stable cross-platform SDK.
 
 ## Goals
 
@@ -47,18 +48,36 @@ tests/worker/
   CLI, socket protocol, cancellation, and artifact tests.
 ```
 
-The public CMake targets should be:
+Current transport status:
+
+- macOS/Linux: Unix domain socket worker is implemented.
+- Windows: process start and IPC are not implemented yet.
+- TCP fallback: not implemented; keep it local-only with auth if added later.
+
+The source-tree CMake targets are:
 
 ```cmake
-libslicer::libslicer          # existing core slicing target
-libslicer::worker_runtime     # worker protocol/server support
+libslicer::libslicer          # core slicing target for this build tree
+libslicer::worker_runtime     # worker protocol/server support inside worker
 libslicer::worker_client      # host-side process/socket client
-orcaslicer-worker             # executable
+orcaslicer-worker             # worker executable
+```
+
+The installed CMake package intentionally exports only the stable host-facing
+surface:
+
+```cmake
+libslicer::worker_client      # link this from host applications
+libslicer::orcaslicer_worker  # imported executable target
 ```
 
 `libslicer::worker_client` is the API a host application such as GPlatform would
 link. It starts the external worker process and communicates with it over a
 socket. It must not run slicing inside the host process.
+
+The package also defines `LIBSLICER_ORCASLICER_WORKER_EXECUTABLE` and
+`LIBSLICER_WORKER_EXECUTABLE` so hosts can pass the installed executable path to
+`WorkerOptions::executable_path`.
 
 ## Runtime Modes
 
@@ -190,6 +209,7 @@ debugging.
 Phase 1 should support:
 
 - One input STL or one input 3MF.
+- Plate index selection for 3MF projects.
 - One output G-code file.
 - Resolved full print config JSON.
 - Resource and data directory initialization.
@@ -202,7 +222,7 @@ Phase 1 should support:
 Phase 2 should add:
 
 - Multi-model jobs.
-- Plate selection for 3MF.
+- More complete multi-plate 3MF fixture coverage.
 - Multi-material and multi-nozzle validation through worker tests.
 - Intermediate preview/stat artifacts.
 - Stronger protocol version negotiation.
