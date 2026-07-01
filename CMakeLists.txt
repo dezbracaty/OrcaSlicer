@@ -263,6 +263,8 @@ add_subdirectory(src/libslic3r)
 set_target_properties(libslic3r PROPERTIES OUTPUT_NAME libslicer)
 add_library(libslicer::libslicer ALIAS libslic3r)
 add_custom_target(libslicer DEPENDS libslic3r)
+add_subdirectory(src/libslicer_worker)
+add_subdirectory(src/orcaslicer_worker)
 
 if(LIBSLICER_BUILD_TESTS)
     enable_testing()

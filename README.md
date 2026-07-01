@@ -63,3 +63,10 @@ or closely coupled to `libslic3r` runtime behavior:
 
 Additional calibration and handy-model data is retained for now until its API
 surface is explicitly removed or isolated.
+
+## Worker Design
+
+The planned worker process and socket integration is documented in:
+
+- [Worker Architecture](docs/worker_architecture.md)
+- [Worker API and Protocol](docs/worker_api.md)
