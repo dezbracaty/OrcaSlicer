@@ -2,6 +2,7 @@
 #define slic3r_ExtrusionEntity_hpp_
 
 #include "libslic3r.h"
+#include "OrcaToolpathTypes.hpp"
 #include "Polygon.hpp"
 #include "Polyline.hpp"
 
@@ -15,32 +16,6 @@ class ExPolygon;
 using ExPolygons = std::vector<ExPolygon>;
 class ExtrusionEntityCollection;
 class Extruder;
-
-// Each ExtrusionRole value identifies a distinct set of { extruder, speed }
-enum ExtrusionRole : uint8_t {
-    erNone,
-    erPerimeter,
-    erExternalPerimeter,
-    erOverhangPerimeter,
-    erInternalInfill,
-    erSolidInfill,
-    erTopSolidInfill,
-    erBottomSurface,
-    erIroning,
-    erBridgeInfill,
-    erInternalBridgeInfill,
-    erGapFill,
-    erSkirt,
-    erBrim,
-    erSupportMaterial,
-    erSupportMaterialInterface,
-    erSupportTransition,
-    erWipeTower,
-    erCustom,
-    // Extrusion role for a collection with multiple extrusion roles.
-    erMixed,
-    erCount
-};
 
 // Special flags describing loop
 enum ExtrusionLoopRole : uint8_t {

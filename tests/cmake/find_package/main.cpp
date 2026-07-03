@@ -2,6 +2,9 @@
 #include <iostream>
 #include <type_traits>
 
+#include <libslic3r/OrcaToolpathRecords.hpp>
+#include <libslic3r/OrcaToolpathTypes.hpp>
+#include <libslicer_worker/PreviewProtocol.hpp>
 #include <libslicer_worker/WorkerClient.hpp>
 #include <libslicer_worker/WorkerEvent.hpp>
 #include <libslicer_worker/WorkerProtocol.hpp>
@@ -27,6 +30,28 @@ int main()
     if (!std::filesystem::exists(LIBSLICER_WORKER_EXE)) {
         std::cerr << "worker executable does not exist: " << LIBSLICER_WORKER_EXE << '\n';
         return 2;
+    }
+
+    libslicer::worker::preview::WireMoveRecord move;
+    move.move_type = libslicer::worker::preview::MoveType::Travel;
+    move.path_kind = libslicer::worker::preview::PathKind::Linear_move;
+    move.flags = static_cast<std::uint32_t>(
+        libslicer::worker::preview::MoveFlags::Drawable |
+        libslicer::worker::preview::MoveFlags::ValidStartPosition |
+        libslicer::worker::preview::MoveFlags::ValidEndPosition);
+    const auto segment = libslicer::worker::preview::make_render_segment_view(move);
+    if (segment.move_type != libslicer::worker::preview::MoveType::Travel) {
+        std::cerr << "preview protocol segment view lost move type\n";
+        return 4;
+    }
+    static_assert(std::is_same_v<libslicer::worker::preview::MoveType, Slic3r::EMoveType>);
+    static_assert(std::is_same_v<libslicer::worker::preview::PathKind, Slic3r::EMovePathType>);
+    static_assert(std::is_same_v<libslicer::worker::preview::ExtrusionRole, Slic3r::ExtrusionRole>);
+    Slic3r::ToolpathMoveVertex public_move;
+    public_move.type = Slic3r::EMoveType::Travel;
+    if (Slic3r::move_type_name(public_move.type) != "travel") {
+        std::cerr << "public toolpath move type helper failed\n";
+        return 5;
     }
 
     libslicer::worker::WorkerClient client([](const libslicer::worker::WorkerEvent&) {});

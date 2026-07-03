@@ -1,12 +1,18 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
+find_dependency(Eigen3 5.0.1)
 find_dependency(Threads)
 
 include("${CMAKE_CURRENT_LIST_DIR}/libslicerTargets.cmake")
 
-set_and_check(LIBSLICER_ORCASLICER_WORKER_EXECUTABLE
-    "@PACKAGE_CMAKE_INSTALL_BINDIR@/orcaslicer-worker")
+if(APPLE)
+    set_and_check(LIBSLICER_ORCASLICER_WORKER_EXECUTABLE
+        "@PACKAGE_CMAKE_INSTALL_BINDIR@/orcaslicer-worker.app/Contents/MacOS/orcaslicer-worker")
+else()
+    set_and_check(LIBSLICER_ORCASLICER_WORKER_EXECUTABLE
+        "@PACKAGE_CMAKE_INSTALL_BINDIR@/orcaslicer-worker")
+endif()
 
 set(LIBSLICER_WORKER_EXECUTABLE "${LIBSLICER_ORCASLICER_WORKER_EXECUTABLE}")
 

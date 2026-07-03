@@ -288,6 +288,14 @@ install(EXPORT libslicerTargets
 )
 
 install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/libslic3r/OrcaCoreTypes.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/libslic3r/OrcaGeometryTypes.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/libslic3r/OrcaToolpathRecords.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/libslic3r/OrcaToolpathTypes.hpp"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/libslic3r"
+)
+
+install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfigVersion.cmake"
     DESTINATION "${LIBSLICER_CMAKE_INSTALL_DIR}"

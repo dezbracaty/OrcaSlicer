@@ -23,6 +23,7 @@ target_link_libraries(host_app PRIVATE libslicer::worker_client)
 The package exports:
 
 - `libslicer::worker_client`: host-side process/socket client library.
+- `libslicer::preview_protocol`: header-only preview/artifact protocol types.
 - `libslicer::orcaslicer_worker`: imported executable target for the installed
   `orcaslicer-worker` binary.
 - `LIBSLICER_ORCASLICER_WORKER_EXECUTABLE`: absolute path to the installed
@@ -33,6 +34,81 @@ The package exports:
 When the repository is embedded from source with `add_subdirectory`, the build
 tree also provides `libslicer::libslicer` and `libslicer::worker_runtime` for
 internal development and tests.
+
+## Public Orca Toolpath Types
+
+The worker protocol does not invent a second set of preview enums. OrcaSlicer
+and external consumers share the same public toolpath semantic definitions in:
+
+```cpp
+#include <libslic3r/OrcaToolpathTypes.hpp>
+```
+
+This header currently owns the common definitions for:
+
+- `Slic3r::EMoveType`
+- `Slic3r::EMovePathType`
+- `Slic3r::ExtrusionRole`
+
+Orca's shared coordinate types live in:
+
+```cpp
+#include <libslic3r/OrcaCoreTypes.hpp>
+```
+
+- `coord_t`
+- `coordf_t`
+
+Orca's shared vector/matrix aliases, including `Slic3r::Vec3f`, live in:
+
+```cpp
+#include <libslic3r/OrcaGeometryTypes.hpp>
+```
+
+Move records shared with Orca's G-code processor live in:
+
+```cpp
+#include <libslic3r/OrcaToolpathRecords.hpp>
+```
+
+This header currently owns:
+
+- `Slic3r::ToolpathMoveVertex`
+
+`Slic3r::GCodeProcessorResult::MoveVertex` is an alias of
+`Slic3r::ToolpathMoveVertex`. External projects can therefore reason about
+toolpath moves with the same semantic names, values, and record fields used by
+Orca's G-code processor and preview pipeline.
+
+The worker preview protocol exposes aliases to these exact types:
+
+```cpp
+#include <type_traits>
+
+#include <libslicer_worker/PreviewProtocol.hpp>
+
+static_assert(std::is_same_v<libslicer::worker::preview::MoveType,
+                             Slic3r::EMoveType>);
+static_assert(std::is_same_v<libslicer::worker::preview::PathKind,
+                             Slic3r::EMovePathType>);
+static_assert(std::is_same_v<libslicer::worker::preview::ExtrusionRole,
+                             Slic3r::ExtrusionRole>);
+```
+
+This is the intended boundary: public, low-dependency Orca semantic types are
+shared; heavy internal objects such as `Slic3r::Print`, `Slic3r::Model`, and
+`Slic3r::GCodeProcessorResult` remain implementation details until they are
+separately reviewed and stabilized.
+
+Binary preview artifacts use explicitly named wire records from
+`libslicer_worker/PreviewBinary.hpp`, such as
+`libslicer::worker::preview::WireMoveRecord`. Wire records are POD transport
+types with `sizeof`, key `offsetof`, and trivially-copyable compile-time
+checks. Use helper functions such as `to_wire_vec3f()` and `to_orca_vec3f()`
+when converting between wire vectors and Orca's Eigen-backed `Slic3r::Vec3f`.
+The numeric values of the shared move/path/role enums are also part of
+`schema_version == 1`; adding, removing, or reordering those enum values must
+bump the preview schema version and update the protocol assertions.
 
 ## Command Line
 

@@ -16,6 +16,7 @@ target_compile_definitions(libslicer_consumer_smoke
 target_link_libraries(libslicer_consumer_smoke
     PRIVATE
         libslicer::libslicer
+        libslicer::preview_protocol
         libslicer::worker_client
 )
 

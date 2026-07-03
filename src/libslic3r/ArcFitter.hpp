@@ -2,18 +2,9 @@
 #define slic3r_ArcFitter_hpp_
 
 #include "Circle.hpp"
+#include "OrcaToolpathTypes.hpp"
 
 namespace Slic3r {
-
-//BBS: linear move(G0 and G1) or arc move(G2 and G3).
-enum class EMovePathType : unsigned char
-{
-    Noop_move,
-    Linear_move,
-    Arc_move_cw,
-    Arc_move_ccw,
-    Count
-};
 
 //BBS
 struct PathFittingData{

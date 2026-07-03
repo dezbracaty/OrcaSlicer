@@ -2,6 +2,7 @@
 #define slic3r_Point_hpp_
 
 #include "libslic3r.h"
+#include "OrcaGeometryTypes.hpp"
 #include <cstddef>
 #include <vector>
 #include <cmath>
@@ -10,9 +11,6 @@
 #include <unordered_map>
 
 #include <oneapi/tbb/scalable_allocator.h>
-
-
-#include <Eigen/Geometry> 
 
 #include "LocalesUtils.hpp"
 
@@ -30,33 +28,6 @@ class Polyline;
 class Polyline3;
 using Vector = Point;
 
-// Base template for eigen derived vectors
-template<int N, int M, class T>
-using Mat = Eigen::Matrix<T, N, M, Eigen::DontAlign, N, M>;
-
-template<int N, class T> using Vec = Mat<N, 1, T>;
-
-// Eigen types, to replace the Slic3r's own types in the future.
-// Vector types with a fixed point coordinate base type.
-using Vec2crd = Eigen::Matrix<coord_t,  2, 1, Eigen::DontAlign>;
-using Vec3crd = Eigen::Matrix<coord_t,  3, 1, Eigen::DontAlign>;
-// using Vec2i   = Eigen::Matrix<int,      2, 1, Eigen::DontAlign>;
-// using Vec3i   = Eigen::Matrix<int,      3, 1, Eigen::DontAlign>;
-// using Vec4i   = Eigen::Matrix<int,      4, 1, Eigen::DontAlign>;
-using Vec2i32 = Eigen::Matrix<int32_t,  2, 1, Eigen::DontAlign>;
-using Vec2i64 = Eigen::Matrix<int64_t,  2, 1, Eigen::DontAlign>;
-using Vec3i32 = Eigen::Matrix<int32_t,  3, 1, Eigen::DontAlign>;
-using Vec3i64 = Eigen::Matrix<int64_t,  3, 1, Eigen::DontAlign>;
-using Vec4i32 = Eigen::Matrix<int32_t,  4, 1, Eigen::DontAlign>;
-
-// Vector types with a double coordinate base type.
-using Vec2f   = Eigen::Matrix<float,    2, 1, Eigen::DontAlign>;
-using Vec3f   = Eigen::Matrix<float,    3, 1, Eigen::DontAlign>;
-using Vec4f   = Eigen::Matrix<float,    4, 1, Eigen::DontAlign>;
-using Vec2d   = Eigen::Matrix<double,   2, 1, Eigen::DontAlign>;
-using Vec3d   = Eigen::Matrix<double,   3, 1, Eigen::DontAlign>;
-using Vec4d   = Eigen::Matrix<double,   4, 1, Eigen::DontAlign>;
-
 template<typename BaseType>
 using PointsAllocator = tbb::scalable_allocator<BaseType>;
 using Points         = std::vector<Point, PointsAllocator<Point>>;
@@ -68,21 +39,6 @@ using Vec2ds         = std::vector<Vec2d>;
 using Pointf3s       = std::vector<Vec3d>;
 
 using VecOfPoints    = std::vector<Points, PointsAllocator<Points>>;
-
-using Matrix2f       = Eigen::Matrix<float,  2, 2, Eigen::DontAlign>;
-using Matrix2d       = Eigen::Matrix<double, 2, 2, Eigen::DontAlign>;
-using Matrix3f       = Eigen::Matrix<float,  3, 3, Eigen::DontAlign>;
-using Matrix3d       = Eigen::Matrix<double, 3, 3, Eigen::DontAlign>;
-using Matrix4f       = Eigen::Matrix<float,  4, 4, Eigen::DontAlign>;
-using Matrix4d       = Eigen::Matrix<double, 4, 4, Eigen::DontAlign>;
-
-template<int N, class T>
-using Transform = Eigen::Transform<float, N, Eigen::Affine, Eigen::DontAlign>;
-
-using Transform2f    = Eigen::Transform<float,  2, Eigen::Affine, Eigen::DontAlign>;
-using Transform2d    = Eigen::Transform<double, 2, Eigen::Affine, Eigen::DontAlign>;
-using Transform3f    = Eigen::Transform<float,  3, Eigen::Affine, Eigen::DontAlign>;
-using Transform3d    = Eigen::Transform<double, 3, Eigen::Affine, Eigen::DontAlign>;
 
 // Utility functions for Point/Polyline conversion
 Polyline to_polyline(const Points &points);
@@ -181,8 +137,6 @@ inline const Vec3d get_base(unsigned index, const Transform3d::LinearPart &trans
 inline const Vec3d get_x_base(const Transform3d::LinearPart &transform) { return get_base(0, transform); }
 inline const Vec3d get_y_base(const Transform3d::LinearPart &transform) { return get_base(1, transform); }
 inline const Vec3d get_z_base(const Transform3d::LinearPart &transform) { return get_base(2, transform); }
-
-template<int N, class T> using Vec = Eigen::Matrix<T,  N, 1, Eigen::DontAlign, N, 1>;
 
 class Point : public Vec2crd
 {

@@ -33,6 +33,7 @@ Required use cases:
 src/libslic3r/
   Core slicing engine.
   No process, socket, Qt, or host-application ownership.
+  Owns shared low-dependency Orca toolpath semantic types.
 
 src/libslicer_worker/
   Worker runtime and protocol layer.
@@ -58,6 +59,7 @@ The source-tree CMake targets are:
 
 ```cmake
 libslicer::libslicer          # core slicing target for this build tree
+libslicer::preview_protocol   # header-only public preview/artifact types
 libslicer::worker_runtime     # worker protocol/server support inside worker
 libslicer::worker_client      # host-side process/socket client
 orcaslicer-worker             # worker executable
@@ -67,6 +69,7 @@ The installed CMake package intentionally exports only the stable host-facing
 surface:
 
 ```cmake
+libslicer::preview_protocol   # shared Orca preview/artifact protocol headers
 libslicer::worker_client      # link this from host applications
 libslicer::orcaslicer_worker  # imported executable target
 ```
@@ -140,6 +143,25 @@ The worker process should own:
 - Model/project loading.
 - Slicing and G-code export.
 - Progress and artifact events.
+
+Shared toolpath semantic types are intentionally not worker-private.
+`coord_t` and `coordf_t` live in `libslic3r/OrcaCoreTypes.hpp`.
+`Slic3r::Vec3f` and related vector aliases live in
+`libslic3r/OrcaGeometryTypes.hpp`. `Slic3r::EMoveType`,
+`Slic3r::EMovePathType`, and `Slic3r::ExtrusionRole` live in
+`libslic3r/OrcaToolpathTypes.hpp`. The G-code processor move record
+`Slic3r::ToolpathMoveVertex` lives in `libslic3r/OrcaToolpathRecords.hpp`, and
+`Slic3r::GCodeProcessorResult::MoveVertex` aliases it. Orca internals and
+external preview consumers include the same public headers.
+
+Preview artifact binary records are explicitly transport-facing wire records.
+They live in `libslicer_worker/PreviewBinary.hpp` with `Wire*` names, fixed
+record-size assertions, fixed key field offsets, and trivially-copyable
+assertions. The wire vector type is a plain `{x,y,z}` POD for binary/socket
+transport; conversion helpers bridge it to Orca's Eigen-backed
+`Slic3r::Vec3f`. The shared move/path/role enum numeric values are frozen by
+the preview schema; changing those values requires a schema version bump and
+updated compile-time assertions.
 
 ## Data Flow
 

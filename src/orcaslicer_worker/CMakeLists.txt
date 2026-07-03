@@ -16,5 +16,6 @@ set_target_properties(orcaslicer-worker PROPERTIES
 
 install(TARGETS orcaslicer-worker
     EXPORT libslicerTargets
+    BUNDLE DESTINATION ${CMAKE_INSTALL_BINDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )

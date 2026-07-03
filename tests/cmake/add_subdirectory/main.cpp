@@ -2,8 +2,12 @@
 #include <string>
 #include <type_traits>
 
+#include <libslic3r/GCode/GCodeProcessor.hpp>
+#include <libslic3r/OrcaToolpathRecords.hpp>
+#include <libslic3r/OrcaToolpathTypes.hpp>
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/Utils.hpp>
+#include <libslicer_worker/PreviewProtocol.hpp>
 #include <libslicer_worker/WorkerClient.hpp>
 #include <libslicer_worker/WorkerEvent.hpp>
 #include <libslicer_worker/WorkerProtocol.hpp>
@@ -26,6 +30,28 @@ int main()
     const std::string line = libslicer::worker::event_to_json_line(event);
     if (line.find("\"type\":\"progress\"") == std::string::npos)
         return 2;
+
+    libslicer::worker::preview::WireMoveRecord move;
+    move.move_type = libslicer::worker::preview::MoveType::Extrude;
+    move.path_kind = libslicer::worker::preview::PathKind::Linear_move;
+    move.extrusion_role = Slic3r::erExternalPerimeter;
+    move.flags = static_cast<std::uint32_t>(
+        libslicer::worker::preview::MoveFlags::Drawable |
+        libslicer::worker::preview::MoveFlags::ValidStartPosition |
+        libslicer::worker::preview::MoveFlags::ValidEndPosition);
+    if (!libslicer::worker::preview::move_is_drawable_segment(move))
+        return 4;
+    if (libslicer::worker::preview::extrusion_role_name(move) != "external_perimeter")
+        return 5;
+    static_assert(std::is_same_v<libslicer::worker::preview::MoveType, Slic3r::EMoveType>);
+    static_assert(std::is_same_v<libslicer::worker::preview::PathKind, Slic3r::EMovePathType>);
+    static_assert(std::is_same_v<libslicer::worker::preview::ExtrusionRole, Slic3r::ExtrusionRole>);
+    static_assert(std::is_same_v<Slic3r::GCodeProcessorResult::MoveVertex, Slic3r::ToolpathMoveVertex>);
+    Slic3r::ToolpathMoveVertex public_move;
+    public_move.type = Slic3r::EMoveType::Extrude;
+    public_move.extrusion_role = Slic3r::erExternalPerimeter;
+    if (Slic3r::move_type_name(public_move.type) != "extrude")
+        return 6;
 
     libslicer::worker::WorkerClient client([](const libslicer::worker::WorkerEvent&) {});
     if (client.running())
