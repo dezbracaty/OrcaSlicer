@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -98,6 +99,60 @@ def assert_gcode(path):
         raise AssertionError("G-code output does not contain filament summary")
 
 
+def assert_preview_artifact(path):
+    if not path.exists():
+        raise AssertionError(f"preview artifact was not created: {path}")
+    data = path.read_bytes()
+    if len(data) < 80:
+        raise AssertionError("preview artifact is smaller than the wire header")
+
+    header = struct.unpack_from("<8sHHHHQQQQQQQQ", data, 0)
+    magic, header_size, version, endian, section_count, table_offset, file_size, metadata_offset, metadata_size, *_ = header
+    if magic != b"ORCAPV1\0":
+        raise AssertionError(f"invalid preview artifact magic: {magic!r}")
+    if header_size != 80 or version != 1 or endian != 0x0102:
+        raise AssertionError(f"unsupported preview artifact header: size={header_size} version={version} endian={endian}")
+    if file_size != len(data):
+        raise AssertionError(f"preview artifact file size mismatch: header={file_size} actual={len(data)}")
+    if table_offset + section_count * 32 > len(data):
+        raise AssertionError("preview artifact section table is outside file bounds")
+    if metadata_offset + metadata_size > len(data):
+        raise AssertionError("preview artifact metadata is outside file bounds")
+
+    metadata = json.loads(data[metadata_offset:metadata_offset + metadata_size].decode("utf-8"))
+    if metadata.get("schema") != "orca.toolpath_preview":
+        raise AssertionError(f"preview metadata schema mismatch: {metadata}")
+    if metadata.get("format") != "orca-toolpath-preview-binary-v1":
+        raise AssertionError(f"preview metadata format mismatch: {metadata}")
+
+    sections = {}
+    for index in range(section_count):
+        section, record_size, offset, size, count = struct.unpack_from("<IIQQQ", data, table_offset + index * 32)
+        if size and offset + size > len(data):
+            raise AssertionError(f"preview section {section} is outside file bounds")
+        if record_size and count and size != record_size * count:
+            raise AssertionError(f"preview section {section} size/count mismatch")
+        sections[section] = {
+            "record_size": record_size,
+            "offset": offset,
+            "size": size,
+            "count": count,
+        }
+
+    required = {1, 2, 3, 4, 5, 6, 9}
+    missing = required.difference(sections)
+    if missing:
+        raise AssertionError(f"preview artifact is missing sections: {sorted(missing)}")
+    if sections[9]["count"] <= 0:
+        raise AssertionError("preview artifact has no move records")
+    if sections[6]["count"] <= 0:
+        raise AssertionError("preview artifact has no color records")
+    if sections[9]["record_size"] != 216:
+        raise AssertionError(f"unexpected move record size: {sections[9]['record_size']}")
+    if sections[6]["record_size"] != 48:
+        raise AssertionError(f"unexpected color record size: {sections[6]['record_size']}")
+
+
 def assert_intermediates_cleaned(work_dir):
     data_dir = work_dir / "data"
     artifacts_dir = work_dir / "artifacts"
@@ -105,6 +160,12 @@ def assert_intermediates_cleaned(work_dir):
         raise AssertionError(f"worker data_dir was not cleaned: {data_dir}")
     if artifacts_dir.exists():
         raise AssertionError(f"empty worker artifacts_dir was not cleaned: {artifacts_dir}")
+
+
+def assert_data_dir_cleaned(work_dir):
+    data_dir = work_dir / "data"
+    if data_dir.exists():
+        raise AssertionError(f"worker data_dir was not cleaned: {data_dir}")
 
 
 def assert_overwrite_false_rejected(worker, source_root, work_dir):
@@ -279,6 +340,80 @@ def run_cli(worker, source_root, root_work_dir):
     assert_intermediates_cleaned(work_dir)
 
 
+def run_preview_outputs(worker, source_root, root_work_dir):
+    work_dir = root_work_dir / "preview"
+    shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True)
+    write_json(work_dir / "config.json", worker_config())
+
+    preview_only = worker_request(source_root, work_dir, "worker-preview-only", "unused.gcode")
+    preview_only["output"]["gcode"] = {"enabled": False}
+    preview_only["output"]["preview"] = {
+        "enabled": True,
+        "required": True,
+        "path": "preview-only.orcapv",
+        "format": "orca-toolpath-preview-binary-v1",
+        "publish": "final",
+    }
+    write_json(work_dir / "request-preview-only.json", preview_only)
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-preview-only.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"worker preview-only slice failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+    preview_events = [event for event in events if event.get("type") == "artifact" and event.get("kind") == "preview"]
+    if not preview_events:
+        raise AssertionError(f"worker did not emit preview artifact event:\n{proc.stdout}")
+    ready = preview_events[-1]
+    if ready.get("phase") != "ready" or not ready.get("complete"):
+        raise AssertionError(f"preview artifact event did not report ready/complete: {ready}")
+    if ready.get("schema") != "orca.toolpath_preview":
+        raise AssertionError(f"preview artifact event schema mismatch: {ready}")
+    if ready.get("format") != "orca-toolpath-preview-binary-v1":
+        raise AssertionError(f"preview artifact event format mismatch: {ready}")
+    if (work_dir / "unused.gcode").exists():
+        raise AssertionError("preview-only request unexpectedly created public G-code")
+    assert_preview_artifact(work_dir / "artifacts" / "preview-only.orcapv")
+    assert_data_dir_cleaned(work_dir)
+
+    gcode_and_preview = worker_request(source_root, work_dir, "worker-gcode-preview", "with-preview.gcode")
+    gcode_and_preview["output"]["gcode"] = {
+        "enabled": True,
+        "required": True,
+        "path": str(work_dir / "with-preview.gcode"),
+    }
+    gcode_and_preview["output"]["preview"] = {
+        "enabled": True,
+        "required": True,
+        "path": "with-preview.orcapv",
+    }
+    write_json(work_dir / "request-gcode-preview.json", gcode_and_preview)
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-gcode-preview.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"worker G-code+preview slice failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+    if not any(event.get("type") == "artifact" and event.get("kind") == "gcode" for event in events):
+        raise AssertionError(f"worker did not emit G-code artifact event:\n{proc.stdout}")
+    if not any(event.get("type") == "artifact" and event.get("kind") == "preview" for event in events):
+        raise AssertionError(f"worker did not emit preview artifact event for G-code+preview:\n{proc.stdout}")
+    assert_gcode(work_dir / "with-preview.gcode")
+    assert_preview_artifact(work_dir / "artifacts" / "with-preview.orcapv")
+    assert_data_dir_cleaned(work_dir)
+
+
 def recv_json_line(sock, timeout_at):
     buffer = bytearray()
     while time.monotonic() < timeout_at:
@@ -417,6 +552,7 @@ def main():
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
     run_cli(args.worker, args.source_root, args.work_dir)
+    run_preview_outputs(args.worker, args.source_root, args.work_dir)
     run_socket(args.worker, args.source_root, args.work_dir)
 
 

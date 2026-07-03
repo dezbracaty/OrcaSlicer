@@ -61,6 +61,14 @@ std::string event_to_json_line(const WorkerEvent& event)
     if (event.type == WorkerEventType::Result) json["success"] = event.success;
     if (event.type == WorkerEventType::Error) json["recoverable"] = event.recoverable;
     if (event.elapsed_ms >= 0) json["elapsed_ms"] = event.elapsed_ms;
+    if (!event.phase.empty()) json["phase"] = event.phase;
+    if (!event.schema.empty()) json["schema"] = event.schema;
+    if (!event.format.empty()) json["format"] = event.format;
+    if (!event.section.empty()) json["section"] = event.section;
+    if (event.offset >= 0) json["offset"] = event.offset;
+    if (event.count >= 0) json["count"] = event.count;
+    if (event.record_size >= 0) json["record_size"] = event.record_size;
+    if (event.type == WorkerEventType::Artifact) json["complete"] = event.complete;
 
     std::ostringstream out;
     out << json.dump() << '\n';
@@ -84,6 +92,14 @@ std::optional<WorkerEvent> event_from_json_line(const std::string& line)
         event.success = json.value("success", false);
         event.recoverable = json.value("recoverable", false);
         event.elapsed_ms = json.value("elapsed_ms", -1LL);
+        event.phase = json.value("phase", "");
+        event.schema = json.value("schema", "");
+        event.format = json.value("format", "");
+        event.section = json.value("section", "");
+        event.offset = json.value("offset", -1LL);
+        event.count = json.value("count", -1LL);
+        event.record_size = json.value("record_size", -1LL);
+        event.complete = json.value("complete", false);
         return event;
     } catch (...) {
         return std::nullopt;

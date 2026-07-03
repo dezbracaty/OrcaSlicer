@@ -33,6 +33,14 @@ enum class MoveFlags : std::uint32_t {
     HasInstance = 1u << 9,
     HasFilament = 1u << 10,
     HasCpColor = 1u << 11,
+    HasTool = 1u << 12,
+};
+
+enum class ColorSource : std::uint8_t {
+    Unknown = 0,
+    Filament = 1,
+    ColorChange = 2,
+    Custom = 3,
 };
 
 inline constexpr MoveFlags operator|(MoveFlags left, MoveFlags right)
@@ -73,6 +81,7 @@ struct WireBoundingBox3f {
 static_assert(sizeof(MoveType) == 1);
 static_assert(sizeof(PathKind) == 1);
 static_assert(sizeof(ExtrusionRole) == 1);
+static_assert(sizeof(ColorSource) == 1);
 static_assert(static_cast<unsigned char>(MoveType::Noop) == 0);
 static_assert(static_cast<unsigned char>(MoveType::Retract) == 1);
 static_assert(static_cast<unsigned char>(MoveType::Unretract) == 2);
@@ -111,6 +120,13 @@ static_assert(static_cast<std::uint8_t>(ExtrusionRole::erWipeTower) == 17);
 static_assert(static_cast<std::uint8_t>(ExtrusionRole::erCustom) == 18);
 static_assert(static_cast<std::uint8_t>(ExtrusionRole::erMixed) == 19);
 static_assert(static_cast<std::uint8_t>(ExtrusionRole::erCount) == 20);
+static_assert(static_cast<std::uint32_t>(MoveFlags::HasFilament) == (1u << 10));
+static_assert(static_cast<std::uint32_t>(MoveFlags::HasCpColor) == (1u << 11));
+static_assert(static_cast<std::uint32_t>(MoveFlags::HasTool) == (1u << 12));
+static_assert(static_cast<std::uint8_t>(ColorSource::Unknown) == 0);
+static_assert(static_cast<std::uint8_t>(ColorSource::Filament) == 1);
+static_assert(static_cast<std::uint8_t>(ColorSource::ColorChange) == 2);
+static_assert(static_cast<std::uint8_t>(ColorSource::Custom) == 3);
 static_assert(std::is_trivially_copyable_v<WireVec3f>);
 static_assert(std::is_trivially_copyable_v<WireBoundingBox3f>);
 static_assert(sizeof(WireVec3f) == 12);

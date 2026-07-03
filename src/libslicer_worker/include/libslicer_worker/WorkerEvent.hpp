@@ -31,9 +31,16 @@ struct WorkerEvent {
     bool success { false };
     bool recoverable { false };
     long long elapsed_ms { -1 };
+    std::string phase;
+    std::string schema;
+    std::string format;
+    std::string section;
+    long long offset { -1 };
+    long long count { -1 };
+    long long record_size { -1 };
+    bool complete { false };
 };
 
 using EventCallback = std::function<void(const WorkerEvent&)>;
 
 } // namespace libslicer::worker
-

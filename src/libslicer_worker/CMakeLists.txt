@@ -49,6 +49,8 @@ add_library(libslicer_worker_runtime STATIC
     src/NanoSVG.cpp
     src/SliceRunner.cpp
     src/WorkerServer.cpp
+    src/artifacts/OutputRequest.cpp
+    src/preview/PreviewArtifactProducer.cpp
 )
 
 target_compile_features(libslicer_worker_runtime PUBLIC cxx_std_17)
@@ -57,6 +59,8 @@ target_include_directories(libslicer_worker_runtime
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_link_libraries(libslicer_worker_runtime

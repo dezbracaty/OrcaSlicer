@@ -1,6 +1,9 @@
 #include "libslicer_worker/WorkerServer.hpp"
 #include "libslicer_worker/WorkerProtocol.hpp"
 
+#include "artifacts/OutputRequest.hpp"
+#include "preview/PreviewArtifactProducer.hpp"
+
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Format/3mf.hpp"
 #include "libslic3r/Format/STL.hpp"
@@ -39,8 +42,7 @@ struct JobRequest {
     int plate_index { -1 };
     std::string config_type;
     std::filesystem::path config_path;
-    std::filesystem::path output_gcode;
-    std::filesystem::path artifacts_dir;
+    artifacts::OutputRequest output;
     bool overwrite { true };
     bool keep_intermediate_files { false };
 };
@@ -484,9 +486,11 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
     }
     request.config_path = resolve_path(request.working_dir, config_json.value("path", ""));
 
-    const nlohmann::json output_json = json.value("output", nlohmann::json::object());
-    request.output_gcode = resolve_path(request.working_dir, output_json.value("gcode", "./output.gcode"));
-    request.artifacts_dir = resolve_path(request.working_dir, output_json.value("artifacts_dir", "./artifacts"));
+    const nlohmann::json output_json = json.contains("output") ? json.at("output") : nlohmann::json::object();
+    if (!artifacts::parse_output_request(output_json, request.working_dir, request.output, error)) {
+        error_code = "invalid_output";
+        return false;
+    }
 
     const nlohmann::json options_json = json.value("options", nlohmann::json::object());
     request.overwrite = options_json.value("overwrite", true);
@@ -511,24 +515,10 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
     return true;
 }
 
-std::filesystem::path normalized_absolute_path(const std::filesystem::path& path)
-{
-    std::error_code ec;
-    std::filesystem::path absolute = std::filesystem::absolute(path, ec);
-    if (ec)
-        absolute = path;
-    return absolute.lexically_normal();
-}
-
-bool is_same_path(const std::filesystem::path& left, const std::filesystem::path& right)
-{
-    return normalized_absolute_path(left) == normalized_absolute_path(right);
-}
-
 bool is_path_inside(const std::filesystem::path& parent, const std::filesystem::path& child)
 {
-    const std::filesystem::path normalized_parent = normalized_absolute_path(parent);
-    const std::filesystem::path normalized_child = normalized_absolute_path(child);
+    const std::filesystem::path normalized_parent = artifacts::normalized_absolute_path(parent);
+    const std::filesystem::path normalized_child = artifacts::normalized_absolute_path(child);
 
     auto parent_it = normalized_parent.begin();
     auto child_it = normalized_child.begin();
@@ -544,8 +534,8 @@ void remove_directory_tree_if_safe(const std::filesystem::path& working_dir,
                                    const std::filesystem::path& directory)
 {
     if (directory.empty() ||
-        is_same_path(directory, working_dir) ||
-        is_same_path(directory, output_parent) ||
+        artifacts::is_same_path(directory, working_dir) ||
+        (!output_parent.empty() && artifacts::is_same_path(directory, output_parent)) ||
         !is_path_inside(working_dir, directory)) {
         return;
     }
@@ -562,8 +552,8 @@ void remove_empty_directory_if_safe(const std::filesystem::path& working_dir,
                                     const std::filesystem::path& directory)
 {
     if (directory.empty() ||
-        is_same_path(directory, working_dir) ||
-        is_same_path(directory, output_parent) ||
+        artifacts::is_same_path(directory, working_dir) ||
+        (!output_parent.empty() && artifacts::is_same_path(directory, output_parent)) ||
         !is_path_inside(working_dir, directory)) {
         return;
     }
@@ -587,9 +577,11 @@ public:
         if (m_request.keep_intermediate_files)
             return;
 
-        const std::filesystem::path output_parent = m_request.output_gcode.parent_path();
+        const std::filesystem::path output_parent = m_request.output.gcode.enabled ?
+            m_request.output.gcode.path.parent_path() :
+            std::filesystem::path();
         remove_directory_tree_if_safe(m_request.working_dir, output_parent, m_request.data_dir);
-        remove_empty_directory_if_safe(m_request.working_dir, output_parent, m_request.artifacts_dir);
+        remove_empty_directory_if_safe(m_request.working_dir, output_parent, m_request.output.artifacts_dir);
     }
 
 private:
@@ -633,10 +625,16 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
 
     const std::string job_id = request.job_id;
     JobIntermediateCleanup cleanup(request);
-    if (!request.overwrite && boost::filesystem::exists(request.output_gcode.string())) {
-        error = "Output G-code already exists: " + request.output_gcode.string();
+    if (!request.overwrite && request.output.gcode.enabled && boost::filesystem::exists(request.output.gcode.path.string())) {
+        error = "Output G-code already exists: " + request.output.gcode.path.string();
         emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "output_exists", error });
-        emit_result(events, job_id, false, "output_exists", error, request.output_gcode, started);
+        emit_result(events, job_id, false, "output_exists", error, request.output.gcode.path, started);
+        return 3;
+    }
+    if (!request.overwrite && request.output.preview.enabled && boost::filesystem::exists(request.output.preview.path.string())) {
+        error = "Output preview already exists: " + request.output.preview.path.string();
+        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "output_exists", error });
+        emit_result(events, job_id, false, "output_exists", error, request.output.preview.path, started);
         return 3;
     }
 
@@ -650,8 +648,10 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
     Slic3r::set_resources_dir(request.resources_dir.string());
     Slic3r::set_data_dir(request.data_dir.string());
     boost::filesystem::create_directories(request.data_dir.string());
-    boost::filesystem::create_directories(request.artifacts_dir.string());
-    boost::filesystem::create_directories(request.output_gcode.parent_path().string());
+    if (request.output.preview.enabled)
+        boost::filesystem::create_directories(request.output.artifacts_dir.string());
+    if (request.output.gcode.enabled)
+        boost::filesystem::create_directories(request.output.gcode.path.parent_path().string());
 
     emit_event(events, { WorkerEventType::Progress, job_id, 10, "loading_input", "", "", "Loading input" });
     Slic3r::Model model;
@@ -721,9 +721,14 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
     }
 
     emit_event(events, { WorkerEventType::Progress, job_id, 85, "gcode", "", "", "Exporting G-code" });
+    std::filesystem::path exported_gcode_path = request.output.gcode.enabled ?
+        request.output.gcode.path :
+        request.data_dir / "internal" / "preview-source.gcode.tmp";
+    if (!request.output.gcode.enabled)
+        boost::filesystem::create_directories(exported_gcode_path.parent_path().string());
+    Slic3r::GCodeProcessorResult result;
     try {
-        Slic3r::GCodeProcessorResult result;
-        const std::string output_path = print.export_gcode(request.output_gcode.string(), &result);
+        const std::string output_path = print.export_gcode(exported_gcode_path.string(), &result);
         if (output_path.empty() || !boost::filesystem::exists(output_path)) {
             error = "G-code export did not create output file";
             emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "gcode_export_failed", error });
@@ -737,9 +742,55 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
         return 5;
     }
 
-    emit_event(events, { WorkerEventType::Artifact, job_id, -1, "", "gcode", "", "", request.output_gcode });
+    std::filesystem::path result_path;
+    if (request.output.gcode.enabled) {
+        WorkerEvent gcode_event;
+        gcode_event.type = WorkerEventType::Artifact;
+        gcode_event.job_id = job_id;
+        gcode_event.kind = "gcode";
+        gcode_event.path = request.output.gcode.path;
+        gcode_event.phase = "ready";
+        gcode_event.complete = true;
+        emit_event(events, gcode_event);
+        result_path = request.output.gcode.path;
+    }
+
+    if (request.output.preview.enabled) {
+        emit_event(events, { WorkerEventType::Progress, job_id, 92, "preview", "", "", "Writing preview artifact" });
+        preview::PreviewProducerContext context;
+        context.job_id = job_id;
+        context.request_path = request.request_path;
+        context.working_dir = request.working_dir;
+        context.resources_dir = request.resources_dir;
+        context.data_dir = request.data_dir;
+        context.artifacts_dir = request.output.artifacts_dir;
+        context.input_type = request.input_type;
+        context.input_path = request.input_path;
+        context.plate_index = request.plate_index;
+        context.gcode_requested = request.output.gcode.enabled;
+        context.gcode_path = request.output.gcode.path;
+        preview::PreviewProducerResult preview_result = preview::produce_preview_artifact(
+            request.output.preview, context, config, result, cancellation);
+        if (!preview_result.success) {
+            if (preview_result.code == "cancelled") {
+                emit_result(events, job_id, false, "cancelled", "Job was cancelled", {}, started);
+                return 6;
+            }
+            if (request.output.preview.required) {
+                emit_event(events, { WorkerEventType::Error, job_id, -1, "", "preview", preview_result.code, preview_result.message, request.output.preview.path });
+                emit_result(events, job_id, false, preview_result.code, preview_result.message, request.output.preview.path, started);
+                return 5;
+            }
+            emit_event(events, { WorkerEventType::Warning, job_id, -1, "", "preview", preview_result.code, preview_result.message, request.output.preview.path });
+        } else {
+            emit_event(events, preview::make_preview_ready_event(job_id, preview_result.path));
+            if (result_path.empty())
+                result_path = preview_result.path;
+        }
+    }
+
     emit_event(events, { WorkerEventType::Progress, job_id, 100, "done", "", "", "Done" });
-    emit_result(events, job_id, true, "", "", request.output_gcode, started);
+    emit_result(events, job_id, true, "", "", result_path, started);
     return 0;
 }
 

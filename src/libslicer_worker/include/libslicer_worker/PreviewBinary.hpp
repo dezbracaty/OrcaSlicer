@@ -16,13 +16,15 @@ inline constexpr std::uint16_t binary_little_endian_marker = 0x0102u;
 
 enum class WireSectionType : std::uint32_t {
     MetadataJson = 1,
-    Layers = 2,
-    Tools = 3,
-    Filaments = 4,
-    Objects = 5,
-    Instances = 6,
-    Moves = 7,
-    Events = 8,
+    StringTable = 2,
+    Layers = 3,
+    Tools = 4,
+    Filaments = 5,
+    Colors = 6,
+    Objects = 7,
+    Instances = 8,
+    Moves = 9,
+    Events = 10,
 };
 
 // Wire* records are the byte-for-byte preview artifact schema. Do not add
@@ -77,6 +79,18 @@ struct WireFilamentRecord {
     float density { 0.0f };
     float cost { 0.0f };
     std::uint32_t flags { 0 };
+};
+
+struct WireColorRecord {
+    std::uint16_t id { invalid_small_id };
+    std::uint16_t filament_id { invalid_small_id };
+    ColorSource source { ColorSource::Unknown };
+    std::array<std::uint8_t, 3> reserved_u8 {};
+    std::array<float, 4> color_rgba {};
+    std::uint64_t name_offset { 0 };
+    std::uint64_t name_size { 0 };
+    std::uint32_t flags { 0 };
+    std::uint32_t reserved { 0 };
 };
 
 struct WireObjectRecord {
@@ -159,6 +173,7 @@ LIBSLICER_PREVIEW_ASSERT_WIRE_RECORD(WireSectionHeader);
 LIBSLICER_PREVIEW_ASSERT_WIRE_RECORD(WireLayerRecord);
 LIBSLICER_PREVIEW_ASSERT_WIRE_RECORD(WireToolRecord);
 LIBSLICER_PREVIEW_ASSERT_WIRE_RECORD(WireFilamentRecord);
+LIBSLICER_PREVIEW_ASSERT_WIRE_RECORD(WireColorRecord);
 LIBSLICER_PREVIEW_ASSERT_WIRE_RECORD(WireObjectRecord);
 LIBSLICER_PREVIEW_ASSERT_WIRE_RECORD(WireInstanceRecord);
 LIBSLICER_PREVIEW_ASSERT_WIRE_RECORD(WireMoveRecord);
@@ -172,6 +187,7 @@ static_assert(sizeof(WireSectionHeader) == 32);
 static_assert(sizeof(WireLayerRecord) == 32);
 static_assert(sizeof(WireToolRecord) == 28);
 static_assert(sizeof(WireFilamentRecord) == 36);
+static_assert(sizeof(WireColorRecord) == 48);
 static_assert(sizeof(WireObjectRecord) == 56);
 static_assert(sizeof(WireInstanceRecord) == 104);
 static_assert(sizeof(WireMoveRecord) == 216);
@@ -180,6 +196,8 @@ static_assert(sizeof(WireEventRecord) == 56);
 static_assert(offsetof(WireFileHeader, section_table_offset) == 16);
 static_assert(offsetof(WireFileHeader, metadata_json_offset) == 32);
 static_assert(offsetof(WireSectionHeader, offset) == 8);
+static_assert(offsetof(WireColorRecord, color_rgba) == 8);
+static_assert(offsetof(WireColorRecord, name_offset) == 24);
 static_assert(offsetof(WireObjectRecord, bounds_mm) == 8);
 static_assert(offsetof(WireInstanceRecord, transform_row_major) == 8);
 static_assert(offsetof(WireMoveRecord, move_type) == 28);
