@@ -1,6 +1,6 @@
 # Orca Slice Artifact Worker Design
 
-Status: implementation in progress.
+Status: final preview artifact v1 implemented.
 
 本文档重新定义 `orcaslicer-worker` 的输出模型：worker 不应该被设计成“只输出 G-code 的程序”，而应该是 **按需 slice artifact producer**。G-code、preview artifact、未来其他 artifact 都应该是独立可选输出。
 
@@ -18,14 +18,14 @@ G-code 和 preview 是两个独立 artifact。
 
 如果两者都不请求，worker 应拒绝该 job。
 
-preview 的数据来源仍然必须是 Orca 内部切片结果，不能从 `.gcode` 反向解析。当前 Orca 管线里 `Slic3r::GCodeProcessorResult` 是在 `Print::export_gcode()` 路径中产生的，因此 preview-only 模式第一版可以使用 worker-owned 临时 G-code sink 来驱动 Orca 生成 `GCodeProcessorResult`，但这个临时文件不是 public artifact，必须自动清理。
+preview 的数据来源仍然必须是 Orca 内部切片结果，不能从 `.gcode` 反向解析。当前实现通过 `Print::export_gcode_result()` 生成 `Slic3r::GCodeProcessorResult`，preview-only 模式不生成 public G-code，也不需要 worker-owned 临时 G-code 文件。
 
 ## Current Implementation Baseline
 
 本文档定义 worker artifact 输出架构。当前实现已经覆盖第一版 final preview artifact 的主路径：
 
 - worker 支持 legacy G-code output。
-- worker 支持 preview-only output，并使用 worker-owned temporary G-code sink 取得 `GCodeProcessorResult`。
+- worker 支持 preview-only output，并通过 `Print::export_gcode_result()` 取得 `GCodeProcessorResult`。
 - worker 支持 G-code + preview 同时输出。
 - public preview headers 已补齐 `WireColorRecord`、`WireSectionType::Colors`、`WireSectionType::StringTable`、`MoveFlags::HasTool`。
 - `WorkerEvent` 已增加并序列化 `phase`、`schema`、`format`、`complete`、`section`、`offset`、`count`、`record_size` 字段。
@@ -38,7 +38,7 @@ preview 的数据来源仍然必须是 Orca 内部切片结果，不能从 `.gco
 - shared memory data plane。
 - move 级 object/instance ownership。
 - 独立 `libslicer::preview_reader` target。
-- Orca GUI 100% 视觉一致；需要 canonical fixtures 覆盖 color-change、support、多工具、多耗材后才能冻结 schema v1。
+- Orca GUI 100% 视觉一致；还需要更多 canonical fixtures 覆盖 color-change、support、多工具、多耗材。
 
 ## Goals
 
@@ -211,33 +211,31 @@ request
   -> result event
 ```
 
-### Important Constraint: GCodeProcessorResult Source
+### GCodeProcessorResult Source
 
-Orca 当前的 `GCodeProcessorResult` 由 `Print::export_gcode()` 产生。也就是说，即使宿主只请求 preview，worker 仍可能需要调用 export path 来获得 preview 所需的 move/layer/role/color 数据。
+Preview 生产必须消费 Orca core 产出的 `GCodeProcessorResult`。当前实现使用：
 
-这不代表必须向宿主输出 G-code。preview-only 第一版可以这样实现：
+```cpp
+Print::export_gcode_result(GCodeProcessorResult* result)
+```
+
+这个 API 复用 Orca G-code generation/processing pipeline 产出 toolpath
+facts，但不写 G-code 文件。worker 因此可以按请求独立发布 artifacts：
 
 ```text
 gcode.enabled=false
 preview.enabled=true
 
-worker writes temporary internal G-code:
-  data_dir/internal/preview-source.gcode.tmp
-
-worker obtains GCodeProcessorResult
-worker writes artifacts/preview.orcapv
-worker deletes temporary internal G-code
+worker obtains GCodeProcessorResult without writing G-code
+worker writes artifacts/preview.orcapv.tmp
+worker validates preview.orcapv.tmp
+worker renames preview.orcapv.tmp to preview.orcapv
 worker emits only kind=preview artifact event
 ```
 
-临时 G-code 是 worker-owned intermediate，不是 public output：
-
-- 不发 artifact event。
-- 成功后删除，除非 `keep_intermediate_files=true`。
-- 失败/取消时删除。
-- 不允许宿主依赖它的路径或内容。
-
-长期更优方案是从 Orca core 拆出“不写 public G-code 文件但能产生 `GCodeProcessorResult`”的 API；这属于后续 core refactor，不阻塞第一版 worker artifact 设计。
+如果 `gcode.enabled=true`，public G-code 是独立 artifact，由
+`Print::export_gcode()` 写到请求路径。G-code 发布失败按 `gcode.required`
+决定 job 成败，不改变 preview artifact 的契约。
 
 ## Artifact Events
 
@@ -346,6 +344,21 @@ StringTable bytes
 | Moves | yes | toolpath moves |
 | Events | yes, may be empty | tool/color/pause/custom events |
 | StringTable | yes, may be empty | names/messages |
+
+### Wire ID Semantics
+
+所有 preview wire id 都是 0-based。
+
+- `WireMoveRecord.filament_id` 是 move 的 active filament id。
+- `WireMoveRecord.tool_id` 是实际物理 tool/nozzle id。
+- `WireFilamentRecord.tool_id` 来自规范化后的 `filament_id -> tool_id`
+  映射。
+- `WireToolRecord.filament_id` 只是该 tool 的 primary filament，不是
+  multi-filament tool 的权威映射。
+- `WireMoveRecord.cp_color_id` 必须能解析到同 id 的 `WireColorRecord`。
+
+producer 不允许用 `tool_id == filament_id` 做通用 fallback。缺失或越界
+mapping facts 必须让 preview production 失败，而不是生成看起来可用但语义错误的 artifact。
 
 ## Public Protocol Types
 
@@ -536,15 +549,15 @@ src/libslicer_worker/src/preview/
 输出：
 
 - `GCodeProcessorResult`
-- optional public gcode path
-- optional internal temporary gcode path
 
 规则：
 
-- 如果 public G-code enabled，export 到 public path。
-- 如果 public G-code disabled 但 preview enabled，export 到 worker-owned temporary path。
+- 始终通过 `Print::export_gcode_result()` 生成内部处理结果。
+- 如果 public G-code enabled，再通过 `Print::export_gcode()` 发布到 public path。
 - 如果 both disabled，request 已经被拒绝。
-- temporary path 必须按 cleanup policy 处理。
+- 内部处理失败报告为 `slice_processing_failed`。
+- public G-code 发布失败报告为 `gcode_publish_failed`，并按 `gcode.required`
+  决定 job 成败。
 
 ### GCodeArtifactProducer
 
@@ -624,18 +637,17 @@ artifacts/preview.orcapv
 Worker-owned transient files：
 
 ```text
-data/internal/preview-source.gcode.tmp
 artifacts/preview.orcapv.tmp
 ```
 
 规则：
 
-- 外部不得消费 `.tmp` 或 `data/internal/*`。
+- 外部不得消费 `.tmp`。
 - 写入失败必须删除 transient files。
 - validation 失败必须删除 `.orcapv.tmp`。
 - cancellation 必须删除 transient files 和未宣布的 final file。
 - 只有 artifact event 宣布 `phase=ready` 后，宿主才能消费 final file。
-- `keep_intermediate_files=true` 可以保留 debug intermediate，但仍不得发 artifact event。
+- `keep_intermediate_files=true` 可以保留 debug scratch paths，但仍不得让宿主依赖未宣布的 artifact。
 
 ## Metadata
 
@@ -729,7 +741,7 @@ libslicer::preview_reader
 - optional preview failure with required G-code keeps job success and emits warning。
 - required preview failure fails job。
 - cancellation leaves no ready preview event and no stale public preview artifact。
-- `keep_intermediate_files=false` cleans internal temporary G-code.
+- preview-only does not create public or internal G-code files.
 
 ### Preview Semantic Tests
 
@@ -758,69 +770,33 @@ libslicer::preview_reader
 - `find_package(libslicer CONFIG REQUIRED)` consumer can include preview protocol headers。
 - public reader can open a generated `.orcapv` fixture。
 
-## Implementation Phases
+## Implemented Coverage
 
-### Phase 1: Output Request Model
+- Normalized output request model supports legacy `output.gcode`, object
+  `output.gcode`, and object `output.preview`.
+- No-output requests are rejected.
+- Artifact ready events include publication fields.
+- `Print::export_gcode_result()` produces `GCodeProcessorResult` without
+  writing G-code.
+- Public G-code publishing is separate from internal processing.
+- Preview writer writes same-directory `.tmp`, validates through the strict
+  public reader, then renames to final `.orcapv`.
+- Preview mapper serializes explicit filament-to-tool mapping and typed preview
+  color facts.
+- Reader rejects corrupt section tables, invalid references, invalid ranges, and
+  invalid string references.
+- Worker tests cover legacy G-code, preview-only, G-code + preview, malformed
+  output request fields, event schema/format/complete, and no internal G-code in
+  preview-only jobs.
 
-- Add normalized output request model。
-- Support legacy `output.gcode` string。
-- Support object `output.gcode`。
-- Support object `output.preview`。
-- Reject no-output requests。
-- Add event fields for artifact readiness。
+## Remaining Scope
 
-### Phase 2: Slice Result Producer
-
-- Preserve current public G-code behavior。
-- Add preview-only temporary G-code sink。
-- Ensure temporary files are cleaned。
-- Ensure `GCodeProcessorResult` is available to artifact producers。
-
-### Phase 3: Preview Protocol Completion
-
-- Add `ColorSource`。
-- Add `MoveFlags::HasTool`。
-- Add `WireColorRecord`。
-- Add `WireSectionType::Colors`。
-- Add `WireSectionType::StringTable`。
-- Add fixed numeric/static layout assertions。
-
-### Phase 4: Preview Writer/Reader/Validator
-
-- Implement binary writer。
-- Implement validator。
-- Implement public reader helpers。
-- Add corrupt-file tests。
-
-### Phase 5: Preview Mapper
-
-- Map moves。
-- Build layers。
-- Build tools from nozzle config and filament maps。
-- Build filaments from `GCodeProcessorResult`。
-- Build colors from filament colors and color-change records。
-- Build events from tool/color/pause/custom moves。
-- Keep object/instance move ownership unavailable unless proven。
-
-### Phase 6: Worker Integration
-
-- Run artifact producers based on requested outputs。
-- Emit only requested public artifact events。
-- Apply required/optional semantics per artifact。
-- Ensure cancellation and failure cleanup。
-
-### Phase 7: Host SDK Stabilization
-
-- Harden reader。
-- Decide whether to split `libslicer::preview_reader`。
-- Freeze schema v1 only after fixtures prove:
-  - preview-only
-  - multi-tool
-  - multi-filament
-  - color-change
-  - support role
-  - Orca project 3MF
-  - install/package consumer compatibility
+- Decide whether to split a dedicated `libslicer::preview_reader` target.
+- Add canonical visual/semantic fixtures for more color-change, support,
+  multi-tool, multi-filament, and Orca project 3MF cases.
+- Add realtime/chunked preview delivery if needed.
+- Add move-level object/instance ownership only after Orca core can provide it
+  reliably.
 
 ## Acceptance Criteria
 

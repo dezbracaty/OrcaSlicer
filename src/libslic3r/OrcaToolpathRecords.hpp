@@ -23,6 +23,7 @@ struct ToolpathMoveVertex
     unsigned int gcode_id{ 0 };
     EMoveType type{ EMoveType::Noop };
     ExtrusionRole extrusion_role{ erNone };
+    // Deprecated name: this stores the active filament id, not the physical tool/nozzle id.
     unsigned char extruder_id{ 0 };
     unsigned char cp_color_id{ 0 };
     Vec3f position{ Vec3f::Zero() }; // mm

@@ -141,7 +141,7 @@ The worker process should own:
 - `Slic3r::set_data_dir`.
 - Config loading and validation.
 - Model/project loading.
-- Slicing and G-code export.
+- Slicing, internal toolpath processing, and requested artifact publication.
 - Progress and artifact events.
 
 Shared toolpath semantic types are intentionally not worker-private.
@@ -183,11 +183,12 @@ orcaslicer-worker
   | load model/project
   | apply resolved config or project-embedded config
   | slice
-  | write output.gcode and optional artifacts
+  | produce internal GCodeProcessorResult
+  | write requested artifacts
   v
 Host application
   |
-  | import output.gcode
+  | consume artifact ready events
   v
 Preview / upload / printer workflow
 ```
@@ -205,10 +206,10 @@ job/
   input.3mf
   input.stl
   config.json              # omitted for project_embedded jobs
-  output.gcode
+  output.gcode             # when requested
   artifacts/
-    stats.json
-    preview.json
+    preview.orcapv         # when requested
+    stats.json             # future optional artifact
     warnings.json
 ```
 
@@ -224,6 +225,9 @@ Ownership is split deliberately:
 - Empty scratch artifact directories are removed by default.
 - `config.json` is required for `config.type=resolved_orca_json` and omitted for
   `config.type=project_embedded`.
+- Preview-only jobs do not create a public G-code file.
+- The worker obtains preview facts through `Print::export_gcode_result()` and
+  does not need an internal temporary G-code file for preview-only jobs.
 
 `options.keep_intermediate_files=true` disables worker scratch cleanup for
 debugging.
@@ -236,7 +240,8 @@ The current worker supports:
 - One input 3MF with external resolved Orca config.
 - OrcaSlicer project 3MF request semantics through
   `input.type=orca_3mf_project` and `config.type=project_embedded`.
-- One output G-code file.
+- Optional public G-code artifact.
+- Optional final `.orcapv` preview artifact.
 - Resolved full print config JSON.
 - Resource and data directory initialization.
 - Progress events.
@@ -259,13 +264,13 @@ Phase 2 should add:
 - Multi-model jobs.
 - More complete multi-plate 3MF fixture coverage.
 - Multi-material and multi-nozzle validation through worker tests.
-- Intermediate preview/stat artifacts.
+- Intermediate/stat artifacts beyond final `.orcapv`.
 - Stronger protocol capability negotiation.
 
 Phase 3 should add:
 
 - Long-lived worker pooling if startup cost is proven significant.
-- Binary artifact format for dense preview data.
+- Chunked/realtime preview artifact delivery.
 - Optional protobuf transport if JSON Lines becomes insufficient.
 
 ## Threading Model
@@ -318,7 +323,12 @@ Recommended error codes:
 - `invalid_config`
 - `model_load_failed`
 - `slice_failed`
-- `gcode_export_failed`
+- `slice_processing_failed`
+- `gcode_publish_failed`
+- `preview_mapping_invalid`
+- `preview_color_table_invalid`
+- `preview_artifact_invalid`
+- `preview_write_failed`
 - `cancelled`
 - `internal_error`
 

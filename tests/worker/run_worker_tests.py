@@ -379,6 +379,8 @@ def run_preview_outputs(worker, source_root, root_work_dir):
         raise AssertionError(f"preview artifact event format mismatch: {ready}")
     if (work_dir / "unused.gcode").exists():
         raise AssertionError("preview-only request unexpectedly created public G-code")
+    if (work_dir / "data" / "internal" / "processed.gcode.tmp").exists():
+        raise AssertionError("preview-only request unexpectedly created internal G-code")
     assert_preview_artifact(work_dir / "artifacts" / "preview-only.orcapv")
     assert_data_dir_cleaned(work_dir)
 
@@ -412,6 +414,72 @@ def run_preview_outputs(worker, source_root, root_work_dir):
     assert_gcode(work_dir / "with-preview.gcode")
     assert_preview_artifact(work_dir / "artifacts" / "with-preview.orcapv")
     assert_data_dir_cleaned(work_dir)
+
+
+def run_malformed_requests(worker, source_root, root_work_dir):
+    work_dir = root_work_dir / "malformed"
+    shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True)
+    write_json(work_dir / "config.json", worker_config())
+
+    base = worker_request(source_root, work_dir, "worker-malformed-base", "unused.gcode")
+    cases = [
+        ("gcode-enabled-string", lambda request: request["output"].update({
+            "gcode": {"enabled": "not-a-bool", "path": str(work_dir / "unused.gcode")}
+        }), "output.gcode.enabled"),
+        ("preview-enabled-string", lambda request: request["output"].update({
+            "gcode": {"enabled": False},
+            "preview": {"enabled": "not-a-bool", "path": "bad.orcapv"}
+        }), "output.preview.enabled"),
+        ("preview-enabled-missing", lambda request: request["output"].update({
+            "gcode": {"enabled": False},
+            "preview": {"path": "bad.orcapv"}
+        }), "output.preview.enabled"),
+        ("preview-chunk-string", lambda request: request["output"].update({
+            "gcode": {"enabled": False},
+            "preview": {"enabled": True, "path": "bad.orcapv", "chunk_records": "not-an-int"}
+        }), "output.preview.chunk_records"),
+        ("preview-required-array", lambda request: request["output"].update({
+            "gcode": {"enabled": False},
+            "preview": {"enabled": True, "path": "bad.orcapv", "required": []}
+        }), "output.preview.required"),
+        ("overwrite-string", lambda request: request["options"].update({
+            "overwrite": "yes"
+        }), "options.overwrite"),
+        ("input-path-number", lambda request: request["input"].update({
+            "path": 123
+        }), "input.path"),
+        ("plate-index-string", lambda request: request["input"].update({
+            "plate_index": "0"
+        }), "input.plate_index"),
+    ]
+
+    for name, mutate, expected_message in cases:
+        request = json.loads(json.dumps(base))
+        request["job_id"] = f"worker-malformed-{name}"
+        mutate(request)
+        request_path = work_dir / f"request-{name}.json"
+        write_json(request_path, request)
+        proc = subprocess.run(
+            [str(worker), "slice", "--job", str(request_path), "--progress", "jsonl"],
+            cwd=str(work_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if proc.returncode == 0:
+            raise AssertionError(f"malformed request {name} unexpectedly succeeded\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+        events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+        results = [event for event in events if event.get("type") == "result"]
+        if not results:
+            raise AssertionError(f"malformed request {name} did not emit result event\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+        result = results[-1]
+        if result.get("success") is not False:
+            raise AssertionError(f"malformed request {name} result was not success=false: {result}")
+        message = result.get("message", "")
+        if expected_message not in message:
+            raise AssertionError(f"malformed request {name} message did not identify {expected_message}: {result}")
 
 
 def recv_json_line(sock, timeout_at):
@@ -553,6 +621,7 @@ def main():
     args.work_dir.mkdir(parents=True, exist_ok=True)
     run_cli(args.worker, args.source_root, args.work_dir)
     run_preview_outputs(args.worker, args.source_root, args.work_dir)
+    run_malformed_requests(args.worker, args.source_root, args.work_dir)
     run_socket(args.worker, args.source_root, args.work_dir)
 
 

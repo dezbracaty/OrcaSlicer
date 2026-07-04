@@ -422,6 +422,81 @@ Slic3r::Vec2d bed_center_from_config(const Slic3r::DynamicPrintConfig& config)
     return { (min_x + max_x) * 0.5, (min_y + max_y) * 0.5 };
 }
 
+bool optional_object_field(const nlohmann::json& json,
+                           const std::string& path,
+                           const std::string& key,
+                           nlohmann::json& value,
+                           std::string& error)
+{
+    if (!json.contains(key)) {
+        value = nlohmann::json::object();
+        return true;
+    }
+    if (!json.at(key).is_object()) {
+        error = path + "." + key + " must be an object";
+        return false;
+    }
+    value = json.at(key);
+    return true;
+}
+
+bool optional_string_field(const nlohmann::json& json,
+                           const std::string& path,
+                           const std::string& key,
+                           const std::string& default_value,
+                           std::string& value,
+                           std::string& error)
+{
+    if (!json.contains(key)) {
+        value = default_value;
+        return true;
+    }
+    if (!json.at(key).is_string()) {
+        error = path + "." + key + " must be a string";
+        return false;
+    }
+    value = json.at(key).get<std::string>();
+    return true;
+}
+
+bool optional_int_field(const nlohmann::json& json,
+                        const std::string& path,
+                        const std::string& key,
+                        int default_value,
+                        int& value,
+                        std::string& error)
+{
+    if (!json.contains(key)) {
+        value = default_value;
+        return true;
+    }
+    if (!json.at(key).is_number_integer()) {
+        error = path + "." + key + " must be an integer";
+        return false;
+    }
+    value = json.at(key).get<int>();
+    return true;
+}
+
+bool optional_bool_field(const nlohmann::json& json,
+                         const std::string& path,
+                         const std::string& key,
+                         bool default_value,
+                         bool& value,
+                         std::string& error)
+{
+    if (!json.contains(key)) {
+        value = default_value;
+        return true;
+    }
+    if (!json.at(key).is_boolean()) {
+        error = path + "." + key + " must be a boolean";
+        return false;
+    }
+    value = json.at(key).get<bool>();
+    return true;
+}
+
 bool parse_request(const std::filesystem::path& request_path, JobRequest& request, std::string& error_code, std::string& error)
 {
     error_code = "invalid_request";
@@ -443,14 +518,18 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
         return false;
     }
 
-    const int version = json.value("version", -1);
+    int version = -1;
+    if (!optional_int_field(json, "request", "version", -1, version, error))
+        return false;
     if (version != WORKER_JOB_REQUEST_VERSION) {
         error_code = "unsupported_protocol_version";
         error = "Unsupported job request version: " + std::to_string(version);
         return false;
     }
 
-    const std::string kind = json.value("kind", "");
+    std::string kind;
+    if (!optional_string_field(json, "request", "kind", "", kind, error))
+        return false;
     if (kind != "slice") {
         error = "Unsupported job kind: " + kind;
         return false;
@@ -458,24 +537,44 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
 
     const std::filesystem::path base = request_path.parent_path();
     request.request_path = request_path;
-    request.job_id = json.value("job_id", "");
+    if (!optional_string_field(json, "request", "job_id", "", request.job_id, error))
+        return false;
     if (request.job_id.empty())
         request.job_id = request_path.stem().string();
-    request.working_dir = resolve_path(base, json.value("working_dir", "."));
-    request.resources_dir = resolve_path(request.working_dir, json.value("resources_dir", ""));
-    request.data_dir = resolve_path(request.working_dir, json.value("data_dir", "./data"));
+    std::string working_dir;
+    std::string resources_dir;
+    std::string data_dir;
+    if (!optional_string_field(json, "request", "working_dir", ".", working_dir, error))
+        return false;
+    request.working_dir = resolve_path(base, working_dir);
+    if (!optional_string_field(json, "request", "resources_dir", "", resources_dir, error))
+        return false;
+    request.resources_dir = resolve_path(request.working_dir, resources_dir);
+    if (!optional_string_field(json, "request", "data_dir", "./data", data_dir, error))
+        return false;
+    request.data_dir = resolve_path(request.working_dir, data_dir);
 
-    const nlohmann::json input_json = json.value("input", nlohmann::json::object());
-    request.input_type = input_json.value("type", "");
-    request.input_path = resolve_path(request.working_dir, input_json.value("path", ""));
-    request.plate_index = input_json.value("plate_index", -1);
+    nlohmann::json input_json;
+    if (!optional_object_field(json, "request", "input", input_json, error))
+        return false;
+    if (!optional_string_field(input_json, "input", "type", "", request.input_type, error))
+        return false;
+    std::string input_path;
+    if (!optional_string_field(input_json, "input", "path", "", input_path, error))
+        return false;
+    request.input_path = resolve_path(request.working_dir, input_path);
+    if (!optional_int_field(input_json, "input", "plate_index", -1, request.plate_index, error))
+        return false;
     if (request.input_type != "stl" && request.input_type != "3mf" && request.input_type != "orca_3mf_project") {
         error = "Unsupported input type: " + request.input_type;
         return false;
     }
 
-    const nlohmann::json config_json = json.value("config", nlohmann::json::object());
-    request.config_type = config_json.value("type", "");
+    nlohmann::json config_json;
+    if (!optional_object_field(json, "request", "config", config_json, error))
+        return false;
+    if (!optional_string_field(config_json, "config", "type", "", request.config_type, error))
+        return false;
     if (request.config_type != "resolved_orca_json" && request.config_type != "project_embedded") {
         error = "Unsupported config type: " + request.config_type;
         return false;
@@ -484,7 +583,10 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
         error = "config.type=project_embedded requires input.type=orca_3mf_project";
         return false;
     }
-    request.config_path = resolve_path(request.working_dir, config_json.value("path", ""));
+    std::string config_path;
+    if (!optional_string_field(config_json, "config", "path", "", config_path, error))
+        return false;
+    request.config_path = resolve_path(request.working_dir, config_path);
 
     const nlohmann::json output_json = json.contains("output") ? json.at("output") : nlohmann::json::object();
     if (!artifacts::parse_output_request(output_json, request.working_dir, request.output, error)) {
@@ -492,9 +594,13 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
         return false;
     }
 
-    const nlohmann::json options_json = json.value("options", nlohmann::json::object());
-    request.overwrite = options_json.value("overwrite", true);
-    request.keep_intermediate_files = options_json.value("keep_intermediate_files", false);
+    nlohmann::json options_json;
+    if (!optional_object_field(json, "request", "options", options_json, error))
+        return false;
+    if (!optional_bool_field(options_json, "options", "overwrite", true, request.overwrite, error))
+        return false;
+    if (!optional_bool_field(options_json, "options", "keep_intermediate_files", false, request.keep_intermediate_files, error))
+        return false;
 
     if (request.resources_dir.empty()) {
         error = "resources_dir is required";
@@ -720,39 +826,47 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
         return 6;
     }
 
-    emit_event(events, { WorkerEventType::Progress, job_id, 85, "gcode", "", "", "Exporting G-code" });
-    std::filesystem::path exported_gcode_path = request.output.gcode.enabled ?
-        request.output.gcode.path :
-        request.data_dir / "internal" / "preview-source.gcode.tmp";
-    if (!request.output.gcode.enabled)
-        boost::filesystem::create_directories(exported_gcode_path.parent_path().string());
+    emit_event(events, { WorkerEventType::Progress, job_id, 85, "processing", "", "", "Processing toolpaths" });
     Slic3r::GCodeProcessorResult result;
     try {
-        const std::string output_path = print.export_gcode(exported_gcode_path.string(), &result);
-        if (output_path.empty() || !boost::filesystem::exists(output_path)) {
-            error = "G-code export did not create output file";
-            emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "gcode_export_failed", error });
-            emit_result(events, job_id, false, "gcode_export_failed", error, {}, started);
-            return 5;
-        }
+        print.export_gcode_result(&result);
     } catch (const std::exception& e) {
         error = e.what();
-        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "gcode_export_failed", error });
-        emit_result(events, job_id, false, "gcode_export_failed", error, {}, started);
+        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "slice_processing_failed", error });
+        emit_result(events, job_id, false, "slice_processing_failed", error, {}, started);
         return 5;
     }
 
     std::filesystem::path result_path;
     if (request.output.gcode.enabled) {
-        WorkerEvent gcode_event;
-        gcode_event.type = WorkerEventType::Artifact;
-        gcode_event.job_id = job_id;
-        gcode_event.kind = "gcode";
-        gcode_event.path = request.output.gcode.path;
-        gcode_event.phase = "ready";
-        gcode_event.complete = true;
-        emit_event(events, gcode_event);
-        result_path = request.output.gcode.path;
+        emit_event(events, { WorkerEventType::Progress, job_id, 88, "gcode", "", "", "Publishing G-code artifact" });
+        bool published_gcode = false;
+        try {
+            const std::string output_path = print.export_gcode(request.output.gcode.path.string(), nullptr, nullptr, true);
+            published_gcode = !output_path.empty() && boost::filesystem::exists(output_path);
+            if (!published_gcode)
+                error = "G-code export did not create the requested output file";
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        if (!published_gcode) {
+            if (request.output.gcode.required) {
+                emit_event(events, { WorkerEventType::Error, job_id, -1, "", "gcode", "gcode_publish_failed", error, request.output.gcode.path });
+                emit_result(events, job_id, false, "gcode_publish_failed", error, request.output.gcode.path, started);
+                return 5;
+            }
+            emit_event(events, { WorkerEventType::Warning, job_id, -1, "", "gcode", "gcode_publish_failed", error, request.output.gcode.path });
+        } else {
+            WorkerEvent gcode_event;
+            gcode_event.type = WorkerEventType::Artifact;
+            gcode_event.job_id = job_id;
+            gcode_event.kind = "gcode";
+            gcode_event.path = request.output.gcode.path;
+            gcode_event.phase = "ready";
+            gcode_event.complete = true;
+            emit_event(events, gcode_event);
+            result_path = request.output.gcode.path;
+        }
     }
 
     if (request.output.preview.enabled) {

@@ -110,6 +110,55 @@ The numeric values of the shared move/path/role enums are also part of
 `schema_version == 1`; adding, removing, or reordering those enum values must
 bump the preview schema version and update the protocol assertions.
 
+## Preview Artifact Contract
+
+The v1 preview artifact is a strict binary artifact with extension `.orcapv`,
+schema `orca.toolpath_preview`, and format
+`orca-toolpath-preview-binary-v1`.
+
+Wire ids are 0-based:
+
+| Field | Meaning |
+| --- | --- |
+| `WireMoveRecord.filament_id` | Active filament for the move. |
+| `WireMoveRecord.tool_id` | Physical tool/nozzle used for the move. |
+| `WireFilamentRecord.id` | Filament id. |
+| `WireFilamentRecord.tool_id` | Physical tool/nozzle selected for this filament. |
+| `WireToolRecord.id` | Physical tool/nozzle id. |
+| `WireToolRecord.filament_id` | Optional primary filament for that tool. It is not the authoritative mapping for multi-filament tools. |
+| `WireMoveRecord.cp_color_id` | Key into the preview color table. |
+| `WireColorRecord.id` | Exact color id referenced by moves. |
+
+`filament_map` is normalized before preview publication and means:
+
+```text
+filament_id -> tool_id
+```
+
+The worker does not use `tool_id == filament_id` as a fallback. Missing,
+out-of-range, or internally inconsistent mapping facts make preview production
+fail with a preview mapping error.
+
+Color records are serialized from Orca's typed preview color facts. The worker
+does not infer color-change ids from custom G-code ordering. A move may set
+`HasCpColor` only when its `cp_color_id` resolves to a `WireColorRecord`.
+
+The public reader `PreviewArtifactStorage::view()` is strict. It rejects:
+
+- unknown or duplicate sections
+- missing required sections
+- section ranges outside the file or overlapping other sections
+- wrong record sizes or misaligned section offsets
+- invalid layer move ranges
+- move references to missing layers/tools/filaments/colors
+- event references to missing moves
+- invalid string table references
+
+The preview producer validates records before writing, writes a same-directory
+temporary file, validates that temporary file through the strict reader, then
+renames it to the final path. The worker emits a preview artifact ready event
+only after the final rename succeeds.
+
 ## Command Line
 
 ### One-Shot Slice
@@ -177,11 +226,17 @@ should print the selected port as a JSON event on stdout:
     "path": "./config.json"
   },
   "output": {
-    "gcode": "./output.gcode",
-    "artifacts_dir": "./artifacts"
+    "artifacts_dir": "./artifacts",
+    "gcode": {
+      "enabled": true,
+      "required": true,
+      "path": "./output.gcode"
+    },
+    "preview": {
+      "enabled": false
+    }
   },
   "options": {
-    "emit_preview": false,
     "overwrite": true,
     "keep_intermediate_files": false
   }
@@ -212,6 +267,74 @@ The worker does not resolve preset bundles or host application database state.
 Hosts that do not submit `project_embedded` must submit a fully resolved config
 JSON.
 
+### Output Request
+
+`output.gcode` accepts either the legacy string form or the object form.
+
+Legacy string form:
+
+```json
+{
+  "output": {
+    "gcode": "./output.gcode",
+    "artifacts_dir": "./artifacts"
+  }
+}
+```
+
+This is equivalent to:
+
+```json
+{
+  "output": {
+    "artifacts_dir": "./artifacts",
+    "gcode": {
+      "enabled": true,
+      "required": true,
+      "path": "./output.gcode"
+    },
+    "preview": {
+      "enabled": false
+    }
+  }
+}
+```
+
+`output.gcode` object fields:
+
+- `enabled`: whether to publish a public G-code artifact.
+- `required`: whether G-code publishing failure fails the job. Defaults to
+  `enabled`.
+- `path`: output path. Relative paths resolve against `working_dir`.
+
+`output.preview` object fields:
+
+- `enabled`: whether to publish a public preview artifact.
+- `required`: whether preview publishing failure fails the job. Defaults to
+  `enabled`.
+- `path`: preview artifact path. Relative paths resolve against
+  `output.artifacts_dir`.
+- `format`: v1 accepts only `orca-toolpath-preview-binary-v1`.
+- `publish`: v1 accepts only `final`.
+- `chunk_records`: reserved for future chunked mode; ignored by final mode
+  after type/range validation.
+
+At least one public artifact must be enabled. If both G-code and preview are
+disabled, the worker rejects the request with `no_outputs_requested`.
+
+New object forms are strictly typed. For example, `output.preview.required=[]`
+is rejected instead of coerced.
+
+Path containment rules:
+
+- `artifacts_dir` may be absolute or relative to `working_dir`.
+- `gcode.path` may be absolute or relative to `working_dir`.
+- `preview.path` may be absolute or relative to `artifacts_dir`.
+- Relative paths must not escape their base with `..` after normalization.
+- Preview output must remain inside `artifacts_dir`.
+- Final artifacts are published only after the producer has finalized the file
+  and the worker has emitted an artifact ready event.
+
 ### File Ownership and Cleanup
 
 The worker treats these files as caller-owned inputs and never deletes them:
@@ -223,7 +346,8 @@ The worker treats these files as caller-owned inputs and never deletes them:
 The worker keeps final output files:
 
 - `output.gcode`
-- non-empty files under `output.artifacts_dir`
+- requested preview artifacts under `output.artifacts_dir`
+- other non-empty files under `output.artifacts_dir`
 
 By default, `options.keep_intermediate_files` is `false`. In that mode the worker
 cleans worker-owned scratch paths after the job finishes:
@@ -353,7 +477,9 @@ Server to client:
   "type": "artifact",
   "job_id": "job-1",
   "kind": "gcode",
-  "path": "/path/to/job/output.gcode"
+  "phase": "ready",
+  "path": "/path/to/job/output.gcode",
+  "complete": true
 }
 ```
 
@@ -364,6 +490,25 @@ Known artifact kinds:
 - `preview`
 - `warnings`
 - `log`
+
+Preview ready event:
+
+```json
+{
+  "type": "artifact",
+  "job_id": "job-1",
+  "kind": "preview",
+  "phase": "ready",
+  "schema": "orca.toolpath_preview",
+  "format": "orca-toolpath-preview-binary-v1",
+  "path": "/path/to/job/artifacts/preview.orcapv",
+  "complete": true
+}
+```
+
+Hosts must treat artifact ready events as the consumption boundary. A
+`result.success=true` event means the job completed under the requested
+`required` policy; it is not a substitute for an artifact ready event.
 
 ### Warning
 
@@ -386,8 +531,8 @@ Server to client:
 {
   "type": "error",
   "job_id": "job-1",
-  "code": "slice_failed",
-  "message": "Slicing failed",
+  "code": "slice_processing_failed",
+  "message": "Slicing or internal toolpath processing failed",
   "recoverable": false
 }
 ```
@@ -492,7 +637,12 @@ struct WorkerEvent {
     std::string stage;
     std::string code;
     std::string message;
+    std::string kind;
+    std::string phase;
+    std::string schema;
+    std::string format;
     std::filesystem::path path;
+    bool complete = false;
     bool success = false;
 };
 
@@ -538,6 +688,9 @@ API rules:
   shutdown onto the owning thread instead.
 - `stop()` requests graceful server shutdown.
 - `kill()` terminates the external process and is safe to call during cleanup.
+- For artifact events, `kind`, `phase`, `schema`, `format`, `path`, and
+  `complete` carry the publication contract. Hosts should not consume files
+  before `phase=="ready"` and `complete==true`.
 
 Qt applications can wrap this API with signal dispatch, but the core client
 should stay Qt-free.
@@ -615,6 +768,27 @@ Rules:
   rejects any request version other than `1`.
 - Socket `start_job` is rejected with `bad_protocol` until a valid `hello`
   handshake has completed.
+
+Stable worker error codes include:
+
+- `bad_protocol`
+- `unsupported_protocol_version`
+- `invalid_request`
+- `output_request_invalid`
+- `preview_request_invalid`
+- `no_outputs_requested`
+- `input_not_found`
+- `invalid_config`
+- `model_load_failed`
+- `slice_failed`
+- `slice_processing_failed`
+- `gcode_publish_failed`
+- `preview_mapping_invalid`
+- `preview_color_table_invalid`
+- `preview_artifact_invalid`
+- `preview_write_failed`
+- `cancelled`
+- `internal_error`
 
 ## Test Plan
 

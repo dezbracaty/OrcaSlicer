@@ -27,6 +27,8 @@ struct SliceResult
     std::string               content;
     std::vector<unsigned int> used_extruders;
     std::vector<int>          filament_maps;
+    std::vector<int>          processor_filament_to_tool_map;
+    size_t                    processor_preview_color_count { 0 };
     bool                      has_wipe_tower { false };
     bool                      has_wipe_tower_tool_ordering { false };
     int                       total_toolchanges { 0 };
@@ -126,6 +128,8 @@ SliceResult slice_to_gcode(const Model &model, const DynamicPrintConfig &config)
     SliceResult slice_result;
     slice_result.used_extruders = used_extruders;
     slice_result.filament_maps = filament_maps;
+    slice_result.processor_filament_to_tool_map = result.filament_to_tool_map;
+    slice_result.processor_preview_color_count = result.preview_colors.size();
     slice_result.has_wipe_tower = has_wipe_tower;
     slice_result.has_wipe_tower_tool_ordering = has_wipe_tower_tool_ordering;
     slice_result.total_toolchanges = print.print_statistics().total_toolchanges;
@@ -295,6 +299,10 @@ SCENARIO("Slice model to G-code with single nozzle multi material", "[slicing][m
     REQUIRE(result.filament_maps.size() == 2);
     CHECK(result.filament_maps[0] == 1);
     CHECK(result.filament_maps[1] == 1);
+    REQUIRE(result.processor_filament_to_tool_map.size() == 2);
+    CHECK(result.processor_filament_to_tool_map[0] == 0);
+    CHECK(result.processor_filament_to_tool_map[1] == 0);
+    CHECK(result.processor_preview_color_count >= 2);
     CHECK_FALSE(result.has_wipe_tower);
     CHECK(result.total_toolchanges > 0);
     CHECK(result.content.find("T1") != std::string::npos);

@@ -11,6 +11,7 @@ add_executable(${_TEST_NAME}_tests
     test_config.cpp
     test_preset_bundle_loading.cpp
     test_preset_setting_id.cpp
+    test_preview_artifact_reader.cpp
     test_slicing.cpp
     test_elephant_foot_compensation.cpp
     test_geometry.cpp
@@ -34,7 +35,10 @@ if (TARGET OpenVDB::openvdb)
 endif()
 
 target_link_libraries(${_TEST_NAME}_tests test_common libslic3r boost_libs Catch2::Catch2WithMain)
-target_include_directories(${_TEST_NAME}_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(${_TEST_NAME}_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/libslicer_worker/include
+)
 set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 
 orcaslicer_copy_test_dlls()

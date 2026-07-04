@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <array>
+#include <map>
 #include <vector>
 #include <mutex>
 #include <string>
@@ -164,6 +165,21 @@ class Print;
 
         using MoveVertex = ToolpathMoveVertex;
 
+        enum class PreviewColorSource : std::uint8_t {
+            Unknown = 0,
+            Filament = 1,
+            ColorChange = 2,
+            Custom = 3,
+        };
+
+        struct PreviewColorFact {
+            std::uint16_t id { 0 };
+            std::uint16_t filament_id { 0 };
+            PreviewColorSource source { PreviewColorSource::Unknown };
+            std::array<float, 4> color_rgba { 1.0f, 0.5f, 0.0f, 1.0f };
+            std::string name;
+        };
+
         struct SliceWarning {
             int         level;                  // 0: normal tips, 1: warning; 2: error
             std::string msg;                    // enum string
@@ -201,8 +217,11 @@ class Print;
         std::vector<float> filament_densities;
         std::vector<float> filament_costs;
         std::vector<int> filament_vitrification_temperature;
+        // Deprecated: prefer filament_to_tool_map. Both maps are 0-based filament_id -> tool_id.
         std::vector<int>   filament_maps;
+        std::vector<int>   filament_to_tool_map;
         std::vector<int>   limit_filament_maps;
+        std::map<std::uint16_t, PreviewColorFact> preview_colors;
         PrintEstimatedStatistics print_statistics;
         std::vector<CustomGCode::Item> custom_gcode_per_print_z;
         bool spiral_vase_mode;
@@ -249,7 +268,10 @@ class Print;
             warnings = other.warnings;
             bed_type = other.bed_type;
             gcode_check_result = other.gcode_check_result;
+            filament_maps = other.filament_maps;
+            filament_to_tool_map = other.filament_to_tool_map;
             limit_filament_maps = other.limit_filament_maps;
+            preview_colors = other.preview_colors;
             filament_printable_reuslt = other.filament_printable_reuslt;
             layer_filaments = other.layer_filaments;
             filament_change_sequence = other.filament_change_sequence;
@@ -807,6 +829,14 @@ class Print;
     public:
         GCodeProcessor();
         void init_filament_maps_and_nozzle_type_when_import_only_gcode();
+        void set_filament_to_tool_map(const std::vector<int>& one_based_map,
+                                      size_t filament_count,
+                                      int default_one_based_tool_id);
+        void rebuild_preview_filament_colors();
+        void record_preview_color(std::uint16_t id,
+                                  std::uint16_t filament_id,
+                                  GCodeProcessorResult::PreviewColorSource source,
+                                  const std::string& color);
         // check whether the gcode path meets the filament_map grouping requirements
         bool check_multi_extruder_gcode_valid(const int                         extruder_size,
                                               const Pointfs                     plate_printable_area,

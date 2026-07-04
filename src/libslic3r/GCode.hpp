@@ -212,7 +212,7 @@ public:
 
     // throws std::runtime_exception on error,
     // throws CanceledException through print->throw_if_canceled().
-    void            do_export(Print* print, const char* path, GCodeProcessorResult* result = nullptr, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+    void            do_export(Print* print, const char* path, GCodeProcessorResult* result = nullptr, ThumbnailsGeneratorCallback thumbnail_cb = nullptr, bool skip_existing_done = true);
     void            export_layer_filaments(GCodeProcessorResult* result);
     //BBS: set offset for gcode writer
     void set_gcode_offset(double x, double y) { m_writer.set_xy_offset(x, y); m_processor.set_xy_offset(x, y);}
@@ -307,10 +307,10 @@ public:
 private:
     class GCodeOutputStream {
     public:
-        GCodeOutputStream(FILE *f, GCodeProcessor &processor) : f(f), m_processor(processor) {}
+        GCodeOutputStream(FILE *f, GCodeProcessor &processor, bool writes_file = true) : f(f), m_processor(processor), m_writes_file(writes_file) {}
         ~GCodeOutputStream() { this->close(); }
 
-        bool is_open() const { return f; }
+        bool is_open() const { return !m_writes_file || f; }
         bool is_error() const;
 
         void flush();
@@ -331,6 +331,7 @@ private:
     private:
         FILE *f = nullptr;
         GCodeProcessor &m_processor;
+        bool m_writes_file = true;
     };
     void            _do_export(Print &print, GCodeOutputStream &file, ThumbnailsGeneratorCallback thumbnail_cb);
 

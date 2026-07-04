@@ -22,6 +22,8 @@
 #include <assert.h>
 #include <regex>
 #include <charconv>
+#include <cctype>
+#include <limits>
 #include <string>
 #include <system_error>
 
@@ -120,6 +122,38 @@ static void set_option_value(ConfigOptionFloats& option, size_t id, float value)
     if (id < option.values.size())
         option.values[id] = static_cast<double>(value);
 };
+
+static std::array<float, 4> parse_preview_color_rgba(const std::string& color)
+{
+    auto hex_value = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        return -1;
+    };
+
+    if (color.size() != 7 && color.size() != 9)
+        return { 1.0f, 0.5f, 0.0f, 1.0f };
+    if (color[0] != '#')
+        return { 1.0f, 0.5f, 0.0f, 1.0f };
+
+    std::array<int, 4> channel { 255, 128, 0, 255 };
+    for (std::size_t i = 0; i < (color.size() - 1) / 2; ++i) {
+        const int high = hex_value(color[1 + i * 2]);
+        const int low = hex_value(color[2 + i * 2]);
+        if (high < 0 || low < 0)
+            return { 1.0f, 0.5f, 0.0f, 1.0f };
+        channel[i] = high * 16 + low;
+    }
+    return {
+        static_cast<float>(channel[0]) / 255.0f,
+        static_cast<float>(channel[1]) / 255.0f,
+        static_cast<float>(channel[2]) / 255.0f,
+        static_cast<float>(channel[3]) / 255.0f
+    };
+}
 
 static float get_option_value(const ConfigOptionFloats& option, size_t id)
 {
@@ -1604,7 +1638,10 @@ void GCodeProcessorResult::reset() {
     required_nozzle_HRC = std::vector<int>(MIN_EXTRUDERS_COUNT, DEFAULT_FILAMENT_HRC);
     filament_densities = std::vector<float>(MIN_EXTRUDERS_COUNT, DEFAULT_FILAMENT_DENSITY);
     filament_costs = std::vector<float>(MIN_EXTRUDERS_COUNT, DEFAULT_FILAMENT_COST);
+    filament_maps.clear();
+    filament_to_tool_map.clear();
     custom_gcode_per_print_z = std::vector<CustomGCode::Item>();
+    preview_colors.clear();
     spiral_vase_mode = false;
     layer_filaments.clear();
     filament_change_sequence.clear();
@@ -1617,6 +1654,46 @@ void GCodeProcessorResult::reset() {
     unlock();
     //BBS: add logs
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: this=%2% reset finished")%__LINE__%this;
+}
+
+void GCodeProcessor::set_filament_to_tool_map(const std::vector<int>& one_based_map,
+                                              size_t filament_count,
+                                              int default_one_based_tool_id)
+{
+    std::vector<int> normalized = one_based_map;
+    normalized.resize(filament_count, default_one_based_tool_id);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](int value) {
+        return value - 1;
+    });
+
+    m_filament_maps = normalized;
+    m_result.filament_to_tool_map = normalized;
+    m_result.filament_maps = normalized;
+}
+
+void GCodeProcessor::record_preview_color(std::uint16_t id,
+                                          std::uint16_t filament_id,
+                                          GCodeProcessorResult::PreviewColorSource source,
+                                          const std::string& color)
+{
+    GCodeProcessorResult::PreviewColorFact fact;
+    fact.id = id;
+    fact.filament_id = filament_id;
+    fact.source = source;
+    fact.color_rgba = parse_preview_color_rgba(color);
+    fact.name = color;
+    m_result.preview_colors[id] = std::move(fact);
+}
+
+void GCodeProcessor::rebuild_preview_filament_colors()
+{
+    const std::size_t max_id = std::numeric_limits<std::uint16_t>::max();
+    for (std::size_t i = 0; i < m_result.extruder_colors.size() && i <= max_id; ++i) {
+        record_preview_color(static_cast<std::uint16_t>(i),
+                             static_cast<std::uint16_t>(i),
+                             GCodeProcessorResult::PreviewColorSource::Filament,
+                             m_result.extruder_colors[i]);
+    }
 }
 
 const std::vector<std::pair<GCodeProcessor::EProducer, std::string>> GCodeProcessor::Producers = {
@@ -1987,6 +2064,7 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
     m_result.filament_densities.resize(filament_count);
     m_result.filament_vitrification_temperature.resize(filament_count);
     m_result.filament_costs.resize(filament_count);
+    m_result.extruder_colors.resize(filament_count);
     m_extruder_temps.resize(filament_count);
     m_filament_nozzle_temp.resize(filament_count);
     m_filament_nozzle_temp_first_layer.resize(filament_count);
@@ -1999,6 +2077,7 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
     std::vector<int> filament_map = config.filament_map.values; // 1 based idxs
     // if filament map has wrong length, set filament to master extruder_id
     filament_map.resize(filament_count, config.master_extruder_id.value);
+    set_filament_to_tool_map(filament_map, filament_count, config.master_extruder_id.value);
 
     for (size_t i = 0; i < filament_count; ++ i) {
         m_extruder_offsets[i] = to_3d(config.extruder_offset.get_at(filament_map[i] - 1).cast<float>().eval(), 0.f);
@@ -2014,7 +2093,11 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
         m_result.filament_densities[i]  = static_cast<float>(config.filament_density.get_at(i));
         m_result.filament_vitrification_temperature[i] = static_cast<float>(config.temperature_vitrification.get_at(i));
         m_result.filament_costs[i]      = static_cast<float>(config.filament_cost.get_at(i));
+        m_result.extruder_colors[i]     = config.filament_colour.get_at(i);
+        if (m_result.extruder_colors[i].empty())
+            m_result.extruder_colors[i] = "#FF8000";
     }
+    rebuild_preview_filament_colors();
 
     if (m_flavor == gcfMarlinLegacy || m_flavor == gcfMarlinFirmware || m_flavor == gcfKlipper || m_flavor == gcfRepRapFirmware) {
         m_time_processor.machine_limits = reinterpret_cast<const MachineEnvelopeConfig&>(config);
@@ -2060,12 +2143,6 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
         m_first_layer_height = std::abs(initial_layer_print_height->value);
 
     m_result.printable_height = config.printable_height;
-
-    auto filament_maps = config.option<ConfigOptionInts>("filament_map");
-    if (filament_maps != nullptr) {
-        m_filament_maps = filament_maps->values;
-        std::transform(m_filament_maps.begin(), m_filament_maps.end(), m_filament_maps.begin(), [](int value) {return value - 1; });
-    }
 
     const ConfigOptionBool* spiral_vase = config.option<ConfigOptionBool>("spiral_mode");
     if (spiral_vase != nullptr) {
@@ -2191,8 +2268,10 @@ void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
 
     auto filament_maps = config.option<ConfigOptionInts>("filament_map");
     if (filament_maps != nullptr) {
-        m_filament_maps = filament_maps->values;
-        std::transform(m_filament_maps.begin(), m_filament_maps.end(), m_filament_maps.begin(), [](int value) {return value - 1; });
+        const ConfigOptionInt* master_extruder_id = config.option<ConfigOptionInt>("master_extruder_id");
+        set_filament_to_tool_map(filament_maps->values,
+                                 m_result.filaments_count,
+                                 master_extruder_id != nullptr ? master_extruder_id->value : 1);
     }
 
     //BBS
@@ -2273,6 +2352,7 @@ void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
     for (size_t i = 0; i < m_result.extruder_colors.size(); ++i) {
         m_extruder_colors[i] = static_cast<unsigned char>(i);
     }
+    rebuild_preview_filament_colors();
 
     m_extruder_temps.resize(m_result.filaments_count);
 
@@ -3210,8 +3290,13 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
                 m_last_default_color_id = 0;
         }
 
-        if (filament_id < m_extruder_colors.size())
+        if (filament_id < m_extruder_colors.size()) {
             m_extruder_colors[filament_id] = static_cast<unsigned char>(m_extruder_offsets.size()) + m_cp_color.counter; // color_change position in list of color for preview
+            record_preview_color(m_extruder_colors[filament_id],
+                                 filament_id,
+                                 GCodeProcessorResult::PreviewColorSource::ColorChange,
+                                 color);
+        }
         ++m_cp_color.counter;
         if (m_cp_color.counter == UCHAR_MAX)
             m_cp_color.counter = 0;
@@ -5431,7 +5516,9 @@ void GCodeProcessor::process_T(const std::string_view command)
 void GCodeProcessor::init_filament_maps_and_nozzle_type_when_import_only_gcode()
 {
     if (m_filament_maps.empty()) {
-        m_filament_maps.assign((int) EnforcerBlockerType::ExtruderMax, 1);
+        m_filament_maps.assign((int) EnforcerBlockerType::ExtruderMax, 0);
+        m_result.filament_to_tool_map = m_filament_maps;
+        m_result.filament_maps = m_filament_maps;
     }
     if (m_result.nozzle_type.empty()) {
         m_result.nozzle_type.assign((int) EnforcerBlockerType::ExtruderMax, NozzleType::ntUndefine);

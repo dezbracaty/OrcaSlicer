@@ -31,6 +31,7 @@ bool is_path_inside(const std::filesystem::path& parent, const std::filesystem::
 }
 
 bool optional_string_field(const nlohmann::json& json,
+                           const std::string& path,
                            const std::string& key,
                            const std::string& default_value,
                            std::string& value,
@@ -41,10 +42,61 @@ bool optional_string_field(const nlohmann::json& json,
         return true;
     }
     if (!json.at(key).is_string()) {
-        error = key + " must be a string";
+        error = path + "." + key + " must be a string";
         return false;
     }
     value = json.at(key).get<std::string>();
+    return true;
+}
+
+bool optional_bool_field(const nlohmann::json& json,
+                         const std::string& path,
+                         const std::string& key,
+                         bool default_value,
+                         bool& value,
+                         std::string& error)
+{
+    if (!json.contains(key)) {
+        value = default_value;
+        return true;
+    }
+    if (!json.at(key).is_boolean()) {
+        error = path + "." + key + " must be a boolean";
+        return false;
+    }
+    value = json.at(key).get<bool>();
+    return true;
+}
+
+bool require_bool_field(const nlohmann::json& json,
+                        const std::string& path,
+                        const std::string& key,
+                        bool& value,
+                        std::string& error)
+{
+    if (!json.contains(key)) {
+        error = path + "." + key + " is required and must be a boolean";
+        return false;
+    }
+    return optional_bool_field(json, path, key, false, value, error);
+}
+
+bool optional_int_field(const nlohmann::json& json,
+                        const std::string& path,
+                        const std::string& key,
+                        int default_value,
+                        int& value,
+                        std::string& error)
+{
+    if (!json.contains(key)) {
+        value = default_value;
+        return true;
+    }
+    if (!json.at(key).is_number_integer()) {
+        error = path + "." + key + " must be an integer";
+        return false;
+    }
+    value = json.at(key).get<int>();
     return true;
 }
 
@@ -70,10 +122,12 @@ bool parse_file_artifact(const nlohmann::json& json,
             return false;
         }
     } else if (json.is_object()) {
-        output.enabled = json.value("enabled", false);
-        output.required = json.value("required", true);
+        if (!optional_bool_field(json, "output.gcode", "enabled", false, output.enabled, error))
+            return false;
+        if (!optional_bool_field(json, "output.gcode", "required", true, output.required, error))
+            return false;
         std::string path;
-        if (!optional_string_field(json, "path", default_filename, path, error))
+        if (!optional_string_field(json, "output.gcode", "path", default_filename, path, error))
             return false;
         const std::filesystem::path raw_path = path;
         output.path = resolve_path(base_dir, raw_path);
@@ -110,18 +164,21 @@ bool parse_preview_artifact(const nlohmann::json& json,
         return false;
     }
 
-    output.enabled = json.value("enabled", false);
-    output.required = json.value("required", true);
+    if (!require_bool_field(json, "output.preview", "enabled", output.enabled, error))
+        return false;
+    if (!optional_bool_field(json, "output.preview", "required", true, output.required, error))
+        return false;
     std::string path;
-    if (!optional_string_field(json, "path", "preview.orcapv", path, error))
+    if (!optional_string_field(json, "output.preview", "path", "preview.orcapv", path, error))
         return false;
     const std::filesystem::path raw_path = path;
     output.path = resolve_path(artifacts_dir, raw_path);
-    if (!optional_string_field(json, "format", std::string(preview::binary_format_name), output.format, error))
+    if (!optional_string_field(json, "output.preview", "format", std::string(preview::binary_format_name), output.format, error))
         return false;
-    if (!optional_string_field(json, "publish", "final", output.publish, error))
+    if (!optional_string_field(json, "output.preview", "publish", "final", output.publish, error))
         return false;
-    output.chunk_records = json.value("chunk_records", 0);
+    if (!optional_int_field(json, "output.preview", "chunk_records", 0, output.chunk_records, error))
+        return false;
 
     if (!output.enabled)
         return true;
@@ -180,7 +237,7 @@ bool parse_output_request(const nlohmann::json& output_json,
     }
 
     std::string artifacts_dir;
-    if (!optional_string_field(output_json, "artifacts_dir", "./artifacts", artifacts_dir, error))
+    if (!optional_string_field(output_json, "output", "artifacts_dir", "./artifacts", artifacts_dir, error))
         return false;
     const std::filesystem::path raw_artifacts_dir = artifacts_dir;
     output.artifacts_dir = resolve_path(working_dir, raw_artifacts_dir);

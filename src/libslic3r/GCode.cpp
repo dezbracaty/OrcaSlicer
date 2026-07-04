@@ -2024,9 +2024,11 @@ WipeTowerType GCode::wipe_tower_type()
     return WipeTowerType::Type2;
 }
 
-void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
+void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb, bool skip_existing_done)
 {
     PROFILE_CLEAR();
+    const bool writes_file = path != nullptr && path[0] != '\0';
+    const std::string final_path = writes_file ? std::string(path) : std::string();
 
     // BBS
     m_curr_print = print;
@@ -2036,10 +2038,13 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     CNumericLocalesSetter locales_setter;
 
     // Does the file exist? If so, we hope that it is still valid.
-    if (print->is_step_done(psGCodeExport) && boost::filesystem::exists(boost::filesystem::path(path)))
+    if (skip_existing_done && writes_file && print->is_step_done(psGCodeExport) && boost::filesystem::exists(boost::filesystem::path(final_path)))
         return;
 
-    BOOST_LOG_TRIVIAL(info) << boost::format("Will export G-code to %1% soon")%path;
+    if (writes_file)
+        BOOST_LOG_TRIVIAL(info) << boost::format("Will export G-code to %1% soon") % final_path;
+    else
+        BOOST_LOG_TRIVIAL(info) << "Will generate G-code processor result without writing G-code file";
 
     GCodeProcessor::s_IsBBLPrinter = print->is_BBL_printer();
     m_writer.set_is_bbl_machine(print->is_BBL_printer());
@@ -2064,28 +2069,33 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     BOOST_LOG_TRIVIAL(info) << "Exporting G-code..." << log_memory_info();
 
     // Remove the old g-code if it exists.
-    boost::nowide::remove(path);
+    if (writes_file)
+        boost::nowide::remove(final_path.c_str());
 
-    fs::path file_path(path);
-    fs::path folder = file_path.parent_path();
-    if (!fs::exists(folder)) {
+    fs::path folder;
+    if (writes_file)
+        folder = fs::path(final_path).parent_path();
+    if (writes_file && !folder.empty() && !fs::exists(folder)) {
         fs::create_directory(folder);
         BOOST_LOG_TRIVIAL(error) << "[WARNING]: the parent path " + folder.string() +" is not there, create it!" << std::endl;
     }
 
-    std::string path_tmp(path);
-    path_tmp += ".tmp";
+    std::string path_tmp;
+    if (writes_file) {
+        path_tmp = final_path;
+        path_tmp += ".tmp";
+    }
 
     m_processor.initialize(path_tmp);
     m_processor.set_print(print);
-    GCodeOutputStream file(boost::nowide::fopen(path_tmp.c_str(), "wb"), m_processor);
+    GCodeOutputStream file(writes_file ? boost::nowide::fopen(path_tmp.c_str(), "wb") : nullptr, m_processor, writes_file);
     if (! file.is_open()) {
-        BOOST_LOG_TRIVIAL(error) << std::string("G-code export to ") + path + " failed.\nCannot open the file for writing.\n" << std::endl;
+        BOOST_LOG_TRIVIAL(error) << std::string("G-code export to ") + final_path + " failed.\nCannot open the file for writing.\n" << std::endl;
         if (!fs::exists(folder)) {
             //fs::create_directory(folder);
             BOOST_LOG_TRIVIAL(error) << "the parent path " + folder.string() +" is not there!!!" << std::endl;
         }
-        throw Slic3r::RuntimeError(std::string("G-code export to ") + path + " failed.\nCannot open the file for writing.\n");
+        throw Slic3r::RuntimeError(std::string("G-code export to ") + final_path + " failed.\nCannot open the file for writing.\n");
     }
 
     try {
@@ -2100,7 +2110,8 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         // Rethrow on any exception. std::runtime_exception and CanceledException are expected to be thrown.
         // Close and remove the file.
         file.close();
-        boost::nowide::remove(path_tmp.c_str());
+        if (writes_file)
+            boost::nowide::remove(path_tmp.c_str());
         throw;
     }
     file.close();
@@ -2168,26 +2179,28 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
                                                  extruder_unprintable_polys, m_print->get_extruder_printable_height(),  m_print->get_filament_maps(),
                                                  m_print->get_physical_unprintable_filaments(m_print->get_slice_used_filaments(false)));
 
-    m_processor.finalize(true);
+    m_processor.finalize(writes_file);
 //    DoExport::update_print_estimated_times_stats(m_processor, print->m_print_statistics);
     DoExport::update_print_estimated_stats(m_processor, m_writer.extruders(), print->m_print_statistics, print->config());
     if (result != nullptr) {
         *result = std::move(m_processor.extract_result());
         // set the filename to the correct value
-        result->filename = path;
+        result->filename = final_path;
     }
 
     //BBS: add some log for error output
     BOOST_LOG_TRIVIAL(debug) << boost::format("Finished processing gcode to %1% ") % path_tmp;
 
-    std::error_code ret = rename_file(path_tmp, path);
-    if (ret) {
-        throw Slic3r::RuntimeError(
-            std::string("Failed to rename the output G-code file from ") + path_tmp + " to " + path + '\n' + "error code " + ret.message() + '\n' +
-            "Is " + path_tmp + " locked?" + '\n');
-    }
-    else {
-        BOOST_LOG_TRIVIAL(info) << boost::format("rename_file from %1% to %2% successfully")% path_tmp % path;
+    if (writes_file) {
+        std::error_code ret = rename_file(path_tmp, final_path);
+        if (ret) {
+            throw Slic3r::RuntimeError(
+                std::string("Failed to rename the output G-code file from ") + path_tmp + " to " + final_path + '\n' + "error code " + ret.message() + '\n' +
+                "Is " + path_tmp + " locked?" + '\n');
+        }
+        else {
+            BOOST_LOG_TRIVIAL(info) << boost::format("rename_file from %1% to %2% successfully")% path_tmp % final_path;
+        }
     }
 
     BOOST_LOG_TRIVIAL(info) << "Exporting G-code finished" << log_memory_info();
@@ -6233,12 +6246,13 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection &support_fill
 
 bool GCode::GCodeOutputStream::is_error() const
 {
-    return ::ferror(this->f);
+    return this->f != nullptr && ::ferror(this->f);
 }
 
 void GCode::GCodeOutputStream::flush()
 {
-    ::fflush(this->f);
+    if (this->f)
+        ::fflush(this->f);
 }
 
 void GCode::GCodeOutputStream::close()
@@ -6253,8 +6267,8 @@ void GCode::GCodeOutputStream::write(const char *what)
 {
     if (what != nullptr) {
         const char* gcode = what;
-        // writes string to file
-        fwrite(gcode, 1, ::strlen(gcode), this->f);
+        if (this->f)
+            fwrite(gcode, 1, ::strlen(gcode), this->f);
         //FIXME don't allocate a string, maybe process a batch of lines?
         m_processor.process_buffer(std::string(gcode));
     }
