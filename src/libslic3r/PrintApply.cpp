@@ -7,6 +7,15 @@
 
 namespace Slic3r {
 
+namespace {
+
+bool is_bbl_printer_config(const PrintConfig& config)
+{
+    return config.printer_model.value.rfind("Bambu Lab", 0) == 0;
+}
+
+} // namespace
+
 // Add or remove support modifier ModelVolumes from model_object_dst to match the ModelVolumes of model_object_new
 // in the exact order and with the same IDs.
 // It is expected, that the model_object_dst already contains the non-support volumes of model_object_new in the correct order.
@@ -1780,6 +1789,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 #ifdef _DEBUG
     check_model_ids_equal(m_model, model);
 #endif /* _DEBUG */
+
+    m_isBBLPrinter = is_bbl_printer_config(m_config);
 
 	//BBS: add timestamp logic
 	if (apply_status != APPLY_STATUS_UNCHANGED)

@@ -9,6 +9,7 @@ add_executable(${_TEST_NAME}_tests
     test_clipper_offset.cpp
     test_clipper_utils.cpp
     test_config.cpp
+    test_config_sdk.cpp
     test_preset_bundle_loading.cpp
     test_preset_setting_id.cpp
     test_preview_artifact_reader.cpp

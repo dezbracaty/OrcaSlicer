@@ -19,9 +19,25 @@ def write_json(path, payload):
 def worker_config():
     return {
         "extruder_type": ["Direct Drive"],
+        "default_nozzle_volume_type": ["Standard"],
+        "filament_colour": ["#26A69A"],
+        "filament_diameter": [1.75],
+        "filament_extruder_variant": ["Direct Drive Standard"],
+        "filament_map": [1],
         "filament_retract_lift_enforce": ["nil"],
+        "filament_self_index": [1],
+        "filament_settings_id": ["Test PLA"],
+        "filament_type": ["PLA"],
+        "gcode_flavor": 0,
         "gcode_comments": True,
         "layer_change_gcode": "G92 E0",
+        "nozzle_diameter": [0.4],
+        "nozzle_volume_type": ["Standard"],
+        "print_settings_id": "Test Process",
+        "printer_model": "Test Printer",
+        "printer_settings_id": "Test Printer 0.4 nozzle",
+        "before_layer_change_gcode": "",
+        "use_relative_e_distances": True,
     }
 
 
@@ -31,6 +47,15 @@ def worker_config_with_oversized_flush_matrix():
         "worker_test_unknown_key": True,
         "filament_colour": ["#26A69A", "#26A69A", "#26A69A", "#26A69A"],
         "filament_diameter": [1.75, 1.75, 1.75, 1.75],
+        "filament_extruder_variant": [
+            "Direct Drive Standard",
+            "Direct Drive Standard",
+            "Direct Drive Standard",
+            "Direct Drive Standard",
+        ],
+        "filament_map": [1, 1, 1, 1],
+        "filament_retract_lift_enforce": ["nil", "nil", "nil", "nil"],
+        "filament_self_index": [1, 2, 3, 4],
         "filament_settings_id": ["Test PLA", "Test PLA", "Test PLA", "Test PLA"],
         "filament_type": ["PLA", "PLA", "PLA", "PLA"],
         "flush_multiplier": [0.3],
@@ -40,6 +65,19 @@ def worker_config_with_oversized_flush_matrix():
             for row in range(8)
             for col in range(8)
         ],
+    })
+    return config
+
+
+def worker_bbl_config_without_layer_reset():
+    config = worker_config()
+    config.update({
+        "printer_model": "Bambu Lab X1 Carbon",
+        "printer_settings_id": "Bambu Lab X1 Carbon 0.4 nozzle",
+        "print_settings_id": "0.20mm Standard @BBL X1C",
+        "before_layer_change_gcode": "",
+        "layer_change_gcode": "",
+        "use_relative_e_distances": True,
     })
     return config
 
@@ -337,6 +375,28 @@ def run_cli(worker, source_root, root_work_dir):
     if not any(event.get("code") == "unknown_config_key" for event in events):
         raise AssertionError(f"worker did not report unknown key warning for oversized flush matrix test:\n{proc.stdout}")
     assert_gcode(work_dir / "cli-oversized-flush-output.gcode")
+    assert_intermediates_cleaned(work_dir)
+
+    write_json(work_dir / "config-bbl-no-g92.json", worker_bbl_config_without_layer_reset())
+    request_bbl_no_g92 = worker_request(
+        source_root,
+        work_dir,
+        "worker-cli-bbl-no-g92",
+        "cli-bbl-no-g92-output.gcode",
+    )
+    request_bbl_no_g92["config"]["path"] = str(work_dir / "config-bbl-no-g92.json")
+    write_json(work_dir / "request-bbl-no-g92.json", request_bbl_no_g92)
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-bbl-no-g92.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"worker CLI BBL without G92 E0 failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    assert_gcode(work_dir / "cli-bbl-no-g92-output.gcode")
     assert_intermediates_cleaned(work_dir)
 
 

@@ -5,8 +5,9 @@ This document defines the public API and socket protocol for the
 
 The command-line worker and Unix domain socket worker are implemented in this
 branch. The install package currently exposes the host-side worker client API
-and the worker executable; it does not export the full in-process `libslic3r`
-slicing engine as a stable install-tree SDK yet.
+and the worker executable. The in-process `libslic3r` target is available when
+embedding this repository with `add_subdirectory`; only the reviewed public
+headers documented below should be treated as SDK surface.
 
 ## CMake Integration
 
@@ -34,6 +35,13 @@ The package exports:
 When the repository is embedded from source with `add_subdirectory`, the build
 tree also provides `libslicer::libslicer` and `libslicer::worker_runtime` for
 internal development and tests.
+
+The config SDK described in this document is part of `libslicer::libslicer`:
+
+```cmake
+add_subdirectory(path/to/OrcaSlicer libslicer-build)
+target_link_libraries(host_app PRIVATE libslicer::libslicer)
+```
 
 ## Public Orca Toolpath Types
 
@@ -258,7 +266,8 @@ extensions such as project config, plates, object paths, and embedded metadata.
 Supported `config.type` values:
 
 - `resolved_orca_json`: requires `config.path`. The worker loads the input
-  model/project, then applies the resolved config JSON.
+  model/project, then applies the resolved config JSON through the public
+  config SDK loader and validator.
 - `project_embedded`: does not use `config.path`. This is accepted only with
   `input.type=orca_3mf_project`; the worker uses the config loaded from the
   OrcaSlicer 3MF project plus slicer defaults.
@@ -377,7 +386,9 @@ values:
 }
 ```
 
-The worker converts this JSON into `Slic3r::DynamicPrintConfig`.
+The worker converts this JSON into `Slic3r::DynamicPrintConfig` through
+`Slic3r::libslicer::ResolvedConfig`, then runs
+`Slic3r::libslicer::validate_resolved_config()` before `Print::apply()`.
 
 Rules:
 
@@ -396,6 +407,139 @@ Rules:
   `layer_change_gcode`. `layer_gcode` is not a worker request key.
 - The config must be resolved before submission; the worker should not depend on
   host application DB state.
+
+## Config SDK API
+
+The public config SDK lives in:
+
+```cpp
+#include <libslic3r/ConfigSDK.hpp>
+```
+
+The API namespace is `Slic3r::libslicer`.
+
+### Schema
+
+Hosts can enumerate Orca config definitions without depending directly on
+`ConfigOptionDef`:
+
+```cpp
+std::vector<Slic3r::libslicer::ConfigDefinition> defs =
+    Slic3r::libslicer::get_config_definitions();
+
+Slic3r::libslicer::ConfigDefinition printer_model =
+    Slic3r::libslicer::get_config_definition("printer_model");
+```
+
+`ConfigDefinition` exposes:
+
+- `key`
+- `type`
+- `label`
+- `enum_options`
+- `unit`
+- `min`
+- `max`
+- `default_value`
+- `scope`
+- `cardinality`
+
+The first implementation maps Orca's internal schema and provides explicit
+scope/cardinality for worker-critical keys such as printer identity, process
+identity, filament arrays, physical extruder arrays, variant lookup arrays,
+plate-scoped wipe tower coordinates, and layer-change G-code fields. Unknown or
+not-yet-classified fields are reported as `Unknown` rather than guessed.
+
+### ResolvedConfig
+
+`ResolvedConfig` is the public facade for already-resolved Orca FFF config:
+
+```cpp
+std::vector<Slic3r::libslicer::ConfigValidationIssue> load_issues;
+
+Slic3r::libslicer::ResolvedConfig config =
+    Slic3r::libslicer::ResolvedConfig::load_json_file("config.json",
+                                                      &load_issues);
+
+if (Slic3r::libslicer::has_config_errors(load_issues)) {
+    // Show load_issues to the user and do not slice.
+}
+```
+
+Supported operations:
+
+- `ResolvedConfig::from_json(text, issues)`
+- `ResolvedConfig::load_json_file(path, issues)`
+- `ResolvedConfig::apply_json(text, issues)`
+- `ResolvedConfig::apply_json_file(path, issues)`
+- `ResolvedConfig::to_json()`
+- `ResolvedConfig::dynamic_config()`
+
+`dynamic_config()` is an escape hatch for advanced integrations and worker
+internals. Normal host code should prefer `ResolvedConfig` plus schema and
+validation APIs.
+
+### Validation
+
+Before slicing, callers must validate the resolved config:
+
+```cpp
+std::vector<Slic3r::libslicer::ConfigValidationIssue> issues =
+    Slic3r::libslicer::validate_resolved_config(config, plate_index);
+
+if (Slic3r::libslicer::has_config_errors(issues)) {
+    // Do not call Print::apply().
+}
+```
+
+The validator currently checks the worker-critical resolved config contract:
+
+- required printer/process identity fields
+- filament-scoped vector lengths
+- positive 1-based `filament_map` values
+- physical extruder arrays used by the selected filament map
+- `filament_self_index` and `filament_extruder_variant`
+- extruder variant lookup consistency
+- support, support interface, and wipe tower filament ids
+- plate-scoped `wipe_tower_x` and `wipe_tower_y`
+- required layer-change G-code fields
+
+Validation issues use stable `code`, `field`, `message`, and `severity`
+members. Unknown JSON keys are warnings; schema conversion failures and invalid
+resolved config contracts are errors.
+
+### BBL Printer Semantics
+
+The resolved config must preserve Orca's BBL printer identity. `Print::apply()`
+derives `Print::is_BBL_printer()` from the final config before validation; the
+current fallback source is `printer_model` beginning with `Bambu Lab`.
+
+For BBL Marlin profiles using relative extruder addressing, the worker must not
+require callers to inject `G92 E0` into `before_layer_change_gcode` or
+`layer_change_gcode`. Non-BBL Marlin profiles still require an exact uppercase
+`G92 E0` reset in relative-E mode.
+
+### Preset Resolution Status
+
+The SDK reserves the following types for the preset-selection resolver:
+
+- `ConfigResolutionRequest`
+- `ConfigResolutionResult`
+- `resolve_fff_config(request)`
+
+This entry point is intentionally present but not implemented yet. The current
+implementation returns an error issue with code `preset_resolution_unsupported`.
+Hosts that need slicing today must submit either:
+
+- `config.type=project_embedded`, letting the worker use config embedded in an
+  Orca project 3MF, or
+- `config.type=resolved_orca_json`, where the host provides a fully resolved
+  config JSON and may use `ResolvedConfig` plus `validate_resolved_config()` for
+  preflight checks.
+
+When the preset resolver is implemented, worker `preset_selection` and external
+host APIs must call this same `resolve_fff_config()` path rather than maintaining
+separate resolver logic.
 
 ## JSON Lines Event Stream
 

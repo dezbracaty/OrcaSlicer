@@ -51,6 +51,17 @@ DynamicPrintConfig base_print_config()
     return config;
 }
 
+DynamicPrintConfig relative_e_without_layer_reset_config(const std::string &printer_model)
+{
+    DynamicPrintConfig config = base_print_config();
+    config.set_key_value("printer_model", new ConfigOptionString(printer_model));
+    config.set_key_value("gcode_flavor", new ConfigOptionEnum<GCodeFlavor>(gcfMarlinFirmware));
+    config.set_key_value("use_relative_e_distances", new ConfigOptionBool(true));
+    config.set_key_value("before_layer_change_gcode", new ConfigOptionString(""));
+    config.set_key_value("layer_change_gcode", new ConfigOptionString(""));
+    return config;
+}
+
 Model load_obj_model(const std::string &filename)
 {
     Model model;
@@ -243,6 +254,35 @@ SCENARIO("Slice model to G-code without support", "[slicing][gcode]")
 
     expect_printable_gcode(result);
     CHECK(result.support_layer_count == 0);
+}
+
+SCENARIO("BBL printer state is derived from config on every Print apply", "[slicing][config][bbl]")
+{
+    setup_test_dirs();
+    Model model = load_obj_model("20mm_cube.obj");
+
+    Print print;
+    print.apply(model, relative_e_without_layer_reset_config("Bambu Lab X1 Carbon"));
+
+    StringObjectException warning;
+    StringObjectException error = print.validate(&warning);
+    CAPTURE(error.string);
+    CHECK(error.string.empty());
+    CHECK(print.is_BBL_printer());
+
+    print.apply(model, relative_e_without_layer_reset_config("Test Marlin Printer"));
+    warning = {};
+    error = print.validate(&warning);
+    CHECK_FALSE(print.is_BBL_printer());
+    CHECK_FALSE(error.string.empty());
+    CHECK(error.opt_key == "before_layer_change_gcode");
+
+    print.apply(model, relative_e_without_layer_reset_config("Bambu Lab X1 Carbon"));
+    warning = {};
+    error = print.validate(&warning);
+    CAPTURE(error.string);
+    CHECK(print.is_BBL_printer());
+    CHECK(error.string.empty());
 }
 
 SCENARIO("Slice model to G-code with normal support", "[slicing][support][gcode]")

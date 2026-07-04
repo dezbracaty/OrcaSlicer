@@ -5,6 +5,7 @@
 #include "preview/PreviewArtifactProducer.hpp"
 
 #include "libslic3r/Config.hpp"
+#include "libslic3r/ConfigSDK.hpp"
 #include "libslic3r/Format/3mf.hpp"
 #include "libslic3r/Format/STL.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
@@ -60,150 +61,26 @@ std::filesystem::path resolve_path(const std::filesystem::path& base, const std:
     return base / path;
 }
 
-std::string json_scalar_to_config_string(const nlohmann::json& value)
+std::string config_issue_message(const Slic3r::libslicer::ConfigValidationIssue& issue)
 {
-    if (value.is_string())
-        return value.get<std::string>();
-    if (value.is_boolean())
-        return value.get<bool>() ? "1" : "0";
-    if (value.is_number_integer())
-        return std::to_string(value.get<long long>());
-    if (value.is_number_unsigned())
-        return std::to_string(value.get<unsigned long long>());
-    if (value.is_number_float()) {
-        std::ostringstream out;
-        out << value.get<double>();
-        return out.str();
-    }
-    return value.dump();
+    std::string message = issue.message;
+    if (!issue.field.empty())
+        message = issue.field + ": " + message;
+    if (!issue.code.empty())
+        message = issue.code + ": " + message;
+    return message;
 }
 
-std::string json_point_to_config_string(const nlohmann::json& value)
+void emit_config_warnings(const std::vector<Slic3r::libslicer::ConfigValidationIssue>& issues,
+                          const EventCallback& events,
+                          const std::string& job_id)
 {
-    if (value.is_array() && value.size() >= 2 && value[0].is_number() && value[1].is_number()) {
-        std::ostringstream out;
-        out << value[0].get<double>() << 'x' << value[1].get<double>();
-        return out.str();
-    }
-    return json_scalar_to_config_string(value);
-}
-
-std::string json_array_to_config_string(const nlohmann::json& value, Slic3r::ConfigOptionType type)
-{
-    char separator = ',';
-    if (type == Slic3r::coStrings)
-        separator = ';';
-    if (type == Slic3r::coPointsGroups)
-        separator = '#';
-
-    std::ostringstream out;
-    bool first = true;
-    for (const nlohmann::json& item : value) {
-        if (!first)
-            out << separator;
-        first = false;
-
-        if (type == Slic3r::coPoints || type == Slic3r::coPoint)
-            out << json_point_to_config_string(item);
-        else if (item.is_array())
-            out << json_array_to_config_string(item, type);
-        else if (type == Slic3r::coStrings)
-            out << '"' << Slic3r::escape_string_cstyle(json_scalar_to_config_string(item)) << '"';
-        else
-            out << json_scalar_to_config_string(item);
-    }
-    return out.str();
-}
-
-bool config_enum_value_from_json(const nlohmann::json& value,
-                                 const Slic3r::t_config_enum_values& enum_values,
-                                 bool allow_nil,
-                                 int& enum_value,
-                                 std::string& error)
-{
-    if (value.is_number_integer()) {
-        enum_value = value.get<int>();
-        return true;
-    }
-
-    if (!value.is_string()) {
-        error = "enum value must be a string or integer";
-        return false;
-    }
-
-    const std::string text = value.get<std::string>();
-    if (text == "nil" && allow_nil) {
-        enum_value = Slic3r::ConfigOptionInts::nil_value();
-        return true;
-    }
-
-    const auto it = enum_values.find(text);
-    if (it == enum_values.end()) {
-        error = "unknown enum value '" + text + "'";
-        return false;
-    }
-
-    enum_value = it->second;
-    return true;
-}
-
-bool apply_enum_config_value(const std::string& key,
-                             const nlohmann::json& value_json,
-                             const Slic3r::ConfigOptionDef& option_def,
-                             Slic3r::DynamicPrintConfig& config,
-                             std::string& error)
-{
-    if (option_def.enum_keys_map == nullptr) {
-        error = "Config option " + key + " has no enum value map";
-        return false;
-    }
-
-    if (option_def.type == Slic3r::coEnum) {
-        const nlohmann::json& scalar = value_json.is_array() && !value_json.empty() ? value_json.front() : value_json;
-        int enum_value = 0;
-        if (!config_enum_value_from_json(scalar, *option_def.enum_keys_map, false, enum_value, error)) {
-            error = "Invalid config value for " + key + ": " + error;
-            return false;
+    for (const auto& issue : issues) {
+        if (issue.severity == Slic3r::libslicer::ConfigIssueSeverity::Warning) {
+            emit_event(events, { WorkerEventType::Warning, job_id, -1, "", "", issue.code,
+                                 config_issue_message(issue) });
         }
-
-        Slic3r::ConfigOption* option = config.option(key, true);
-        auto* enum_option = dynamic_cast<Slic3r::ConfigOptionEnumGeneric*>(option);
-        if (enum_option != nullptr)
-            enum_option->keys_map = option_def.enum_keys_map;
-        option->setInt(enum_value);
-        return true;
     }
-
-    if (!value_json.is_array()) {
-        error = "Invalid config value for " + key + ": enum array value must be an array";
-        return false;
-    }
-
-    Slic3r::ConfigOption* option = config.option(key, true);
-    auto* enum_option = dynamic_cast<Slic3r::ConfigOptionEnumsGeneric*>(option);
-    if (enum_option != nullptr)
-        enum_option->keys_map = option_def.enum_keys_map;
-    if (auto* enum_nullable_option = dynamic_cast<Slic3r::ConfigOptionEnumsGenericNullable*>(option); enum_nullable_option != nullptr)
-        enum_nullable_option->keys_map = option_def.enum_keys_map;
-
-    std::vector<int> enum_values;
-    enum_values.reserve(value_json.size());
-    for (const nlohmann::json& item : value_json) {
-        int enum_value = 0;
-        if (!config_enum_value_from_json(item, *option_def.enum_keys_map, option->nullable(), enum_value, error)) {
-            error = "Invalid config value for " + key + ": " + error;
-            return false;
-        }
-        enum_values.push_back(enum_value);
-    }
-
-    auto* int_values = dynamic_cast<Slic3r::ConfigOptionInts*>(option);
-    if (int_values == nullptr) {
-        error = "Invalid config value for " + key + ": enum option storage is not an integer vector";
-        return false;
-    }
-    int_values->values = std::move(enum_values);
-    return true;
 }
 
 bool apply_resolved_config(const std::filesystem::path& config_path,
@@ -212,61 +89,47 @@ bool apply_resolved_config(const std::filesystem::path& config_path,
                            const std::string& job_id,
                            std::string& error)
 {
-    std::ifstream input(config_path);
-    if (!input.good()) {
-        error = "Config file not found: " + config_path.string();
+    Slic3r::libslicer::ResolvedConfig resolved(std::move(config));
+    std::vector<Slic3r::libslicer::ConfigValidationIssue> issues;
+    if (!resolved.apply_json_file(config_path, &issues)) {
+        error = issues.empty() ? "Failed to load resolved config JSON" : config_issue_message(issues.front());
+        config = std::move(resolved.dynamic_config());
         return false;
     }
 
-    nlohmann::json json;
-    try {
-        input >> json;
-    } catch (const std::exception& e) {
-        error = std::string("Failed to parse config JSON: ") + e.what();
-        return false;
-    }
-    if (!json.is_object()) {
-        error = "Config JSON must be an object";
-        return false;
-    }
+    emit_config_warnings(issues, events, job_id);
 
-    const Slic3r::ConfigDef* config_def = config.def();
-    if (config_def == nullptr) {
-        error = "DynamicPrintConfig has no config definition";
+    if (Slic3r::libslicer::has_config_errors(issues)) {
+        const auto it = std::find_if(issues.begin(), issues.end(), [](const auto& issue) {
+            return issue.severity == Slic3r::libslicer::ConfigIssueSeverity::Error;
+        });
+        error = it != issues.end() ? config_issue_message(*it) : "Invalid resolved config JSON";
+        config = std::move(resolved.dynamic_config());
         return false;
     }
 
-    Slic3r::ConfigSubstitutionContext substitutions(Slic3r::ForwardCompatibilitySubstitutionRule::Disable);
-    for (auto it = json.begin(); it != json.end(); ++it) {
-        const std::string key = it.key();
-        const Slic3r::ConfigOptionDef* option_def = config_def->get(key);
-        if (option_def == nullptr) {
-            emit_event(events, { WorkerEventType::Warning, job_id, -1, "", "", "unknown_config_key",
-                                 "Unknown config key: " + key });
-            continue;
-        }
-
-        if (option_def->type == Slic3r::coEnum || option_def->type == Slic3r::coEnums) {
-            if (!apply_enum_config_value(key, it.value(), *option_def, config, error))
-                return false;
-            continue;
-        }
-
-        std::string value;
-        if (it.value().is_array())
-            value = json_array_to_config_string(it.value(), option_def->type);
-        else
-            value = json_scalar_to_config_string(it.value());
-
-        try {
-            config.set_deserialize(key, value, substitutions);
-        } catch (const std::exception& e) {
-            error = "Invalid config value for " + key + ": " + e.what();
-            return false;
-        }
-    }
-
+    config = std::move(resolved.dynamic_config());
     return true;
+}
+
+bool validate_resolved_config_for_worker(const Slic3r::DynamicPrintConfig& config,
+                                         const EventCallback& events,
+                                         const std::string& job_id,
+                                         int plate_index,
+                                         std::string& error)
+{
+    const std::vector<Slic3r::libslicer::ConfigValidationIssue> issues =
+        Slic3r::libslicer::validate_resolved_config(config, plate_index);
+    emit_config_warnings(issues, events, job_id);
+
+    if (!Slic3r::libslicer::has_config_errors(issues))
+        return true;
+
+    const auto it = std::find_if(issues.begin(), issues.end(), [](const auto& issue) {
+        return issue.severity == Slic3r::libslicer::ConfigIssueSeverity::Error;
+    });
+    error = it != issues.end() ? config_issue_message(*it) : "Invalid resolved config";
+    return false;
 }
 
 void normalize_flush_volumes_config(Slic3r::DynamicPrintConfig& config)
@@ -777,6 +640,12 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
         return 4;
     }
     normalize_flush_volumes_config(config);
+    if (request.config_type == "resolved_orca_json" &&
+        !validate_resolved_config_for_worker(config, events, job_id, request.plate_index, error)) {
+        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "invalid_config", error });
+        emit_result(events, job_id, false, "invalid_config", error, {}, started);
+        return 4;
+    }
 
     if (cancellation.cancelled()) {
         emit_result(events, job_id, false, "cancelled", "Job was cancelled", {}, started);

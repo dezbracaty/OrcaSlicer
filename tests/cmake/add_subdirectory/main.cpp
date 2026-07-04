@@ -3,6 +3,7 @@
 #include <type_traits>
 
 #include <libslic3r/GCode/GCodeProcessor.hpp>
+#include <libslic3r/ConfigSDK.hpp>
 #include <libslic3r/OrcaToolpathRecords.hpp>
 #include <libslic3r/OrcaToolpathTypes.hpp>
 #include <libslic3r/PrintConfig.hpp>
@@ -23,6 +24,12 @@ int main()
     Slic3r::set_data_dir(".");
 
     const auto &defs = Slic3r::print_config_def;
+    const Slic3r::libslicer::ConfigDefinition printer_model =
+        Slic3r::libslicer::get_config_definition("printer_model");
+    if (printer_model.key != "printer_model" ||
+        printer_model.scope != Slic3r::libslicer::ConfigScope::Printer)
+        return 7;
+
     libslicer::worker::WorkerEvent event;
     event.type = libslicer::worker::WorkerEventType::Progress;
     event.job_id = "add-subdirectory-smoke";
