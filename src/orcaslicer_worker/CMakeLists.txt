@@ -12,6 +12,7 @@ target_link_libraries(orcaslicer-worker
 set_target_properties(orcaslicer-worker PROPERTIES
     OUTPUT_NAME orcaslicer-worker
     EXPORT_NAME orcaslicer_worker
+    MACOSX_BUNDLE OFF
 )
 
 install(TARGETS orcaslicer-worker
