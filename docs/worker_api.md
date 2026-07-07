@@ -115,14 +115,14 @@ types with `sizeof`, key `offsetof`, and trivially-copyable compile-time
 checks. Use helper functions such as `to_wire_vec3f()` and `to_orca_vec3f()`
 when converting between wire vectors and Orca's Eigen-backed `Slic3r::Vec3f`.
 The numeric values of the shared move/path/role enums are also part of
-`schema_version == 1`; adding, removing, or reordering those enum values must
+`schema_version == 2`; adding, removing, or reordering those enum values must
 bump the preview schema version and update the protocol assertions.
 
 ## Preview Artifact Contract
 
-The v1 preview artifact is a strict binary artifact with extension `.orcapv`,
+The preview artifact is a strict binary artifact with extension `.orcapv`,
 schema `orca.toolpath_preview`, and format
-`orca-toolpath-preview-binary-v1`.
+`orca-toolpath-preview-binary-v2` (`schema_version == 2`).
 
 Wire ids are 0-based:
 
@@ -135,6 +135,7 @@ Wire ids are 0-based:
 | `WireToolRecord.id` | Physical tool/nozzle id. |
 | `WireToolRecord.filament_id` | Optional primary filament for that tool. It is not the authoritative mapping for multi-filament tools. |
 | `WireMoveRecord.cp_color_id` | Key into the preview color table. |
+| `WireMoveRecord.joint_angle_end_rad` | Signed miter turn angle (radians, 2D xy) at the move's end vertex vs. the next move that continues the same extrusion path; `0` at path breaks. Added in `schema_version == 2` (reuses a former `reserved_f32` slot; record size stays 216 bytes). See `docs/toolpath_preview_joint_angle.md`. |
 | `WireColorRecord.id` | Exact color id referenced by moves. |
 
 `filament_map` is normalized before preview publication and means:
@@ -323,7 +324,7 @@ This is equivalent to:
   `enabled`.
 - `path`: preview artifact path. Relative paths resolve against
   `output.artifacts_dir`.
-- `format`: v1 accepts only `orca-toolpath-preview-binary-v1`.
+- `format`: accepts only `orca-toolpath-preview-binary-v2`.
 - `publish`: v1 accepts only `final`.
 - `chunk_records`: reserved for future chunked mode; ignored by final mode
   after type/range validation.
@@ -644,7 +645,7 @@ Preview ready event:
   "kind": "preview",
   "phase": "ready",
   "schema": "orca.toolpath_preview",
-  "format": "orca-toolpath-preview-binary-v1",
+  "format": "orca-toolpath-preview-binary-v2",
   "path": "/path/to/job/artifacts/preview.orcapv",
   "complete": true
 }

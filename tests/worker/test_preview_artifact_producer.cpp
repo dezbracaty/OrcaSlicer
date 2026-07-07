@@ -6,8 +6,10 @@
 #include <catch2/catch_all.hpp>
 
 #include <array>
+#include <cmath>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -158,7 +160,91 @@ void assert_mapping(const PreviewArtifactView& view, const std::vector<int>& exp
     }
 }
 
+void setup_single_filament(Slic3r::GCodeProcessorResult& result)
+{
+    result.filaments_count = 1;
+    result.filament_to_tool_map = { 0 };
+    result.filament_maps = { 0 };
+    result.extruder_colors = { "#112233" };
+    result.filament_diameters = { 1.75f };
+    result.filament_densities = { 1.24f };
+    result.filament_costs = { 20.0f };
+    result.preview_colors[0] = color_fact(
+        0, 0, Slic3r::GCodeProcessorResult::PreviewColorSource::Filament,
+        { 0.5f, 0.25f, 0.75f, 1.0f }, "#112233");
+}
+
+std::optional<float> joint_angle_for_gcode(const PreviewArtifactView& view, unsigned int gcode_id)
+{
+    for (const WireMoveRecord& move : view.records<WireMoveRecord>(WireSectionType::Moves)) {
+        if (move.gcode_id == gcode_id)
+            return move.joint_angle_end_rad;
+    }
+    return std::nullopt;
+}
+
 } // namespace
+
+TEST_CASE("Preview producer computes faithful per-move joint angles", "[worker][preview_artifact]")
+{
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "libslicer-preview-producer-joint-test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+
+    Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
+    Slic3r::GCodeProcessorResult result;
+    setup_single_filament(result);
+
+    // gcode_id doubles as an intent label for the assertions below.
+    result.moves.push_back(move(0, 0, 0, 0, Slic3r::EMoveType::Travel, { 0.0f, 0.0f, 0.2f }));
+    result.moves.push_back(move(1, 0, 0, 0, Slic3r::EMoveType::Extrude, { 1.0f, 0.0f, 0.2f })); // straight run
+    result.moves.push_back(move(2, 0, 0, 0, Slic3r::EMoveType::Extrude, { 2.0f, 0.0f, 0.2f })); // corner ahead
+    result.moves.push_back(move(3, 0, 0, 0, Slic3r::EMoveType::Extrude, { 2.0f, 1.0f, 0.2f })); // extrude -> travel
+    result.moves.push_back(move(4, 0, 0, 0, Slic3r::EMoveType::Travel, { 5.0f, 5.0f, 0.2f }));  // travel start
+    result.moves.push_back(move(5, 0, 0, 0, Slic3r::EMoveType::Extrude, { 6.0f, 5.0f, 0.2f })); // extrude -> seam
+    result.moves.push_back(move(6, 0, 0, 0, Slic3r::EMoveType::Seam, { 6.0f, 5.0f, 0.2f }));    // seam between coincident extrudes
+    result.moves.push_back(move(7, 0, 0, 0, Slic3r::EMoveType::Extrude, { 7.0f, 5.0f, 0.2f })); // zero-length next
+    result.moves.push_back(move(8, 0, 0, 0, Slic3r::EMoveType::Extrude, { 7.0f, 5.0f, 0.2f })); // coincident endpoint
+
+    CancellationToken cancellation;
+    const std::filesystem::path path = root / "preview.orcapv";
+    PreviewProducerResult produced = produce_preview_artifact(
+        preview_output(path), preview_context(root), config, result, cancellation);
+    REQUIRE(produced.success);
+
+    PreviewArtifactStorage storage;
+    storage.load(path);
+    const PreviewArtifactView view = storage.view();
+
+    // Wire schema was bumped to 2 alongside the new field.
+    CHECK(view.header.version == 2);
+    CHECK(schema_version == 2);
+
+    constexpr float half_pi = 1.57079632679f;
+
+    // Straight extrude->extrude run: no turn.
+    CHECK(joint_angle_for_gcode(view, 1).value() == Catch::Approx(0.0f).margin(1e-5f));
+    // Real +90 degree corner (+x into +y) at the shared vertex.
+    CHECK(joint_angle_for_gcode(view, 2).value() == Catch::Approx(half_pi).margin(1e-5f));
+    // extrude -> travel is a path break: pointy cap, angle 0.
+    CHECK(joint_angle_for_gcode(view, 3).value() == Catch::Approx(0.0f).margin(1e-5f));
+    // travel move itself is never a continuous extrusion joint.
+    CHECK(joint_angle_for_gcode(view, 4).value() == Catch::Approx(0.0f).margin(1e-5f));
+    // extrude -> seam (between two coincident extrudes) is a break: angle 0.
+    CHECK(joint_angle_for_gcode(view, 5).value() == Catch::Approx(0.0f).margin(1e-5f));
+    // seam move itself: angle 0.
+    CHECK(joint_angle_for_gcode(view, 6).value() == Catch::Approx(0.0f).margin(1e-5f));
+    // Next extrude is zero-length: no defined direction, angle 0.
+    CHECK(joint_angle_for_gcode(view, 7).value() == Catch::Approx(0.0f).margin(1e-5f));
+
+    // The only nonzero angle in the whole stream is the genuine corner.
+    int nonzero = 0;
+    for (const WireMoveRecord& m : view.records<WireMoveRecord>(WireSectionType::Moves)) {
+        if (std::abs(m.joint_angle_end_rad) > 1e-5f)
+            ++nonzero;
+    }
+    CHECK(nonzero == 1);
+}
 
 TEST_CASE("Preview producer serializes explicit filament-to-tool mappings", "[worker][preview_artifact]")
 {

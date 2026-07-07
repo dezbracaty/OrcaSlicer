@@ -89,7 +89,7 @@ preview 的数据来源仍然必须是 Orca 内部切片结果，不能从 `.gco
     "preview": {
       "enabled": true,
       "required": true,
-      "format": "orca-toolpath-preview-binary-v1",
+      "format": "orca-toolpath-preview-binary-v2",
       "publish": "final",
       "path": "preview.orcapv"
     }
@@ -154,7 +154,7 @@ Object 字段：
 
 - `enabled`: 是否输出 public preview artifact。
 - `required`: preview 失败时是否让 job 失败。默认等于 `enabled`。
-- `format`: 第一版只接受 `orca-toolpath-preview-binary-v1`。
+- `format`: 当前只接受 `orca-toolpath-preview-binary-v2`。
 - `publish`: 第一版只接受 `final`。`chunked` 必须拒绝，直到实时预览完成。
 - `path`: preview artifact 路径。相对路径以 `artifacts_dir` 为基准。
 - `chunk_records`: 预留给未来 chunked 模式；第一版只做类型和正数校验。
@@ -248,7 +248,7 @@ preview ready event：
   "kind": "preview",
   "phase": "ready",
   "schema": "orca.toolpath_preview",
-  "format": "orca-toolpath-preview-binary-v1",
+  "format": "orca-toolpath-preview-binary-v2",
   "path": "/absolute/path/to/job/artifacts/preview.orcapv",
   "complete": true
 }
@@ -281,7 +281,7 @@ gcode ready event：
 字段语义：
 
 - `schema`: preview 语义 schema，例如 `orca.toolpath_preview`。
-- `format`: preview 二进制格式，例如 `orca-toolpath-preview-binary-v1`。
+- `format`: preview 二进制格式，例如 `orca-toolpath-preview-binary-v2`。
 - `complete`: final artifact 必须为 `true`。
 - `section/offset/count/record_size`: 第一版只为未来 chunked preview 预留；final-only preview 不需要发送。
 
@@ -413,6 +413,7 @@ src/libslicer_worker/include/libslicer_worker/
 - time per mode
 - print Z
 - object label id
+- joint miter angle at end vertex（`joint_angle_end_rad`，schema_version 2 起）
 - reserved fields
 
 宿主程序只能在对应 flag 存在时使用对应 ID：
@@ -422,6 +423,8 @@ src/libslicer_worker/include/libslicer_worker/
 - `HasCpColor`
 - `HasObject`
 - `HasInstance`
+
+`joint_angle_end_rad`（schema_version 2 起）是该 move `end_position_mm` 处、与下一条**延续同一挤出路径**的 move 之间的有符号 miter 转角（2D，xy 平面，弧度）。仅当前后两条都是带有效端点的 `Extrude` 时非零；seam/travel/wipe/retract/换料换色以及零长度后继一律为 `0`（尖角）。宿主用它做 billboard 端盖的 miter 延伸；`0` 表示路径断点，应渲染为尖角。该字段复用了原 `reserved_f32[0]` 槽位，wire 记录尺寸保持 216 字节不变，v1 读端会把它当作预留 0 值。详见 `docs/toolpath_preview_joint_angle.md`。
 
 ### WireColorRecord
 
@@ -656,8 +659,8 @@ Metadata JSON 应包含：
 ```json
 {
   "schema": "orca.toolpath_preview",
-  "schema_version": 1,
-  "binary_format": "orca-toolpath-preview-binary-v1",
+  "schema_version": 2,
+  "binary_format": "orca-toolpath-preview-binary-v2",
   "producer": {
     "name": "orcaslicer-worker",
     "orcaslicer_commit": null,

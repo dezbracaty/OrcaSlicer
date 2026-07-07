@@ -10,9 +10,9 @@
 
 namespace libslicer::worker::preview {
 
-inline constexpr std::uint32_t schema_version = 1;
+inline constexpr std::uint32_t schema_version = 2;
 inline constexpr std::string_view schema_name = "orca.toolpath_preview";
-inline constexpr std::string_view binary_format_name = "orca-toolpath-preview-binary-v1";
+inline constexpr std::string_view binary_format_name = "orca-toolpath-preview-binary-v2";
 inline constexpr std::string_view coordinate_space_name = "orca_plate_world_mm";
 
 using MoveType = Slic3r::EMoveType;

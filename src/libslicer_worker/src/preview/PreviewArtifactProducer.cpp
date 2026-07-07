@@ -308,6 +308,28 @@ void map_moves_and_events(const Slic3r::GCodeProcessorResult& result, std::size_
         records.moves.push_back(move);
     }
 
+    // Faithful miter angle (see docs/toolpath_preview_joint_angle.md). records.moves is the full
+    // ordered move stream incl. non-drawable moves, so path breaks are visible here. Requiring both
+    // neighbours to be continuous extrusions makes seams/travels/wipes/retracts become angle 0
+    // (pointy cap), which the consumer cannot determine after it drops non-drawable moves at load.
+    for (std::size_t i = 0; i + 1 < records.moves.size(); ++i) {
+        const WireMoveRecord& a = records.moves[i];
+        const WireMoveRecord& b = records.moves[i + 1];
+        const bool continues =
+            a.move_type == MoveType::Extrude && has_flag(a.flags, MoveFlags::ValidEndPosition) &&
+            b.move_type == MoveType::Extrude && has_flag(b.flags, MoveFlags::ValidStartPosition);
+        if (!continues)
+            continue;
+        const float ix = a.end_position_mm.x - a.start_position_mm.x;
+        const float iy = a.end_position_mm.y - a.start_position_mm.y;
+        const float ox = b.end_position_mm.x - b.start_position_mm.x;
+        const float oy = b.end_position_mm.y - b.start_position_mm.y;
+        if (ox == 0.0f && oy == 0.0f)
+            continue; // zero-length next move
+        records.moves[i].joint_angle_end_rad =
+            std::atan2(ix * oy - iy * ox, ix * ox + iy * oy);
+    }
+
     records.layers.reserve(layer_ranges.size());
     for (const auto& [layer_id, range] : layer_ranges) {
         WireLayerRecord layer;

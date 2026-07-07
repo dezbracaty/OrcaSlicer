@@ -148,7 +148,7 @@ def assert_preview_artifact(path):
     magic, header_size, version, endian, section_count, table_offset, file_size, metadata_offset, metadata_size, *_ = header
     if magic != b"ORCAPV1\0":
         raise AssertionError(f"invalid preview artifact magic: {magic!r}")
-    if header_size != 80 or version != 1 or endian != 0x0102:
+    if header_size != 80 or version != 2 or endian != 0x0102:
         raise AssertionError(f"unsupported preview artifact header: size={header_size} version={version} endian={endian}")
     if file_size != len(data):
         raise AssertionError(f"preview artifact file size mismatch: header={file_size} actual={len(data)}")
@@ -160,7 +160,7 @@ def assert_preview_artifact(path):
     metadata = json.loads(data[metadata_offset:metadata_offset + metadata_size].decode("utf-8"))
     if metadata.get("schema") != "orca.toolpath_preview":
         raise AssertionError(f"preview metadata schema mismatch: {metadata}")
-    if metadata.get("format") != "orca-toolpath-preview-binary-v1":
+    if metadata.get("format") != "orca-toolpath-preview-binary-v2":
         raise AssertionError(f"preview metadata format mismatch: {metadata}")
 
     sections = {}
@@ -412,7 +412,7 @@ def run_preview_outputs(worker, source_root, root_work_dir):
         "enabled": True,
         "required": True,
         "path": "preview-only.orcapv",
-        "format": "orca-toolpath-preview-binary-v1",
+        "format": "orca-toolpath-preview-binary-v2",
         "publish": "final",
     }
     write_json(work_dir / "request-preview-only.json", preview_only)
@@ -435,7 +435,7 @@ def run_preview_outputs(worker, source_root, root_work_dir):
         raise AssertionError(f"preview artifact event did not report ready/complete: {ready}")
     if ready.get("schema") != "orca.toolpath_preview":
         raise AssertionError(f"preview artifact event schema mismatch: {ready}")
-    if ready.get("format") != "orca-toolpath-preview-binary-v1":
+    if ready.get("format") != "orca-toolpath-preview-binary-v2":
         raise AssertionError(f"preview artifact event format mismatch: {ready}")
     if (work_dir / "unused.gcode").exists():
         raise AssertionError("preview-only request unexpectedly created public G-code")

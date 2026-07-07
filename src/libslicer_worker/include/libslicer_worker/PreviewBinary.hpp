@@ -147,7 +147,8 @@ struct WireMoveRecord {
     float print_z_mm { 0.0f };
     std::int32_t object_label_id { -1 };
     std::array<std::uint32_t, 8> reserved_u32 {};
-    std::array<float, 8> reserved_f32 {};
+    float joint_angle_end_rad { 0.0f };   // signed miter turn at end_position_mm; 0 at path breaks
+    std::array<float, 7> reserved_f32 {};
 };
 
 struct WireEventRecord {
@@ -206,6 +207,7 @@ static_assert(offsetof(WireMoveRecord, flags) == 36);
 static_assert(offsetof(WireMoveRecord, start_position_mm) == 40);
 static_assert(offsetof(WireMoveRecord, time_s) == 132);
 static_assert(offsetof(WireMoveRecord, reserved_u32) == 152);
+static_assert(offsetof(WireMoveRecord, joint_angle_end_rad) == 184);
 static_assert(offsetof(WireEventRecord, move_id) == 8);
 static_assert(offsetof(WireEventRecord, message_offset) == 32);
 

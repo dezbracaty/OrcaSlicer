@@ -36,7 +36,7 @@ struct ArtifactFixture {
 
 ArtifactFixture make_minimal_artifact()
 {
-    const std::string metadata = R"({"schema":"orca.toolpath_preview","format":"orca-toolpath-preview-binary-v1"})";
+    const std::string metadata = R"({"schema":"orca.toolpath_preview","format":"orca-toolpath-preview-binary-v2"})";
 
     WireLayerRecord layer;
     layer.id = 0;
