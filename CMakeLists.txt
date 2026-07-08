@@ -264,6 +264,55 @@ add_subdirectory(src/libslic3r)
 set_target_properties(libslic3r PROPERTIES OUTPUT_NAME libslicer)
 add_library(libslicer::libslicer ALIAS libslic3r)
 add_custom_target(libslicer DEPENDS libslic3r)
+
+# Public, DTO-only ConfigSDK shared library. The same ConfigSDK.cpp is also
+# compiled into libslic3r for in-tree callers (worker/tests) with full symbol
+# visibility; here it is compiled again into a standalone shared library that
+# privately absorbs libslic3r and exposes only the LIBSLICER_CONFIG_SDK_API
+# symbols. No single binary links both, so there is no duplicate-symbol clash.
+# External consumers link this target and include <libslic3r/ConfigSDK.hpp> only
+# — no Orca internal headers or transitive link dependencies.
+add_library(libslicer_config_sdk SHARED
+    src/libslic3r/ConfigSDK.cpp
+    src/libslicer_worker/src/NanoSVG.cpp
+)
+target_link_libraries(libslicer_config_sdk PRIVATE libslic3r)
+target_include_directories(libslicer_config_sdk
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps_src
+)
+target_compile_features(libslicer_config_sdk PUBLIC cxx_std_17)
+target_compile_definitions(libslicer_config_sdk
+    PUBLIC LIBSLICER_CONFIG_SDK_SHARED
+    PRIVATE LIBSLICER_CONFIG_SDK_EXPORTS
+)
+set_target_properties(libslicer_config_sdk PROPERTIES
+    EXPORT_NAME config_sdk
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+# Restrict the exported dynamic symbol table to the public SDK namespace so the
+# absorbed libslic3r archive does not re-export its internals. macOS uses an
+# exported-symbols allow-list; other platforms would need a version script.
+if(APPLE)
+    target_link_options(libslicer_config_sdk PRIVATE
+        "LINKER:-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/cmake/config_sdk_exported_symbols.txt")
+    set_target_properties(libslicer_config_sdk PROPERTIES
+        LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/config_sdk_exported_symbols.txt")
+endif()
+add_library(libslicer::config_sdk ALIAS libslicer_config_sdk)
+
+install(TARGETS libslicer_config_sdk
+    EXPORT libslicerTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
 add_subdirectory(src/libslicer_worker)
 add_subdirectory(src/orcaslicer_worker)
 

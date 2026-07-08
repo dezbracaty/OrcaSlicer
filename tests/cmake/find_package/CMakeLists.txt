@@ -15,6 +15,10 @@ if(NOT TARGET libslicer::preview_protocol)
     message(FATAL_ERROR "libslicer::preview_protocol target is missing")
 endif()
 
+if(NOT TARGET libslicer::config_sdk)
+    message(FATAL_ERROR "libslicer::config_sdk target is missing")
+endif()
+
 if(NOT TARGET libslicer::orcaslicer_worker)
     message(FATAL_ERROR "libslicer::orcaslicer_worker executable target is missing")
 endif()
@@ -32,6 +36,7 @@ target_link_libraries(libslicer_find_package_smoke
     PRIVATE
         libslicer::preview_protocol
         libslicer::worker_client
+        libslicer::config_sdk
 )
 
 add_custom_target(run_libslicer_find_package_smoke

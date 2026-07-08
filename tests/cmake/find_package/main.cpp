@@ -1,7 +1,11 @@
 #include <filesystem>
+#include <algorithm>
 #include <iostream>
+#include <string>
 #include <type_traits>
+#include <vector>
 
+#include <libslic3r/ConfigSDK.hpp>
 #include <libslic3r/OrcaToolpathRecords.hpp>
 #include <libslic3r/OrcaToolpathTypes.hpp>
 #include <libslicer_worker/PreviewProtocol.hpp>
@@ -60,6 +64,55 @@ int main()
         return 3;
     }
 
+    // Exercise the DTO-only ConfigSDK through the shared library. This TU only
+    // includes <libslic3r/ConfigSDK.hpp> — no Orca internal headers such as
+    // PrintConfig.hpp are installed, so this also proves the header is DTO-clean.
+    if (Slic3r::libslicer::config_sdk_version().empty()) {
+        std::cerr << "config_sdk_version() returned empty\n";
+        return 6;
+    }
+    if (Slic3r::libslicer::config_sdk_capabilities().empty()) {
+        std::cerr << "config_sdk_capabilities() returned empty\n";
+        return 7;
+    }
+    const std::vector<std::string> capabilities = Slic3r::libslicer::config_sdk_capabilities();
+    if (std::find(capabilities.begin(), capabilities.end(), "preset_catalog.v1") == capabilities.end()) {
+        std::cerr << "preset_catalog.v1 capability is missing\n";
+        return 10;
+    }
+    if (std::find(capabilities.begin(), capabilities.end(), "project_3mf_config.v1") == capabilities.end()) {
+        std::cerr << "project_3mf_config.v1 capability is missing\n";
+        return 12;
+    }
+    const std::vector<Slic3r::libslicer::ConfigDefinition> definitions =
+        Slic3r::libslicer::list_config_definitions();
+    if (definitions.empty()) {
+        std::cerr << "list_config_definitions() returned empty\n";
+        return 8;
+    }
+    // Empty requests must fail through structured issues, never by throwing or
+    // silently selecting defaults.
+    const Slic3r::libslicer::ConfigResolutionResult resolution =
+        Slic3r::libslicer::resolve_fff_config(Slic3r::libslicer::ConfigResolutionRequest {});
+    if (!Slic3r::libslicer::has_config_errors(resolution.issues)) {
+        std::cerr << "resolve_fff_config() did not report missing required fields\n";
+        return 9;
+    }
+    const Slic3r::libslicer::PresetCatalogResult catalog =
+        Slic3r::libslicer::load_preset_catalog(Slic3r::libslicer::PresetCatalogRequest {});
+    if (!Slic3r::libslicer::has_config_errors(catalog.issues)) {
+        std::cerr << "load_preset_catalog() did not report missing required fields\n";
+        return 11;
+    }
+    const Slic3r::libslicer::Project3mfExtractionResult project_3mf =
+        Slic3r::libslicer::extract_project_3mf_config(Slic3r::libslicer::Project3mfExtractionRequest {});
+    if (!Slic3r::libslicer::has_config_errors(project_3mf.issues)) {
+        std::cerr << "extract_project_3mf_config() did not report missing required fields\n";
+        return 13;
+    }
+
     std::cout << "worker=" << LIBSLICER_WORKER_EXE << '\n';
+    std::cout << "config_sdk=" << Slic3r::libslicer::config_sdk_version()
+              << " definitions=" << definitions.size() << '\n';
     return 0;
 }

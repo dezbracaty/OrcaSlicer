@@ -102,6 +102,7 @@ set(lisbslic3r_sources
     Config.hpp
     ConfigSDK.cpp
     ConfigSDK.hpp
+    ConfigSDK_internal.hpp
     ContourZ.cpp
     CustomGCode.cpp
     CustomGCode.hpp

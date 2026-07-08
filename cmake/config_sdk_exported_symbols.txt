@@ -1,0 +1,9 @@
+# Exported symbol allow-list for the DTO-only config_sdk shared library (macOS).
+#
+# CXX_VISIBILITY_PRESET=hidden only hides symbols from config_sdk's own objects;
+# the libslic3r static archive it absorbs was compiled with default visibility,
+# so without this list the dylib would re-export thousands of Orca internal
+# symbols. This restricts the dynamic symbol table to the public SDK namespace
+# (Slic3r::libslicer::*) only. Mach-O prepends an extra '_' to C++ mangled names,
+# hence the leading '__'.
+__ZN6Slic3r9libslicer*
