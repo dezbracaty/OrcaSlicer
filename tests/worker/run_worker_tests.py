@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import array
+import ctypes
 import json
+import mmap
 import os
 import shutil
 import socket
@@ -102,7 +105,7 @@ def worker_request(source_root, work_dir, job_id, output_name, input_type="stl",
     config = {
         "type": config_type,
     }
-    if config_type == "resolved_orca_json":
+    if config_type in {"resolved_orca_json", "preset_selection"}:
         config["path"] = str(work_dir / "config.json")
 
     return {
@@ -127,6 +130,64 @@ def worker_request(source_root, work_dir, job_id, output_name, input_type="stl",
     }
 
 
+def preset_selection_config(source_root):
+    return {
+        "vendor_bundle_dirs": [
+            str(source_root / "resources" / "profiles" / "OrcaFilamentLibrary"),
+            str(source_root / "resources" / "profiles" / "BBL"),
+        ],
+        "printer_preset_id": "Bambu Lab X1 Carbon 0.4 nozzle",
+        "process_preset_id": "0.20mm Standard @BBL X1C",
+        "process_overrides": {
+            "bridge_line_width": "0.4",
+        },
+        "filament_slots": [
+            {
+                "slot_index": 0,
+                "filament_preset_id": "Bambu PLA Basic @BBL X1C",
+                "color": "#FFFFFF",
+                "filament_type": "PLA",
+            },
+            {
+                "slot_index": 1,
+                "filament_preset_id": "Bambu PLA Basic @BBL X1C",
+                "color": "#000000",
+                "filament_type": "PLA",
+            },
+        ],
+    }
+
+
+def project_process_preset(name):
+    return {
+        "type": "process",
+        "name": name,
+        "version": "1.0.0",
+        "from": "project",
+        "inherits": "0.20mm Standard @BBL X1C",
+        "print_settings_id": name,
+        "layer_height": "0.23",
+    }
+
+
+def enable_shared_memory_preview(request):
+    request["output"]["preview"] = {
+        "enabled": True,
+        "transport": "shared_memory",
+        "format": "orca-toolpath-preview-binary-v2",
+        "publish": "final",
+    }
+
+
+def enable_shared_memory_fd_preview(request):
+    request["output"]["preview"] = {
+        "enabled": True,
+        "transport": "shared_memory_fd",
+        "format": "orca-toolpath-preview-binary-v2",
+        "publish": "final",
+    }
+
+
 def assert_gcode(path):
     if not path.exists():
         raise AssertionError(f"G-code file was not created: {path}")
@@ -137,10 +198,75 @@ def assert_gcode(path):
         raise AssertionError("G-code output does not contain filament summary")
 
 
-def assert_preview_artifact(path):
-    if not path.exists():
-        raise AssertionError(f"preview artifact was not created: {path}")
-    data = path.read_bytes()
+def read_posix_shared_memory(shm_name, size):
+    if not shm_name:
+        raise AssertionError("shared-memory preview event did not include shm_name")
+    if not isinstance(size, int) or size <= 0:
+        raise AssertionError(f"shared-memory preview event has invalid size: {size!r}")
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    libc.shm_open.restype = ctypes.c_int
+    libc.shm_unlink.argtypes = [ctypes.c_char_p]
+    libc.shm_unlink.restype = ctypes.c_int
+
+    name = shm_name.encode("utf-8")
+    fd = libc.shm_open(name, os.O_RDONLY, 0)
+    if fd < 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno), shm_name)
+    try:
+        mapping = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+        try:
+            if libc.shm_unlink(name) != 0:
+                errno = ctypes.get_errno()
+                raise OSError(errno, os.strerror(errno), shm_name)
+            return mapping[:]
+        finally:
+            mapping.close()
+    finally:
+        os.close(fd)
+
+
+def shared_memory_exists(shm_name):
+    if not shm_name:
+        raise AssertionError("shared-memory name is empty")
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    libc.shm_open.restype = ctypes.c_int
+
+    fd = libc.shm_open(shm_name.encode("utf-8"), os.O_RDONLY, 0)
+    if fd >= 0:
+        os.close(fd)
+        return True
+    errno = ctypes.get_errno()
+    if errno == getattr(os, "ENOENT", 2):
+        return False
+    raise OSError(errno, os.strerror(errno), shm_name)
+
+
+def assert_shared_memory_absent(shm_name):
+    if shared_memory_exists(shm_name):
+        raise AssertionError(f"shared-memory segment was not cleaned up: {shm_name}")
+
+
+def read_fd_bytes(fd, size):
+    if fd < 0:
+        raise AssertionError("shared-memory fd preview event did not include a valid fd")
+    if not isinstance(size, int) or size <= 0:
+        raise AssertionError(f"shared-memory fd preview event has invalid size: {size!r}")
+    try:
+        mapping = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+        try:
+            return mapping[:]
+        finally:
+            mapping.close()
+    finally:
+        os.close(fd)
+
+
+def assert_preview_artifact_bytes(data, expected_transport=None):
     if len(data) < 80:
         raise AssertionError("preview artifact is smaller than the wire header")
 
@@ -162,6 +288,10 @@ def assert_preview_artifact(path):
         raise AssertionError(f"preview metadata schema mismatch: {metadata}")
     if metadata.get("format") != "orca-toolpath-preview-binary-v2":
         raise AssertionError(f"preview metadata format mismatch: {metadata}")
+    if expected_transport is not None:
+        actual_transport = metadata.get("output", {}).get("preview_transport")
+        if actual_transport != expected_transport:
+            raise AssertionError(f"preview metadata transport mismatch: {metadata}")
 
     sections = {}
     for index in range(section_count):
@@ -189,6 +319,12 @@ def assert_preview_artifact(path):
         raise AssertionError(f"unexpected move record size: {sections[9]['record_size']}")
     if sections[6]["record_size"] != 48:
         raise AssertionError(f"unexpected color record size: {sections[6]['record_size']}")
+
+
+def assert_preview_artifact(path, expected_transport=None):
+    if not path.exists():
+        raise AssertionError(f"preview artifact was not created: {path}")
+    assert_preview_artifact_bytes(path.read_bytes(), expected_transport=expected_transport)
 
 
 def assert_intermediates_cleaned(work_dir):
@@ -277,6 +413,105 @@ def assert_project_embedded_requires_orca_project(worker, source_root, work_dir)
         raise AssertionError(f"worker did not reject invalid project_embedded request:\n{proc.stdout}\n{proc.stderr}")
 
 
+def assert_preset_selection_failure_code(worker, source_root, work_dir, name, selection, expected_code):
+    write_json(work_dir / f"preset-selection-{name}.json", selection)
+
+    request = worker_request(
+        source_root,
+        work_dir,
+        f"worker-cli-preset-selection-{name}",
+        f"{name}-output.gcode",
+        config_type="preset_selection",
+    )
+    request["config"]["path"] = str(work_dir / f"preset-selection-{name}.json")
+    write_json(work_dir / f"request-preset-selection-{name}.json", request)
+
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / f"request-preset-selection-{name}.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if proc.returncode == 0:
+        raise AssertionError(f"worker accepted invalid preset_selection for {name}")
+
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+    results = [event for event in events if event.get("type") == "result"]
+    if not results or results[-1].get("code") != expected_code:
+        raise AssertionError(f"worker did not propagate {expected_code} for preset_selection {name}:\n{proc.stdout}\n{proc.stderr}")
+
+
+def assert_preset_selection_reports_sdk_error_code(worker, source_root, work_dir):
+    selection = preset_selection_config(source_root)
+    selection["filament_slots"][0]["filament_preset_id"] = "Missing SDK Filament Preset"
+    assert_preset_selection_failure_code(worker, source_root, work_dir, "missing-filament", selection, "preset_not_found")
+
+
+def assert_preset_selection_reports_incompatible_error_code(worker, source_root, work_dir):
+    incompatible_process = preset_selection_config(source_root)
+    incompatible_process["process_preset_id"] = "0.48mm Draft @BBL A1M 0.8 nozzle"
+    assert_preset_selection_failure_code(
+        worker,
+        source_root,
+        work_dir,
+        "incompatible-process",
+        incompatible_process,
+        "preset_incompatible",
+    )
+
+    incompatible_filament = preset_selection_config(source_root)
+    incompatible_filament["filament_slots"][0]["filament_preset_id"] = "Bambu ASA-CF @BBL A1"
+    assert_preset_selection_failure_code(
+        worker,
+        source_root,
+        work_dir,
+        "incompatible-filament",
+        incompatible_filament,
+        "preset_incompatible",
+    )
+
+
+def assert_preset_selection_uses_project_preset_file(worker, source_root, work_dir):
+    process_name = "SDK Worker Project Process"
+    project_preset_relative = Path("project-presets") / "sdk-worker-project-process.config"
+    write_json(work_dir / project_preset_relative, project_process_preset(process_name))
+
+    selection = preset_selection_config(source_root)
+    selection["project_preset_files"] = [str(project_preset_relative)]
+    selection["process_preset_id"] = process_name
+    write_json(work_dir / "preset-selection-project-process.json", selection)
+
+    request = worker_request(
+        source_root,
+        work_dir,
+        "worker-cli-preset-selection-project-process",
+        "cli-preset-selection-project-process-output.gcode",
+        config_type="preset_selection",
+    )
+    request["config"]["path"] = str(work_dir / "preset-selection-project-process.json")
+    write_json(work_dir / "request-preset-selection-project-process.json", request)
+
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-preset-selection-project-process.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"worker CLI project preset_selection failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+    results = [event for event in events if event.get("type") == "result"]
+    if not results or not results[-1].get("success"):
+        raise AssertionError(f"worker CLI project preset_selection did not emit a successful result: {proc.stdout}")
+    assert_gcode(work_dir / "cli-preset-selection-project-process-output.gcode")
+    assert_intermediates_cleaned(work_dir)
+
+
 def run_cli(worker, source_root, root_work_dir):
     work_dir = root_work_dir / "cli"
     shutil.rmtree(work_dir, ignore_errors=True)
@@ -303,6 +538,33 @@ def run_cli(worker, source_root, root_work_dir):
         raise AssertionError(f"worker CLI did not emit a successful result: {proc.stdout}")
     assert_gcode(work_dir / "cli-output.gcode")
     assert_intermediates_cleaned(work_dir)
+
+    write_json(work_dir / "preset-selection.json", preset_selection_config(source_root))
+    request_preset_selection = worker_request(
+        source_root,
+        work_dir,
+        "worker-cli-preset-selection",
+        "cli-preset-selection-output.gcode",
+        config_type="preset_selection",
+    )
+    request_preset_selection["config"]["path"] = str(work_dir / "preset-selection.json")
+    write_json(work_dir / "request-preset-selection.json", request_preset_selection)
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-preset-selection.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"worker CLI preset_selection failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    assert_gcode(work_dir / "cli-preset-selection-output.gcode")
+    assert_intermediates_cleaned(work_dir)
+    assert_preset_selection_uses_project_preset_file(worker, source_root, work_dir)
+    assert_preset_selection_reports_sdk_error_code(worker, source_root, work_dir)
+    assert_preset_selection_reports_incompatible_error_code(worker, source_root, work_dir)
+
     assert_overwrite_false_rejected(worker, source_root, work_dir)
     assert_bad_request_version_rejected(worker, source_root, work_dir)
     assert_project_embedded_requires_orca_project(worker, source_root, work_dir)
@@ -441,7 +703,49 @@ def run_preview_outputs(worker, source_root, root_work_dir):
         raise AssertionError("preview-only request unexpectedly created public G-code")
     if (work_dir / "data" / "internal" / "processed.gcode.tmp").exists():
         raise AssertionError("preview-only request unexpectedly created internal G-code")
-    assert_preview_artifact(work_dir / "artifacts" / "preview-only.orcapv")
+    assert_preview_artifact(work_dir / "artifacts" / "preview-only.orcapv", expected_transport="file")
+    assert_data_dir_cleaned(work_dir)
+
+    shared_memory_preview = worker_request(source_root, work_dir, "worker-preview-shared-memory", "unused-shm.gcode")
+    shared_memory_preview["output"]["gcode"] = {"enabled": False}
+    shared_memory_preview["output"]["preview"] = {
+        "enabled": True,
+        "required": True,
+        "path": "shared-memory.orcapv",
+        "transport": "shared_memory",
+        "format": "orca-toolpath-preview-binary-v2",
+        "publish": "final",
+    }
+    write_json(work_dir / "request-preview-shared-memory.json", shared_memory_preview)
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(work_dir / "request-preview-shared-memory.json"), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"worker shared-memory preview slice failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+    preview_events = [event for event in events if event.get("type") == "artifact" and event.get("kind") == "preview"]
+    if not preview_events:
+        raise AssertionError(f"worker did not emit shared-memory preview artifact event:\n{proc.stdout}")
+    ready = preview_events[-1]
+    if ready.get("phase") != "ready" or not ready.get("complete"):
+        raise AssertionError(f"shared-memory preview artifact event did not report ready/complete: {ready}")
+    if ready.get("transport") != "shared_memory":
+        raise AssertionError(f"shared-memory preview artifact event transport mismatch: {ready}")
+    if "path" in ready:
+        raise AssertionError(f"shared-memory preview artifact event unexpectedly exposed a file path: {ready}")
+    if ready.get("schema") != "orca.toolpath_preview":
+        raise AssertionError(f"shared-memory preview artifact event schema mismatch: {ready}")
+    if ready.get("format") != "orca-toolpath-preview-binary-v2":
+        raise AssertionError(f"shared-memory preview artifact event format mismatch: {ready}")
+    preview_bytes = read_posix_shared_memory(ready.get("shm_name", ""), ready.get("size"))
+    assert_preview_artifact_bytes(preview_bytes, expected_transport="shared_memory")
+    if (work_dir / "artifacts" / "shared-memory.orcapv").exists():
+        raise AssertionError("shared-memory preview request unexpectedly created a preview file")
     assert_data_dir_cleaned(work_dir)
 
     gcode_and_preview = worker_request(source_root, work_dir, "worker-gcode-preview", "with-preview.gcode")
@@ -472,7 +776,7 @@ def run_preview_outputs(worker, source_root, root_work_dir):
     if not any(event.get("type") == "artifact" and event.get("kind") == "preview" for event in events):
         raise AssertionError(f"worker did not emit preview artifact event for G-code+preview:\n{proc.stdout}")
     assert_gcode(work_dir / "with-preview.gcode")
-    assert_preview_artifact(work_dir / "artifacts" / "with-preview.orcapv")
+    assert_preview_artifact(work_dir / "artifacts" / "with-preview.orcapv", expected_transport="file")
     assert_data_dir_cleaned(work_dir)
 
 
@@ -560,6 +864,69 @@ def recv_json_line(sock, timeout_at):
     raise AssertionError("timed out waiting for worker socket event")
 
 
+class WorkerSocketReader:
+    def __init__(self):
+        self.buffer = bytearray()
+        self.pending_fds = []
+
+    def close_pending_fds(self):
+        while self.pending_fds:
+            os.close(self.pending_fds.pop())
+
+    def _pop_event(self):
+        newline = self.buffer.find(b"\n")
+        if newline < 0:
+            return None
+        raw_bytes = bytes(self.buffer[:newline])
+        del self.buffer[:newline + 1]
+        if not raw_bytes:
+            return None
+        raw = raw_bytes.decode("utf-8")
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"worker socket sent invalid JSON line: {raw!r}") from exc
+        fd = self.pending_fds.pop(0) if self.pending_fds else None
+        return event, fd
+
+    def recv_event(self, sock, timeout_at):
+        event = self._pop_event()
+        if event is not None:
+            return event
+
+        while time.monotonic() < timeout_at:
+            ancbuf_size = socket.CMSG_SPACE(array.array("i", [0]).itemsize * 4)
+            try:
+                chunk, ancdata, flags, _ = sock.recvmsg(4096, ancbuf_size)
+            except socket.timeout as exc:
+                raise AssertionError("timed out waiting for worker socket event") from exc
+            if not chunk:
+                raise AssertionError("worker socket closed before result")
+            for level, cmsg_type, data in ancdata:
+                if level != socket.SOL_SOCKET or cmsg_type != socket.SCM_RIGHTS:
+                    continue
+                fds = array.array("i")
+                usable = len(data) - (len(data) % fds.itemsize)
+                fds.frombytes(data[:usable])
+                self.pending_fds.extend(fds.tolist())
+            self.buffer.extend(chunk)
+            event = self._pop_event()
+            if event is not None:
+                return event
+        raise AssertionError("timed out waiting for worker socket event")
+
+
+def recv_worker_event(reader, sock, timeout_at, label):
+    try:
+        return reader.recv_event(sock, timeout_at)
+    except AssertionError as exc:
+        raise AssertionError(f"{label}: {exc}") from exc
+
+
+def send_start_job(sock, request_path):
+    sock.sendall(json.dumps({"type": "start_job", "request_path": str(request_path)}).encode("utf-8") + b"\n")
+
+
 def run_socket(worker, source_root, root_work_dir):
     work_dir = root_work_dir / "socket"
     shutil.rmtree(work_dir, ignore_errors=True)
@@ -572,6 +939,7 @@ def run_socket(worker, source_root, root_work_dir):
         pass
     write_json(work_dir / "config.json", worker_config())
     request = worker_request(source_root, work_dir, "worker-socket-stl", "socket-output.gcode")
+    enable_shared_memory_preview(request)
     write_json(work_dir / "request.json", request)
     second_request = worker_request(
         source_root,
@@ -581,7 +949,11 @@ def run_socket(worker, source_root, root_work_dir):
         input_type="3mf",
         input_path=test_3mf_path(source_root),
     )
+    enable_shared_memory_preview(second_request)
     write_json(work_dir / "request-2.json", second_request)
+    fd_request = worker_request(source_root, work_dir, "worker-socket-fd-preview", "socket-output-fd.gcode")
+    enable_shared_memory_fd_preview(fd_request)
+    write_json(work_dir / "request-fd.json", fd_request)
 
     proc = subprocess.Popen(
         [str(worker), "serve", "--socket", str(socket_path)],
@@ -620,37 +992,116 @@ def run_socket(worker, source_root, root_work_dir):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(120)
             client.connect(str(socket_path))
+            reader = WorkerSocketReader()
             client.sendall(json.dumps({"type": "hello", "protocol": 999}).encode("utf-8") + b"\n")
-            event = recv_json_line(client, time.monotonic() + 30)
+            event, fd = recv_worker_event(reader, client, time.monotonic() + 30, "unsupported protocol response")
+            if fd is not None:
+                os.close(fd)
             if event.get("code") != "unsupported_protocol_version":
                 raise AssertionError(f"worker accepted unsupported protocol version: {event}")
             client.sendall(json.dumps({"type": "hello", "protocol": 1}).encode("utf-8") + b"\n")
-            event = recv_json_line(client, time.monotonic() + 30)
+            event, fd = recv_worker_event(reader, client, time.monotonic() + 30, "hello response")
+            if fd is not None:
+                os.close(fd)
             if event.get("type") != "hello" or event.get("protocol") != 1:
                 raise AssertionError(f"worker did not return a versioned hello: {event}")
-            client.sendall(json.dumps({"type": "start_job", "request_path": str(work_dir / "request.json")}).encode("utf-8") + b"\n")
+            send_start_job(client, work_dir / "request.json")
 
             result = None
+            first_preview = None
             timeout_at = time.monotonic() + 120
             while result is None:
-                event = recv_json_line(client, timeout_at)
+                event, fd = recv_worker_event(reader, client, timeout_at, "first named-shm socket job")
+                if fd is not None:
+                    os.close(fd)
+                if (event.get("type") == "artifact" and
+                        event.get("kind") == "preview" and
+                        event.get("transport") == "shared_memory"):
+                    first_preview = event
                 if event.get("type") == "result":
                     result = event
             if not result.get("success"):
                 raise AssertionError(f"worker socket returned failure result: {result}")
-            client.sendall(json.dumps({"type": "start_job", "request_path": str(work_dir / "request-2.json")}).encode("utf-8") + b"\n")
+            if first_preview is None:
+                raise AssertionError("worker socket did not emit shared-memory preview for first job")
+            send_start_job(client, work_dir / "request-2.json")
             second_result = None
+            second_preview = None
             timeout_at = time.monotonic() + 120
             while second_result is None:
-                event = recv_json_line(client, timeout_at)
+                event, fd = recv_worker_event(reader, client, timeout_at, "second named-shm socket job")
+                if fd is not None:
+                    os.close(fd)
+                if event.get("type") == "error" and event.get("code") == "job_active":
+                    time.sleep(0.05)
+                    send_start_job(client, work_dir / "request-2.json")
+                    continue
+                if (event.get("type") == "artifact" and
+                        event.get("kind") == "preview" and
+                        event.get("transport") == "shared_memory"):
+                    second_preview = event
                 if event.get("type") == "result":
                     second_result = event
             if not second_result.get("success"):
                 raise AssertionError(f"worker socket returned failure result for second job: {second_result}")
+            if second_preview is None:
+                raise AssertionError("worker socket did not emit shared-memory preview for second job")
+            assert_shared_memory_absent(first_preview.get("shm_name", ""))
+
+            send_start_job(client, work_dir / "request-fd.json")
+            fd_result = None
+            fd_preview = None
+            fd_preview_descriptor = None
+            timeout_at = time.monotonic() + 120
+            while fd_result is None:
+                event, fd = recv_worker_event(reader, client, timeout_at, "fd preview socket job")
+                if event.get("type") == "error" and event.get("code") == "job_active":
+                    if fd is not None:
+                        os.close(fd)
+                    time.sleep(0.05)
+                    send_start_job(client, work_dir / "request-fd.json")
+                    continue
+                if (event.get("type") == "artifact" and
+                        event.get("kind") == "preview" and
+                        event.get("transport") == "shared_memory_fd"):
+                    fd_preview = event
+                    fd_preview_descriptor = fd
+                elif fd is not None:
+                    os.close(fd)
+                if event.get("type") == "result":
+                    fd_result = event
+            if not fd_result.get("success"):
+                if fd_preview_descriptor is not None:
+                    os.close(fd_preview_descriptor)
+                raise AssertionError(f"worker socket returned failure result for fd preview job: {fd_result}")
+            if fd_preview is None:
+                raise AssertionError("worker socket did not emit shared-memory-fd preview")
+            if fd_preview_descriptor is None:
+                raise AssertionError(f"shared-memory-fd preview event did not include an fd: {fd_preview}")
+            if fd_preview.get("path"):
+                raise AssertionError(f"shared-memory-fd preview unexpectedly exposed a path: {fd_preview}")
+            if fd_preview.get("shm_name"):
+                raise AssertionError(f"shared-memory-fd preview unexpectedly exposed a shm name: {fd_preview}")
+            fd_preview_bytes = read_fd_bytes(fd_preview_descriptor, fd_preview.get("size"))
+            fd_preview_descriptor = None
+            assert_preview_artifact_bytes(fd_preview_bytes, expected_transport="shared_memory_fd")
+
             client.sendall(json.dumps({"type": "stop", "force": True}).encode("utf-8") + b"\n")
+            reader.close_pending_fds()
+
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = proc.communicate(timeout=5)
+            raise AssertionError(f"worker server did not stop after stop request\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
+        if proc.returncode != 0:
+            stdout, stderr = proc.communicate(timeout=5)
+            raise AssertionError(f"worker server exited with {proc.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
+        assert_shared_memory_absent(second_preview.get("shm_name", ""))
 
         assert_gcode(work_dir / "socket-output.gcode")
         assert_gcode(work_dir / "socket-output-2.gcode")
+        assert_gcode(work_dir / "socket-output-fd.gcode")
         assert_intermediates_cleaned(work_dir)
     finally:
         try:

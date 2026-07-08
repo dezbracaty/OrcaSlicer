@@ -3,15 +3,24 @@
 #include "libslicer_worker/PreviewBinary.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
-#include <cstring>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace libslicer::worker::preview {
 
@@ -87,8 +96,43 @@ struct PreviewArtifactView {
 
 class PreviewArtifactStorage {
 public:
+    PreviewArtifactStorage() = default;
+
+    ~PreviewArtifactStorage()
+    {
+        clear_mapped();
+    }
+
+    PreviewArtifactStorage(const PreviewArtifactStorage& other)
+    {
+        load_bytes(other.storage_data(), other.storage_size());
+    }
+
+    PreviewArtifactStorage& operator=(const PreviewArtifactStorage& other)
+    {
+        if (this != &other)
+            load_bytes(other.storage_data(), other.storage_size());
+        return *this;
+    }
+
+    PreviewArtifactStorage(PreviewArtifactStorage&& other) noexcept
+    {
+        move_from(std::move(other));
+    }
+
+    PreviewArtifactStorage& operator=(PreviewArtifactStorage&& other) noexcept
+    {
+        if (this != &other) {
+            clear_mapped();
+            m_storage.clear();
+            move_from(std::move(other));
+        }
+        return *this;
+    }
+
     void load(const std::filesystem::path& path)
     {
+        clear_mapped();
         std::ifstream input(path, std::ios::binary | std::ios::ate);
         if (!input.good())
             throw std::runtime_error("Preview artifact not found: " + path.string());
@@ -104,13 +148,96 @@ public:
             throw std::runtime_error("Failed to read preview artifact: " + path.string());
     }
 
+    void load_bytes(const std::byte* data, std::size_t size)
+    {
+        clear_mapped();
+        if (size == 0) {
+            m_storage.clear();
+            return;
+        }
+        if (data == nullptr && size != 0)
+            throw std::runtime_error("Preview artifact bytes pointer is null");
+        m_storage.assign(data, data + size);
+    }
+
+    void load_file_descriptor(int fd, std::size_t size, bool close_after_map = true)
+    {
+#ifdef _WIN32
+        (void)fd;
+        (void)size;
+        (void)close_after_map;
+        throw std::runtime_error("Preview artifact file-descriptor mapping is not implemented on Windows");
+#else
+        if (fd < 0)
+            throw std::runtime_error("Preview artifact file descriptor is invalid");
+        if (size == 0) {
+            if (close_after_map)
+                ::close(fd);
+            throw std::runtime_error("Preview artifact file descriptor size is zero");
+        }
+
+        clear_mapped();
+        m_storage.clear();
+
+        struct stat statbuf {};
+        if (::fstat(fd, &statbuf) != 0) {
+            const std::string message = std::strerror(errno);
+            if (close_after_map)
+                ::close(fd);
+            throw std::runtime_error("Failed to stat preview artifact file descriptor: " + message);
+        }
+        if (statbuf.st_size < 0 || size > static_cast<std::size_t>(statbuf.st_size)) {
+            if (close_after_map)
+                ::close(fd);
+            throw std::runtime_error("Preview artifact file descriptor is smaller than advertised size");
+        }
+
+        void* mapped = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        if (mapped == MAP_FAILED) {
+            const std::string message = std::strerror(errno);
+            if (close_after_map)
+                ::close(fd);
+            throw std::runtime_error("Failed to map preview artifact file descriptor: " + message);
+        }
+
+        if (close_after_map)
+            ::close(fd);
+        m_mapped = mapped;
+        m_mapped_size = size;
+#endif
+    }
+
+    void load_shared_memory(const std::string& shm_name, std::size_t size, bool unlink_after_open = true)
+    {
+#ifdef _WIN32
+        (void)shm_name;
+        (void)size;
+        (void)unlink_after_open;
+        throw std::runtime_error("Preview artifact shared memory is not implemented on Windows");
+#else
+        if (shm_name.empty())
+            throw std::runtime_error("Preview artifact shared memory name is empty");
+        if (size == 0)
+            throw std::runtime_error("Preview artifact shared memory size is zero");
+
+        const int fd = ::shm_open(shm_name.c_str(), O_RDONLY, 0);
+        if (fd < 0)
+            throw std::runtime_error("Preview artifact shared memory not found: " + shm_name);
+        load_file_descriptor(fd, size, true);
+        if (unlink_after_open)
+            ::shm_unlink(shm_name.c_str());
+#endif
+    }
+
     PreviewArtifactView view() const
     {
-        if (m_storage.size() < sizeof(WireFileHeader))
+        const std::byte* data = storage_data();
+        const std::size_t size = storage_size();
+        if (size < sizeof(WireFileHeader))
             throw std::runtime_error("Preview artifact is empty");
 
         PreviewArtifactView view;
-        view.storage = { m_storage.data(), m_storage.size() };
+        view.storage = { data, size };
         view.header = read_object<WireFileHeader>(0);
         if (view.header.magic != binary_magic)
             throw std::runtime_error("Invalid preview artifact magic");
@@ -120,28 +247,28 @@ public:
             throw std::runtime_error("Unsupported preview artifact schema version");
         if (view.header.endian != binary_little_endian_marker)
             throw std::runtime_error("Unsupported preview artifact byte order");
-        if (view.header.file_size != m_storage.size())
+        if (view.header.file_size != size)
             throw std::runtime_error("Preview artifact file size mismatch");
-        if (view.header.metadata_json_offset > m_storage.size() ||
-            view.header.metadata_json_size > m_storage.size() - view.header.metadata_json_offset) {
+        if (view.header.metadata_json_offset > size ||
+            view.header.metadata_json_size > size - view.header.metadata_json_offset) {
             throw std::runtime_error("Preview artifact metadata is outside file bounds");
         }
 
         const std::uint64_t table_size = static_cast<std::uint64_t>(view.header.section_count) * sizeof(WireSectionHeader);
-        if (view.header.section_table_offset > m_storage.size() ||
-            table_size > m_storage.size() - view.header.section_table_offset) {
+        if (view.header.section_table_offset > size ||
+            table_size > size - view.header.section_table_offset) {
             throw std::runtime_error("Preview artifact section table is outside file bounds");
         }
 
         view.metadata_json.assign(
-            reinterpret_cast<const char*>(m_storage.data() + view.header.metadata_json_offset),
+            reinterpret_cast<const char*>(data + view.header.metadata_json_offset),
             static_cast<std::size_t>(view.header.metadata_json_size));
 
         for (std::uint16_t i = 0; i < view.header.section_count; ++i) {
             const std::uint64_t offset = view.header.section_table_offset + i * sizeof(WireSectionHeader);
             WireSectionHeader section = read_object<WireSectionHeader>(offset);
             validate_known_section(section);
-            if (section.size > 0 && (section.offset > m_storage.size() || section.size > m_storage.size() - section.offset))
+            if (section.size > 0 && (section.offset > size || section.size > size - section.offset))
                 throw std::runtime_error("Preview artifact section is outside file bounds");
             if (section.size > 0 && section.offset % 8 != 0)
                 throw std::runtime_error("Preview artifact section is not 8-byte aligned");
@@ -321,14 +448,48 @@ private:
     template <class T>
     T read_object(std::uint64_t offset) const
     {
-        if (offset > m_storage.size() || sizeof(T) > m_storage.size() - offset)
+        const std::byte* data = storage_data();
+        const std::size_t size = storage_size();
+        if (offset > size || sizeof(T) > size - offset)
             throw std::runtime_error("Preview artifact read is outside file bounds");
         T value;
-        std::memcpy(&value, m_storage.data() + offset, sizeof(T));
+        std::memcpy(&value, data + offset, sizeof(T));
         return value;
     }
 
+    const std::byte* storage_data() const
+    {
+        return m_mapped != nullptr ? reinterpret_cast<const std::byte*>(m_mapped) : m_storage.data();
+    }
+
+    std::size_t storage_size() const
+    {
+        return m_mapped != nullptr ? m_mapped_size : m_storage.size();
+    }
+
+    void clear_mapped() noexcept
+    {
+#ifndef _WIN32
+        if (m_mapped != nullptr) {
+            ::munmap(m_mapped, m_mapped_size);
+            m_mapped = nullptr;
+            m_mapped_size = 0;
+        }
+#endif
+    }
+
+    void move_from(PreviewArtifactStorage&& other) noexcept
+    {
+        m_storage = std::move(other.m_storage);
+        m_mapped = other.m_mapped;
+        m_mapped_size = other.m_mapped_size;
+        other.m_mapped = nullptr;
+        other.m_mapped_size = 0;
+    }
+
     std::vector<std::byte> m_storage;
+    void* m_mapped { nullptr };
+    std::size_t m_mapped_size { 0 };
 };
 
 struct RenderSegmentView {

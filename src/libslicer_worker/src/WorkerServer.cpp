@@ -1,6 +1,8 @@
 #include "libslicer_worker/WorkerProtocol.hpp"
 #include "libslicer_worker/WorkerServer.hpp"
 
+#include "preview/PreviewArtifactProducer.hpp"
+
 #include <nlohmann/json.hpp>
 
 #ifndef _WIN32
@@ -73,7 +75,7 @@ bool recv_line(int fd, std::string& buffer, std::string& line)
 
 void send_event(int fd, const WorkerEvent& event)
 {
-    send_all(fd, event_to_json_line(event));
+    send_worker_event(fd, event);
 }
 #endif
 
@@ -94,6 +96,8 @@ int run_worker_server(const ServerOptions& options)
         std::cerr << "Socket path is too long: " << socket_path << '\n';
         return 2;
     }
+
+    preview::sweep_stale_preview_shared_memory();
 
     ::unlink(socket_path.c_str());
     const int server_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -133,11 +137,25 @@ int run_worker_server(const ServerOptions& options)
         std::mutex send_mutex;
         std::string recv_buffer;
         std::string active_job_id;
+        std::string pending_preview_shm_name;
         bool handshake_complete = false;
 
         auto emit_to_client = [&](const WorkerEvent& event) {
             std::lock_guard<std::mutex> lock(send_mutex);
+            if (event.type == WorkerEventType::Artifact &&
+                event.kind == "preview" &&
+                event.transport == "shared_memory" &&
+                !event.shm_name.empty()) {
+                pending_preview_shm_name = event.shm_name;
+            }
             send_event(client_fd, event);
+        };
+
+        auto cleanup_pending_preview_shm = [&] {
+            if (!pending_preview_shm_name.empty()) {
+                preview::unlink_preview_shared_memory(pending_preview_shm_name);
+                pending_preview_shm_name.clear();
+            }
         };
 
         std::string line;
@@ -174,6 +192,7 @@ int run_worker_server(const ServerOptions& options)
                     emit_to_client({ WorkerEventType::Error, "", -1, "", "", "job_active", "A job is already active" });
                     continue;
                 }
+                cleanup_pending_preview_shm();
                 const std::string request_path = message.value("request_path", "");
                 active_job_id = message.value("job_id", "");
                 if (request_path.empty()) {
@@ -210,6 +229,7 @@ int run_worker_server(const ServerOptions& options)
 
         if (job_thread.joinable())
             job_thread.join();
+        cleanup_pending_preview_shm();
         ::close(client_fd);
     }
 

@@ -14,6 +14,7 @@ struct FileArtifactOutput {
 };
 
 struct PreviewArtifactOutput : FileArtifactOutput {
+    std::string transport { "file" };
     std::string format;
     std::string publish;
     int chunk_records { 0 };

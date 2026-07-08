@@ -8,7 +8,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <csignal>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -18,6 +22,13 @@
 #include <stdexcept>
 #include <system_error>
 #include <utility>
+
+#ifndef _WIN32
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace libslicer::worker::preview {
 namespace {
@@ -388,7 +399,8 @@ nlohmann::json build_metadata(const artifacts::PreviewArtifactOutput& request,
         { "plate_index", context.plate_index }
     };
     metadata["output"] = {
-        { "preview", request.path.string() },
+        { "preview_transport", request.transport },
+        { "preview", request.transport == "file" ? request.path.string() : "" },
         { "gcode_requested", context.gcode_requested },
         { "gcode", context.gcode_path.string() }
     };
@@ -441,6 +453,26 @@ void validate_preview_artifact(const std::filesystem::path& path)
     try {
         PreviewArtifactStorage storage;
         storage.load(path);
+        const PreviewArtifactView view = storage.view();
+        const nlohmann::json metadata = nlohmann::json::parse(view.metadata_json);
+        if (metadata.value("schema", "") != std::string(schema_name))
+            throw_artifact_error("Preview artifact metadata schema mismatch");
+        if (metadata.value("format", "") != std::string(binary_format_name))
+            throw_artifact_error("Preview artifact metadata format mismatch");
+        (void)view.records<WireMoveRecord>(WireSectionType::Moves);
+        (void)view.records<WireColorRecord>(WireSectionType::Colors);
+    } catch (const PreviewProducerException&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw_artifact_error(e.what());
+    }
+}
+
+void validate_preview_artifact_bytes(const std::vector<std::byte>& bytes)
+{
+    try {
+        PreviewArtifactStorage storage;
+        storage.load_bytes(bytes.data(), bytes.size());
         const PreviewArtifactView view = storage.view();
         const nlohmann::json metadata = nlohmann::json::parse(view.metadata_json);
         if (metadata.value("schema", "") != std::string(schema_name))
@@ -513,10 +545,9 @@ void validate_preview_records(const PreviewRecords& records)
     }
 }
 
-void write_preview_artifact(const std::filesystem::path& path,
-                            const artifacts::PreviewArtifactOutput& request,
-                            const PreviewProducerContext& context,
-                            const PreviewRecords& records)
+std::vector<std::byte> build_preview_artifact_bytes(const artifacts::PreviewArtifactOutput& request,
+                                                    const PreviewProducerContext& context,
+                                                    const PreviewRecords& records)
 {
     const std::string metadata_json = build_metadata(request, context, records).dump();
     std::vector<SectionPayload> payloads = make_payloads(records, metadata_json);
@@ -558,7 +589,11 @@ void write_preview_artifact(const std::filesystem::path& path,
         append_bytes(file, &section, sizeof(section));
     header.file_size = file.size();
     std::memcpy(file.data(), &header, sizeof(header));
+    return file;
+}
 
+void write_preview_artifact_file(const std::filesystem::path& path, const std::vector<std::byte>& file)
+{
     std::filesystem::create_directories(path.parent_path());
     const std::filesystem::path tmp_path = path.string() + ".tmp";
     {
@@ -585,7 +620,228 @@ void write_preview_artifact(const std::filesystem::path& path,
     }
 }
 
+#ifndef _WIN32
+constexpr char shm_name_prefix[] = "/ocpv";
+
+std::string make_shm_name()
+{
+    static std::atomic<std::uint64_t> sequence { 0 };
+    char name[32];
+    const auto pid = static_cast<unsigned int>(::getpid());
+    const auto seq = static_cast<unsigned int>(sequence.fetch_add(1, std::memory_order_relaxed));
+    std::snprintf(name, sizeof(name), "%s%08x%08x", shm_name_prefix, pid, seq);
+    return name;
+}
+
+#if defined(__linux__)
+int hex_digit_value(char value)
+{
+    if (value >= '0' && value <= '9')
+        return value - '0';
+    if (value >= 'a' && value <= 'f')
+        return 10 + value - 'a';
+    if (value >= 'A' && value <= 'F')
+        return 10 + value - 'A';
+    return -1;
+}
+
+std::optional<pid_t> parse_preview_shm_pid(const char* filename)
+{
+    constexpr char file_prefix[] = "ocpv";
+    constexpr std::size_t prefix_size = sizeof(file_prefix) - 1;
+    constexpr std::size_t pid_digits = 8;
+    constexpr std::size_t sequence_digits = 8;
+    constexpr std::size_t expected_size = prefix_size + pid_digits + sequence_digits;
+
+    if (filename == nullptr || std::strlen(filename) != expected_size ||
+        std::strncmp(filename, file_prefix, prefix_size) != 0) {
+        return std::nullopt;
+    }
+
+    unsigned int pid = 0;
+    for (std::size_t index = 0; index < pid_digits; ++index) {
+        const int digit = hex_digit_value(filename[prefix_size + index]);
+        if (digit < 0)
+            return std::nullopt;
+        pid = (pid << 4) | static_cast<unsigned int>(digit);
+    }
+    for (std::size_t index = prefix_size + pid_digits; index < expected_size; ++index) {
+        if (hex_digit_value(filename[index]) < 0)
+            return std::nullopt;
+    }
+    if (pid == 0 || pid > static_cast<unsigned int>(std::numeric_limits<pid_t>::max()))
+        return std::nullopt;
+    return static_cast<pid_t>(pid);
+}
+
+bool process_is_alive(pid_t pid)
+{
+    errno = 0;
+    if (::kill(pid, 0) == 0)
+        return true;
+    return errno == EPERM;
+}
+#endif
+
+std::string write_preview_artifact_shared_memory(const std::vector<std::byte>& file)
+{
+    validate_preview_artifact_bytes(file);
+
+    std::string shm_name;
+    int fd = -1;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        shm_name = make_shm_name();
+        fd = ::shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd >= 0)
+            break;
+        if (errno != EEXIST)
+            throw_write_error("Failed to create preview shared memory: " + std::string(std::strerror(errno)));
+    }
+    if (fd < 0)
+        throw_write_error("Failed to create unique preview shared memory name");
+
+    const auto cleanup_on_error = [&] {
+        ::shm_unlink(shm_name.c_str());
+        ::close(fd);
+    };
+
+    if (::ftruncate(fd, static_cast<off_t>(file.size())) != 0) {
+        const std::string message = std::strerror(errno);
+        cleanup_on_error();
+        throw_write_error("Failed to size preview shared memory: " + message);
+    }
+
+    void* mapped = ::mmap(nullptr, file.size(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        const std::string message = std::strerror(errno);
+        cleanup_on_error();
+        throw_write_error("Failed to map preview shared memory: " + message);
+    }
+
+    std::memcpy(mapped, file.data(), file.size());
+    if (::munmap(mapped, file.size()) != 0) {
+        const std::string message = std::strerror(errno);
+        cleanup_on_error();
+        throw_write_error("Failed to unmap preview shared memory: " + message);
+    }
+
+    ::close(fd);
+    return shm_name;
+}
+
+int write_preview_artifact_shared_memory_fd(const std::vector<std::byte>& file)
+{
+    validate_preview_artifact_bytes(file);
+
+    std::string shm_name;
+    int fd = -1;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        shm_name = make_shm_name();
+        fd = ::shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd >= 0)
+            break;
+        if (errno != EEXIST)
+            throw_write_error("Failed to create preview shared memory fd: " + std::string(std::strerror(errno)));
+    }
+    if (fd < 0)
+        throw_write_error("Failed to create unique preview shared memory fd name");
+
+    // Remove the namespace entry immediately. The segment now lives only as
+    // long as producer/consumer file descriptors remain open.
+    if (::shm_unlink(shm_name.c_str()) != 0) {
+        const std::string message = std::strerror(errno);
+        ::close(fd);
+        throw_write_error("Failed to unlink preview shared memory fd name: " + message);
+    }
+
+    const auto cleanup_on_error = [&] {
+        ::close(fd);
+    };
+
+    if (::ftruncate(fd, static_cast<off_t>(file.size())) != 0) {
+        const std::string message = std::strerror(errno);
+        cleanup_on_error();
+        throw_write_error("Failed to size preview shared memory fd: " + message);
+    }
+
+    void* mapped = ::mmap(nullptr, file.size(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        const std::string message = std::strerror(errno);
+        cleanup_on_error();
+        throw_write_error("Failed to map preview shared memory fd: " + message);
+    }
+
+    std::memcpy(mapped, file.data(), file.size());
+    if (::munmap(mapped, file.size()) != 0) {
+        const std::string message = std::strerror(errno);
+        cleanup_on_error();
+        throw_write_error("Failed to unmap preview shared memory fd: " + message);
+    }
+
+    return fd;
+}
+
+void unlink_preview_shared_memory_name(const std::string& shm_name)
+{
+    if (!shm_name.empty())
+        ::shm_unlink(shm_name.c_str());
+}
+
+void close_preview_file_descriptor(int fd)
+{
+    if (fd >= 0)
+        ::close(fd);
+}
+#else
+std::string write_preview_artifact_shared_memory(const std::vector<std::byte>&)
+{
+    throw_write_error("Preview shared_memory transport is not implemented on Windows");
+}
+
+int write_preview_artifact_shared_memory_fd(const std::vector<std::byte>&)
+{
+    throw_write_error("Preview shared_memory_fd transport is not implemented on Windows");
+}
+
+void unlink_preview_shared_memory_name(const std::string&)
+{
+}
+
+void close_preview_file_descriptor(int)
+{
+}
+#endif
+
 } // namespace
+
+void unlink_preview_shared_memory(const std::string& shm_name)
+{
+    unlink_preview_shared_memory_name(shm_name);
+}
+
+std::size_t sweep_stale_preview_shared_memory()
+{
+#if defined(__linux__)
+    DIR* dir = ::opendir("/dev/shm");
+    if (dir == nullptr)
+        return 0;
+
+    std::size_t swept = 0;
+    while (dirent* entry = ::readdir(dir)) {
+        const std::optional<pid_t> pid = parse_preview_shm_pid(entry->d_name);
+        if (!pid.has_value() || process_is_alive(*pid))
+            continue;
+
+        const std::string shm_name = std::string("/") + entry->d_name;
+        if (::shm_unlink(shm_name.c_str()) == 0)
+            ++swept;
+    }
+    ::closedir(dir);
+    return swept;
+#else
+    return 0;
+#endif
+}
 
 PreviewProducerResult produce_preview_artifact(const artifacts::PreviewArtifactOutput& request,
                                                const PreviewProducerContext& context,
@@ -594,6 +850,7 @@ PreviewProducerResult produce_preview_artifact(const artifacts::PreviewArtifactO
                                                CancellationToken& cancellation)
 {
     PreviewProducerResult result;
+    result.transport = request.transport.empty() ? "file" : request.transport;
     result.path = request.path;
     try {
         if (cancellation.cancelled()) {
@@ -610,10 +867,25 @@ PreviewProducerResult produce_preview_artifact(const artifacts::PreviewArtifactO
             return result;
         }
 
-        write_preview_artifact(request.path, request, context, records);
+        const std::vector<std::byte> artifact_bytes = build_preview_artifact_bytes(request, context, records);
+        result.size = artifact_bytes.size();
+        if (result.transport == "file") {
+            write_preview_artifact_file(request.path, artifact_bytes);
+        } else if (result.transport == "shared_memory") {
+            result.shm_name = write_preview_artifact_shared_memory(artifact_bytes);
+            result.path.clear();
+        } else if (result.transport == "shared_memory_fd") {
+            result.file_descriptor = write_preview_artifact_shared_memory_fd(artifact_bytes);
+            result.path.clear();
+        } else {
+            throw_write_error("Unsupported preview transport: " + result.transport);
+        }
         if (cancellation.cancelled()) {
             std::error_code ec;
             std::filesystem::remove(request.path, ec);
+            unlink_preview_shared_memory(result.shm_name);
+            close_preview_file_descriptor(result.file_descriptor);
+            result.file_descriptor = -1;
             result.code = "cancelled";
             result.message = "Job was cancelled";
             return result;
@@ -623,25 +895,35 @@ PreviewProducerResult produce_preview_artifact(const artifacts::PreviewArtifactO
     } catch (const PreviewProducerException& e) {
         std::error_code ec;
         std::filesystem::remove(request.path.string() + ".tmp", ec);
+        unlink_preview_shared_memory(result.shm_name);
+        close_preview_file_descriptor(result.file_descriptor);
+        result.file_descriptor = -1;
         result.code = e.code();
         result.message = e.what();
     } catch (const std::exception& e) {
         std::error_code ec;
         std::filesystem::remove(request.path.string() + ".tmp", ec);
+        unlink_preview_shared_memory(result.shm_name);
+        close_preview_file_descriptor(result.file_descriptor);
+        result.file_descriptor = -1;
         result.code = "preview_write_failed";
         result.message = e.what();
     }
     return result;
 }
 
-WorkerEvent make_preview_ready_event(const std::string& job_id, const std::filesystem::path& path)
+WorkerEvent make_preview_ready_event(const std::string& job_id, const PreviewProducerResult& result)
 {
     WorkerEvent event;
     event.type = WorkerEventType::Artifact;
     event.job_id = job_id;
     event.kind = "preview";
-    event.path = path;
+    event.path = result.path;
     event.phase = "ready";
+    event.transport = result.transport;
+    event.shm_name = result.shm_name;
+    event.size = result.size;
+    event.file_descriptor = result.file_descriptor;
     event.schema = std::string(schema_name);
     event.format = std::string(binary_format_name);
     event.complete = true;

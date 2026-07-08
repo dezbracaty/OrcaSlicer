@@ -2,10 +2,13 @@
 
 #include "libslicer_worker/PreviewReader.hpp"
 #include "libslicer_worker/SliceJob.hpp"
+#include "libslicer_worker/WorkerProtocol.hpp"
 
 #include <catch2/catch_all.hpp>
+#include <nlohmann/json.hpp>
 
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <filesystem>
 #include <map>
@@ -14,6 +17,13 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -28,6 +38,20 @@ artifacts::PreviewArtifactOutput preview_output(const std::filesystem::path& pat
     output.path = path;
     output.format = std::string(binary_format_name);
     output.publish = "final";
+    return output;
+}
+
+artifacts::PreviewArtifactOutput shared_memory_preview_output(const std::filesystem::path& path)
+{
+    artifacts::PreviewArtifactOutput output = preview_output(path);
+    output.transport = "shared_memory";
+    return output;
+}
+
+artifacts::PreviewArtifactOutput shared_memory_fd_preview_output(const std::filesystem::path& path)
+{
+    artifacts::PreviewArtifactOutput output = preview_output(path);
+    output.transport = "shared_memory_fd";
     return output;
 }
 
@@ -292,6 +316,242 @@ TEST_CASE("Preview producer serializes exact color ids referenced by moves", "[w
     }
     CHECK(saw_referenced_color_change);
 }
+
+TEST_CASE("Output request parses preview transport modes", "[worker][preview_artifact]")
+{
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "libslicer-preview-output-request-test";
+    artifacts::OutputRequest output;
+    std::string error;
+
+    const nlohmann::json shared_memory_request = {
+        { "artifacts_dir", "artifacts" },
+        { "preview", {
+            { "enabled", true },
+            { "transport", "shared_memory" },
+            { "format", std::string(binary_format_name) },
+            { "publish", "final" }
+        } }
+    };
+    REQUIRE(artifacts::parse_output_request(shared_memory_request, root, output, error));
+    CHECK(output.preview.enabled);
+    CHECK(output.preview.transport == "shared_memory");
+    CHECK(output.preview.path == root / "artifacts" / "preview.orcapv");
+
+    const nlohmann::json shared_memory_fd_request = {
+        { "artifacts_dir", "artifacts" },
+        { "preview", {
+            { "enabled", true },
+            { "transport", "shared_memory_fd" },
+            { "format", std::string(binary_format_name) },
+            { "publish", "final" }
+        } }
+    };
+    REQUIRE(artifacts::parse_output_request(shared_memory_fd_request, root, output, error));
+    CHECK(output.preview.enabled);
+    CHECK(output.preview.transport == "shared_memory_fd");
+    CHECK(output.preview.path == root / "artifacts" / "preview.orcapv");
+
+    const nlohmann::json file_request = {
+        { "artifacts_dir", "artifacts" },
+        { "preview", {
+            { "enabled", true },
+            { "format", std::string(binary_format_name) },
+            { "publish", "final" }
+        } }
+    };
+    REQUIRE(artifacts::parse_output_request(file_request, root, output, error));
+    CHECK(output.preview.transport == "file");
+
+    const nlohmann::json invalid_request = {
+        { "artifacts_dir", "artifacts" },
+        { "preview", {
+            { "enabled", true },
+            { "transport", "pipe" },
+            { "format", std::string(binary_format_name) },
+            { "publish", "final" }
+        } }
+    };
+    CHECK_FALSE(artifacts::parse_output_request(invalid_request, root, output, error));
+    CHECK(error.find("unsupported output.preview transport") != std::string::npos);
+}
+
+#ifndef _WIN32
+TEST_CASE("Preview producer writes shared memory transport", "[worker][preview_artifact]")
+{
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "libslicer-preview-producer-shm-test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+
+    Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
+    Slic3r::GCodeProcessorResult result;
+    make_result(result, { 0, 0 }, true);
+    CancellationToken cancellation;
+
+    const std::filesystem::path file_path = root / "preview.orcapv";
+    PreviewProducerResult produced = produce_preview_artifact(
+        shared_memory_preview_output(file_path), preview_context(root), config, result, cancellation);
+    REQUIRE(produced.success);
+    CHECK(produced.transport == "shared_memory");
+    CHECK(produced.path.empty());
+    REQUIRE_FALSE(produced.shm_name.empty());
+    REQUIRE(produced.size > 0);
+    CHECK_FALSE(std::filesystem::exists(file_path));
+
+    PreviewArtifactStorage storage;
+    storage.load_shared_memory(produced.shm_name, static_cast<std::size_t>(produced.size), false);
+    const PreviewArtifactView view = storage.view();
+    const nlohmann::json metadata = nlohmann::json::parse(view.metadata_json);
+    CHECK(metadata.at("output").at("preview_transport") == "shared_memory");
+    CHECK(view.records<WireMoveRecord>(WireSectionType::Moves).size() == result.moves.size());
+
+    const int write_fd = ::shm_open(produced.shm_name.c_str(), O_RDWR, 0);
+    REQUIRE(write_fd >= 0);
+    void* writable = ::mmap(nullptr, static_cast<std::size_t>(produced.size), PROT_READ | PROT_WRITE, MAP_SHARED, write_fd, 0);
+    REQUIRE(writable != MAP_FAILED);
+    constexpr std::uint64_t marker = 0x5d4b3a291807f6e5ULL;
+    reinterpret_cast<WireFileHeader*>(writable)->reserved[0] = marker;
+    CHECK(::munmap(writable, static_cast<std::size_t>(produced.size)) == 0);
+    ::close(write_fd);
+    CHECK(storage.view().header.reserved[0] == marker);
+
+    unlink_preview_shared_memory(produced.shm_name);
+    const int missing_fd = ::shm_open(produced.shm_name.c_str(), O_RDONLY, 0);
+    CHECK(missing_fd < 0);
+    CHECK(errno == ENOENT);
+    if (missing_fd >= 0)
+        ::close(missing_fd);
+
+    const WorkerEvent event = make_preview_ready_event("preview-shm-job", produced);
+    const std::optional<WorkerEvent> parsed = event_from_json_line(event_to_json_line(event));
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->transport == "shared_memory");
+    CHECK(parsed->shm_name == produced.shm_name);
+    CHECK(parsed->size == produced.size);
+    CHECK(parsed->path.empty());
+
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Preview artifact storage maps anonymous shared memory file descriptors", "[worker][preview_artifact]")
+{
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "libslicer-preview-fd-reader-test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+
+    Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
+    Slic3r::GCodeProcessorResult result;
+    make_result(result, { 0, 0 }, true);
+    CancellationToken cancellation;
+
+    PreviewProducerResult produced = produce_preview_artifact(
+        shared_memory_preview_output(root / "preview.orcapv"), preview_context(root), config, result, cancellation);
+    REQUIRE(produced.success);
+    REQUIRE_FALSE(produced.shm_name.empty());
+    REQUIRE(produced.size > 0);
+
+    const int fd = ::shm_open(produced.shm_name.c_str(), O_RDONLY, 0);
+    REQUIRE(fd >= 0);
+    CHECK(::shm_unlink(produced.shm_name.c_str()) == 0);
+
+    PreviewArtifactStorage storage;
+    storage.load_file_descriptor(fd, static_cast<std::size_t>(produced.size));
+    errno = 0;
+    CHECK(::fcntl(fd, F_GETFD) < 0);
+    CHECK(errno == EBADF);
+
+    const PreviewArtifactView view = storage.view();
+    const nlohmann::json metadata = nlohmann::json::parse(view.metadata_json);
+    CHECK(metadata.at("output").at("preview_transport") == "shared_memory");
+    CHECK(view.records<WireMoveRecord>(WireSectionType::Moves).size() == result.moves.size());
+
+    const int missing_fd = ::shm_open(produced.shm_name.c_str(), O_RDONLY, 0);
+    CHECK(missing_fd < 0);
+    CHECK(errno == ENOENT);
+    if (missing_fd >= 0)
+        ::close(missing_fd);
+
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Preview producer sends anonymous shared memory fd preview events", "[worker][preview_artifact][protocol]")
+{
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "libslicer-preview-producer-shm-fd-test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+
+    Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
+    Slic3r::GCodeProcessorResult result;
+    make_result(result, { 0, 0 }, true);
+    CancellationToken cancellation;
+
+    const std::filesystem::path file_path = root / "preview.orcapv";
+    PreviewProducerResult produced = produce_preview_artifact(
+        shared_memory_fd_preview_output(file_path), preview_context(root), config, result, cancellation);
+    INFO(produced.code << ": " << produced.message);
+    REQUIRE(produced.success);
+    CHECK(produced.transport == "shared_memory_fd");
+    CHECK(produced.path.empty());
+    CHECK(produced.shm_name.empty());
+    REQUIRE(produced.size > 0);
+    REQUIRE(produced.file_descriptor >= 0);
+    CHECK_FALSE(std::filesystem::exists(file_path));
+
+    int sockets[2] { -1, -1 };
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    WorkerEvent event = make_preview_ready_event("preview-shm-fd-job", produced);
+    REQUIRE(event.file_descriptor == produced.file_descriptor);
+    REQUIRE(send_worker_event(sockets[0], event));
+    ::close(produced.file_descriptor);
+    produced.file_descriptor = -1;
+
+    WorkerProtocolReader reader;
+    std::optional<WorkerEvent> received = receive_worker_event(sockets[1], reader);
+    REQUIRE(received.has_value());
+    CHECK(received->type == WorkerEventType::Artifact);
+    CHECK(received->kind == "preview");
+    CHECK(received->transport == "shared_memory_fd");
+    CHECK(received->shm_name.empty());
+    CHECK(received->path.empty());
+    CHECK(received->size == produced.size);
+    REQUIRE(received->file_descriptor >= 0);
+
+    PreviewArtifactStorage storage;
+    storage.load_file_descriptor(received->file_descriptor, static_cast<std::size_t>(received->size));
+    received->file_descriptor = -1;
+    const PreviewArtifactView view = storage.view();
+    const nlohmann::json metadata = nlohmann::json::parse(view.metadata_json);
+    CHECK(metadata.at("output").at("preview_transport") == "shared_memory_fd");
+    CHECK(view.records<WireMoveRecord>(WireSectionType::Moves).size() == result.moves.size());
+
+    ::close(sockets[0]);
+    ::close(sockets[1]);
+    std::filesystem::remove_all(root);
+}
+
+#if defined(__linux__)
+TEST_CASE("Preview producer sweeps stale Linux shared memory names", "[worker][preview_artifact]")
+{
+    constexpr const char* stale_name = "/ocpv7fffffff00000000";
+    ::shm_unlink(stale_name);
+
+    int fd = ::shm_open(stale_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    REQUIRE(fd >= 0);
+    ::close(fd);
+
+    CHECK(sweep_stale_preview_shared_memory() >= 1);
+
+    errno = 0;
+    fd = ::shm_open(stale_name, O_RDONLY, 0);
+    CHECK(fd < 0);
+    CHECK(errno == ENOENT);
+    if (fd >= 0)
+        ::close(fd);
+
+    ::shm_unlink(stale_name);
+}
+#endif
+#endif
 
 TEST_CASE("Preview producer rejects missing mapping facts", "[worker][preview_artifact]")
 {

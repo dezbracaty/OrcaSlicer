@@ -6,6 +6,8 @@
 #include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/PrintConfig.hpp>
 
+#include <cstdint>
+#include <cstddef>
 #include <filesystem>
 #include <string>
 
@@ -33,7 +35,11 @@ struct PreviewProducerResult {
     bool success { false };
     std::string code;
     std::string message;
+    std::string transport { "file" };
     std::filesystem::path path;
+    std::string shm_name;
+    std::uint64_t size { 0 };
+    int file_descriptor { -1 };
 };
 
 PreviewProducerResult produce_preview_artifact(const artifacts::PreviewArtifactOutput& request,
@@ -42,6 +48,10 @@ PreviewProducerResult produce_preview_artifact(const artifacts::PreviewArtifactO
                                                const Slic3r::GCodeProcessorResult& gcode_result,
                                                CancellationToken& cancellation);
 
-WorkerEvent make_preview_ready_event(const std::string& job_id, const std::filesystem::path& path);
+WorkerEvent make_preview_ready_event(const std::string& job_id, const PreviewProducerResult& result);
+
+void unlink_preview_shared_memory(const std::string& shm_name);
+
+std::size_t sweep_stale_preview_shared_memory();
 
 } // namespace libslicer::worker::preview

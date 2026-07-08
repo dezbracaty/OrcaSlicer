@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <functional>
+#include <cstdint>
 #include <string>
 
 namespace libslicer::worker {
@@ -32,6 +33,9 @@ struct WorkerEvent {
     bool recoverable { false };
     long long elapsed_ms { -1 };
     std::string phase;
+    std::string transport;
+    std::string shm_name;
+    std::uint64_t size { 0 };
     std::string schema;
     std::string format;
     std::string section;
@@ -39,6 +43,10 @@ struct WorkerEvent {
     long long count { -1 };
     long long record_size { -1 };
     bool complete { false };
+
+    // Transient POSIX fd received over SCM_RIGHTS. The event consumer owns this
+    // descriptor and must close it. JSON serialization never includes it.
+    int file_descriptor { -1 };
 };
 
 using EventCallback = std::function<void(const WorkerEvent&)>;

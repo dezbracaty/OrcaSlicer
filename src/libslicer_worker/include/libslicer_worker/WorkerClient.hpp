@@ -27,6 +27,7 @@ public:
     WorkerClient& operator=(WorkerClient&& other) noexcept;
 
     bool start(const WorkerOptions& options);
+    bool connect(const WorkerOptions& options);
     bool connect();
     bool submit(const SliceJob& job);
     bool cancel(const std::string& job_id);

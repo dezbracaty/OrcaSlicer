@@ -177,12 +177,20 @@ bool parse_preview_artifact(const nlohmann::json& json,
         return false;
     if (!optional_string_field(json, "output.preview", "publish", "final", output.publish, error))
         return false;
+    if (!optional_string_field(json, "output.preview", "transport", "file", output.transport, error))
+        return false;
     if (!optional_int_field(json, "output.preview", "chunk_records", 0, output.chunk_records, error))
         return false;
 
     if (!output.enabled)
         return true;
-    if (output.path.empty()) {
+    if (output.transport != "file" &&
+        output.transport != "shared_memory" &&
+        output.transport != "shared_memory_fd") {
+        error = "unsupported output.preview transport: " + output.transport;
+        return false;
+    }
+    if (output.transport == "file" && output.path.empty()) {
         error = "enabled output.preview path is required";
         return false;
     }
@@ -198,7 +206,7 @@ bool parse_preview_artifact(const nlohmann::json& json,
         error = "output.preview.chunk_records must be non-negative";
         return false;
     }
-    if (!is_path_inside_or_same(artifacts_dir, output.path)) {
+    if (output.transport == "file" && !is_path_inside_or_same(artifacts_dir, output.path)) {
         error = "output.preview.path must be contained by output.artifacts_dir";
         return false;
     }

@@ -5,7 +5,7 @@
 #include "preview/PreviewArtifactProducer.hpp"
 
 #include "libslic3r/Config.hpp"
-#include "libslic3r/ConfigSDK.hpp"
+#include "libslic3r/ConfigSDK_internal.hpp"
 #include "libslic3r/Format/3mf.hpp"
 #include "libslic3r/Format/STL.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
@@ -18,6 +18,10 @@
 
 #include <boost/filesystem/operations.hpp>
 #include <nlohmann/json.hpp>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -48,10 +52,18 @@ struct JobRequest {
     bool keep_intermediate_files { false };
 };
 
+bool parse_preset_selection_file(const JobRequest& job,
+                                 Slic3r::libslicer::ConfigResolutionRequest& request,
+                                 std::string& error);
+
 void emit_event(const EventCallback& events, WorkerEvent event)
 {
     if (events)
         events(event);
+#ifndef _WIN32
+    if (event.file_descriptor >= 0)
+        ::close(event.file_descriptor);
+#endif
 }
 
 std::filesystem::path resolve_path(const std::filesystem::path& base, const std::filesystem::path& path)
@@ -71,6 +83,21 @@ std::string config_issue_message(const Slic3r::libslicer::ConfigValidationIssue&
     return message;
 }
 
+const Slic3r::libslicer::ConfigValidationIssue* first_config_error(
+    const std::vector<Slic3r::libslicer::ConfigValidationIssue>& issues)
+{
+    const auto it = std::find_if(issues.begin(), issues.end(), [](const auto& issue) {
+        return issue.severity == Slic3r::libslicer::ConfigIssueSeverity::Error;
+    });
+    return it != issues.end() ? &*it : nullptr;
+}
+
+std::string config_issue_code_or(const Slic3r::libslicer::ConfigValidationIssue* issue,
+                                 const std::string& fallback)
+{
+    return issue != nullptr && !issue->code.empty() ? issue->code : fallback;
+}
+
 void emit_config_warnings(const std::vector<Slic3r::libslicer::ConfigValidationIssue>& issues,
                           const EventCallback& events,
                           const std::string& job_id)
@@ -87,11 +114,14 @@ bool apply_resolved_config(const std::filesystem::path& config_path,
                            Slic3r::DynamicPrintConfig& config,
                            const EventCallback& events,
                            const std::string& job_id,
+                           std::string& error_code,
                            std::string& error)
 {
     Slic3r::libslicer::ResolvedConfig resolved(std::move(config));
     std::vector<Slic3r::libslicer::ConfigValidationIssue> issues;
     if (!resolved.apply_json_file(config_path, &issues)) {
+        const Slic3r::libslicer::ConfigValidationIssue* issue = issues.empty() ? nullptr : &issues.front();
+        error_code = config_issue_code_or(issue, "invalid_config");
         error = issues.empty() ? "Failed to load resolved config JSON" : config_issue_message(issues.front());
         config = std::move(resolved.dynamic_config());
         return false;
@@ -100,10 +130,9 @@ bool apply_resolved_config(const std::filesystem::path& config_path,
     emit_config_warnings(issues, events, job_id);
 
     if (Slic3r::libslicer::has_config_errors(issues)) {
-        const auto it = std::find_if(issues.begin(), issues.end(), [](const auto& issue) {
-            return issue.severity == Slic3r::libslicer::ConfigIssueSeverity::Error;
-        });
-        error = it != issues.end() ? config_issue_message(*it) : "Invalid resolved config JSON";
+        const Slic3r::libslicer::ConfigValidationIssue* issue = first_config_error(issues);
+        error_code = config_issue_code_or(issue, "invalid_config");
+        error = issue != nullptr ? config_issue_message(*issue) : "Invalid resolved config JSON";
         config = std::move(resolved.dynamic_config());
         return false;
     }
@@ -116,6 +145,7 @@ bool validate_resolved_config_for_worker(const Slic3r::DynamicPrintConfig& confi
                                          const EventCallback& events,
                                          const std::string& job_id,
                                          int plate_index,
+                                         std::string& error_code,
                                          std::string& error)
 {
     const std::vector<Slic3r::libslicer::ConfigValidationIssue> issues =
@@ -125,11 +155,56 @@ bool validate_resolved_config_for_worker(const Slic3r::DynamicPrintConfig& confi
     if (!Slic3r::libslicer::has_config_errors(issues))
         return true;
 
-    const auto it = std::find_if(issues.begin(), issues.end(), [](const auto& issue) {
-        return issue.severity == Slic3r::libslicer::ConfigIssueSeverity::Error;
-    });
-    error = it != issues.end() ? config_issue_message(*it) : "Invalid resolved config";
+    const Slic3r::libslicer::ConfigValidationIssue* issue = first_config_error(issues);
+    error_code = config_issue_code_or(issue, "invalid_config");
+    error = issue != nullptr ? config_issue_message(*issue) : "Invalid resolved config";
     return false;
+}
+
+bool apply_preset_selection_config(const JobRequest& request,
+                                   Slic3r::DynamicPrintConfig& config,
+                                   const EventCallback& events,
+                                   const std::string& job_id,
+                                   std::string& error_code,
+                                   std::string& error)
+{
+    Slic3r::libslicer::ConfigResolutionRequest resolution_request;
+    if (!parse_preset_selection_file(request, resolution_request, error)) {
+        error_code = "invalid_config";
+        return false;
+    }
+
+    Slic3r::libslicer::ConfigResolutionResult resolved =
+        Slic3r::libslicer::resolve_fff_config(resolution_request);
+    emit_config_warnings(resolved.issues, events, job_id);
+
+    if (Slic3r::libslicer::has_config_errors(resolved.issues)) {
+        const Slic3r::libslicer::ConfigValidationIssue* issue = first_config_error(resolved.issues);
+        error_code = config_issue_code_or(issue, "invalid_config");
+        error = issue != nullptr ? config_issue_message(*issue) : "Preset selection failed";
+        return false;
+    }
+
+    Slic3r::libslicer::ResolvedConfig resolved_config(std::move(config));
+    std::vector<Slic3r::libslicer::ConfigValidationIssue> load_issues;
+    if (!resolved_config.apply_json(resolved.full_config_json, &load_issues)) {
+        const Slic3r::libslicer::ConfigValidationIssue* issue = load_issues.empty() ? nullptr : &load_issues.front();
+        error_code = config_issue_code_or(issue, "invalid_config");
+        error = load_issues.empty() ? "Failed to load resolved preset-selection config" : config_issue_message(load_issues.front());
+        config = std::move(resolved_config.dynamic_config());
+        return false;
+    }
+    emit_config_warnings(load_issues, events, job_id);
+    if (Slic3r::libslicer::has_config_errors(load_issues)) {
+        const Slic3r::libslicer::ConfigValidationIssue* issue = first_config_error(load_issues);
+        error_code = config_issue_code_or(issue, "invalid_config");
+        error = issue != nullptr ? config_issue_message(*issue) : "Invalid resolved preset-selection config";
+        config = std::move(resolved_config.dynamic_config());
+        return false;
+    }
+
+    config = std::move(resolved_config.dynamic_config());
+    return true;
 }
 
 void normalize_flush_volumes_config(Slic3r::DynamicPrintConfig& config)
@@ -360,6 +435,128 @@ bool optional_bool_field(const nlohmann::json& json,
     return true;
 }
 
+bool optional_path_list_field(const nlohmann::json& json,
+                              const std::string& path,
+                              const std::string& key,
+                              const std::filesystem::path& base,
+                              std::vector<std::filesystem::path>& value,
+                              std::string& error)
+{
+    value.clear();
+    if (!json.contains(key))
+        return true;
+    if (!json.at(key).is_array()) {
+        error = path + "." + key + " must be an array";
+        return false;
+    }
+    for (const nlohmann::json& item : json.at(key)) {
+        if (!item.is_string()) {
+            error = path + "." + key + " entries must be strings";
+            return false;
+        }
+        value.push_back(resolve_path(base, item.get<std::string>()));
+    }
+    return true;
+}
+
+std::string json_field_as_object_text(const nlohmann::json& json,
+                                      const std::string& path,
+                                      const std::string& key,
+                                      std::string& error)
+{
+    if (!json.contains(key))
+        return {};
+    if (json.at(key).is_object())
+        return json.at(key).dump();
+    if (json.at(key).is_string())
+        return json.at(key).get<std::string>();
+    error = path + "." + key + " must be an object or JSON string";
+    return {};
+}
+
+bool parse_preset_selection_file(const JobRequest& job,
+                                 Slic3r::libslicer::ConfigResolutionRequest& request,
+                                 std::string& error)
+{
+    std::ifstream input(job.config_path);
+    if (!input.good()) {
+        error = "Preset selection file not found: " + job.config_path.string();
+        return false;
+    }
+
+    nlohmann::json json;
+    try {
+        input >> json;
+    } catch (const std::exception& e) {
+        error = std::string("Failed to parse preset selection JSON: ") + e.what();
+        return false;
+    }
+    if (!json.is_object()) {
+        error = "Preset selection JSON must be an object";
+        return false;
+    }
+
+    request.resources_dir = job.resources_dir;
+    request.data_dir = job.data_dir;
+    request.plate_index = job.plate_index;
+    request.strict = true;
+
+    if (!optional_path_list_field(json, "config", "vendor_bundle_dirs", job.working_dir,
+                                  request.vendor_bundle_dirs, error))
+        return false;
+    if (!optional_path_list_field(json, "config", "user_preset_dirs", job.working_dir,
+                                  request.user_preset_dirs, error))
+        return false;
+    if (!optional_path_list_field(json, "config", "project_preset_files", job.working_dir,
+                                  request.project_preset_files, error))
+        return false;
+    if (!optional_string_field(json, "config", "printer_preset_id", "", request.printer_preset_id, error))
+        return false;
+    if (!optional_string_field(json, "config", "process_preset_id", "", request.process_preset_id, error))
+        return false;
+    if (!optional_bool_field(json, "config", "strict", true, request.strict, error))
+        return false;
+    if (!optional_bool_field(json, "config", "apply_extruder", false, request.apply_extruder, error))
+        return false;
+
+    request.printer_overrides_json = json_field_as_object_text(json, "config", "printer_overrides", error);
+    if (!error.empty()) return false;
+    request.process_overrides_json = json_field_as_object_text(json, "config", "process_overrides", error);
+    if (!error.empty()) return false;
+    request.project_overrides_json = json_field_as_object_text(json, "config", "project_overrides", error);
+    if (!error.empty()) return false;
+
+    if (!json.contains("filament_slots") || !json.at("filament_slots").is_array()) {
+        error = "config.filament_slots must be an array";
+        return false;
+    }
+    const nlohmann::json& filament_slots = json.at("filament_slots");
+    request.filament_slots.reserve(filament_slots.size());
+    for (size_t i = 0; i < filament_slots.size(); ++i) {
+        if (!filament_slots.at(i).is_object()) {
+            error = "config.filament_slots entries must be objects";
+            return false;
+        }
+        const std::string path = "config.filament_slots[" + std::to_string(i) + "]";
+        Slic3r::libslicer::FilamentSlotRequest slot;
+        if (!optional_int_field(filament_slots.at(i), path, "slot_index", static_cast<int>(i), slot.slot_index, error))
+            return false;
+        if (!optional_string_field(filament_slots.at(i), path, "filament_preset_id", "", slot.filament_preset_id, error))
+            return false;
+        if (!optional_string_field(filament_slots.at(i), path, "color", "", slot.color, error))
+            return false;
+        if (!optional_string_field(filament_slots.at(i), path, "color_type", "", slot.color_type, error))
+            return false;
+        if (!optional_string_field(filament_slots.at(i), path, "filament_type", "", slot.filament_type, error))
+            return false;
+        slot.slot_overrides_json = json_field_as_object_text(filament_slots.at(i), path, "slot_overrides", error);
+        if (!error.empty()) return false;
+        request.filament_slots.push_back(std::move(slot));
+    }
+
+    return true;
+}
+
 bool parse_request(const std::filesystem::path& request_path, JobRequest& request, std::string& error_code, std::string& error)
 {
     error_code = "invalid_request";
@@ -438,7 +635,9 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
         return false;
     if (!optional_string_field(config_json, "config", "type", "", request.config_type, error))
         return false;
-    if (request.config_type != "resolved_orca_json" && request.config_type != "project_embedded") {
+    if (request.config_type != "resolved_orca_json" &&
+        request.config_type != "project_embedded" &&
+        request.config_type != "preset_selection") {
         error = "Unsupported config type: " + request.config_type;
         return false;
     }
@@ -473,7 +672,8 @@ bool parse_request(const std::filesystem::path& request_path, JobRequest& reques
         error = "input.type and input.path are required";
         return false;
     }
-    if (request.config_type == "resolved_orca_json" && request.config_path.empty()) {
+    if ((request.config_type == "resolved_orca_json" || request.config_type == "preset_selection") &&
+        request.config_path.empty()) {
         error = "config.path is required";
         return false;
     }
@@ -582,6 +782,8 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
                                const EventCallback& events,
                                CancellationToken& cancellation)
 {
+    preview::sweep_stale_preview_shared_memory();
+
     const Clock::time_point started = Clock::now();
     JobRequest request;
     std::string error_code;
@@ -600,7 +802,9 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
         emit_result(events, job_id, false, "output_exists", error, request.output.gcode.path, started);
         return 3;
     }
-    if (!request.overwrite && request.output.preview.enabled && boost::filesystem::exists(request.output.preview.path.string())) {
+    if (!request.overwrite && request.output.preview.enabled &&
+        request.output.preview.transport == "file" &&
+        boost::filesystem::exists(request.output.preview.path.string())) {
         error = "Output preview already exists: " + request.output.preview.path.string();
         emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "output_exists", error });
         emit_result(events, job_id, false, "output_exists", error, request.output.preview.path, started);
@@ -634,16 +838,26 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
     emit_event(events, { WorkerEventType::Progress, job_id, 20, "loading_config", "", "", "Loading config" });
     Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
     config.apply(loaded_config, true);
-    if (request.config_type == "resolved_orca_json" && !apply_resolved_config(request.config_path, config, events, job_id, error)) {
-        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "invalid_config", error });
-        emit_result(events, job_id, false, "invalid_config", error, {}, started);
+    std::string config_error_code = "invalid_config";
+    if (request.config_type == "resolved_orca_json" &&
+        !apply_resolved_config(request.config_path, config, events, job_id, config_error_code, error)) {
+        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", config_error_code, error });
+        emit_result(events, job_id, false, config_error_code, error, {}, started);
+        return 4;
+    }
+    config_error_code = "invalid_config";
+    if (request.config_type == "preset_selection" &&
+        !apply_preset_selection_config(request, config, events, job_id, config_error_code, error)) {
+        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", config_error_code, error });
+        emit_result(events, job_id, false, config_error_code, error, {}, started);
         return 4;
     }
     normalize_flush_volumes_config(config);
-    if (request.config_type == "resolved_orca_json" &&
-        !validate_resolved_config_for_worker(config, events, job_id, request.plate_index, error)) {
-        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "invalid_config", error });
-        emit_result(events, job_id, false, "invalid_config", error, {}, started);
+    config_error_code = "invalid_config";
+    if ((request.config_type == "resolved_orca_json" || request.config_type == "preset_selection") &&
+        !validate_resolved_config_for_worker(config, events, job_id, request.plate_index, config_error_code, error)) {
+        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", config_error_code, error });
+        emit_result(events, job_id, false, config_error_code, error, {}, started);
         return 4;
     }
 
@@ -766,7 +980,7 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
             }
             emit_event(events, { WorkerEventType::Warning, job_id, -1, "", "preview", preview_result.code, preview_result.message, request.output.preview.path });
         } else {
-            emit_event(events, preview::make_preview_ready_event(job_id, preview_result.path));
+            emit_event(events, preview::make_preview_ready_event(job_id, preview_result));
             if (result_path.empty())
                 result_path = preview_result.path;
         }

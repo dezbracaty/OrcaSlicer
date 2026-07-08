@@ -18,6 +18,32 @@ target_include_directories(worker_preview_tests
 
 orcaslicer_discover_tests(worker_preview_tests)
 
+add_executable(worker_protocol_tests
+    test_worker_protocol.cpp
+)
+
+target_link_libraries(worker_protocol_tests
+    PRIVATE
+        test_common
+        libslicer::worker_runtime
+        Catch2::Catch2WithMain
+)
+
+orcaslicer_discover_tests(worker_protocol_tests)
+
+add_executable(worker_client_tests
+    test_worker_client.cpp
+)
+
+target_link_libraries(worker_client_tests
+    PRIVATE
+        test_common
+        libslicer::worker_runtime
+        Catch2::Catch2WithMain
+)
+
+orcaslicer_discover_tests(worker_client_tests)
+
 set(WORKER_TEST_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/run_worker_tests.py)
 set(WORKER_TEST_WORK_DIR ${CMAKE_CURRENT_BINARY_DIR}/worker-test)
 

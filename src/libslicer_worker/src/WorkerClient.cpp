@@ -16,6 +16,7 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -90,6 +91,14 @@ bool send_all(int fd, const std::string& message)
 std::string make_message(nlohmann::json json)
 {
     return json.dump() + "\n";
+}
+
+void close_event_file_descriptor_after_callback(WorkerEvent& event)
+{
+    if (event.file_descriptor >= 0) {
+        ::close(event.file_descriptor);
+        event.file_descriptor = -1;
+    }
 }
 #endif
 
@@ -194,28 +203,24 @@ bool WorkerClient::connect()
             m_impl->connected.store(true);
             Impl* impl = m_impl;
             m_impl->read_thread = std::thread([impl]() {
-                std::string buffer;
-                char chunk[4096];
+                WorkerProtocolReader reader;
                 while (impl->connected.load()) {
-                    const ssize_t count = ::recv(impl->fd, chunk, sizeof(chunk), 0);
-                    if (count <= 0)
+                    std::optional<WorkerEvent> event = receive_worker_event(impl->fd, reader);
+                    if (!event.has_value())
                         break;
-                    buffer.append(chunk, static_cast<size_t>(count));
-                    size_t pos = std::string::npos;
-                    while ((pos = buffer.find('\n')) != std::string::npos) {
-                        std::string line = buffer.substr(0, pos);
-                        buffer.erase(0, pos + 1);
-                        if (auto event = event_from_json_line(line); event && impl->on_event) {
-                            try {
-                                impl->on_event(*event);
-                            } catch (const std::exception& e) {
-                                impl->set_last_error(std::string("worker event callback failed: ") + e.what());
-                            } catch (...) {
-                                impl->set_last_error("worker event callback failed");
-                            }
+                    if (impl->on_event) {
+                        try {
+                            impl->on_event(*event);
+                        } catch (const std::exception& e) {
+                            impl->set_last_error(std::string("worker event callback failed: ") + e.what());
+                        } catch (...) {
+                            impl->set_last_error("worker event callback failed");
                         }
                     }
+                    close_event_file_descriptor_after_callback(*event);
                 }
+                for (int fd : reader.pending_file_descriptors)
+                    ::close(fd);
             });
             if (!send_all(m_impl->fd, make_message({ { "type", "hello" }, { "protocol", WORKER_PROTOCOL_VERSION } }))) {
                 m_impl->set_last_error("failed to send worker hello");
@@ -230,6 +235,14 @@ bool WorkerClient::connect()
     m_impl->set_last_error("Timed out connecting to worker socket");
     return false;
 #endif
+}
+
+bool WorkerClient::connect(const WorkerOptions& options)
+{
+    if (m_impl == nullptr)
+        return false;
+    m_impl->options = options;
+    return connect();
 }
 
 bool WorkerClient::submit(const SliceJob& job)
