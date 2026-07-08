@@ -33,14 +33,16 @@ The package exports:
   path.
 
 When the repository is embedded from source with `add_subdirectory`, the build
-tree also provides `libslicer::libslicer` and `libslicer::worker_runtime` for
-internal development and tests.
+tree provides the public Config SDK target `libslicer::config_sdk`. The internal
+source-tree targets `libslicer::libslicer` and `libslicer::worker_runtime` are
+for in-repository development and tests.
 
-The config SDK described in this document is part of `libslicer::libslicer`:
+The config SDK described in this document is consumed through
+`libslicer::config_sdk`:
 
 ```cmake
 add_subdirectory(path/to/OrcaSlicer libslicer-build)
-target_link_libraries(host_app PRIVATE libslicer::libslicer)
+target_link_libraries(host_app PRIVATE libslicer::config_sdk)
 ```
 
 ## Public Orca Toolpath Types
@@ -269,13 +271,64 @@ Supported `config.type` values:
 - `resolved_orca_json`: requires `config.path`. The worker loads the input
   model/project, then applies the resolved config JSON through the public
   config SDK loader and validator.
+- `preset_selection`: requires `config.path`. The path points to a preset
+  selection JSON document; the worker resolves it with the same
+  `resolve_fff_config()` path exposed by the config SDK, then applies the
+  resolved config loader and validator before slicing.
 - `project_embedded`: does not use `config.path`. This is accepted only with
   `input.type=orca_3mf_project`; the worker uses the config loaded from the
   OrcaSlicer 3MF project plus slicer defaults.
 
-The worker does not resolve preset bundles or host application database state.
-Hosts that do not submit `project_embedded` must submit a fully resolved config
-JSON.
+`resolved_orca_json` remains a full resolved config contract. The worker does
+not infer host application database state in that mode. Hosts that want worker
+side preset resolution should use `preset_selection`.
+
+`preset_selection` document shape:
+
+```json
+{
+  "vendor_bundle_dirs": [
+    "/absolute/path/to/resources/profiles/OrcaFilamentLibrary",
+    "/absolute/path/to/resources/profiles/BBL"
+  ],
+  "user_preset_dirs": [],
+  "project_preset_files": [],
+  "printer_preset_id": "Bambu Lab X1 Carbon 0.4 nozzle",
+  "process_preset_id": "0.20mm Standard @BBL X1C",
+  "filament_slots": [
+    {
+      "slot_index": 0,
+      "filament_preset_id": "Bambu PLA Basic @BBL X1C",
+      "color": "#FFFFFF",
+      "filament_type": "PLA",
+      "slot_overrides": {}
+    }
+  ],
+  "process_overrides": {
+    "bridge_line_width": "0.4"
+  },
+  "project_overrides": {},
+  "strict": true,
+  "apply_extruder": false
+}
+```
+
+Relative paths inside `vendor_bundle_dirs`, `user_preset_dirs`, and
+`project_preset_files` are resolved against `working_dir`. If
+`vendor_bundle_dirs` is omitted, the resolver discovers vendor bundles under
+`resources_dir/profiles`; explicit bundle paths are recommended when callers
+need deterministic startup and dependency ordering such as
+`OrcaFilamentLibrary` before `BBL`. Missing or wrong-type search paths are
+reported as `preset_search_path_invalid`. If an explicitly loaded vendor bundle,
+user preset dir, or multiple project preset files introduce a duplicate preset
+name and the request selects that name, resolution fails with `preset_ambiguous`
+instead of silently picking one preset.
+If the selected process or filament is incompatible with the selected printer
+or process, resolution fails with `preset_incompatible`; project-local presets
+loaded through `project_preset_files` are treated as project authority and are
+not rejected solely because they inherited a system preset whitelist. Malformed
+project preset JSON, unknown project preset `type`, or an unknown `inherits`
+target are reported as `project_preset_invalid`.
 
 ### Output Request
 
@@ -324,6 +377,11 @@ This is equivalent to:
   `enabled`.
 - `path`: preview artifact path. Relative paths resolve against
   `output.artifacts_dir`.
+- `transport`: `file`, `shared_memory`, or `shared_memory_fd`. Defaults to
+  `file`. `shared_memory` publishes a named POSIX shm segment in JSON events
+  with `shm_name` and `size`; `shared_memory_fd` publishes an anonymous POSIX shm
+  fd over the socket protocol with `SCM_RIGHTS` and is not useful over JSONL
+  stdout.
 - `format`: accepts only `orca-toolpath-preview-binary-v2`.
 - `publish`: v1 accepts only `final`.
 - `chunk_records`: reserved for future chunked mode; ignored by final mode
@@ -387,8 +445,8 @@ values:
 }
 ```
 
-The worker converts this JSON into `Slic3r::DynamicPrintConfig` through
-`Slic3r::libslicer::ResolvedConfig`, then runs
+The worker converts this JSON into `Slic3r::DynamicPrintConfig` through the
+internal Config SDK loader, then runs
 `Slic3r::libslicer::validate_resolved_config()` before `Print::apply()`.
 
 Rules:
@@ -442,51 +500,33 @@ Slic3r::libslicer::ConfigDefinition printer_model =
 - `min`
 - `max`
 - `default_value`
+- `default_json`
+- `nullable`
+- `internal`
 - `scope`
 - `cardinality`
 
 The first implementation maps Orca's internal schema and provides explicit
 scope/cardinality for worker-critical keys such as printer identity, process
 identity, filament arrays, physical extruder arrays, variant lookup arrays,
-plate-scoped wipe tower coordinates, and layer-change G-code fields. Unknown or
-not-yet-classified fields are reported as `Unknown` rather than guessed.
-
-### ResolvedConfig
-
-`ResolvedConfig` is the public facade for already-resolved Orca FFF config:
-
-```cpp
-std::vector<Slic3r::libslicer::ConfigValidationIssue> load_issues;
-
-Slic3r::libslicer::ResolvedConfig config =
-    Slic3r::libslicer::ResolvedConfig::load_json_file("config.json",
-                                                      &load_issues);
-
-if (Slic3r::libslicer::has_config_errors(load_issues)) {
-    // Show load_issues to the user and do not slice.
-}
-```
-
-Supported operations:
-
-- `ResolvedConfig::from_json(text, issues)`
-- `ResolvedConfig::load_json_file(path, issues)`
-- `ResolvedConfig::apply_json(text, issues)`
-- `ResolvedConfig::apply_json_file(path, issues)`
-- `ResolvedConfig::to_json()`
-- `ResolvedConfig::dynamic_config()`
-
-`dynamic_config()` is an escape hatch for advanced integrations and worker
-internals. Normal host code should prefer `ResolvedConfig` plus schema and
-validation APIs.
+process-extruder variant arrays, plate-scoped wipe tower coordinates, and
+layer-change G-code fields. Unknown or not-yet-classified fields are reported as
+`Unknown` rather than guessed. `default_value` is Orca's legacy serialized
+string form; `default_json` is the typed JSON form hosts should use for dynamic
+setting UIs. `internal` marks schema entries that are develop/internal-facing in
+Orca and should normally be hidden from end-user editors.
 
 ### Validation
 
 Before slicing, callers must validate the resolved config:
 
 ```cpp
+Slic3r::libslicer::ConfigValidationRequest request;
+request.full_config_json = resolved_config_json;
+request.plate_index = plate_index;
+
 std::vector<Slic3r::libslicer::ConfigValidationIssue> issues =
-    Slic3r::libslicer::validate_resolved_config(config, plate_index);
+    Slic3r::libslicer::validate_resolved_config(request);
 
 if (Slic3r::libslicer::has_config_errors(issues)) {
     // Do not call Print::apply().
@@ -499,6 +539,7 @@ The validator currently checks the worker-critical resolved config contract:
 - filament-scoped vector lengths
 - positive 1-based `filament_map` values
 - physical extruder arrays used by the selected filament map
+- optional process-extruder variant arrays, when present
 - `filament_self_index` and `filament_extruder_variant`
 - extruder variant lookup consistency
 - support, support interface, and wipe tower filament ids
@@ -507,7 +548,9 @@ The validator currently checks the worker-critical resolved config contract:
 
 Validation issues use stable `code`, `field`, `message`, and `severity`
 members. Unknown JSON keys are warnings; schema conversion failures and invalid
-resolved config contracts are errors.
+resolved config contracts are errors. `ConfigValidationRequest::run_print_validate`
+is reserved for a heavier future `Print::validate()` bridge; when set today the
+SDK returns an `unsupported_config_feature` error instead of silently ignoring it.
 
 ### BBL Printer Semantics
 
@@ -522,25 +565,25 @@ require callers to inject `G92 E0` into `before_layer_change_gcode` or
 
 ### Preset Resolution Status
 
-The SDK reserves the following types for the preset-selection resolver:
+The SDK and worker both use the same preset-selection resolver:
 
 - `ConfigResolutionRequest`
 - `ConfigResolutionResult`
 - `resolve_fff_config(request)`
 
-This entry point is intentionally present but not implemented yet. The current
-implementation returns an error issue with code `preset_resolution_unsupported`.
-Hosts that need slicing today must submit either:
+`resolve_fff_config()` loads vendor bundles from `resources/profiles` or
+explicit `vendor_bundle_dirs`, accepts user preset directories and project
+preset files, selects printer/process/filament presets, applies strict
+overrides, and emits full resolved config JSON. Hosts that need slicing can
+submit either:
 
 - `config.type=project_embedded`, letting the worker use config embedded in an
   Orca project 3MF, or
 - `config.type=resolved_orca_json`, where the host provides a fully resolved
-  config JSON and may use `ResolvedConfig` plus `validate_resolved_config()` for
-  preflight checks.
-
-When the preset resolver is implemented, worker `preset_selection` and external
-host APIs must call this same `resolve_fff_config()` path rather than maintaining
-separate resolver logic.
+  config JSON and may use `validate_resolved_config(ConfigValidationRequest)` for
+  preflight checks, or
+- `config.type=preset_selection`, where the worker resolves preset selections
+  through `resolve_fff_config()` before slicing.
 
 ## JSON Lines Event Stream
 
@@ -650,6 +693,29 @@ Preview ready event:
   "complete": true
 }
 ```
+
+Named shared-memory preview ready event:
+
+```json
+{
+  "type": "artifact",
+  "job_id": "job-1",
+  "kind": "preview",
+  "phase": "ready",
+  "transport": "shared_memory",
+  "schema": "orca.toolpath_preview",
+  "format": "orca-toolpath-preview-binary-v2",
+  "shm_name": "/ocpv1234567800000000",
+  "size": 264241152,
+  "complete": true
+}
+```
+
+Anonymous fd preview ready event in socket mode has the same JSON fields except
+`transport` is `shared_memory_fd`, no `path` or `shm_name` is present, and the
+descriptor is delivered as ancillary data on the same socket message. Raw socket
+consumers must close the received fd after mapping or loading it; `WorkerClient`
+adds the callback-scoped lifetime rule described below.
 
 Hosts must treat artifact ready events as the consumption boundary. A
 `result.success=true` event means the job completed under the requested
@@ -787,6 +853,10 @@ struct WorkerEvent {
     std::string schema;
     std::string format;
     std::filesystem::path path;
+    std::string transport;
+    std::string shm_name;
+    std::uint64_t size = 0;
+    int file_descriptor = -1;
     bool complete = false;
     bool success = false;
 };
@@ -804,6 +874,7 @@ public:
     WorkerClient& operator=(WorkerClient&& other) noexcept;
 
     bool start(const WorkerOptions& options);
+    bool connect(const WorkerOptions& options);
     bool connect();
     bool submit(const SliceJob& job);
     bool cancel(const std::string& job_id);
@@ -823,7 +894,9 @@ API rules:
   Store it by value, `std::unique_ptr`, or another single-owner wrapper; do not
   copy it between adapters.
 - `start()` starts the external `orcaslicer-worker serve` process.
-- `connect()` connects to the worker socket and performs `hello`.
+- `connect(options)` connects to an externally managed worker socket and
+  performs `hello`; `connect()` uses the options previously supplied to
+  `start(options)`.
 - `submit()` sends `start_job`.
 - Event callbacks are invoked from the client's I/O thread unless a host
   adapter marshals them to another thread.
@@ -836,6 +909,10 @@ API rules:
 - For artifact events, `kind`, `phase`, `schema`, `format`, `path`, and
   `complete` carry the publication contract. Hosts should not consume files
   before `phase=="ready"` and `complete==true`.
+- For `transport=="shared_memory_fd"` preview events, `file_descriptor` is valid
+  only for the duration of the callback. Load/map it in the callback, or `dup()`
+  it if ownership must outlive the callback. `WorkerClient` closes any delivered
+  fd after the callback returns as a leak backstop.
 
 Qt applications can wrap this API with signal dispatch, but the core client
 should stay Qt-free.
@@ -924,6 +1001,16 @@ Stable worker error codes include:
 - `no_outputs_requested`
 - `input_not_found`
 - `invalid_config`
+- `unknown_config_key`
+- `missing_required_config`
+- `invalid_config_json`
+- `invalid_config_cardinality`
+- `preset_search_path_invalid`
+- `preset_not_found`
+- `preset_ambiguous`
+- `preset_incompatible`
+- `project_preset_invalid`
+- `preset_resolution_failed`
 - `model_load_failed`
 - `slice_failed`
 - `slice_processing_failed`
@@ -951,6 +1038,10 @@ Required initial tests:
 - Unknown config keys produce warnings, not crashes.
 - The worker slices an STL input with resolved config JSON.
 - The worker slices a 3MF input with resolved config JSON.
+- The worker slices an STL input with `preset_selection`, including a
+  project-local process preset loaded through relative `project_preset_files`.
+- `preset_selection` failures propagate SDK error codes for missing presets and
+  incompatible process/filament selections.
 - Host CMake smoke tests prove `WorkerClient` is move-only and installable with
   both `find_package(libslicer CONFIG REQUIRED)` and source-tree
   `add_subdirectory`.

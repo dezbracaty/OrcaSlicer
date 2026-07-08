@@ -37,15 +37,16 @@ export artifacts
 
 ## Current Implementation Status
 
-当前分支已经落地第一阶段公共 config SDK：
+当前分支已经落地公共 DTO-only config SDK：
 
-- `src/libslic3r/ConfigSDK.hpp` 暴露 `ConfigDefinition`、`ResolvedConfig`、`ConfigValidationIssue`、`ConfigResolutionRequest` 和 `ConfigResolutionResult`。
-- `ResolvedConfig` 支持从 resolved Orca JSON 加载、叠加和导出，并把 unknown key 报告为 warning。
+- `src/libslic3r/ConfigSDK.hpp` 暴露 `ConfigDefinition`、`ConfigIssue` / `ConfigValidationIssue`、`ConfigResolutionRequest`、`ConfigResolutionResult`、`ConfigValidationRequest` 和 3MF/preset DTO。
+- `ResolvedConfig` 和 `DynamicPrintConfig` 桥接只存在于 `ConfigSDK_internal.hpp`，不是安装给外部 host 的 public API。
 - `get_config_definitions()` / `get_config_definition()` 从 Orca 内部 schema 映射公共 schema 信息。
 - `validate_resolved_config()` 校验 worker-critical resolved config contract，包括 filament vector 维度、physical extruder / variant lookup、plate-scoped wipe tower 字段和 layer-change G-code 字段。
-- `orcaslicer-worker` 的 `resolved_orca_json` 路径已经复用同一套 `ResolvedConfig` loader 和 validator；校验在 worker-owned normalization 之后、`Print::apply()` 之前执行。
+- `orcaslicer-worker` 的 `resolved_orca_json` 路径已经复用同一套内部 loader 和 validator；校验在 worker-owned normalization 之后、`Print::apply()` 之前执行。
 - `Print::apply()` 已经从最终 config 的 `printer_model` 推导 BBL 状态，并且每次 apply 都重新覆盖 `m_isBBLPrinter`。测试覆盖 BBL relative-E 无 `G92 E0` 通过、复用同一 `Print` 切换到非 BBL 后失败，以及 worker `resolved_orca_json` 的 BBL 无 `G92 E0` 路径。
-- `resolve_fff_config()` 作为 future preset-selection resolver API 入口已经保留，但当前明确返回 `preset_resolution_unsupported`，尚未执行 `PresetBundle::full_fff_config()`。
+- `resolve_fff_config()` 已实现第一版 preset-selection resolver：加载 vendor bundle、user preset dir、project preset file，选择 printer/process/filament，应用 overrides，产出 full resolved config JSON 和 normalized diff。
+- `orcaslicer-worker` 已接入 `config.type=preset_selection`。worker parser 从 `config.path` 读取扁平 selection JSON，构造 `ConfigResolutionRequest`，调用同一个 `resolve_fff_config()`，再走现有 resolved config loader、normalization 和 validator；CLI e2e 同时覆盖系统 preset selection 和 `project_preset_files` 中 project-local process preset 的实际切片路径。
 
 ## Non-Goals
 
@@ -201,21 +202,12 @@ struct ConfigDefinition
     std::string unit;
     std::optional<double> min;
     std::optional<double> max;
+    std::string default_value; // Orca legacy serialized string
     std::string default_json;
+    bool nullable;
+    bool internal;
     ConfigScope scope;
     ConfigCardinality cardinality;
-};
-
-class ResolvedConfig
-{
-public:
-    std::string to_json() const;
-    static ResolvedConfig from_json(std::string_view json);
-
-    // Escape hatch for advanced integrations. This must not be the main SDK
-    // path used by host applications.
-    const Slic3r::DynamicPrintConfig& dynamic_config() const;
-    Slic3r::DynamicPrintConfig& dynamic_config();
 };
 
 struct ConfigResolutionRequest
@@ -227,12 +219,16 @@ struct ConfigResolutionRequest
     std::vector<std::filesystem::path> project_preset_files;
 
     std::string printer_preset_id;
-    std::string print_preset_id;
-    std::vector<std::string> filament_preset_ids;
+    std::string process_preset_id;
+    std::vector<FilamentSlotRequest> filament_slots;
 
-    ResolvedConfig project_config_edits;
-    std::vector<int> filament_map;
+    std::string project_overrides_json;
+    std::string printer_overrides_json;
+    std::string process_overrides_json;
+
+    int plate_index;
     bool apply_extruder { false };
+    bool strict { true };
 };
 
 enum class ConfigIssueSeverity
@@ -251,21 +247,28 @@ struct ConfigValidationIssue
 
 struct ConfigResolutionResult
 {
-    ResolvedConfig config;
-    std::vector<std::string> warnings;
-    std::vector<ConfigValidationIssue> issues;
+    std::string full_config_json;
+    std::string normalized_diff_json;
+    std::vector<ConfigIssue> issues;
+};
+
+struct ConfigValidationRequest
+{
+    std::string full_config_json;
+    int plate_index;
+    bool run_print_validate { false };
 };
 
 std::vector<ConfigDefinition> get_config_definitions();
 ConfigResolutionResult resolve_fff_config(const ConfigResolutionRequest& request);
-std::vector<ConfigValidationIssue> validate_resolved_config(const ResolvedConfig& config, int plate_index);
+std::vector<ConfigIssue> validate_resolved_config(const ConfigValidationRequest& request);
 
 } // namespace Slic3r::libslicer
 ```
 
 内部可以复用 `PresetBundle::full_fff_config()`、`DynamicPrintConfig`、`ConfigOptionDef` 和 `print_config_def`，但主 API 边界必须是库级的、无 GUI 类型的、可被 worker 和外部 host 调用的。
 
-`DynamicPrintConfig` 只能作为 escape hatch 暴露给高级集成。主路径必须使用 `ResolvedConfig`、`ConfigResolutionRequest`、`ConfigResolutionResult` 和 `ConfigValidationIssue`，避免外部应用直接依赖 Orca 内部 config 类型。
+`DynamicPrintConfig` / `ResolvedConfig` 只能存在于库内 bridge。主路径必须使用 JSON DTO、`ConfigResolutionRequest`、`ConfigResolutionResult`、`ConfigValidationRequest` 和 `ConfigIssue`，避免外部应用直接依赖 Orca 内部 config 类型。
 
 ### Config Definition / Schema API
 
@@ -279,7 +282,10 @@ std::vector<ConfigValidationIssue> validate_resolved_config(const ResolvedConfig
 - enum options
 - unit
 - min/max
-- default value
+- legacy default value string
+- typed default JSON
+- nullable
+- internal/develop-facing marker
 - scope: `printer` / `process` / `filament` / `project` / `object` / `internal`
 - vector cardinality: scalar、filament-scoped、nozzle/extruder-scoped、plate-scoped、variant-scoped、matrix
 
@@ -297,26 +303,25 @@ schema API 要满足两个使用场景：
 ```cpp
 ConfigResolutionRequest request;
 request.printer_preset_id = "Bambu Lab X1 Carbon 0.4 nozzle";
-request.print_preset_id = "0.20mm Standard @BBL X1C";
-request.filament_preset_ids = {
-    "Bambu PLA Basic @BBL X1C",
-    "Bambu PLA Basic @BBL X1C"
+request.process_preset_id = "0.20mm Standard @BBL X1C";
+request.filament_slots = {
+    {0, "Bambu PLA Basic @BBL X1C", "#FFFFFF", "", "PLA", ""},
+    {1, "Bambu PLA Basic @BBL X1C", "#000000", "", "PLA", ""}
 };
-request.filament_map = {1, 2};
-request.project_config_edits = ResolvedConfig::from_json(R"({
+request.project_overrides_json = R"({
   "layer_height": 0.2
-})");
+})";
 ```
 
-resolver 输出的 `ResolvedConfig` 才能进入 worker 或直接进入 slicing API。调用端手写完整 `filament_self_index`、`filament_extruder_variant`、printer variant arrays、preset id group 等字段不是支持的主路径。
+resolver 输出的 `full_config_json` 才能进入 worker 或直接进入 slicing API。调用端手写完整 `filament_self_index`、`filament_extruder_variant`、printer variant arrays、preset id group 等字段不是支持的主路径。
 
 resolver 需要支持明确的 search policy：
 
 - System/vendor presets: 从 `resources_dir` 下的 Orca vendor bundles 加载，或从 `vendor_bundle_dirs` 中显式加载。
 - User presets: 从 `data_dir` 下的用户 preset 目录加载，或从 `user_preset_dirs` 中显式加载。
-- Project-local presets: 从 `orca_3mf_project` 解出的 project preset 或 `project_preset_files` 加载，优先级高于 system preset，低于 request 中直接给出的 `project_config_edits` override。
+- Project-local presets: 从 `orca_3mf_project` 解出的 project preset 或 `project_preset_files` 加载，优先级高于 system preset，低于 request 中直接给出的 `printer_overrides_json` / `process_overrides_json` / `project_overrides_json` override。
 - Name resolution: preset id 必须支持 Orca canonical name；如果 bare name 命中多个 bundle，应返回 ambiguous 错误，除非 request 指定 vendor/bundle id。
-- Compatibility: resolver 只负责合成 config，不自动替换不兼容 preset；兼容性问题应作为 error 或 warning 返回，由调用端决定是否继续。
+- Compatibility: resolver 只负责合成 config，不自动替换不兼容 preset；第一版对 system/user process 和 filament 在合成前执行 Orca compatibility check，不兼容时返回 `preset_incompatible`。`project_preset_files` 加载的 project-local preset 视为项目权威，不因继承到的 system whitelist 单独拒绝。
 
 ### Resolved Config Validator
 
@@ -331,6 +336,7 @@ validator 必须按 key 的 cardinality 分类校验，不能把所有 vector �
 | Filament map | filament slot count | `filament_map` | length equals filament slot count; each value is 1-based and within physical extruder/nozzle count accepted by printer config |
 | Physical nozzle/extruder scoped | physical nozzle/extruder count | `nozzle_diameter`, `extruder_offset`, `min_layer_height`, `max_layer_height` | length equals physical nozzle/extruder count; do not force to filament slot count |
 | Printer variant lookup scoped | indexable by `filament_map` / extruder id | `extruder_type`, `nozzle_volume_type`, `default_nozzle_volume_type` | length must cover every 1-based extruder id referenced by `filament_map`; BBL single-nozzle multi-filament jobs may still require resolved values that are indexable for each mapped filament |
+| Process-extruder variant scoped | `print_extruder_variant` table length | `print_extruder_id`, `print_extruder_variant` | schema/cardinality must distinguish process variant vectors from filament-slot and physical-extruder vectors; non-empty process variant metadata must have matching id/variant lengths and positive 1-based extruder ids |
 | Filament-extruder variant scoped | variant table length | `filament_extruder_variant`, `filament_self_index` | both exist; lengths match; every `(filament_self_index, filament_extruder_variant)` lookup needed by `update_values_to_printer_extruders_for_multiple_filaments()` must resolve |
 | Plate scoped | plate count or selected plate index | `wipe_tower_x`, `wipe_tower_y`, other per-plate fields | length must include selected `plate_index`; do not force to filament slot count |
 | Matrix scoped | square or explicitly shaped by source count | `flush_volumes_matrix`, `flush_volumes_vector` | normalized to filament slot count where Orca profile resize behavior requires it |
@@ -355,7 +361,9 @@ warning 可用于历史兼容字段缺失；会导致错误切片、assert、越
 validator 是切片前强制 gate。worker 必须在 `Print::apply()` 前执行：
 
 ```text
-issues = validate_resolved_config(config, plate_index)
+request.full_config_json = full_config_json
+request.plate_index = plate_index
+issues = validate_resolved_config(request)
 if any issue.severity == Error:
   fail job with invalid_resolved_config
 Print::apply()
@@ -392,55 +400,60 @@ worker 可以做有限 normalization，例如当前已有的 flush volume resize
 
 ### New Mode: `preset_selection`
 
-当前 worker parser 只接受 `resolved_orca_json` 和 `project_embedded`。`preset_selection` 是新增协议，需要伴随 request version bump 或 feature flag 落地。
+当前 worker parser 接受 `resolved_orca_json`、`project_embedded` 和 `preset_selection`。第一版 `preset_selection` 保持 request `version: 1`，`config.path` 指向一个扁平 selection JSON 文件。
 
 新增模式用于让非 Orca GUI 调用端只提交选择信息。建议协议：
 
 ```json
 {
-  "version": 2,
+  "version": 1,
   "config": {
     "type": "preset_selection",
-    "search": {
-      "vendor_bundle_dirs": ["./resources/profiles"],
-      "user_preset_dirs": ["./data/user"],
-      "project_preset_files": ["./project_presets.json"],
-      "ambiguity": "error"
-    },
-    "printer": {
-      "id": "Bambu Lab X1 Carbon 0.4 nozzle",
-      "vendor": "BBL"
-    },
-    "process": {
-      "id": "0.20mm Standard @BBL X1C"
-    },
-    "filaments": [
-      { "id": "Bambu PLA Basic @BBL X1C", "slot": 1 },
-      { "id": "Bambu PLA Basic @BBL X1C", "slot": 2 }
-    ],
-    "filament_map": [1, 2],
-    "apply_extruder": false,
-    "project_config_edits": {
-      "layer_height": 0.2
-    }
+    "path": "./preset-selection.json"
   }
+}
+```
+
+`preset-selection.json`:
+
+```json
+{
+  "vendor_bundle_dirs": [
+    "/absolute/path/to/resources/profiles/OrcaFilamentLibrary",
+    "/absolute/path/to/resources/profiles/BBL"
+  ],
+  "user_preset_dirs": [],
+  "project_preset_files": [],
+  "printer_preset_id": "Bambu Lab X1 Carbon 0.4 nozzle",
+  "process_preset_id": "0.20mm Standard @BBL X1C",
+  "filament_slots": [
+    {
+      "slot_index": 0,
+      "filament_preset_id": "Bambu PLA Basic @BBL X1C",
+      "color": "#FFFFFF",
+      "filament_type": "PLA",
+      "slot_overrides": {}
+    }
+  ],
+  "printer_overrides": {},
+  "process_overrides": {},
+  "project_overrides": {},
+  "strict": true,
+  "apply_extruder": false
 }
 ```
 
 字段语义：
 
-- `version`: 新协议使用 request version 2。version 1 worker 必须拒绝 `preset_selection`，错误码为 `unsupported_config_type`。
-- `search.vendor_bundle_dirs`: 可选。为空时使用 `resources_dir` 下的默认 Orca profile/vendor bundle 位置。
-- `search.user_preset_dirs`: 可选。为空时使用 `data_dir` 下的用户 preset 位置。
-- `search.project_preset_files`: 可选。用于 3MF 解出的 project-local presets 或调用端导出的 project preset overlay。
-- `search.ambiguity`: `error` 或 `first_match`。第一版必须默认 `error`。
-- `printer.id`: 必填。可以是 canonical name；如果是 bare name 且多 bundle 命中，必须报 ambiguous。
-- `printer.vendor`: 可选，但建议提供，用于 disambiguation。
-- `process.id`: 必填。
-- `filaments`: 必填，长度定义 filament slot count；顺序即 slot order。
-- `filament_map`: 可选。缺省时 resolver 按 Orca 默认行为生成；显式提供时长度必须等于 `filaments` 长度。
-- `apply_extruder`: 可选，默认 `false`，语义直接传给 `PresetBundle::full_fff_config()`。
-- `project_config_edits`: 可选，作为最终 project override 应用；它不是完整 resolved config。
+- `vendor_bundle_dirs`: 可选。为空时 resolver 会扫描 `resources_dir/profiles` 下的默认 vendor bundle；显式提供时按给定顺序加载。BBL 路径需要先加载 `OrcaFilamentLibrary`，再加载 `BBL`。
+- `user_preset_dirs`: 可选。为空时不额外加载 user preset。
+- `project_preset_files`: 可选。用于 3MF 解出的 project-local presets 或调用端导出的 project preset overlay。
+- `printer_preset_id`: 必填。第一版按 preset name 精确选择。
+- `process_preset_id`: 必填。
+- `filament_slots`: 必填，长度定义 filament slot count；顺序即 slot order。每项支持 `slot_index`、`filament_preset_id`、`color`、`color_type`、`filament_type` 和 `slot_overrides`。
+- `printer_overrides` / `process_overrides` / `project_overrides`: 可选，作为对应层级 override 应用。值可为 JSON object 或 JSON string。
+- `strict`: 可选，默认 `true`。strict 模式下 unknown override key 会转为 error。
+- `apply_extruder`: 可选，默认 `false`，语义传给 resolver 的 full config 合成路径。
 
 错误码：
 
@@ -461,6 +474,8 @@ worker 处理步骤：
 load project/model
 construct ConfigResolutionRequest
 resolve_fff_config()
+apply resolved JSON through internal ConfigSDK loader
+worker-owned normalization
 validate resolved config contract
 Print::apply()
 Print::validate()
@@ -504,7 +519,7 @@ BBL profile 例如 `Bambu Lab X1 Carbon 0.4 nozzle` 不应为了通过校验而�
 
 ### Phase 2: Add Resolved Config Contract Validation
 
-- 增加 public `validate_resolved_config(config, plate_index)`。
+- 增加 public `validate_resolved_config(ConfigValidationRequest)`。
 - worker 在 `Print::apply()` 前调用 validator。
 - 外部 slicing API 在 `Print::apply()` 前调用同一 validator。
 - 对常见配置缺失返回明确错误码和字段名。
@@ -512,19 +527,21 @@ BBL profile 例如 `Bambu Lab X1 Carbon 0.4 nozzle` 不应为了通过校验而�
 
 ### Phase 3: Add Public Config SDK API
 
-- 新增 `ResolvedConfig` facade。
+- 新增 DTO-only `ConfigSDK.hpp`，`ResolvedConfig` / `DynamicPrintConfig` bridge 放到 `ConfigSDK_internal.hpp`。
 - 新增 `ConfigDefinition` / schema API，映射内部 `ConfigOptionDef` / `print_config_def`。
-- 明确 `DynamicPrintConfig` 只作为 advanced escape hatch。
+- 明确 public API 不暴露 `DynamicPrintConfig`。
 - 安装导出 public headers，保证 `find_package(libslicer)` 用户可用。
 
 ### Phase 4: Add Library Resolver API
 
-- 新增无 GUI 类型的 preset resolution API。
-- 内部复用 `PresetBundle` 和 `full_fff_config()`。
-- 外部 SDK 和 worker 共用 `resolve_fff_config()`。
-- 实现 request version 2 的 `preset_selection` parser。
-- 实现 preset search path、project-local preset overlay、ambiguity handling 和错误码。
-- worker 新增 `preset_selection` config type。
+- 新增无 GUI 类型的 preset resolution API。（已实现）
+- 内部复用 `PresetBundle` 和 `full_fff_config()` 等价合成路径。（已实现）
+- 外部 SDK 和 worker 共用 `resolve_fff_config()`。（已实现）
+- 实现 worker `preset_selection` parser。（第一版已实现，request version 仍为 1，selection JSON 为扁平结构）
+- 实现 preset search path、project-local preset overlay 和错误码。（第一版已实现；显式 vendor/user/project 搜索路径错误已覆盖 `preset_search_path_invalid`，project preset 解析/type/inherits 错误已覆盖 `project_preset_invalid`，显式 vendor bundle、user preset dir 和 project preset 文件重名选择已覆盖 `preset_ambiguous`，resolver 合成失败映射为 `preset_resolution_failed`）
+- worker 新增 `preset_selection` config type。（已实现，CLI e2e 覆盖 BBL X1C + 双 PLA slot system preset，并覆盖通过相对 `project_preset_files` 选择 project-local process preset 后实际切片）
+- worker 现在把 ConfigSDK 的首个 error issue code 透传到 error/result event；例如 `preset_not_found`、`preset_incompatible`、`preset_ambiguous`、`unknown_config_key`、`invalid_config_cardinality`，CLI e2e 覆盖缺失 filament preset 的 `preset_not_found` 透传，以及 BBL X1C 下不兼容 process / filament selection 的 `preset_incompatible` 透传。
+- 后续仍需补强更多真实项目/多耗材 fixture；resolver 和 worker CLI 已有 bundled BBL 单槽/双槽基础覆盖和基础 compatibility 错误覆盖。
 
 ### Phase 5: Reduce Global State Risk
 
