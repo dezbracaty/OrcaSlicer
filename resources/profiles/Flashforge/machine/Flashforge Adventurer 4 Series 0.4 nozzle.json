@@ -7,6 +7,9 @@
 	"instantiation": "true",
 	"printer_variant": "0.4",
 	"printer_model": "Flashforge Adventurer 4 Series",
+	"default_filament_profile": [
+		"Generic PLA @Flashforge AD4"
+	],
 	"default_print_profile": "0.20mm Standard @Flashforge AD4 0.4 Nozzle",
 	"nozzle_diameter": [
 		"0.4"
