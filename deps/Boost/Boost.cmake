@@ -78,6 +78,47 @@ if(_boost_version_hpp_candidates)
     message(STATUS "✅ 发现安装目录: ${BOOST_INSTALL_DIR}")
 endif()
 
+# This build deliberately disables the optional bzip2, liblzma, and zstd
+# backends for boost::iostreams. A shared install produced with different
+# options is not ABI/dependency compatible: its package config would make
+# consumers resolve dependencies that this build explicitly excludes.
+if(HAS_INSTALL)
+    file(GLOB _boost_iostreams_config_candidates LIST_DIRECTORIES FALSE
+        "${BOOST_INSTALL_DIR}/lib/cmake/boost_iostreams-${BOOST_VERSION}/boost_iostreams-config.cmake"
+        "${BOOST_INSTALL_DIR}/lib64/cmake/boost_iostreams-${BOOST_VERSION}/boost_iostreams-config.cmake"
+    )
+    list(LENGTH _boost_iostreams_config_candidates _boost_iostreams_config_count)
+
+    set(_boost_install_contract_valid TRUE)
+    set(_boost_install_contract_error "")
+    if(NOT _boost_iostreams_config_count EQUAL 1)
+        set(_boost_install_contract_valid FALSE)
+        set(_boost_install_contract_error
+            "expected exactly one boost_iostreams package config, found ${_boost_iostreams_config_count}")
+    else()
+        list(GET _boost_iostreams_config_candidates 0 _boost_iostreams_config)
+        file(READ "${_boost_iostreams_config}" _boost_iostreams_config_content)
+        foreach(_disabled_dependency BZip2 LibLZMA zstd)
+            if(_boost_iostreams_config_content MATCHES
+               "find_dependency[ \t\r\n]*\\([ \t\r\n]*${_disabled_dependency}([ \t\r\n\\)]|$)")
+                set(_boost_install_contract_valid FALSE)
+                string(APPEND _boost_install_contract_error
+                    " boost_iostreams still requires ${_disabled_dependency};")
+            endif()
+        endforeach()
+    endif()
+
+    if(NOT _boost_install_contract_valid)
+        message(WARNING
+            "Rejecting incompatible Boost ${BOOST_ACTUAL_BUILD_TYPE} install:"
+            "${_boost_install_contract_error} Rebuilding this build/install entry with "
+            "BOOST_IOSTREAMS_ENABLE_ZSTD/BZIP2/LZMA=OFF.")
+        file(REMOVE_RECURSE "${BOOST_BUILD_DIR}" "${BOOST_INSTALL_DIR}")
+        set(HAS_INSTALL FALSE)
+        set(HAS_BUILD FALSE)
+    endif()
+endif()
+
 if(EXISTS "${BOOST_BUILD_DIR}/CMakeCache.txt")
     set(HAS_BUILD TRUE)
     message(STATUS "📁 发现构建目录: ${BOOST_BUILD_DIR}")

@@ -911,26 +911,26 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
 
     emit_event(events, { WorkerEventType::Progress, job_id, 85, "processing", "", "", "Processing toolpaths" });
     Slic3r::GCodeProcessorResult result;
-    try {
-        print.export_gcode_result(&result);
-    } catch (const std::exception& e) {
-        error = e.what();
-        emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "slice_processing_failed", error });
-        emit_result(events, job_id, false, "slice_processing_failed", error, {}, started);
-        return 5;
-    }
-
     std::filesystem::path result_path;
     if (request.output.gcode.enabled) {
         emit_event(events, { WorkerEventType::Progress, job_id, 88, "gcode", "", "", "Publishing G-code artifact" });
         bool published_gcode = false;
         try {
-            const std::string output_path = print.export_gcode(request.output.gcode.path.string(), nullptr, nullptr, true);
+            // A G-code export is one Print lifecycle step. Populate the processor result
+            // during the same export instead of completing psGCodeExport once for the
+            // preview and then trying to run the completed step again for the file.
+            const std::string output_path = print.export_gcode(request.output.gcode.path.string(), &result, nullptr, true);
             published_gcode = !output_path.empty() && boost::filesystem::exists(output_path);
             if (!published_gcode)
                 error = "G-code export did not create the requested output file";
         } catch (const std::exception& e) {
             error = e.what();
+            // The combined export also owns the GCodeProcessorResult. If it
+            // fails, that result is incomplete and must not feed a preview,
+            // even when the G-code artifact itself was optional.
+            emit_event(events, { WorkerEventType::Error, job_id, -1, "", "gcode", "slice_processing_failed", error, request.output.gcode.path });
+            emit_result(events, job_id, false, "slice_processing_failed", error, request.output.gcode.path, started);
+            return 5;
         }
         if (!published_gcode) {
             if (request.output.gcode.required) {
@@ -949,6 +949,15 @@ int run_slice_job_from_request(const std::filesystem::path& request_path,
             gcode_event.complete = true;
             emit_event(events, gcode_event);
             result_path = request.output.gcode.path;
+        }
+    } else {
+        try {
+            print.export_gcode_result(&result);
+        } catch (const std::exception& e) {
+            error = e.what();
+            emit_event(events, { WorkerEventType::Error, job_id, -1, "", "", "slice_processing_failed", error });
+            emit_result(events, job_id, false, "slice_processing_failed", error, {}, started);
+            return 5;
         }
     }
 

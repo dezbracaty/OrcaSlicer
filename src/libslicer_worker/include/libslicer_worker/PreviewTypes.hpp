@@ -1,6 +1,5 @@
 #pragma once
 
-#include <libslic3r/OrcaGeometryTypes.hpp>
 #include <libslic3r/OrcaToolpathTypes.hpp>
 
 #include <array>
@@ -131,16 +130,6 @@ static_assert(std::is_trivially_copyable_v<WireVec3f>);
 static_assert(std::is_trivially_copyable_v<WireBoundingBox3f>);
 static_assert(sizeof(WireVec3f) == 12);
 static_assert(sizeof(WireBoundingBox3f) == 24);
-
-inline WireVec3f to_wire_vec3f(const Slic3r::Vec3f& value)
-{
-    return { value.x(), value.y(), value.z() };
-}
-
-inline Slic3r::Vec3f to_orca_vec3f(const WireVec3f& value)
-{
-    return { value.x, value.y, value.z };
-}
 
 inline constexpr std::string_view move_type_name(MoveType type)
 {

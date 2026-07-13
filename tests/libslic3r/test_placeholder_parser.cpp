@@ -1,9 +1,103 @@
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
+#include <map>
+#include <set>
+
 #include "libslic3r/PlaceholderParser.hpp"
 #include "libslic3r/PrintConfig.hpp"
 
 using namespace Slic3r;
+
+TEST_CASE("Custom G-code override placeholders have complete definitions", "[PlaceholderParser][PrintConfig]")
+{
+    const auto &placeholders_by_gcode = custom_gcode_specific_placeholders();
+
+    SECTION("Every allow-listed placeholder has exactly one definition") {
+        for (const auto &[gcode_type, placeholders] : placeholders_by_gcode) {
+            std::set<std::string> unique_placeholders;
+            for (const std::string &placeholder : placeholders) {
+                CAPTURE(gcode_type, placeholder);
+                REQUIRE(unique_placeholders.insert(placeholder).second);
+                REQUIRE(custom_gcode_specific_config_def.has(placeholder));
+            }
+        }
+    }
+
+    SECTION("Runtime override keys are allow-listed for their G-code type") {
+        const std::map<std::string, std::vector<std::string>> runtime_override_keys{
+            {"layer_change_gcode", {"most_used_physical_extruder_id"}},
+            {"timelapse_gcode", {"most_used_physical_extruder_id", "curr_physical_extruder_id", "timelapse_pos_x",
+                                    "timelapse_pos_y", "has_timelapse_safe_pos"}},
+            {"wrapping_detection_gcode", {"layer_num", "layer_z", "max_layer_z", "most_used_physical_extruder_id",
+                                             "curr_physical_extruder_id"}},
+            {"machine_pause_gcode", {"color_change_extruder"}},
+            {"filament_start_gcode", {"layer_num", "layer_z", "max_layer_z", "retraction_distance_when_cut",
+                                         "long_retraction_when_cut", "temperature", "nozzle_temperature",
+                                         "first_layer_temperature", "nozzle_temperature_initial_layer"}},
+            {"change_filament_gcode", {"current_hotend", "next_hotend", "outer_wall_volumetric_speed", "flush_length",
+                                          "flush_volumetric_speeds", "flush_temperatures", "filament_cooling_before_tower",
+                                          "filament_tower_interface_print_temp", "filament_tower_interface_purge_volume",
+                                          "is_prime_tower_interface", "temperature", "nozzle_temperature", "first_layer_temperature",
+                                          "nozzle_temperature_initial_layer", "wipe_avoid_perimeter", "wipe_avoid_pos_x"}},
+            {"tcr_rotated_gcode", {"filament_end_gcode", "change_filament_gcode", "filament_start_gcode",
+                                     "deretraction_from_wipe_tower_generator", "layer_num", "layer_z", "toolchange_z"}},
+        };
+
+        for (const auto &[gcode_type, runtime_keys] : runtime_override_keys) {
+            const auto category = placeholders_by_gcode.find(gcode_type);
+            CAPTURE(gcode_type);
+            REQUIRE(category != placeholders_by_gcode.end());
+            for (const std::string &runtime_key : runtime_keys) {
+                CAPTURE(runtime_key);
+                REQUIRE(std::find(category->second.begin(), category->second.end(), runtime_key) != category->second.end());
+            }
+        }
+    }
+
+    SECTION("New runtime override definitions preserve their ConfigOption types") {
+        const std::map<std::string, ConfigOptionType> expected_types{
+            {"most_used_physical_extruder_id", coInt},
+            {"curr_physical_extruder_id", coInt},
+            {"timelapse_pos_x", coInt},
+            {"timelapse_pos_y", coInt},
+            {"has_timelapse_safe_pos", coBool},
+            {"color_change_extruder", coInt},
+            {"retraction_distance_when_cut", coFloat},
+            {"long_retraction_when_cut", coBool},
+            {"temperature", coInts},
+            {"nozzle_temperature", coInts},
+            {"first_layer_temperature", coInts},
+            {"nozzle_temperature_initial_layer", coInts},
+            {"current_hotend", coInt},
+            {"next_hotend", coInt},
+            {"toolchange_z", coFloat},
+            {"outer_wall_volumetric_speed", coFloat},
+            {"flush_length", coFloat},
+            {"flush_volumetric_speeds", coFloats},
+            {"flush_temperatures", coInts},
+            {"filament_cooling_before_tower", coFloats},
+            {"filament_tower_interface_print_temp", coInt},
+            {"filament_tower_interface_purge_volume", coFloat},
+            {"is_prime_tower_interface", coBool},
+            {"wipe_avoid_perimeter", coBool},
+            {"wipe_avoid_pos_x", coFloat},
+            {"filament_end_gcode", coString},
+            {"change_filament_gcode", coString},
+            {"filament_start_gcode", coString},
+            {"deretraction_from_wipe_tower_generator", coString},
+        };
+
+        for (const auto &[placeholder, expected_type] : expected_types) {
+            const ConfigOptionDef *definition = custom_gcode_specific_config_def.get(placeholder);
+            CAPTURE(placeholder);
+            REQUIRE(definition != nullptr);
+            REQUIRE(definition->type == expected_type);
+            REQUIRE_FALSE(definition->label.empty());
+            REQUIRE_FALSE(definition->tooltip.empty());
+        }
+    }
+}
 
 SCENARIO("Placeholder parser scripting", "[PlaceholderParser]") {
     PlaceholderParser parser;

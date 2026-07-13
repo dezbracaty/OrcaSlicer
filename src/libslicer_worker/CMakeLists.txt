@@ -36,11 +36,6 @@ target_link_libraries(libslicer_worker_client
         Threads::Threads
 )
 
-target_link_libraries(libslicer_preview_protocol
-    INTERFACE
-        Eigen3::Eigen
-)
-
 set_target_properties(libslicer_worker_client PROPERTIES
     EXPORT_NAME worker_client
 )

@@ -9,15 +9,6 @@
 
 namespace Slic3r {
 
-enum class ToolpathTimeMode : unsigned char
-{
-    Normal,
-    Stealth,
-    Count
-};
-
-inline constexpr std::size_t toolpath_time_mode_count = static_cast<std::size_t>(ToolpathTimeMode::Count);
-
 struct ToolpathMoveVertex
 {
     unsigned int gcode_id{ 0 };

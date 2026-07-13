@@ -59,6 +59,7 @@ This header currently owns the common definitions for:
 - `Slic3r::EMoveType`
 - `Slic3r::EMovePathType`
 - `Slic3r::ExtrusionRole`
+- `Slic3r::ToolpathTimeMode` and `Slic3r::toolpath_time_mode_count`
 
 Orca's shared coordinate types live in:
 
@@ -69,26 +70,10 @@ Orca's shared coordinate types live in:
 - `coord_t`
 - `coordf_t`
 
-Orca's shared vector/matrix aliases, including `Slic3r::Vec3f`, live in:
-
-```cpp
-#include <libslic3r/OrcaGeometryTypes.hpp>
-```
-
-Move records shared with Orca's G-code processor live in:
-
-```cpp
-#include <libslic3r/OrcaToolpathRecords.hpp>
-```
-
-This header currently owns:
-
-- `Slic3r::ToolpathMoveVertex`
-
-`Slic3r::GCodeProcessorResult::MoveVertex` is an alias of
-`Slic3r::ToolpathMoveVertex`. External projects can therefore reason about
-toolpath moves with the same semantic names, values, and record fields used by
-Orca's G-code processor and preview pipeline.
+Orca's Eigen-backed geometry aliases and G-code processor move records remain
+internal to the slicer/worker build. They are deliberately not installed as
+part of the preview protocol SDK; external consumers use the POD wire records
+below instead.
 
 The worker preview protocol exposes aliases to these exact types:
 
@@ -114,8 +99,11 @@ Binary preview artifacts use explicitly named wire records from
 `libslicer_worker/PreviewBinary.hpp`, such as
 `libslicer::worker::preview::WireMoveRecord`. Wire records are POD transport
 types with `sizeof`, key `offsetof`, and trivially-copyable compile-time
-checks. Use helper functions such as `to_wire_vec3f()` and `to_orca_vec3f()`
-when converting between wire vectors and Orca's Eigen-backed `Slic3r::Vec3f`.
+checks. The installed preview protocol does not expose Orca's Eigen-backed
+geometry aliases or conversion helpers. Conversion between internal
+`Slic3r::Vec3f` values and `WireVec3f` stays inside the worker implementation,
+so consuming `libslicer::preview_protocol` does not add an Eigen package
+dependency to the host.
 The numeric values of the shared move/path/role enums are also part of
 `schema_version == 2`; adding, removing, or reordering those enum values must
 bump the preview schema version and update the protocol assertions.

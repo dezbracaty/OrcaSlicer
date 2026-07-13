@@ -148,18 +148,20 @@ Shared toolpath semantic types are intentionally not worker-private.
 `coord_t` and `coordf_t` live in `libslic3r/OrcaCoreTypes.hpp`.
 `Slic3r::Vec3f` and related vector aliases live in
 `libslic3r/OrcaGeometryTypes.hpp`. `Slic3r::EMoveType`,
-`Slic3r::EMovePathType`, and `Slic3r::ExtrusionRole` live in
+`Slic3r::EMovePathType`, `Slic3r::ExtrusionRole`, and preview time-mode
+constants live in the installed, Eigen-free
 `libslic3r/OrcaToolpathTypes.hpp`. The G-code processor move record
-`Slic3r::ToolpathMoveVertex` lives in `libslic3r/OrcaToolpathRecords.hpp`, and
-`Slic3r::GCodeProcessorResult::MoveVertex` aliases it. Orca internals and
-external preview consumers include the same public headers.
+`Slic3r::ToolpathMoveVertex` remains internal in
+`libslic3r/OrcaToolpathRecords.hpp`; external preview consumers use the POD
+wire records rather than Orca's Eigen-backed internal record.
 
 Preview artifact binary records are explicitly transport-facing wire records.
 They live in `libslicer_worker/PreviewBinary.hpp` with `Wire*` names, fixed
 record-size assertions, fixed key field offsets, and trivially-copyable
 assertions. The wire vector type is a plain `{x,y,z}` POD for binary/socket
-transport; conversion helpers bridge it to Orca's Eigen-backed
-`Slic3r::Vec3f`. The shared move/path/role enum numeric values are frozen by
+transport; conversion from Orca's Eigen-backed `Slic3r::Vec3f` stays private
+to the worker implementation so the installed preview protocol has no Eigen
+package dependency. The shared move/path/role enum numeric values are frozen by
 the preview schema; changing those values requires a schema version bump and
 updated compile-time assertions.
 

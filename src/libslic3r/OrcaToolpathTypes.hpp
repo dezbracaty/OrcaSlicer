@@ -1,6 +1,7 @@
 #ifndef slic3r_OrcaToolpathTypes_hpp_
 #define slic3r_OrcaToolpathTypes_hpp_
 
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -58,6 +59,15 @@ enum ExtrusionRole : std::uint8_t {
     erMixed,
     erCount
 };
+
+enum class ToolpathTimeMode : unsigned char
+{
+    Normal,
+    Stealth,
+    Count
+};
+
+inline constexpr std::size_t toolpath_time_mode_count = static_cast<std::size_t>(ToolpathTimeMode::Count);
 
 inline constexpr std::string_view move_type_name(EMoveType type)
 {

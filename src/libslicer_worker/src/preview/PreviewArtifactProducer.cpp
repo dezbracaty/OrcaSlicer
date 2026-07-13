@@ -94,6 +94,11 @@ bool is_finite(const Slic3r::Vec3f& value)
     return std::isfinite(value.x()) && std::isfinite(value.y()) && std::isfinite(value.z());
 }
 
+WireVec3f to_wire_vec3f(const Slic3r::Vec3f& value)
+{
+    return { value.x(), value.y(), value.z() };
+}
+
 std::uint32_t flag(MoveFlags flag)
 {
     return static_cast<std::uint32_t>(flag);

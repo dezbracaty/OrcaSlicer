@@ -2,8 +2,6 @@
 
 #include "libslicer_worker/PreviewTypes.hpp"
 
-#include <libslic3r/OrcaToolpathRecords.hpp>
-
 #include <array>
 #include <cstddef>
 #include <cstdint>

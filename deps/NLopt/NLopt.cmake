@@ -80,10 +80,65 @@ set(HAS_BUILD FALSE)
 set(HAS_SOURCE FALSE)
 set(HAS_ZIP FALSE)
 
+function(_nlopt_validate_install_contract install_dir out_valid out_package_dir out_error)
+    file(GLOB _nlopt_config_candidates LIST_DIRECTORIES FALSE
+        "${install_dir}/lib/cmake/nlopt/NLoptConfig.cmake"
+        "${install_dir}/lib64/cmake/nlopt/NLoptConfig.cmake"
+    )
+    file(GLOB _nlopt_targets_candidates LIST_DIRECTORIES FALSE
+        "${install_dir}/lib/cmake/nlopt/NLoptLibraryDepends.cmake"
+        "${install_dir}/lib64/cmake/nlopt/NLoptLibraryDepends.cmake"
+    )
+    list(LENGTH _nlopt_config_candidates _nlopt_config_count)
+    list(LENGTH _nlopt_targets_candidates _nlopt_targets_count)
+
+    set(_valid TRUE)
+    set(_package_dir "")
+    set(_error "")
+    if(NOT _nlopt_config_count EQUAL 1 OR NOT _nlopt_targets_count EQUAL 1)
+        set(_valid FALSE)
+        set(_error
+            "expected one NLoptConfig.cmake and one NLoptLibraryDepends.cmake; "
+            "found ${_nlopt_config_count} config and ${_nlopt_targets_count} targets files")
+    else()
+        list(GET _nlopt_config_candidates 0 _nlopt_config)
+        list(GET _nlopt_targets_candidates 0 _nlopt_targets)
+        get_filename_component(_package_dir "${_nlopt_config}" DIRECTORY)
+        file(READ "${_nlopt_config}" _nlopt_config_content)
+        file(READ "${_nlopt_targets}" _nlopt_targets_content)
+        if(NOT _nlopt_targets_content MATCHES "NLopt::nlopt([ \t\r\n\\)]|$)")
+            set(_valid FALSE)
+            string(APPEND _error " required imported target NLopt::nlopt is missing;")
+        endif()
+        if(_nlopt_config_content MATCHES "NLopt::nlopt_cxx"
+           OR _nlopt_targets_content MATCHES "NLopt::nlopt_cxx")
+            set(_valid FALSE)
+            string(APPEND _error " package exports NLopt::nlopt_cxx instead of the required C target;")
+        endif()
+    endif()
+
+    set(${out_valid} "${_valid}" PARENT_SCOPE)
+    set(${out_package_dir} "${_package_dir}" PARENT_SCOPE)
+    set(${out_error} "${_error}" PARENT_SCOPE)
+endfunction()
+
 # NLopt 安装后会有 include/nlopt.h
 if(EXISTS "${NLOPT_INSTALL_DIR}/include/nlopt.h")
     set(HAS_INSTALL TRUE)
     message(STATUS "✅ 发现安装目录: ${NLOPT_INSTALL_DIR}")
+endif()
+
+if(HAS_INSTALL)
+    _nlopt_validate_install_contract("${NLOPT_INSTALL_DIR}"
+        _nlopt_install_contract_valid _nlopt_package_dir _nlopt_install_contract_error)
+    if(NOT _nlopt_install_contract_valid)
+        message(WARNING
+            "Rejecting incompatible NLopt ${NLOPT_ACTUAL_BUILD_TYPE} install:"
+            "${_nlopt_install_contract_error} Rebuilding this build/install entry with NLOPT_CXX=OFF.")
+        file(REMOVE_RECURSE "${NLOPT_BUILD_DIR}" "${NLOPT_INSTALL_DIR}")
+        set(HAS_INSTALL FALSE)
+        set(HAS_BUILD FALSE)
+    endif()
 endif()
 
 # CMake 项目：CMakeCache 即认为已配置，lib/ 下有产物即认为构建完成
@@ -297,6 +352,7 @@ elseif(NLOPT_STATUS STREQUAL "SOURCE_ONLY")
             -DCMAKE_BUILD_TYPE=${NLOPT_ACTUAL_BUILD_TYPE}
             -DCMAKE_INSTALL_PREFIX=${NLOPT_INSTALL_DIR}
             -DBUILD_SHARED_LIBS=${_nlopt_shared}
+            -DNLOPT_CXX:BOOL=OFF
             -DNLOPT_PYTHON:BOOL=OFF
             -DNLOPT_OCTAVE:BOOL=OFF
             -DNLOPT_MATLAB:BOOL=OFF
@@ -496,8 +552,15 @@ endif()
 
 # 注册到主项目的 find_package(NLopt)
 if(NLOPT_FOUND)
+    _nlopt_validate_install_contract("${NLOPT_INSTALL_DIR}"
+        _nlopt_install_contract_valid _nlopt_package_dir _nlopt_install_contract_error)
+    if(NOT _nlopt_install_contract_valid)
+        message(FATAL_ERROR
+            "NLopt install does not satisfy the required NLopt::nlopt target contract:"
+            "${_nlopt_install_contract_error}")
+    endif()
     list(PREPEND CMAKE_PREFIX_PATH "${NLOPT_INSTALL_DIR}")
-    set(NLopt_DIR "${NLOPT_INSTALL_DIR}/lib/cmake/nlopt" CACHE PATH "NLopt cmake config dir" FORCE)
+    set(NLopt_DIR "${_nlopt_package_dir}" CACHE PATH "NLopt cmake config dir" FORCE)
     set(NLopt_AVAILABLE TRUE CACHE BOOL "NLopt library is available")
     message(STATUS "")
     message(STATUS "🎯 NLopt 库已就绪")
