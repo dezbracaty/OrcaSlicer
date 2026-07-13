@@ -53,10 +53,24 @@ add_test(
         --worker $<TARGET_FILE:orcaslicer-worker>
         --source-root ${CMAKE_SOURCE_DIR}
         --work-dir ${WORKER_TEST_WORK_DIR}
+        --scenario core
 )
 set_tests_properties(worker_cli_socket_slice PROPERTIES
     LABELS "worker;slicing"
     TIMEOUT 180
+)
+
+add_test(
+    NAME worker_firehorse_project_slice
+    COMMAND ${Python3_EXECUTABLE} ${WORKER_TEST_SCRIPT}
+        --worker $<TARGET_FILE:orcaslicer-worker>
+        --source-root ${CMAKE_SOURCE_DIR}
+        --work-dir ${CMAKE_CURRENT_BINARY_DIR}/worker-firehorse-test
+        --scenario firehorse
+)
+set_tests_properties(worker_firehorse_project_slice PROPERTIES
+    LABELS "worker;slicing;firehorse"
+    TIMEOUT 300
 )
 
 add_custom_target(worker_tests

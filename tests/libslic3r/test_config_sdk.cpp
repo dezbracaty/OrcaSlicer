@@ -718,6 +718,79 @@ TEST_CASE("Project 3MF extraction materializes embedded presets for resolver reu
     std::filesystem::remove_all(data_dir);
 }
 
+TEST_CASE("Firehorse project extraction resolves and validates its complete BBL configuration", "[ConfigSDK][firehorse]")
+{
+    const auto issue_summary = [](const std::vector<ConfigIssue>& issues) {
+        std::string summary;
+        for (const ConfigIssue& issue : issues) {
+            if (!summary.empty())
+                summary += '\n';
+            summary += issue.code + " " + issue.field + ": " + issue.message;
+        }
+        return summary;
+    };
+
+    const std::filesystem::path data_dir = make_temp_data_dir();
+    Project3mfExtractionRequest extraction_request;
+    extraction_request.project_file = std::filesystem::path(TEST_DATA_DIR) / "test_3mf" / "firehorse.3mf";
+    extraction_request.data_dir = data_dir;
+    extraction_request.plate_index = 0;
+    extraction_request.strict = true;
+
+    const Project3mfExtractionResult extracted = extract_project_3mf_config(extraction_request);
+    INFO(issue_summary(extracted.issues));
+    REQUIRE_FALSE(has_config_errors(extracted.issues));
+    REQUIRE(extracted.printer_preset_id == "Bambu Lab X1 Carbon 0.4 nozzle");
+    REQUIRE(extracted.process_preset_id == "0.20mm Standard @BBL X1C");
+    REQUIRE(extracted.filament_slots.size() == 2);
+    REQUIRE_FALSE(extracted.project_config_json.empty());
+
+    ConfigResolutionRequest resolution_request;
+    resolution_request.resources_dir = repo_resources_dir();
+    resolution_request.data_dir = data_dir;
+    resolution_request.vendor_bundle_dirs.push_back(
+        resolution_request.resources_dir / "profiles" / "OrcaFilamentLibrary");
+    resolution_request.vendor_bundle_dirs.push_back(
+        resolution_request.resources_dir / "profiles" / "BBL");
+    resolution_request.project_preset_files = extracted.extracted_project_preset_files;
+    resolution_request.printer_preset_id = extracted.printer_preset_id;
+    resolution_request.process_preset_id = extracted.process_preset_id;
+    resolution_request.filament_slots = extracted.filament_slots;
+    resolution_request.printer_overrides_json = extracted.printer_overrides_json;
+    resolution_request.process_overrides_json = extracted.process_overrides_json;
+    resolution_request.project_overrides_json = extracted.project_overrides_json;
+    resolution_request.plate_index = extraction_request.plate_index;
+    resolution_request.strict = true;
+
+    const ConfigResolutionResult resolved = resolve_fff_config(resolution_request);
+    INFO(issue_summary(resolved.issues));
+    REQUIRE_FALSE(has_config_errors(resolved.issues));
+    REQUIRE_FALSE(resolved.full_config_json.empty());
+
+    const json full_config = json::parse(resolved.full_config_json);
+    REQUIRE(full_config.at("printer_model") == "Bambu Lab X1 Carbon");
+    REQUIRE(full_config.at("printer_settings_id") == extracted.printer_preset_id);
+    REQUIRE(full_config.at("print_settings_id") == extracted.process_preset_id);
+    REQUIRE(full_config.at("filament_settings_id").is_array());
+    REQUIRE(full_config.at("filament_settings_id").size() == extracted.filament_slots.size());
+    REQUIRE(full_config.at("filament_colour").is_array());
+    REQUIRE(full_config.at("filament_colour").size() == extracted.filament_slots.size());
+    REQUIRE(full_config.at("filament_map").is_array());
+    REQUIRE(full_config.at("filament_map").size() == extracted.filament_slots.size());
+    for (std::size_t index = 0; index < extracted.filament_slots.size(); ++index) {
+        INFO("filament slot " << index);
+        REQUIRE(full_config.at("filament_settings_id").at(index) ==
+                extracted.filament_slots.at(index).filament_preset_id);
+    }
+
+    const std::vector<ConfigIssue> validation_issues = validate_resolved_config(
+        ConfigValidationRequest { resolved.full_config_json, extraction_request.plate_index, false });
+    INFO(issue_summary(validation_issues));
+    REQUIRE_FALSE(has_config_errors(validation_issues));
+
+    std::filesystem::remove_all(data_dir);
+}
+
 TEST_CASE("Project 3MF extraction reports missing required request fields", "[ConfigSDK]")
 {
     const Project3mfExtractionResult result = extract_project_3mf_config(Project3mfExtractionRequest {});

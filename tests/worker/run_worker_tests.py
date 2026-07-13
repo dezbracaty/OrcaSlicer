@@ -2,6 +2,7 @@
 import argparse
 import array
 import ctypes
+import hashlib
 import json
 import mmap
 import os
@@ -96,6 +97,18 @@ def orca_project_3mf_path(source_root):
     path = source_root / "resources" / "calib" / "pressure_advance" / "pa_pattern.3mf"
     if not path.exists():
         raise AssertionError(f"Orca project 3MF fixture not found: {path}")
+    return path
+
+
+def firehorse_3mf_path(source_root):
+    path = source_root / "tests" / "data" / "test_3mf" / "firehorse.3mf"
+    if not path.exists():
+        raise AssertionError(f"Firehorse project 3MF fixture not found: {path}")
+    if path.stat().st_size != 9211164:
+        raise AssertionError(f"Firehorse project 3MF fixture size mismatch: {path.stat().st_size}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != "2df2ba25776b46fd04dcd914c04930895e1f961edf0162967bcee8fcd5237430":
+        raise AssertionError(f"Firehorse project 3MF fixture SHA-256 mismatch: {digest}")
     return path
 
 
@@ -662,6 +675,81 @@ def run_cli(worker, source_root, root_work_dir):
     assert_intermediates_cleaned(work_dir)
 
 
+def run_firehorse_project(worker, source_root, root_work_dir):
+    work_dir = root_work_dir / "firehorse"
+    shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True)
+
+    gcode_path = work_dir / "firehorse-output.gcode"
+    preview_path = work_dir / "artifacts" / "firehorse-output.orcapv"
+    request = worker_request(
+        source_root,
+        work_dir,
+        "worker-firehorse-project",
+        gcode_path.name,
+        input_type="orca_3mf_project",
+        input_path=firehorse_3mf_path(source_root),
+        config_type="project_embedded",
+    )
+    request["input"]["plate_index"] = 0
+    request["output"]["gcode"] = {
+        "enabled": True,
+        "required": True,
+        "path": str(gcode_path),
+    }
+    request["output"]["preview"] = {
+        "enabled": True,
+        "required": True,
+        "path": preview_path.name,
+        "format": "orca-toolpath-preview-binary-v2",
+        "publish": "final",
+    }
+    request_path = work_dir / "request-firehorse-project.json"
+    write_json(request_path, request)
+
+    proc = subprocess.run(
+        [str(worker), "slice", "--job", str(request_path), "--progress", "jsonl"],
+        cwd=str(work_dir),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"worker firehorse project slice failed with {proc.returncode}\n"
+            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+
+    events = [json.loads(line) for line in proc.stdout.splitlines() if line.lstrip().startswith("{")]
+    results = [event for event in events if event.get("type") == "result"]
+    if not results or not results[-1].get("success"):
+        raise AssertionError(f"worker firehorse project did not emit a successful result: {proc.stdout}")
+    if results[-1].get("path") != str(gcode_path):
+        raise AssertionError(f"worker firehorse result path mismatch: {results[-1]}")
+
+    for kind, expected_path in (("gcode", gcode_path), ("preview", preview_path)):
+        ready = [
+            event for event in events
+            if event.get("type") == "artifact" and event.get("kind") == kind
+        ]
+        if not ready:
+            raise AssertionError(f"worker firehorse did not emit {kind} artifact event: {proc.stdout}")
+        artifact = ready[-1]
+        if artifact.get("phase") != "ready" or not artifact.get("complete"):
+            raise AssertionError(f"worker firehorse {kind} artifact was not ready/complete: {artifact}")
+        if artifact.get("path") != str(expected_path):
+            raise AssertionError(f"worker firehorse {kind} artifact path mismatch: {artifact}")
+
+    assert_gcode(gcode_path)
+    if gcode_path.stat().st_size <= 0:
+        raise AssertionError("worker firehorse G-code artifact is empty")
+    assert_preview_artifact(preview_path, expected_transport="file")
+    if preview_path.stat().st_size <= 0:
+        raise AssertionError("worker firehorse preview artifact is empty")
+    assert_data_dir_cleaned(work_dir)
+
+
 def run_preview_outputs(worker, source_root, root_work_dir):
     work_dir = root_work_dir / "preview"
     shutil.rmtree(work_dir, ignore_errors=True)
@@ -1122,6 +1210,7 @@ def main():
     parser.add_argument("--worker", required=True, type=Path)
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--work-dir", required=True, type=Path)
+    parser.add_argument("--scenario", choices=("all", "core", "firehorse"), default="all")
     args = parser.parse_args()
 
     if not args.worker.exists():
@@ -1130,10 +1219,13 @@ def main():
         raise AssertionError("socket worker tests currently require Unix domain sockets")
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
-    run_cli(args.worker, args.source_root, args.work_dir)
-    run_preview_outputs(args.worker, args.source_root, args.work_dir)
-    run_malformed_requests(args.worker, args.source_root, args.work_dir)
-    run_socket(args.worker, args.source_root, args.work_dir)
+    if args.scenario in {"all", "core"}:
+        run_cli(args.worker, args.source_root, args.work_dir)
+        run_preview_outputs(args.worker, args.source_root, args.work_dir)
+        run_malformed_requests(args.worker, args.source_root, args.work_dir)
+        run_socket(args.worker, args.source_root, args.work_dir)
+    if args.scenario in {"all", "firehorse"}:
+        run_firehorse_project(args.worker, args.source_root, args.work_dir)
 
 
 if __name__ == "__main__":
