@@ -420,7 +420,7 @@ public:
     // Headless SDK bridge: merge a separately loaded vendor bundle while reusing
     // the existing duplicate detection path. PresetBundle is not installed as a
     // public SDK header.
-    std::vector<std::string>    merge_vendor_bundle_for_config_sdk(PresetBundle &&other) { return merge_presets(std::move(other)); }
+    std::vector<std::string>    merge_vendor_bundle_for_headless_use(PresetBundle &&other) { return merge_presets(std::move(other)); }
 
     // Export a config bundle file containing all the presets and the names of the active presets.
     //void                        export_configbundle(const std::string &path, bool export_system_settings = false, bool export_physical_printers = false);

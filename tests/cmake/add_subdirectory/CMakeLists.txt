@@ -20,8 +20,8 @@ foreach(_link IN LISTS _libslicer_sdk_links)
     # LINK_ONLY/BUILD_INTERFACE dependencies are the private static-link
     # closure, not public SDK targets.  Reject only an unwrapped public target
     # or an internal target deliberately placed in INSTALL_INTERFACE.
-    if(_link MATCHES "^(libslic3r|libslicer_worker|orcaslicer_worker|libslicer::libslicer)$" OR
-       _link MATCHES "^\\$<INSTALL_INTERFACE:(libslic3r|libslicer_worker|orcaslicer_worker|libslicer::libslicer)>$")
+    if(_link MATCHES "^(libslic3r|libslicer::libslicer)$" OR
+       _link MATCHES "^\\$<INSTALL_INTERFACE:(libslic3r|libslicer::libslicer)>$")
         message(FATAL_ERROR "libslicer::sdk_v1 publicly leaks internal target ${_link}")
     endif()
 endforeach()

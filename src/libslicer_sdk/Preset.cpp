@@ -1187,7 +1187,7 @@ Result<std::shared_ptr<PresetCatalogState>> load_preset_catalog(const ContextOpt
             if (!vendor_errors[index].empty())
                 return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(
                     ErrorCode::invalid_configuration, vendor_errors[index], "/resources_dir");
-            const auto duplicates = catalog->bundle->merge_vendor_bundle_for_config_sdk(
+            const auto duplicates = catalog->bundle->merge_vendor_bundle_for_headless_use(
                 std::move(*vendor_bundles[index]));
             if (!duplicates.empty())
                 return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(

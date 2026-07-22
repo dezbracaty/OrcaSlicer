@@ -100,9 +100,6 @@ set(lisbslic3r_sources
     CommonDefs.hpp
     Config.cpp
     Config.hpp
-    ConfigSDK.cpp
-    ConfigSDK.hpp
-    ConfigSDK_internal.hpp
     ContourZ.cpp
     CustomGCode.cpp
     CustomGCode.hpp

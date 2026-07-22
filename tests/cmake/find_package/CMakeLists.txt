@@ -10,8 +10,7 @@ find_package(libslicer CONFIG REQUIRED)
 if(NOT TARGET libslicer::sdk_v1)
     message(FATAL_ERROR "libslicer::sdk_v1 target is missing")
 endif()
-foreach(_private_target IN ITEMS libslicer::libslicer libslicer::config_sdk
-                                 libslicer::worker libslicer::orcaslicer_worker)
+foreach(_private_target IN ITEMS libslicer::libslicer)
     if(TARGET "${_private_target}")
         message(FATAL_ERROR "Installed package exposes private target ${_private_target}")
     endif()
@@ -22,8 +21,8 @@ foreach(_link IN LISTS _libslicer_sdk_links)
     # Relocatable paths under lib/libslicer/private are implementation archive
     # files, not exported CMake targets.  Only a target-valued public item is a
     # package-surface leak.
-    if(_link MATCHES "^(libslic3r|libslicer_worker|orcaslicer_worker|libslicer::libslicer)$" OR
-       _link MATCHES "^\\$<INSTALL_INTERFACE:(libslic3r|libslicer_worker|orcaslicer_worker|libslicer::libslicer)>$")
+    if(_link MATCHES "^(libslic3r|libslicer::libslicer)$" OR
+       _link MATCHES "^\\$<INSTALL_INTERFACE:(libslic3r|libslicer::libslicer)>$")
         message(FATAL_ERROR "Installed SDK publicly leaks internal target ${_link}")
     endif()
 endforeach()

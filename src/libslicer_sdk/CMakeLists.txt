@@ -6,7 +6,7 @@ add_library(libslicer_sdk_v1 STATIC
     Preset.cpp
     Project.cpp
     Slice.cpp
-    ../libslicer_worker/src/NanoSVG.cpp
+    NanoSVG.cpp
 )
 
 add_library(libslicer::sdk_v1 ALIAS libslicer_sdk_v1)

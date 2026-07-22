@@ -420,8 +420,8 @@ export 并返回 `resource_limit_exceeded`。禁止先完整写到无界 path/ve
 libslic3r，并通过 CMake 的 link-only 依赖向静态库调用方传递必要库，不传递内部 include
 directory。
 
-现有 ConfigSDK 或 worker 可作为显式 legacy option 保留，但不进入默认 SDK target，也不能
-影响 v1 公共符号。
+旧配置解析接口和 worker 接口不属于 v1，拆除后不得重新进入默认 SDK target，也不能影响 v1
+公共符号。
 
 ## 14. 实施顺序
 
