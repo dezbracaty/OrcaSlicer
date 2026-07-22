@@ -1,5 +1,6 @@
 #include "ContextInternal.hpp"
 #include "OrcaConfigAdapter.hpp"
+#include "ProjectInternal.hpp"
 #include "SliceInternal.hpp"
 
 #include <array>
@@ -12,11 +13,13 @@ SdkContext::SdkContext(std::shared_ptr<detail::ContextState> state) : state_(std
 
 Result<SdkContext> SdkContext::create(ContextOptions options)
 {
-    const std::array<std::pair<std::uint64_t, const char *>, 5> limits {{
+    const std::array<std::pair<std::uint64_t, const char *>, 7> limits {{
         {options.limits.project_input_bytes, "/limits/project_input_bytes"},
         {options.limits.project_uncompressed_bytes, "/limits/project_uncompressed_bytes"},
         {options.limits.model_triangles, "/limits/model_triangles"},
         {options.limits.gcode_bytes, "/limits/gcode_bytes"},
+        {options.limits.preview_bytes, "/limits/preview_bytes"},
+        {options.limits.preview_moves, "/limits/preview_moves"},
         {options.limits.temporary_disk_bytes, "/limits/temporary_disk_bytes"},
     }};
     for (const auto &limit : limits) {
@@ -84,6 +87,13 @@ Result<PresetRepository> SdkContext::presets()
     std::lock_guard<std::mutex> lock(state_->mutex);
     return detail::ResultAccess::success(PresetRepository(
         std::make_shared<PresetRepository::State>(state_->preset_catalog)));
+}
+
+Result<ProjectBuilder> SdkContext::create_project_builder()
+{
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return detail::ResultAccess::success(ProjectBuilder(
+        std::make_shared<ProjectBuilder::State>(state_)));
 }
 
 Result<SliceEngine> SdkContext::create_slice_engine()

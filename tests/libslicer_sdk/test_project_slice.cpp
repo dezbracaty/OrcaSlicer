@@ -23,10 +23,98 @@ ContextOptions integration_options(const std::filesystem::path &root)
     return {std::filesystem::path(LIBSLICER_TEST_RESOURCES_DIR),
             root / "data", root / "temporary", {},
             {64ull * 1024 * 1024, 256ull * 1024 * 1024, 2'000'000,
+             128ull * 1024 * 1024, 5'000'000,
              128ull * 1024 * 1024, 128ull * 1024 * 1024}};
 }
 
+MeshData cube_mesh(double size)
+{
+    return {{{0, 0, 0}, {size, 0, 0}, {size, size, 0}, {0, size, 0},
+             {0, 0, size}, {size, 0, size}, {size, size, size}, {0, size, size}},
+            {{0, 1, 2}, {0, 2, 3}, {4, 6, 5}, {4, 7, 6},
+             {0, 4, 5}, {0, 5, 1}, {1, 5, 6}, {1, 6, 2},
+             {2, 6, 7}, {2, 7, 3}, {3, 7, 4}, {3, 4, 0}}};
+}
+
+Matrix4d identity_matrix()
+{
+    return {{{1.0, 0.0, 0.0, 0.0,
+              0.0, 1.0, 0.0, 0.0,
+              0.0, 0.0, 1.0, 0.0,
+              0.0, 0.0, 0.0, 1.0}}};
+}
+
 } // namespace
+
+TEST_CASE("Public SDK ProjectBuilder accepts app-owned mesh scene input",
+          "[libslicer_sdk][project][builder]")
+{
+    const auto unique = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    TemporaryRoot root{std::filesystem::temp_directory_path() /
+                       ("libslicer-sdk-builder-" + unique)};
+    REQUIRE(std::filesystem::create_directories(root.path));
+
+    auto context = SdkContext::create(integration_options(root.path));
+    REQUIRE(context.has_value());
+    auto repository = context.value().presets();
+    REQUIRE(repository.has_value());
+    auto printers = repository.value().list(PresetKind::printer);
+    auto processes = repository.value().list(PresetKind::process);
+    auto filaments = repository.value().list(PresetKind::filament);
+    REQUIRE(printers.has_value());
+    REQUIRE(processes.has_value());
+    REQUIRE(filaments.has_value());
+    REQUIRE_FALSE(printers.value().empty());
+    REQUIRE_FALSE(processes.value().empty());
+    REQUIRE_FALSE(filaments.value().empty());
+
+    PresetSelection selection{
+        {printers.value().front().ref, printers.value().front().revision},
+        {processes.value().front().ref, processes.value().front().revision},
+        {{filaments.value().front().ref, filaments.value().front().revision}}};
+
+    auto builder = context.value().create_project_builder();
+    REQUIRE(builder.has_value());
+    REQUIRE(builder.value().set_selected_presets(selection).has_value());
+    REQUIRE(builder.value().set_project_filament_map(
+        {FilamentMapMode::manual, {ToolId{1}}}).has_value());
+    auto plate = builder.value().add_plate("Plate 1");
+    REQUIRE(plate.has_value());
+    ObjectInput object;
+    object.name = "SDK cube";
+    object.parts.push_back({"cube", cube_mesh(20.0), {}});
+    auto object_id = builder.value().add_object(std::move(object));
+    REQUIRE(object_id.has_value());
+    auto instance = builder.value().add_instance(plate.value(), object_id.value(),
+                                                 identity_matrix());
+    REQUIRE(instance.has_value());
+    auto project = builder.value().build();
+    if (!project.has_value() && !project.diagnostics().empty())
+        INFO(project.diagnostics().front().message << " at " <<
+             project.diagnostics().front().field);
+    REQUIRE(project.has_value());
+
+    auto snapshot = project.value().snapshot();
+    REQUIRE(snapshot.has_value());
+    CHECK(snapshot.value().plates().size() == 1);
+    CHECK(snapshot.value().objects().size() == 1);
+    CHECK(snapshot.value().parts().size() == 1);
+    auto instances = snapshot.value().instances(plate.value());
+    REQUIRE(instances.has_value());
+    REQUIRE(instances.value().size() == 1);
+    CHECK(instances.value().front() == instance.value());
+
+    auto engine = context.value().create_slice_engine();
+    REQUIRE(engine.has_value());
+    auto inspection = engine.value().inspect({snapshot.value(), plate.value(), std::nullopt});
+    if (!inspection.has_value() && !inspection.diagnostics().empty())
+        INFO(inspection.diagnostics().front().message << " at " <<
+             inspection.diagnostics().front().field);
+    REQUIRE(inspection.has_value());
+    CHECK(inspection.value().effective_filament_map.mode == FilamentMapMode::manual);
+    CHECK(inspection.value().effective_filament_map.tools == std::vector<ToolId>{ToolId{1}});
+}
 
 TEST_CASE("Public SDK loads edits resolves saves and slices an Orca FFF project",
           "[libslicer_sdk][project][slice][integration]")
@@ -83,7 +171,8 @@ TEST_CASE("Public SDK loads edits resolves saves and slices an Orca FFF project"
 
     auto snapshot = project.value().snapshot();
     REQUIRE(snapshot.has_value());
-    const SliceRequest request{snapshot.value(), plate, std::nullopt};
+    SliceRequest request{snapshot.value(), plate, std::nullopt};
+    request.output.preview = PreviewDelivery::memory;
     auto inspection = engine.value().inspect(request);
     REQUIRE(inspection.has_value());
     CHECK(inspection.value().effective_filament_map.mode == FilamentMapMode::manual);
@@ -111,8 +200,15 @@ TEST_CASE("Public SDK loads edits resolves saves and slices an Orca FFF project"
     auto sliced = job.value().wait();
     REQUIRE(sliced.has_value());
     REQUIRE(sliced.value());
-    CHECK_FALSE(sliced.value()->gcode_bytes.empty());
-    CHECK(sliced.value()->gcode_bytes.find("G1") != std::string::npos);
+    REQUIRE(sliced.value()->gcode_bytes.has_value());
+    REQUIRE(sliced.value()->preview);
+    CHECK_FALSE(sliced.value()->gcode_bytes->empty());
+    CHECK(sliced.value()->gcode_bytes->find("G1") != std::string::npos);
+    CHECK(sliced.value()->preview->schema_id == "libslicer.preview");
+    CHECK(sliced.value()->preview->coordinate_space == "orca_plate_world_mm");
+    CHECK_FALSE(sliced.value()->preview->layers.empty());
+    CHECK_FALSE(sliced.value()->preview->filaments.empty());
+    CHECK_FALSE(sliced.value()->preview->moves.empty());
     CHECK(sliced.value()->effective_filament_map.mode == FilamentMapMode::manual);
     CHECK(sliced.value()->statistics.layer_count > 0);
     REQUIRE_FALSE(events.empty());

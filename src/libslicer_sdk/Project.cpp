@@ -37,6 +37,7 @@ bool operator==(const Name &lhs, const Name &rhs) noexcept                      
 LIBSLICER_DEFINE_PROJECT_ID(PlateId)
 LIBSLICER_DEFINE_PROJECT_ID(ObjectId)
 LIBSLICER_DEFINE_PROJECT_ID(PartId)
+LIBSLICER_DEFINE_PROJECT_ID(InstanceId)
 #undef LIBSLICER_DEFINE_PROJECT_ID
 
 namespace detail {
@@ -53,11 +54,17 @@ PartId ProjectIdAccess::part(std::shared_ptr<const ProjectIdentity> project, std
 {
     return PartId(std::make_shared<const PartId::Binding>(PartId::Binding{std::move(project), value}));
 }
+InstanceId ProjectIdAccess::instance(std::shared_ptr<const ProjectIdentity> project, std::uint64_t value)
+{
+    return InstanceId(std::make_shared<const InstanceId::Binding>(InstanceId::Binding{std::move(project), value}));
+}
 bool ProjectIdAccess::belongs(const PlateId &id, const std::shared_ptr<const ProjectIdentity> &project)
 { return id.binding_->project == project; }
 bool ProjectIdAccess::belongs(const ObjectId &id, const std::shared_ptr<const ProjectIdentity> &project)
 { return id.binding_->project == project; }
 bool ProjectIdAccess::belongs(const PartId &id, const std::shared_ptr<const ProjectIdentity> &project)
+{ return id.binding_->project == project; }
+bool ProjectIdAccess::belongs(const InstanceId &id, const std::shared_ptr<const ProjectIdentity> &project)
 { return id.binding_->project == project; }
 
 const std::shared_ptr<const ProjectData> &ProjectSnapshotAccess::data(
@@ -142,6 +149,17 @@ bool same_project(const PartId &id, const detail::ProjectData &data)
 {
     return detail::ProjectIdAccess::belongs(id, data.identity);
 }
+bool same_project(const InstanceId &id, const detail::ProjectData &data)
+{
+    return detail::ProjectIdAccess::belongs(id, data.identity);
+}
+
+std::shared_ptr<const detail::ProjectIdentity> new_project_identity()
+{
+    static std::atomic<std::uint64_t> next_identity{1};
+    return std::make_shared<const detail::ProjectIdentity>(
+        detail::ProjectIdentity{next_identity.fetch_add(1)});
+}
 
 const Slic3r::ModelObject *find_object(const detail::ProjectData &data, ObjectId id)
 {
@@ -155,6 +173,15 @@ Slic3r::ModelObject *find_object(detail::ProjectData &data, ObjectId id)
 {
     return const_cast<Slic3r::ModelObject *>(find_object(
         static_cast<const detail::ProjectData &>(data), id));
+}
+
+std::optional<std::size_t> object_position(const Slic3r::Model &model, ObjectId id,
+                                           const std::shared_ptr<const detail::ProjectIdentity> &identity)
+{
+    if (!detail::ProjectIdAccess::belongs(id, identity)) return std::nullopt;
+    for (std::size_t index = 0; index < model.objects.size(); ++index)
+        if (model.objects[index]->id().id == id.value()) return index;
+    return std::nullopt;
 }
 
 Slic3r::ModelVolume *find_part(detail::ProjectData &data, PartId id)
@@ -231,6 +258,16 @@ void apply_project_map(detail::ProjectData &data, const FilamentMapOverride &map
     for (ToolId tool : map.tools) tools.push_back(static_cast<int>(tool.value));
     data.project_config.set_key_value("filament_map", new Slic3r::ConfigOptionInts(std::move(tools)));
     data.project_config.set_key_value("filament_map_mode",
+        new Slic3r::ConfigOptionEnum<Slic3r::FilamentMapMode>(core_map_mode(map.mode)));
+}
+
+void apply_project_map(Slic3r::DynamicPrintConfig &config, const FilamentMapOverride &map)
+{
+    std::vector<int> tools;
+    tools.reserve(map.tools.size());
+    for (ToolId tool : map.tools) tools.push_back(static_cast<int>(tool.value));
+    config.set_key_value("filament_map", new Slic3r::ConfigOptionInts(std::move(tools)));
+    config.set_key_value("filament_map_mode",
         new Slic3r::ConfigOptionEnum<Slic3r::FilamentMapMode>(core_map_mode(map.mode)));
 }
 
@@ -594,6 +631,27 @@ Result<std::vector<LayerRange>> ProjectSnapshot::layer_ranges(ObjectId id) const
     return detail::ResultAccess::success(std::move(result));
 }
 
+Result<std::vector<InstanceId>> ProjectSnapshot::instances(PlateId id) const
+{
+    const auto position = plate_position(*state_->data, id);
+    if (!position) return failure<std::vector<InstanceId>>(
+        ErrorCode::not_found, "Plate was not found", "/entity");
+    std::vector<InstanceId> result;
+    const auto &plate = state_->data->plates[*position];
+    result.reserve(plate.objects_and_instances.size());
+    for (const auto &[object_index, instance_index] : plate.objects_and_instances) {
+        if (object_index < 0 || instance_index < 0) continue;
+        const std::size_t object_pos = static_cast<std::size_t>(object_index);
+        const std::size_t instance_pos = static_cast<std::size_t>(instance_index);
+        if (object_pos >= state_->data->model.objects.size()) continue;
+        const auto *object = state_->data->model.objects[object_pos];
+        if (instance_pos >= object->instances.size()) continue;
+        result.push_back(detail::ProjectIdAccess::instance(
+            state_->data->identity, object->instances[instance_pos]->id().id));
+    }
+    return detail::ResultAccess::success(std::move(result));
+}
+
 PresetSelection ProjectSnapshot::project_selected_presets() const { return state_->data->selection; }
 
 FilamentMapOverride ProjectSnapshot::project_filament_map() const { return project_map(*state_->data); }
@@ -923,9 +981,7 @@ Result<Project> Project::load(SdkContext &context, const std::filesystem::path &
                                 "v1 only supports FFF project 3MF",
                                 "/project/selected_presets/printer");
 
-    static std::atomic<std::uint64_t> next_identity{1};
-    auto identity = std::make_shared<const detail::ProjectIdentity>(
-        detail::ProjectIdentity{next_identity.fetch_add(1)});
+    auto identity = new_project_identity();
     auto data = std::make_shared<detail::ProjectData>(catalog->schema, context_state->options.limits,
                                                       std::move(selection), identity);
     data->source_path = path;
@@ -996,6 +1052,520 @@ Result<ProjectSnapshot> Project::snapshot() const
 }
 
 ProjectEdit::ProjectEdit(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+ProjectBuilder::ProjectBuilder(std::shared_ptr<State> state) : state_(std::move(state))
+{
+    if (!state_->identity) state_->identity = new_project_identity();
+    state_->model.set_backup_path("detach");
+}
+
+namespace {
+
+template<class BuilderState>
+Result<void> check_builder(const BuilderState &state)
+{
+    if (state.owner != std::this_thread::get_id())
+        return detail::ResultAccess::failure(ErrorCode::conflict,
+                                             "ProjectBuilder must be used from its creating thread",
+                                             "/builder");
+    if (state.terminal)
+        return detail::ResultAccess::failure(ErrorCode::conflict,
+                                             "ProjectBuilder is already closed", "/builder");
+    return detail::ResultAccess::success();
+}
+
+Result<Slic3r::TriangleMesh> builder_mesh(const MeshData &mesh, const std::string &field)
+{
+    if (mesh.vertices_mm.empty())
+        return detail::ResultAccess::failure<Slic3r::TriangleMesh>(
+            ErrorCode::invalid_argument, "Mesh must contain vertices", field + "/vertices_mm");
+    if (mesh.triangles.empty())
+        return detail::ResultAccess::failure<Slic3r::TriangleMesh>(
+            ErrorCode::invalid_argument, "Mesh must contain triangles", field + "/triangles");
+    if (mesh.vertices_mm.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        return detail::ResultAccess::failure<Slic3r::TriangleMesh>(
+            ErrorCode::resource_limit_exceeded, "Mesh vertex count exceeds core limits",
+            field + "/vertices_mm");
+
+    std::vector<Slic3r::Vec3f> vertices;
+    vertices.reserve(mesh.vertices_mm.size());
+    for (std::size_t index = 0; index < mesh.vertices_mm.size(); ++index) {
+        const auto &vertex = mesh.vertices_mm[index];
+        if (!std::isfinite(vertex.x) || !std::isfinite(vertex.y) || !std::isfinite(vertex.z))
+            return detail::ResultAccess::failure<Slic3r::TriangleMesh>(
+                ErrorCode::invalid_argument, "Mesh vertices must be finite",
+                field + "/vertices_mm/" + std::to_string(index));
+        vertices.emplace_back(static_cast<float>(vertex.x), static_cast<float>(vertex.y),
+                              static_cast<float>(vertex.z));
+    }
+
+    std::vector<Slic3r::Vec3i32> faces;
+    faces.reserve(mesh.triangles.size());
+    for (std::size_t index = 0; index < mesh.triangles.size(); ++index) {
+        const auto &triangle = mesh.triangles[index];
+        if (triangle.a >= mesh.vertices_mm.size() || triangle.b >= mesh.vertices_mm.size() ||
+            triangle.c >= mesh.vertices_mm.size())
+            return detail::ResultAccess::failure<Slic3r::TriangleMesh>(
+                ErrorCode::invalid_argument, "Triangle index is outside vertex array",
+                field + "/triangles/" + std::to_string(index));
+        if (triangle.a == triangle.b || triangle.a == triangle.c || triangle.b == triangle.c)
+            return detail::ResultAccess::failure<Slic3r::TriangleMesh>(
+                ErrorCode::invalid_argument, "Degenerate triangle is not allowed",
+                field + "/triangles/" + std::to_string(index));
+        faces.emplace_back(static_cast<int>(triangle.a), static_cast<int>(triangle.b),
+                           static_cast<int>(triangle.c));
+    }
+    return detail::ResultAccess::success(
+        Slic3r::TriangleMesh(std::move(vertices), std::move(faces)));
+}
+
+Result<Slic3r::Geometry::Transformation> builder_transform(
+    const Matrix4d &matrix, const std::string &field)
+{
+    for (std::size_t index = 0; index < matrix.row_major.size(); ++index)
+        if (!std::isfinite(matrix.row_major[index]))
+            return detail::ResultAccess::failure<Slic3r::Geometry::Transformation>(
+                ErrorCode::invalid_argument, "Transform matrix values must be finite",
+                field + "/" + std::to_string(index));
+    const auto close = [](double lhs, double rhs) {
+        return std::abs(lhs - rhs) <= 1e-9;
+    };
+    if (!close(matrix.row_major[12], 0.0) || !close(matrix.row_major[13], 0.0) ||
+        !close(matrix.row_major[14], 0.0) || !close(matrix.row_major[15], 1.0))
+        return detail::ResultAccess::failure<Slic3r::Geometry::Transformation>(
+            ErrorCode::invalid_argument, "Transform matrix must be affine", field);
+    Slic3r::Transform3d transform = Slic3r::Transform3d::Identity();
+    for (int row = 0; row < 4; ++row)
+        for (int column = 0; column < 4; ++column)
+            transform.matrix()(row, column) =
+                matrix.row_major[static_cast<std::size_t>(row * 4 + column)];
+    return detail::ResultAccess::success(Slic3r::Geometry::Transformation(transform));
+}
+
+template<class BuilderState>
+Result<void> validate_builder_selection(const BuilderState &state,
+                                        std::optional<Slic3r::DynamicPrintConfig> &printer_config)
+{
+    if (!state.selection)
+        return detail::ResultAccess::failure(ErrorCode::invalid_argument,
+                                             "Preset selection is required", "/selection");
+    const auto &selection = *state.selection;
+    if (selection.printer.ref.kind() != PresetKind::printer ||
+        selection.process.ref.kind() != PresetKind::process ||
+        selection.filaments.empty())
+        return detail::ResultAccess::failure(ErrorCode::invalid_argument,
+                                             "Preset selection kinds are invalid", "/selection");
+    auto catalog = state.context->preset_catalog;
+    std::lock_guard<std::mutex> catalog_lock(catalog->mutex);
+    const auto validate_selected = [&](const SelectedPreset &selected, PresetKind kind,
+                                       const std::string &field) -> Result<void> {
+        if (selected.ref.kind() != kind)
+            return detail::ResultAccess::failure(ErrorCode::invalid_argument,
+                                                 "Selected preset kind is invalid",
+                                                 field + "/ref/kind");
+        if (selected.ref.origin() == PresetOrigin::project_embedded)
+            return detail::ResultAccess::failure(ErrorCode::unsupported,
+                                                 "ProjectBuilder v1 does not create embedded presets",
+                                                 field);
+        const auto found = catalog->records.find(detail::PresetKey{
+            kind, selected.ref.origin(), selected.ref.id()});
+        if (found == catalog->records.end())
+            return detail::ResultAccess::failure(ErrorCode::not_found,
+                                                 "Selected repository preset was not found", field);
+        if (found->second.summary.revision != selected.revision)
+            return detail::ResultAccess::failure(ErrorCode::conflict,
+                                                 "Selected repository preset revision changed",
+                                                 field + "/revision");
+        if (kind == PresetKind::printer && found->second.core) {
+            if (found->second.core->printer_technology() != Slic3r::ptFFF)
+                return detail::ResultAccess::failure(ErrorCode::unsupported,
+                                                     "v1 only supports FFF slicing",
+                                                     field);
+            printer_config = found->second.core->config;
+        }
+        return detail::ResultAccess::success();
+    };
+    auto valid = validate_selected(selection.printer, PresetKind::printer, "/selection/printer");
+    if (!valid.has_value()) return valid;
+    valid = validate_selected(selection.process, PresetKind::process, "/selection/process");
+    if (!valid.has_value()) return valid;
+    for (std::size_t index = 0; index < selection.filaments.size(); ++index) {
+        valid = validate_selected(selection.filaments[index], PresetKind::filament,
+                                  "/selection/filaments/" + std::to_string(index));
+        if (!valid.has_value()) return valid;
+    }
+    return detail::ResultAccess::success();
+}
+
+} // namespace
+
+Result<void> ProjectBuilder::set_selected_presets(PresetSelection selection)
+{
+    auto valid = check_builder(*state_);
+    if (!valid.has_value()) return valid;
+    if (selection.printer.ref.kind() != PresetKind::printer ||
+        selection.process.ref.kind() != PresetKind::process ||
+        selection.filaments.empty())
+        return detail::ResultAccess::failure(ErrorCode::invalid_argument,
+                                             "Preset selection kinds are invalid", "/selection");
+    for (std::size_t index = 0; index < selection.filaments.size(); ++index)
+        if (selection.filaments[index].ref.kind() != PresetKind::filament)
+            return detail::ResultAccess::failure(
+                ErrorCode::invalid_argument, "Filament selection kind is invalid",
+                "/selection/filaments/" + std::to_string(index));
+    state_->selection = std::move(selection);
+    return detail::ResultAccess::success();
+}
+
+Result<void> ProjectBuilder::set_project_overrides(ConfigPatch patch)
+{
+    auto valid = check_builder(*state_);
+    if (!valid.has_value()) return valid;
+    valid = validate_patch(state_->context->preset_catalog->schema, patch, OptionScope::project);
+    if (!valid.has_value()) return valid;
+    Slic3r::DynamicPrintConfig config = state_->project_config;
+    auto applied = replace_generic_config(config, state_->context->preset_catalog->schema, patch);
+    if (!applied.has_value()) return applied;
+    state_->project_overrides = std::move(patch);
+    state_->project_config = std::move(config);
+    return detail::ResultAccess::success();
+}
+
+Result<void> ProjectBuilder::set_project_filament_map(FilamentMapOverride map)
+{
+    auto valid = check_builder(*state_);
+    if (!valid.has_value()) return valid;
+    valid = validate_map_values(map, "/filament_map");
+    if (!valid.has_value()) return valid;
+    state_->project_filament_map = std::move(map);
+    return detail::ResultAccess::success();
+}
+
+Result<PlateId> ProjectBuilder::add_plate(std::string name, ConfigPatch overrides)
+{
+    auto valid = check_builder(*state_);
+    if (!valid.has_value())
+        return detail::ResultAccess::failure<PlateId>(*valid.error_code(),
+            valid.diagnostics().front().message, valid.diagnostics().front().field);
+    valid = validate_patch(state_->context->preset_catalog->schema, overrides, OptionScope::plate);
+    if (!valid.has_value())
+        return detail::ResultAccess::failure<PlateId>(*valid.error_code(),
+            valid.diagnostics().front().message, valid.diagnostics().front().field);
+    Slic3r::DynamicPrintConfig config;
+    auto applied = replace_generic_config(config, state_->context->preset_catalog->schema, overrides);
+    if (!applied.has_value())
+        return detail::ResultAccess::failure<PlateId>(*applied.error_code(),
+            applied.diagnostics().front().message, applied.diagnostics().front().field);
+    Slic3r::PlateData plate;
+    plate.plate_index = static_cast<int>(state_->plates.size());
+    plate.plate_name = std::move(name);
+    plate.locked = false;
+    plate.config = std::move(config);
+    state_->plates.push_back(std::move(plate));
+    return detail::ResultAccess::success(detail::ProjectIdAccess::plate(
+        state_->identity, static_cast<std::uint64_t>(state_->plates.back().plate_index + 1)));
+}
+
+Result<ObjectId> ProjectBuilder::add_object(ObjectInput input)
+{
+    auto valid = check_builder(*state_);
+    if (!valid.has_value())
+        return detail::ResultAccess::failure<ObjectId>(*valid.error_code(),
+            valid.diagnostics().front().message, valid.diagnostics().front().field);
+    if (input.parts.empty())
+        return detail::ResultAccess::failure<ObjectId>(
+            ErrorCode::invalid_argument, "Object must contain at least one mesh part",
+            "/object/parts");
+    std::uint64_t added_triangles = 0;
+    for (std::size_t index = 0; index < input.parts.size(); ++index) {
+        const auto count = input.parts[index].mesh.triangles.size();
+        if (std::numeric_limits<std::uint64_t>::max() - added_triangles < count)
+            return detail::ResultAccess::failure<ObjectId>(
+                ErrorCode::resource_limit_exceeded, "Mesh triangle count overflow",
+                "/object/parts/" + std::to_string(index) + "/mesh/triangles");
+        added_triangles += count;
+    }
+    if (state_->triangle_count > state_->context->options.limits.model_triangles ||
+        added_triangles > state_->context->options.limits.model_triangles - state_->triangle_count)
+        return detail::ResultAccess::failure<ObjectId>(
+            ErrorCode::resource_limit_exceeded, "Model triangle limit exceeded",
+            "/limits/model_triangles");
+    valid = validate_patch(state_->context->preset_catalog->schema, input.overrides,
+                           OptionScope::object);
+    if (!valid.has_value())
+        return detail::ResultAccess::failure<ObjectId>(*valid.error_code(),
+            valid.diagnostics().front().message, valid.diagnostics().front().field);
+
+    Slic3r::ModelObject *object = state_->model.add_object();
+    object->name = std::move(input.name);
+    if (!object->config.has("extruder") || object->config.extruder() == 0)
+        object->config.set_key_value("extruder", new Slic3r::ConfigOptionInt(1));
+    for (std::size_t index = 0; index < input.parts.size(); ++index) {
+        auto mesh = builder_mesh(input.parts[index].mesh,
+                                 "/object/parts/" + std::to_string(index) + "/mesh");
+        if (!mesh.has_value())
+            return detail::ResultAccess::failure<ObjectId>(*mesh.error_code(),
+                mesh.diagnostics().front().message, mesh.diagnostics().front().field);
+        valid = validate_patch(state_->context->preset_catalog->schema,
+                               input.parts[index].overrides, OptionScope::part);
+        if (!valid.has_value())
+            return detail::ResultAccess::failure<ObjectId>(*valid.error_code(),
+                valid.diagnostics().front().message, valid.diagnostics().front().field);
+        Slic3r::ModelVolume *volume = object->add_volume(
+            std::move(mesh).value(), Slic3r::ModelVolumeType::MODEL_PART, false);
+        volume->name = std::move(input.parts[index].name);
+        volume->source.object_idx = static_cast<int>(state_->model.objects.size() - 1);
+        volume->source.volume_idx = static_cast<int>(index);
+        Slic3r::DynamicPrintConfig part_config;
+        auto applied = replace_generic_config(part_config, state_->context->preset_catalog->schema,
+                                              input.parts[index].overrides);
+        if (!applied.has_value())
+            return detail::ResultAccess::failure<ObjectId>(*applied.error_code(),
+                applied.diagnostics().front().message, applied.diagnostics().front().field);
+        volume->config.assign_config(std::move(part_config));
+    }
+    Slic3r::DynamicPrintConfig object_config = object->config.get();
+    auto applied = replace_generic_config(object_config, state_->context->preset_catalog->schema,
+                                          input.overrides);
+    if (!applied.has_value())
+        return detail::ResultAccess::failure<ObjectId>(*applied.error_code(),
+            applied.diagnostics().front().message, applied.diagnostics().front().field);
+    object->config.assign_config(std::move(object_config));
+    state_->triangle_count += added_triangles;
+    return detail::ResultAccess::success(detail::ProjectIdAccess::object(
+        state_->identity, object->id().id));
+}
+
+Result<InstanceId> ProjectBuilder::add_instance(PlateId plate, ObjectId object_id,
+                                                Matrix4d transform)
+{
+    auto valid = check_builder(*state_);
+    if (!valid.has_value())
+        return detail::ResultAccess::failure<InstanceId>(*valid.error_code(),
+            valid.diagnostics().front().message, valid.diagnostics().front().field);
+    if (!detail::ProjectIdAccess::belongs(plate, state_->identity))
+        return detail::ResultAccess::failure<InstanceId>(
+            ErrorCode::not_found, "Plate was not found", "/plate");
+    if (plate.value() == 0 || plate.value() > state_->plates.size())
+        return detail::ResultAccess::failure<InstanceId>(
+            ErrorCode::not_found, "Plate was not found", "/plate");
+    const auto object_index = object_position(state_->model, object_id, state_->identity);
+    if (!object_index)
+        return detail::ResultAccess::failure<InstanceId>(
+            ErrorCode::not_found, "Object was not found", "/object");
+    auto core_transform = builder_transform(transform, "/transform");
+    if (!core_transform.has_value())
+        return detail::ResultAccess::failure<InstanceId>(*core_transform.error_code(),
+            core_transform.diagnostics().front().message,
+            core_transform.diagnostics().front().field);
+    Slic3r::ModelObject *object = state_->model.objects[*object_index];
+    const std::size_t instance_index = object->instances.size();
+    Slic3r::ModelInstance *instance = object->add_instance();
+    instance->set_transformation(std::move(core_transform).value());
+    state_->plates[static_cast<std::size_t>(plate.value() - 1)].objects_and_instances.emplace_back(
+        static_cast<int>(*object_index), static_cast<int>(instance_index));
+    return detail::ResultAccess::success(detail::ProjectIdAccess::instance(
+        state_->identity, instance->id().id));
+}
+
+Result<void> ProjectBuilder::set_layer_ranges(ObjectId object_id, std::vector<LayerRange> ranges)
+{
+    auto valid = check_builder(*state_);
+    if (!valid.has_value()) return valid;
+    const auto object_index = object_position(state_->model, object_id, state_->identity);
+    if (!object_index)
+        return detail::ResultAccess::failure(ErrorCode::not_found,
+                                             "Object was not found", "/object");
+    Slic3r::t_layer_config_ranges staged;
+    double previous_end = -std::numeric_limits<double>::infinity();
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        const auto &range = ranges[index];
+        if (!std::isfinite(range.z_min_mm) || !std::isfinite(range.z_max_mm) ||
+            range.z_min_mm < 0.0 || range.z_min_mm >= range.z_max_mm ||
+            range.z_min_mm < previous_end)
+            return detail::ResultAccess::failure(
+                ErrorCode::invalid_argument,
+                "Layer ranges must be finite, ordered, and non-overlapping",
+                "/layer_ranges/" + std::to_string(index));
+        valid = validate_patch(state_->context->preset_catalog->schema, range.overrides,
+                               OptionScope::layer_range);
+        if (!valid.has_value()) return valid;
+        Slic3r::DynamicPrintConfig config;
+        auto applied = detail::apply_patch_to_core_config(range.overrides, config);
+        if (!applied.has_value()) return applied;
+        Slic3r::ModelConfig model_config;
+        model_config.assign_config(std::move(config));
+        staged.emplace(Slic3r::t_layer_height_range{range.z_min_mm, range.z_max_mm},
+                       std::move(model_config));
+        previous_end = range.z_max_mm;
+    }
+    state_->model.objects[*object_index]->layer_config_ranges = std::move(staged);
+    return detail::ResultAccess::success();
+}
+
+Result<Project> ProjectBuilder::build()
+{
+    auto valid = check_builder(*state_);
+    if (!valid.has_value())
+        return detail::ResultAccess::failure<Project>(*valid.error_code(),
+            valid.diagnostics().front().message, valid.diagnostics().front().field);
+    if (state_->plates.empty())
+        return detail::ResultAccess::failure<Project>(
+            ErrorCode::invalid_argument, "Project must contain at least one plate", "/plates");
+    std::size_t instance_count = 0;
+    std::set<std::pair<int, int>> assigned_instances;
+    for (std::size_t plate_index = 0; plate_index < state_->plates.size(); ++plate_index) {
+        auto &plate = state_->plates[plate_index];
+        if (plate.plate_index != static_cast<int>(plate_index))
+            return detail::ResultAccess::failure<Project>(
+                ErrorCode::invalid_configuration, "Plate identities are invalid", "/plates");
+        for (const auto &binding : plate.objects_and_instances) {
+            if (!assigned_instances.insert(binding).second)
+                return detail::ResultAccess::failure<Project>(
+                    ErrorCode::invalid_configuration,
+                    "Every model instance must belong to exactly one plate", "/plates");
+        }
+    }
+    for (std::size_t object_index = 0; object_index < state_->model.objects.size(); ++object_index) {
+        const auto *object = state_->model.objects[object_index];
+        if (object->volumes.empty())
+            return detail::ResultAccess::failure<Project>(
+                ErrorCode::invalid_argument, "Object must contain at least one part",
+                "/objects/" + std::to_string(object_index) + "/parts");
+        if (object->instances.empty())
+            return detail::ResultAccess::failure<Project>(
+                ErrorCode::invalid_argument, "Object must have at least one plate instance",
+                "/objects/" + std::to_string(object_index) + "/instances");
+        for (std::size_t instance_index = 0; instance_index < object->instances.size();
+             ++instance_index) {
+            const auto binding = std::make_pair(static_cast<int>(object_index),
+                                                static_cast<int>(instance_index));
+            if (!assigned_instances.count(binding))
+                return detail::ResultAccess::failure<Project>(
+                    ErrorCode::invalid_configuration,
+                    "Every model instance must belong to exactly one plate", "/plates");
+            ++instance_count;
+        }
+    }
+    if (state_->model.objects.empty() || instance_count == 0)
+        return detail::ResultAccess::failure<Project>(
+            ErrorCode::invalid_argument, "Project must contain printable model instances",
+            "/objects");
+
+    std::optional<Slic3r::DynamicPrintConfig> selected_printer_config;
+    valid = validate_builder_selection(*state_, selected_printer_config);
+    if (!valid.has_value())
+        return detail::ResultAccess::failure<Project>(*valid.error_code(),
+            valid.diagnostics().front().message, valid.diagnostics().front().field);
+
+    const std::size_t slot_count = state_->selection->filaments.size();
+    Slic3r::DynamicPrintConfig project_config = state_->project_config;
+    const FilamentMapOverride map = state_->project_filament_map.value_or(
+        FilamentMapOverride{FilamentMapMode::manual,
+                            std::vector<ToolId>(slot_count, ToolId{1})});
+    auto map_valid = validate_map(map, slot_count, "/filament_map");
+    if (!map_valid.has_value())
+        return detail::ResultAccess::failure<Project>(ErrorCode::invalid_configuration,
+            map_valid.diagnostics().front().message, map_valid.diagnostics().front().field);
+    const std::size_t tool_count = selected_printer_config
+        ? physical_tool_count(*selected_printer_config) : 0;
+    for (std::size_t index = 0; index < map.tools.size(); ++index)
+        if (tool_count == 0 || map.tools[index].value > tool_count)
+            return detail::ResultAccess::failure<Project>(
+                ErrorCode::invalid_configuration,
+                "Filament map references an unavailable physical tool",
+                "/filament_map/tools/" + std::to_string(index));
+    apply_project_map(project_config, map);
+    project_config.option<Slic3r::ConfigOptionString>(
+        "printer_settings_id", true)->value = state_->selection->printer.ref.id();
+    project_config.option<Slic3r::ConfigOptionString>(
+        "print_settings_id", true)->value = state_->selection->process.ref.id();
+    auto &filament_ids = project_config.option<Slic3r::ConfigOptionStrings>(
+        "filament_settings_id", true)->values;
+    filament_ids.clear();
+    for (const auto &filament : state_->selection->filaments)
+        filament_ids.push_back(filament.ref.id());
+
+    auto data = std::make_shared<detail::ProjectData>(
+        state_->context->preset_catalog->schema, state_->context->options.limits,
+        *state_->selection, state_->identity);
+    data->project_overrides = state_->project_overrides;
+    data->project_config = std::move(project_config);
+    data->model = std::move(state_->model);
+    data->plates = std::move(state_->plates);
+
+    auto patch_valid = validate_patch_for_commit(data->schema, data->project_overrides,
+        OptionScope::project, std::nullopt, slot_count, "/project_overrides");
+    if (!patch_valid.has_value())
+        return detail::ResultAccess::failure<Project>(*patch_valid.error_code(),
+            patch_valid.diagnostics().front().message, patch_valid.diagnostics().front().field);
+    for (std::size_t plate_index = 0; plate_index < data->plates.size(); ++plate_index) {
+        auto patch = detail::config_to_generic_patch(data->plates[plate_index].config, data->schema);
+        if (!patch.has_value())
+            return detail::ResultAccess::failure<Project>(*patch.error_code(),
+                patch.diagnostics().front().message, patch.diagnostics().front().field);
+        patch_valid = validate_patch_for_commit(data->schema, patch.value(), OptionScope::plate,
+            std::nullopt, slot_count,
+            "/plates/" + std::to_string(plate_index) + "/overrides");
+        if (!patch_valid.has_value())
+            return detail::ResultAccess::failure<Project>(*patch_valid.error_code(),
+                patch_valid.diagnostics().front().message,
+                patch_valid.diagnostics().front().field);
+    }
+    for (const Slic3r::ModelObject *object : data->model.objects) {
+        auto patch = detail::config_to_generic_patch(object->config.get(), data->schema);
+        if (!patch.has_value())
+            return detail::ResultAccess::failure<Project>(*patch.error_code(),
+                patch.diagnostics().front().message, patch.diagnostics().front().field);
+        patch_valid = validate_patch_for_commit(data->schema, patch.value(), OptionScope::object,
+            std::nullopt, slot_count,
+            "/objects/" + std::to_string(object->id().id) + "/overrides");
+        if (!patch_valid.has_value())
+            return detail::ResultAccess::failure<Project>(*patch_valid.error_code(),
+                patch_valid.diagnostics().front().message,
+                patch_valid.diagnostics().front().field);
+        for (const Slic3r::ModelVolume *volume : object->volumes) {
+            patch = detail::config_to_generic_patch(volume->config.get(), data->schema);
+            if (!patch.has_value())
+                return detail::ResultAccess::failure<Project>(*patch.error_code(),
+                    patch.diagnostics().front().message, patch.diagnostics().front().field);
+            patch_valid = validate_patch_for_commit(data->schema, patch.value(),
+                OptionScope::part, std::nullopt, slot_count,
+                "/parts/" + std::to_string(volume->id().id) + "/overrides");
+            if (!patch_valid.has_value())
+                return detail::ResultAccess::failure<Project>(*patch_valid.error_code(),
+                    patch_valid.diagnostics().front().message,
+                    patch_valid.diagnostics().front().field);
+        }
+        std::size_t range_index = 0;
+        for (const auto &[range, config] : object->layer_config_ranges) {
+            (void) range;
+            patch = detail::config_to_generic_patch(config.get(), data->schema);
+            if (!patch.has_value())
+                return detail::ResultAccess::failure<Project>(*patch.error_code(),
+                    patch.diagnostics().front().message, patch.diagnostics().front().field);
+            patch_valid = validate_patch_for_commit(data->schema, patch.value(),
+                OptionScope::layer_range, std::nullopt, slot_count,
+                "/objects/" + std::to_string(object->id().id) + "/layer_ranges/" +
+                    std::to_string(range_index++) + "/overrides");
+            if (!patch_valid.has_value())
+                return detail::ResultAccess::failure<Project>(*patch_valid.error_code(),
+                    patch_valid.diagnostics().front().message,
+                    patch_valid.diagnostics().front().field);
+        }
+    }
+
+    auto project_state = std::make_shared<Project::State>();
+    project_state->current = std::move(data);
+    project_state->context = state_->context;
+    state_->terminal = true;
+    return detail::ResultAccess::success(Project(std::move(project_state)));
+}
+
+void ProjectBuilder::discard() noexcept
+{
+    state_->terminal = true;
+}
 
 Result<void> ProjectEdit::set_project_selected_presets(PresetSelection selection, SlotRemap remap)
 {
@@ -1835,7 +2405,7 @@ Result<detail::FrozenSliceInput> resolve_impl(
     EffectiveConfiguration effective = detail::EffectiveConfigurationAccess::make(
         catalog->schema, std::move(values).value(), std::move(provenance), std::move(config));
     return detail::ResultAccess::success(detail::FrozenSliceInput{
-        context, snapshot, plate, std::move(effective), std::move(map)});
+        context, snapshot, plate, std::move(effective), std::move(map), {}});
 }
 
 } // namespace

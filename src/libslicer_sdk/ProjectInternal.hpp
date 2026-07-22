@@ -1,6 +1,7 @@
 #pragma once
 
 #include <libslicer/v1/Project.hpp>
+#include <libslicer/v1/Slice.hpp>
 
 #include "ContextInternal.hpp"
 
@@ -36,9 +37,11 @@ struct ProjectIdAccess {
     static PlateId plate(std::shared_ptr<const ProjectIdentity> project, std::uint64_t value);
     static ObjectId object(std::shared_ptr<const ProjectIdentity> project, std::uint64_t value);
     static PartId part(std::shared_ptr<const ProjectIdentity> project, std::uint64_t value);
+    static InstanceId instance(std::shared_ptr<const ProjectIdentity> project, std::uint64_t value);
     static bool belongs(const PlateId &id, const std::shared_ptr<const ProjectIdentity> &project);
     static bool belongs(const ObjectId &id, const std::shared_ptr<const ProjectIdentity> &project);
     static bool belongs(const PartId &id, const std::shared_ptr<const ProjectIdentity> &project);
+    static bool belongs(const InstanceId &id, const std::shared_ptr<const ProjectIdentity> &project);
 };
 
 struct ProjectSnapshotAccess {
@@ -100,6 +103,7 @@ struct FrozenSliceInput {
     PlateId plate;
     EffectiveConfiguration configuration;
     EffectiveFilamentMap filament_map;
+    SliceOutputOptions output;
 };
 
 Result<FrozenSliceInput> resolve_slice_input(
@@ -140,6 +144,22 @@ struct ProjectEdit::State {
     std::set<std::uint64_t> layer_ranges_set;
     bool project_map_set {false};
     std::set<std::uint64_t> local_map_set;
+};
+
+struct ProjectBuilder::State {
+    explicit State(std::shared_ptr<detail::ContextState> context_value)
+        : context(std::move(context_value)), owner(std::this_thread::get_id()) {}
+    std::shared_ptr<detail::ContextState> context;
+    std::thread::id owner;
+    bool terminal {false};
+    std::shared_ptr<const detail::ProjectIdentity> identity;
+    std::optional<PresetSelection> selection;
+    std::optional<FilamentMapOverride> project_filament_map;
+    ConfigPatch project_overrides;
+    Slic3r::DynamicPrintConfig project_config;
+    Slic3r::Model model;
+    std::vector<Slic3r::PlateData> plates;
+    std::uint64_t triangle_count {0};
 };
 
 struct EffectiveConfiguration::State {

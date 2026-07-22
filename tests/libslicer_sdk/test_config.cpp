@@ -44,6 +44,8 @@ ContextOptions context_options(const std::filesystem::path &root)
              256ull * 1024 * 1024,
              2'000'000,
              128ull * 1024 * 1024,
+             128ull * 1024 * 1024,
+             5'000'000,
              128ull * 1024 * 1024}};
 }
 
@@ -151,6 +153,8 @@ TEST_CASE("SdkContext public validation reports each zero resource limit",
         "/limits/project_uncompressed_bytes",
         "/limits/model_triangles",
         "/limits/gcode_bytes",
+        "/limits/preview_bytes",
+        "/limits/preview_moves",
         "/limits/temporary_disk_bytes"};
 
     for (std::size_t index = 0; index < fields.size(); ++index) {
@@ -160,7 +164,9 @@ TEST_CASE("SdkContext public validation reports each zero resource limit",
         case 1: options.limits.project_uncompressed_bytes = 0; break;
         case 2: options.limits.model_triangles = 0; break;
         case 3: options.limits.gcode_bytes = 0; break;
-        case 4: options.limits.temporary_disk_bytes = 0; break;
+        case 4: options.limits.preview_bytes = 0; break;
+        case 5: options.limits.preview_moves = 0; break;
+        case 6: options.limits.temporary_disk_bytes = 0; break;
         default: FAIL("unexpected resource limit index");
         }
 

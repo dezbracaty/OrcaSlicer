@@ -4,6 +4,7 @@
 #include "Preset.hpp"
 
 #include <filesystem>
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -34,12 +35,14 @@ private:                                                             \
     friend class Project;                                             \
     friend class ProjectSnapshot;                                     \
     friend class ProjectEdit;                                         \
+    friend class ProjectBuilder;                                      \
     friend struct detail::ProjectIdAccess;                            \
 };
 
 LIBSLICER_DECLARE_PROJECT_ID(PlateId)
 LIBSLICER_DECLARE_PROJECT_ID(ObjectId)
 LIBSLICER_DECLARE_PROJECT_ID(PartId)
+LIBSLICER_DECLARE_PROJECT_ID(InstanceId)
 #undef LIBSLICER_DECLARE_PROJECT_ID
 
 struct PlateInfo { PlateId id; std::string name; ConfigPatch overrides; bool locked; };
@@ -50,6 +53,35 @@ struct LayerRange {
     double      z_min_mm;
     double      z_max_mm;
     ConfigPatch overrides;
+};
+
+struct Vec3d { double x, y, z; };
+
+struct Triangle {
+    std::uint32_t a;
+    std::uint32_t b;
+    std::uint32_t c;
+};
+
+struct Matrix4d {
+    std::array<double, 16> row_major;
+};
+
+struct MeshData {
+    std::vector<Vec3d>   vertices_mm;
+    std::vector<Triangle> triangles;
+};
+
+struct MeshPartInput {
+    std::string name;
+    MeshData    mesh;
+    ConfigPatch overrides;
+};
+
+struct ObjectInput {
+    std::string                name;
+    std::vector<MeshPartInput> parts;
+    ConfigPatch                overrides;
 };
 
 struct SlotRemap { std::vector<std::optional<FilamentSlotId>> old_to_new; };
@@ -74,6 +106,7 @@ public:
     std::vector<PlateInfo> plates() const;
     std::vector<ObjectInfo> objects() const;
     std::vector<PartInfo> parts() const;
+    Result<std::vector<InstanceId>> instances(PlateId plate) const;
     Result<std::vector<LayerRange>> layer_ranges(ObjectId object) const;
     PresetSelection project_selected_presets() const;
 
@@ -88,8 +121,11 @@ private:
     friend class Project;
     friend class ProjectEdit;
     friend class SliceEngine;
+    friend class ProjectBuilder;
     friend struct detail::ProjectSnapshotAccess;
 };
+
+class Project;
 
 class ProjectEdit {
 public:
@@ -113,6 +149,27 @@ private:
     friend class Project;
 };
 
+class ProjectBuilder {
+public:
+    Result<void> set_selected_presets(PresetSelection selection);
+    Result<void> set_project_overrides(ConfigPatch patch);
+    Result<void> set_project_filament_map(FilamentMapOverride map);
+
+    Result<PlateId> add_plate(std::string name, ConfigPatch overrides = {});
+    Result<ObjectId> add_object(ObjectInput object);
+    Result<InstanceId> add_instance(PlateId plate, ObjectId object, Matrix4d transform);
+    Result<void> set_layer_ranges(ObjectId object, std::vector<LayerRange> ranges);
+
+    Result<Project> build();
+    void discard() noexcept;
+
+private:
+    struct State;
+    explicit ProjectBuilder(std::shared_ptr<State> state);
+    std::shared_ptr<State> state_;
+    friend class SdkContext;
+};
+
 class Project {
 public:
     static Result<Project> load(SdkContext &context, const std::filesystem::path &path);
@@ -125,6 +182,7 @@ private:
     explicit Project(std::shared_ptr<State> state);
     std::shared_ptr<State> state_;
     friend class ProjectEdit;
+    friend class ProjectBuilder;
 };
 
 class EffectiveConfiguration {

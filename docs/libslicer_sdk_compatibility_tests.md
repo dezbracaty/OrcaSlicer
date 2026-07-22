@@ -204,7 +204,7 @@ custom-G-code/embedded-preset CRUD；`json.hpp` 单独自包含，其他核心�
 | busy | active job 未终态时同 engine 再 submit | `/engine` |
 | unsupported | `SliceEngine::inspect()` 接收 auto filament mode | `/filament_map/mode` |
 | io | load 不存在或不可读 path | `/path` |
-| resource_limit_exceeded | G-code 写入超过 limit | `/limits/gcode_bytes` |
+| resource_limit_exceeded | G-code 或 preview 写入超过 limit | `/limits/gcode_bytes`、`/limits/preview_bytes` 或 `/limits/preview_moves` |
 | invalid_configuration | validate 拒绝已解析配置 | 对应 `/configuration/<OptionId>` |
 | cancelled | StageBarrier 到达后 cancel 并 wait | `/job` |
 | slicing_failed | test hook 在 validate 成功后的 process/export 注入 core failure | `/slice` |
@@ -504,6 +504,27 @@ excluded、object scope 和 wipe-tower 参数。分别切每个 PlateId，验证
 custom G-code 和 plate index 正确，输出分别匹配各自 historical golden；连续交替切 plate 不得
 复用上一 plate 状态。
 
+### PRJ-11：GPlatform-style mesh builder
+
+public contract test 只包含 `<libslicer/v1/...>`，用 `ProjectBuilder` 从已解析 triangle mesh 构建
+Project，不经过 3MF 临时文件、不调用 STL/OBJ importer、不 include Orca/libslic3r 私有头。
+fixture 至少包含两个 object、多个 mesh part、两个 plate、多个 instance、object/part/layer-range
+overrides 和 manual filament map。`build()` 成功后必须能 snapshot、edit、inspect 和 submit。
+
+### PRJ-12：builder 与等价 Orca 3MF baseline
+
+为同一 scene 准备等价 Orca/Bambu project 3MF golden。分别通过 `ProjectBuilder` 和
+`Project::load()` 构建 Project，比较 project/plate/object/part/layer-range patch、selected
+presets、manual map、切片 diagnostics、statistics 和 normalized G-code SHA-256。允许 3MF metadata
+只存在于 load 路径，但不得影响切片结果。
+
+### PRJ-13：builder 输入边界
+
+分别验证空 mesh、空 object、空 part 列表、triangle index 越界、退化 triangle、NaN/Inf 坐标、
+NaN/Inf transform、跨工程/过期 ObjectId、无 selection、缺 manual map、超出 `model_triangles`
+limit 均返回规定错误，不发布部分 Project。`ResourceProbe` 证明 triangle 计数按 unique geometry
+而不是 instance 数累计。
+
 ## 7. 切片 inspection 与配置解析测试
 
 ### RES-01：全局/plate 合成顺序
@@ -595,12 +616,40 @@ SliceResult。
 ### SLC-04：原始 G-code bytes
 
 用内部 fake byte exporter 分别产生 embedded NUL、非 UTF-8、高位 bytes 和末尾 NUL，验证
-`gcode_bytes.size()` 与输入长度完全相等并逐字节比较；不追加 NUL、不做编码转换。3MF/XML
-无法合法承载的 byte pattern 只用于 adapter conformance test，不伪装成 3MF fixture。
+`gcode_bytes.has_value()` 且 `gcode_bytes->size()` 与输入长度完全相等并逐字节比较；不追加 NUL、
+不做编码转换。3MF/XML 无法合法承载的 byte pattern 只用于 adapter conformance test，不伪装成
+3MF fixture。
 
 ### SLC-05：post-process
 
 非空 post-process 配置在执行任何外部命令前返回 `invalid_configuration`。
+
+### SLC-06：输出模式
+
+同一 fixture 分别运行 gcode-only、preview-only 和 gcode+preview。gcode-only 不生成 preview；
+preview-only 不返回 `gcode_bytes` 但返回完整 preview；gcode+preview 的 G-code、statistics、final
+map 和 preview 必须来自同一次 slice。`include_gcode=false && preview=none` 返回
+`invalid_argument`。
+
+### SLC-07：preview 来源
+
+用 `PreviewProbe` 证明 preview 由本次 `GCodeProcessorResult` 转换，不通过重新解析 G-code。
+测试注入一个会让 G-code reparse 与 processor 结果可区分的 move/event case，断言公开 preview
+匹配 processor oracle，而不是 G-code 文本 oracle。不得链接或恢复 worker target。
+
+### SLC-08：preview 字段语义
+
+固定 preview fixtures 覆盖 layers、tools、filaments、colors、moves 和 events。逐字段比较
+metadata、object/instance 列表、layer print Z/height/duration、tool/nozzle/offset、
+filament/tool/color、move type/path kind/extrusion role、start/end/arc、width/height、speed、
+temperature、fan、time、print Z 和 joint_angle_end_rad。object/instance 只有可证明时填 ID；
+不可证明时必须为空 optional，不能猜测。
+
+### SLC-09：preview 复杂场景
+
+多耗材、多 tool、color change、tool change、support、retract/unretract、wipe tower 和带 joint
+angle 的 fixture 必须产生稳定 preview。public enum 映射未知 core 值时返回 `unknown` 加 warning，
+不能泄漏 core enum 数值或 worker wire 常量。
 
 ## 10. Job、取消和线程测试
 
@@ -645,8 +694,8 @@ expected revision 的 commit 返回 `conflict`；不死锁、不混合 state。
 
 ### JOB-08：输入不借用
 
-所有接收 string/string_view/vector/ConfigPatch/callback 的入口在返回或提交后立即销毁、覆盖
-原调用方 buffer，并用 `LifetimeProbe` 验证后续任务不再读取原地址；公开结果仍保持原值。
+所有接收 string/string_view/vector/ConfigPatch/mesh DTO/callback 的入口在返回或提交后立即销毁、
+覆盖原调用方 buffer，并用 `LifetimeProbe` 验证后续任务不再读取原地址；公开结果仍保持原值。
 
 ### JOB-09：初始 context handle 生命周期
 
@@ -664,9 +713,11 @@ LifetimeProbe 验证 context state 才关闭。
 - archive uncompressed bytes；
 - model triangles；
 - temporary disk bytes；
-- G-code bytes。
+- G-code bytes；
+- preview bytes；
+- preview moves。
 
-首先对五个字段逐一设置 0，其他字段保持有效，`SdkContext::create()` 必须返回
+首先对每个 limit 字段逐一设置 0，其他字段保持有效，`SdkContext::create()` 必须返回
 `invalid_argument`，field 精确为 `/limits/<field>`。
 
 按 API 第 6 节冻结的计数口径构造边界 oracle：
@@ -677,11 +728,14 @@ LifetimeProbe 验证 context state 才关闭。
 - model triangles：成功 materialize 的唯一 mesh geometry facets 数，instance 不重复计数；
 - temporary disk：同一时刻全部 SDK-owned temporary files 的 aggregate live-byte high-water，
   覆盖写不累计历史写入量；
-- G-code：sink 已 commit 的原始 bytes，总数也即单次结果 high-water。
+- G-code：sink 已 commit 的原始 bytes，总数也即单次结果 high-water；
+- preview bytes：memory DTO 或 artifact payload 已 commit bytes；
+- preview moves：公开 PreviewMove record 数。
 
-每项超限必须返回 `resource_limit_exceeded`，不发布部分 Project 或 SliceResult。G-code 超限
-测试通过 `ResourceProbe` 断言每次 reserve/write 前检查，sink high-water mark 不超过 limit，
-并证明没有先生成超预算完整输出再 stat/read-back/truncate。
+每项超限必须返回 `resource_limit_exceeded`，不发布部分 Project、SliceResult、preview 或
+artifact。G-code/preview 超限测试通过 `ResourceProbe` 断言每次 reserve/write/append 前检查，
+sink high-water mark 不超过 limit，并证明没有先生成超预算完整输出再 stat/read-back/truncate。
+artifact case 还必须证明临时文件未原子发布，取消或超限不留下可被误认为成功结果的文件。
 
 加入 zip-bomb 风格 archive、极大 XML 声明值和恶意 entry size fixture，验证在实际扩张前
 拒绝。`ResourceProbe` 分别记录 declared bytes、requested growth 和 committed growth；断言
@@ -696,8 +750,8 @@ LifetimeProbe 验证 context state 才关闭。
 | --- | --- |
 | G1 公共基础 | API-01..05、CFG-01..06 |
 | G2 预设 | PRE-01..07 |
-| G3 工程 | PRJ-01..10、RES-01..04、MAP-01/03/04/05 |
-| G4 切片 | MAP-02、SLC-01..05、JOB-01..09 |
+| G3 工程 | PRJ-01..13、RES-01..04、MAP-01/03/04/05 |
+| G4 切片 | MAP-02、SLC-01..09、JOB-01..09 |
 | G5 发布 | 全部资源限制、安装 consumer、完整 ctest |
 
 任何 gate 失败都不能通过删除断言、放宽 baseline、跳过已知 ConfigOptionType 或改写 fixture

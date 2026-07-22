@@ -23,9 +23,11 @@ internal implementation │
   RuntimeCoordinator
     ├─ PresetCatalogAdapter
     ├─ Orca3mfAdapter
+    ├─ SceneBuilderAdapter
     ├─ OrcaConfigAdapter
     ├─ SliceInputResolver
     ├─ PrintAdapter
+    ├─ PreviewAdapter
     └─ BoundedGcodeSink
 ```
 
@@ -34,10 +36,12 @@ internal implementation │
 - `RuntimeCoordinator`：隔离和串行化依赖进程级路径、静态状态或非线程安全 core 的任务；
 - `PresetCatalogAdapter`：repository preset 的加载、继承、兼容性、编辑和保存；
 - `Orca3mfAdapter`：Orca/Bambu project 3MF load/save 与 project state 转换；
+- `SceneBuilderAdapter`：把公开 mesh/scene DTO materialize 成内部 Model/ProjectState；
 - `OrcaConfigAdapter`：schema、ConfigValue 与 core option 的无损双向转换；
 - `SliceInputResolver`：由 SliceEngine inspect/submit 调用，固定 revision 并解析 global/plate 配置；
 - `PrintAdapter`：从不可变 snapshot 构造一次性切片状态并驱动 validate/process/export；
-- `BoundedGcodeSink`：在 G-code 增长过程中执行输出预算检查。
+- `PreviewAdapter`：把同一次切片产生的 `GCodeProcessorResult` 转换成公共 preview DTO 或 artifact；
+- `BoundedGcodeSink`：在 G-code/preview/artifact 增长过程中执行输出预算检查。
 
 这些名称允许修改，但职责不能遗漏。
 
@@ -264,6 +268,34 @@ ProjectSnapshot 引用不可变 ProjectState。ProjectEdit 从 expected revision
 save 捕获恰好 expected revision 的完整 state 并输出临时文件；完整成功后再替换目标文件。
 具体替换手段按平台实现，但不能让成功文件混合两个 revision。
 
+### 6.1 SceneBuilderAdapter
+
+`SceneBuilderAdapter` 是 `ProjectBuilder` 的唯一实现入口，负责把公开 DTO 转换成与
+`Orca3mfAdapter` load 后等价的内部 `ProjectState`。它不能要求调用方 include `libslic3r` 私有头，
+也不能把公开 DTO 临时序列化成 3MF 再调用 importer 作为主路径。
+
+转换顺序固定为：
+
+```text
+validate public DTO
+  → materialize unique mesh geometry
+  → create ModelObject / volume-part state
+  → create plate and instance state
+  → attach project/plate/object/part/layer-range ConfigPatch
+  → attach preset selection and manual filament map
+  → run same ProjectState validation as 3MF load
+  → publish Project
+```
+
+校验必须在 publish 前完成：UTF-8/NUL 字符串、finite 坐标、triangle index、退化 triangle、空
+mesh、transform、plate/object binding、selection revision、manual map 完整性和资源 limit 均不得
+延迟到切片中途才失败。`model_triangles` 统计 materialized unique geometry，不按 instance 重复
+计数。
+
+builder 不做自动排版、不移动模型、不执行 mesh repair 的猜测行为。若 core materialize 需要
+修正 winding、法线或内部缓存，这属于不可观察实现细节；不得改变公开坐标单位、instance
+transform 或配置分层。
+
 ## 7. 配置解析：禁止压平 Model scope
 
 `PresetBundle::full_fff_config()` 的等价逻辑只负责产生全局 preset/project 基线；随后只叠加
@@ -351,21 +383,50 @@ prepare immutable input copy
   → apply(global + plate config, layered Model)
   → validate
   → process
-  → export G-code
+  → export requested G-code and fill GCodeProcessorResult
+  → convert requested preview from GCodeProcessorResult
   → collect statistics and diagnostics
   → publish immutable SliceResult
 ```
 
 任一阶段失败或取消都丢弃 staged output。只有全部阶段成功才发布 SliceResult。
 
+请求的 G-code、statistics、final map 和 preview 必须来自同一个 `FrozenSliceInput`、同一个内部
+Print/Model 副本和同一次 process/export。preview-only 仍使用同一次 export 阶段填充的
+`GCodeProcessorResult`，但不得向 SliceResult 发布 `gcode_bytes`。禁止在 `PreviewAdapter` 中重新
+解析已生成的 G-code 作为 fallback，也禁止把旧 worker 的 `.orcapv` wire type、shared-memory
+transport 或 protocol headers 重新暴露给公共 SDK。
+
 取消通过 core 已有取消检查和 SDK 阶段边界共同实现。终态只能发布一次。callback 由独立
 dispatcher 读取事件队列，避免在 core 内部栈上执行 App 代码。
+
+### 9.1 PreviewAdapter
+
+`PreviewAdapter` 的输入是本次 export 填充的 `GCodeProcessorResult`、冻结的 project entity
+mapping、final manual filament map 和 printer/filament metadata。输出是公共 `SlicePreview` DTO
+或 SDK-owned artifact。
+
+字段语义以旧 preview artifact v2 为基础：metadata、layers、tools、filaments、colors、objects/
+instances 可证明映射、moves 和 events。公共 enum 必须由 SDK 自己定义；内部 extrusion role、
+move type、color source 和 path kind 通过显式转换表映射，未知值映射到公共 `unknown` 并保留
+diagnostic warning，不能把 core enum 值透传给调用方。
+
+object/instance 归属必须通过冻结 project state 与 processor move 的稳定关联证明。无法证明时
+公共 optional 置空；不得根据空间位置、名称或索引猜测。颜色、tool、filament、layer、width、
+height、speed、temperature、fan、time 和 joint angle 等字段按 processor 原始单位转换成 API
+规定的 mm、秒、摄氏度和百分比。
+
+artifact 输出只是公共 DTO 的一种持久化传输形式。它可以复用旧 `.orcapv v2` 的 schema 字段语义
+和二进制布局经验，但不承诺旧 worker ABI，不安装旧 worker headers，也不恢复 worker target。
+写 artifact 必须先写 SDK-owned 临时文件，完成 preview bytes/moves/temporary disk 预算检查后
+原子发布到 `preview_artifact_path`。
 
 ## 10. BoundedGcodeSink 与资源预算
 
 计数严格使用 API 第 6 节口径：输入实际 byte length；每个 archive entry 的 decompressor output
 累计且重复 entry 重复计数；triangle 按 materialized unique mesh geometry facets；temporary
-disk 按全部 SDK-owned live files 的 aggregate high-water；G-code 按 sink committed bytes。
+disk 按全部 SDK-owned live files 的 aggregate high-water；G-code 按 sink committed bytes；
+preview bytes 按内存 DTO/artifact payload committed bytes；preview moves 按 move record 数。
 所有计数在下一次增长前检查，等于 limit 允许。
 
 G-code writer 应直接写入受限 sink。sink 每次 reserve/write 前检查剩余预算，超限立即取消
@@ -373,7 +434,14 @@ export 并返回 `resource_limit_exceeded`。禁止先完整写到无界 path/ve
 或截断伪装成限制。
 
 如果现有 exporter 只能写文件，应为其增加内部受限输出抽象或严格受控的 file sink；不能把
-内部文件路径暴露成公共结果。成功后 `gcode_bytes` 以精确 byte count 移交 SliceResult。
+内部文件路径暴露成公共结果。`include_gcode=true` 成功后，`gcode_bytes` 以精确 byte count
+移交 SliceResult；`include_gcode=false` 时该 sink 只允许作为内部 processor 填充通道存在，最终
+不得发布 G-code bytes。
+
+preview memory builder 和 artifact writer 使用同一预算模型。`preview_moves` 在追加 move 前检查；
+`preview_bytes` 在追加序列化 payload 或 DTO owned storage 前检查。artifact 临时文件还必须计入
+`temporary_disk_bytes`。超限、取消或转换失败时删除临时 artifact，并且不得发布 `SlicePreview`、
+artifact path 或半截 SliceResult。
 
 ## 11. 线程实现要求
 
@@ -392,9 +460,12 @@ export 并返回 `resource_limit_exceeded`。禁止先完整写到无界 path/ve
 - `StageBarrier`：在 queued/preparing/validating/slicing/exporting 的确定边界阻塞并确认已到达，
   用于无竞态取消测试；
 - `ResourceProbe`：记录 archive 声明/实际扩张 bytes、unique-mesh triangle 计数、全部临时文件的
-  aggregate live/high-water、G-code sink reserve/write/committed high-water；
+  aggregate live/high-water、G-code sink reserve/write/committed high-water、preview bytes/moves
+  reserve/write/committed high-water；
 - `CoreCallProbe`：记录 plate index、参与切片的 instance IDs、apply/process/export 次数，以及
   auto-map 计算入口是否被调用；
+- `PreviewProbe`：记录 preview 是否由本次 `GCodeProcessorResult` 转换、转换的 layer/tool/
+  filament/color/move/event 数、object/instance 归属缺失原因，以及 artifact 临时文件发布/清理；
 - `LifetimeProbe`：验证公开输入复制完成后不再借用调用方 buffer。
 - `FailureInjectionHook`：只在 test target 中分别于 validate 成功后的 process、export，以及
   facade 未分类异常边界注入确定性失败，用于验证 `slicing_failed` 和 `internal` 映射。
@@ -411,8 +482,8 @@ export 并返回 `resource_limit_exceeded`。禁止先完整写到无界 path/ve
 除 `FailureInjectionHook` 和 `PresetFailureInjectionHook` 外，hooks 只观察或暂停既有阶段。
 两个 injection hook 仅编译进 test target，生产 target 不含注入分支；未启用注入时不得改变
 计算结果。compatibility tests 必须用
-这些计数器证明超限发生在扩张前、G-code high-water mark 不超过 limit，并确定性触发各阶段
-取消和错误映射。
+这些计数器证明超限发生在扩张前、G-code/preview high-water mark 不超过 limit，并确定性触发各
+阶段取消和错误映射。
 
 ## 13. 安装边界
 
@@ -429,10 +500,11 @@ directory。
 2. Context state、RuntimeCoordinator 和资源限制骨架；
 3. repository preset adapter 与事务；
 4. Orca 3MF load/snapshot/edit/save；
-5. SliceInputResolver 与 SliceEngine inspect/submit 同步冻结，严格保持 global/plate 与 Model scopes 分离；
-6. manual filament map 验证；
-7. PrintAdapter、取消、G-code sink 和统计；
-8. 安装导出和兼容性测试。
+5. ProjectBuilder 与 SceneBuilderAdapter；
+6. SliceInputResolver 与 SliceEngine inspect/submit 同步冻结，严格保持 global/plate 与 Model scopes 分离；
+7. manual filament map 验证；
+8. PrintAdapter、PreviewAdapter、取消、G-code/preview sink 和统计；
+9. 安装导出和兼容性测试。
 
 每一阶段必须先通过
 [`libslicer_sdk_compatibility_tests.md`](./libslicer_sdk_compatibility_tests.md) 对应 gate，

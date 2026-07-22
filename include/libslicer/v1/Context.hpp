@@ -12,6 +12,7 @@ namespace libslicer::v1 {
 namespace detail { struct ContextAccess; struct ContextState; }
 
 class PresetRepository;
+class ProjectBuilder;
 class SliceEngine;
 
 struct ResourceLimits {
@@ -19,6 +20,8 @@ struct ResourceLimits {
     std::uint64_t project_uncompressed_bytes;
     std::uint64_t model_triangles;
     std::uint64_t gcode_bytes;
+    std::uint64_t preview_bytes;
+    std::uint64_t preview_moves;
     std::uint64_t temporary_disk_bytes;
 };
 
@@ -35,6 +38,7 @@ public:
     static Result<SdkContext> create(ContextOptions options);
 
     Result<PresetRepository> presets();
+    Result<ProjectBuilder> create_project_builder();
     Result<SliceEngine> create_slice_engine();
 
 private:

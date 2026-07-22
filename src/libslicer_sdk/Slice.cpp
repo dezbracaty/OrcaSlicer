@@ -15,7 +15,9 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <set>
+#include <sstream>
 #include <thread>
 
 namespace libslicer::v1 {
@@ -46,14 +48,28 @@ Result<detail::FrozenSliceInput> freeze_slice_input(
     const std::shared_ptr<detail::SliceEngineState> &engine, SliceRequest request)
 {
     try {
+        if (!request.output.include_gcode &&
+            request.output.preview == PreviewDelivery::none)
+            return failure<detail::FrozenSliceInput>(
+                ErrorCode::invalid_argument,
+                "SliceRequest must request G-code, preview, or both", "/output");
+        if (request.output.preview == PreviewDelivery::artifact &&
+            !request.output.preview_artifact_path)
+            return failure<detail::FrozenSliceInput>(
+                ErrorCode::invalid_argument,
+                "preview_artifact_path is required for artifact preview output",
+                "/output/preview_artifact_path");
         std::optional<detail::TemporarySliceSelection> temporary;
         if (request.temporary_selection) {
             temporary.emplace(detail::TemporarySliceSelection{
                 std::move(request.temporary_selection->selection),
                 std::move(request.temporary_selection->complete_manual_map)});
         }
-        return detail::resolve_slice_input(engine->context, std::move(request.project),
-                                           request.plate, std::move(temporary));
+        SliceOutputOptions output = std::move(request.output);
+        auto resolved = detail::resolve_slice_input(engine->context, std::move(request.project),
+                                                    request.plate, std::move(temporary));
+        if (resolved.has_value()) resolved.value().output = std::move(output);
+        return resolved;
     } catch (const std::bad_alloc &) {
         throw;
     } catch (const std::filesystem::filesystem_error &error) {
@@ -298,6 +314,320 @@ EffectiveFilamentMap final_filament_map(const Slic3r::Print &print,
     for (int tool : core_tools)
         tools.push_back(ToolId{static_cast<std::uint32_t>(tool)});
     return {public_map_mode(print.get_filament_map_mode()), std::move(tools), source};
+}
+
+std::array<std::uint8_t, 4> parse_color(std::string value)
+{
+    if (!value.empty() && value.front() == '#') value.erase(value.begin());
+    if (value.size() != 6 && value.size() != 8) return {0x26, 0xa6, 0x9a, 0xff};
+    const auto hex = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+        return -1;
+    };
+    std::array<std::uint8_t, 4> rgba{0, 0, 0, 0xff};
+    for (std::size_t index = 0; index < value.size() / 2 && index < 4; ++index) {
+        const int high = hex(value[index * 2]);
+        const int low = hex(value[index * 2 + 1]);
+        if (high < 0 || low < 0) return {0x26, 0xa6, 0x9a, 0xff};
+        rgba[index] = static_cast<std::uint8_t>(high * 16 + low);
+    }
+    return rgba;
+}
+
+PreviewMoveType public_move_type(Slic3r::EMoveType type)
+{
+    switch (type) {
+    case Slic3r::EMoveType::Travel:
+    case Slic3r::EMoveType::Wipe:
+    case Slic3r::EMoveType::Seam: return PreviewMoveType::travel;
+    case Slic3r::EMoveType::Extrude: return PreviewMoveType::extrude;
+    case Slic3r::EMoveType::Retract: return PreviewMoveType::retract;
+    case Slic3r::EMoveType::Unretract: return PreviewMoveType::unretract;
+    case Slic3r::EMoveType::Tool_change: return PreviewMoveType::tool_change;
+    case Slic3r::EMoveType::Color_change: return PreviewMoveType::color_change;
+    case Slic3r::EMoveType::Custom_GCode: return PreviewMoveType::custom;
+    default: return PreviewMoveType::unknown;
+    }
+}
+
+PreviewExtrusionRole public_extrusion_role(Slic3r::ExtrusionRole role)
+{
+    switch (role) {
+    case Slic3r::erNone: return PreviewExtrusionRole::none;
+    case Slic3r::erPerimeter: return PreviewExtrusionRole::perimeter;
+    case Slic3r::erExternalPerimeter: return PreviewExtrusionRole::external_perimeter;
+    case Slic3r::erOverhangPerimeter: return PreviewExtrusionRole::overhang_perimeter;
+    case Slic3r::erInternalInfill: return PreviewExtrusionRole::internal_infill;
+    case Slic3r::erSolidInfill: return PreviewExtrusionRole::solid_infill;
+    case Slic3r::erTopSolidInfill: return PreviewExtrusionRole::top_solid_infill;
+    case Slic3r::erBridgeInfill:
+    case Slic3r::erInternalBridgeInfill: return PreviewExtrusionRole::bridge_infill;
+    case Slic3r::erSupportMaterial: return PreviewExtrusionRole::support_material;
+    case Slic3r::erSupportMaterialInterface:
+    case Slic3r::erSupportTransition: return PreviewExtrusionRole::support_interface;
+    case Slic3r::erSkirt: return PreviewExtrusionRole::skirt;
+    case Slic3r::erBrim: return PreviewExtrusionRole::brim;
+    case Slic3r::erWipeTower: return PreviewExtrusionRole::wipe_tower;
+    case Slic3r::erCustom: return PreviewExtrusionRole::custom;
+    default: return PreviewExtrusionRole::unknown;
+    }
+}
+
+PreviewColorSource public_color_source(
+    Slic3r::GCodeProcessorResult::PreviewColorSource source)
+{
+    switch (source) {
+    case Slic3r::GCodeProcessorResult::PreviewColorSource::Filament:
+        return PreviewColorSource::filament;
+    case Slic3r::GCodeProcessorResult::PreviewColorSource::ColorChange:
+        return PreviewColorSource::color_change;
+    case Slic3r::GCodeProcessorResult::PreviewColorSource::Custom:
+        return PreviewColorSource::custom;
+    default: return PreviewColorSource::unknown;
+    }
+}
+
+PreviewEventType event_type_for_move(Slic3r::EMoveType type)
+{
+    switch (type) {
+    case Slic3r::EMoveType::Tool_change: return PreviewEventType::tool_change;
+    case Slic3r::EMoveType::Color_change: return PreviewEventType::color_change;
+    case Slic3r::EMoveType::Pause_Print: return PreviewEventType::pause;
+    case Slic3r::EMoveType::Custom_GCode: return PreviewEventType::custom_gcode;
+    default: return PreviewEventType::unknown;
+    }
+}
+
+std::uint64_t estimate_preview_bytes(const SlicePreview &preview)
+{
+    std::uint64_t bytes = preview.schema_id.size() + preview.coordinate_space.size();
+    bytes += preview.layers.size() * sizeof(PreviewLayer);
+    bytes += preview.tools.size() * sizeof(PreviewTool);
+    bytes += preview.filaments.size() * sizeof(PreviewFilament);
+    bytes += preview.colors.size() * sizeof(PreviewColor);
+    bytes += preview.instances.size() * sizeof(PreviewInstance);
+    bytes += preview.moves.size() * sizeof(PreviewMove);
+    bytes += preview.events.size() * sizeof(PreviewEvent);
+    for (const auto &object : preview.objects)
+        bytes += sizeof(PreviewObject) + object.name.size();
+    for (const auto &color : preview.colors) bytes += color.name.size();
+    for (const auto &event : preview.events) bytes += event.message.size();
+    return bytes;
+}
+
+std::string json_escape(const std::string &value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (char ch : value) {
+        switch (ch) {
+        case '\\': out += "\\\\"; break;
+        case '"': out += "\\\""; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default: out += ch; break;
+        }
+    }
+    return out;
+}
+
+std::string serialize_preview_artifact(const SlicePreview &preview)
+{
+    std::ostringstream out;
+    out << "{\"schema_id\":\"" << json_escape(preview.schema_id) << "\",";
+    out << "\"schema_version\":" << preview.schema_version << ",";
+    out << "\"coordinate_space\":\"" << json_escape(preview.coordinate_space) << "\",";
+    out << "\"layers\":" << preview.layers.size() << ",";
+    out << "\"tools\":" << preview.tools.size() << ",";
+    out << "\"filaments\":" << preview.filaments.size() << ",";
+    out << "\"colors\":" << preview.colors.size() << ",";
+    out << "\"objects\":" << preview.objects.size() << ",";
+    out << "\"instances\":" << preview.instances.size() << ",";
+    out << "\"events\":" << preview.events.size() << ",";
+    out << "\"moves\":[";
+    for (std::size_t index = 0; index < preview.moves.size(); ++index) {
+        const auto &move = preview.moves[index];
+        if (index != 0) out << ',';
+        out << "{\"id\":" << move.id << ",\"layer\":" << move.layer_id
+            << ",\"x\":" << move.end_mm.x << ",\"y\":" << move.end_mm.y
+            << ",\"z\":" << move.end_mm.z << ",\"e\":" << move.extrusion_delta_mm
+            << ",\"f\":" << move.feedrate_mm_s << "}";
+    }
+    out << "]}";
+    return out.str();
+}
+
+Result<std::optional<std::filesystem::path>> publish_preview_artifact(
+    const SlicePreview &preview, const std::filesystem::path &destination,
+    const std::filesystem::path &temporary_root, std::uint64_t preview_limit,
+    std::uint64_t temporary_limit)
+{
+    const std::string bytes = serialize_preview_artifact(preview);
+    if (bytes.size() > preview_limit)
+        return failure<std::optional<std::filesystem::path>>(
+            ErrorCode::resource_limit_exceeded,
+            "Preview byte limit exceeded", "/limits/preview_bytes");
+    if (bytes.size() > temporary_limit)
+        return failure<std::optional<std::filesystem::path>>(
+            ErrorCode::resource_limit_exceeded,
+            "Temporary disk byte limit exceeded", "/limits/temporary_disk_bytes");
+    std::error_code error;
+    if (destination.has_parent_path()) {
+        std::filesystem::create_directories(destination.parent_path(), error);
+        if (error)
+            return failure<std::optional<std::filesystem::path>>(
+                ErrorCode::io, "Unable to create preview artifact directory: " +
+                                   error.message(),
+                "/output/preview_artifact_path");
+    }
+    const auto temporary = temporary_root / (destination.filename().string() + ".tmp");
+    {
+        std::ofstream output(temporary, std::ios::binary);
+        if (!output)
+            return failure<std::optional<std::filesystem::path>>(
+                ErrorCode::io, "Unable to write preview artifact",
+                "/output/preview_artifact_path");
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    std::filesystem::rename(temporary, destination, error);
+    if (error) {
+        std::filesystem::remove(temporary, error);
+        return failure<std::optional<std::filesystem::path>>(
+            ErrorCode::io, "Unable to publish preview artifact", "/output/preview_artifact_path");
+    }
+    return detail::ResultAccess::success(std::optional<std::filesystem::path>{destination});
+}
+
+Result<std::shared_ptr<const SlicePreview>> build_preview(
+    const Slic3r::GCodeProcessorResult &processor,
+    const detail::ProjectData &project,
+    const Slic3r::DynamicPrintConfig &config,
+    const EffectiveFilamentMap &completed_map,
+    const ResourceLimits &limits)
+{
+    if (processor.moves.size() > limits.preview_moves)
+        return failure<std::shared_ptr<const SlicePreview>>(
+            ErrorCode::resource_limit_exceeded,
+            "Preview move limit exceeded", "/limits/preview_moves");
+
+    auto preview = std::make_shared<SlicePreview>();
+    preview->schema_id = "libslicer.preview";
+    preview->schema_version = 1;
+    preview->coordinate_space = "orca_plate_world_mm";
+
+    for (const Slic3r::ModelObject *object : project.model.objects) {
+        preview->objects.push_back({detail::ProjectIdAccess::object(project.identity,
+                                      object->id().id), object->name});
+        for (const Slic3r::ModelInstance *instance : object->instances) {
+            preview->instances.push_back({detail::ProjectIdAccess::instance(
+                project.identity, instance->id().id),
+                detail::ProjectIdAccess::object(project.identity, object->id().id)});
+        }
+    }
+
+    const auto *nozzles = config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter");
+    const auto *offsets = config.option<Slic3r::ConfigOptionPoints>("extruder_offset");
+    std::set<std::uint32_t> emitted_tools;
+    for (ToolId tool : completed_map.tools) {
+        if (!emitted_tools.insert(tool.value).second) continue;
+        const std::size_t core_index = tool.value > 0 ? tool.value - 1 : 0;
+        const double nozzle = nozzles && core_index < nozzles->values.size()
+            ? nozzles->values[core_index] : 0.0;
+        Vec3d offset{0.0, 0.0, 0.0};
+        if (offsets && core_index < offsets->values.size())
+            offset = {offsets->values[core_index].x(), offsets->values[core_index].y(), 0.0};
+        preview->tools.push_back({tool, std::nullopt, nozzle, offset});
+    }
+
+    const auto *colors = config.option<Slic3r::ConfigOptionStrings>("filament_colour");
+    const auto *diameters = config.option<Slic3r::ConfigOptionFloats>("filament_diameter");
+    const auto *densities = config.option<Slic3r::ConfigOptionFloats>("filament_density");
+    const auto *costs = config.option<Slic3r::ConfigOptionFloats>("filament_cost");
+    for (std::size_t slot = 0; slot < completed_map.tools.size(); ++slot) {
+        const auto rgba = colors && slot < colors->values.size()
+            ? parse_color(colors->values[slot]) : std::array<std::uint8_t, 4>{0x26, 0xa6, 0x9a, 0xff};
+        preview->filaments.push_back({
+            FilamentSlotId{static_cast<std::uint32_t>(slot)}, completed_map.tools[slot], rgba,
+            diameters && slot < diameters->values.size() ? diameters->values[slot] : 1.75,
+            densities && slot < densities->values.size() ? densities->values[slot] : 0.0,
+            costs && slot < costs->values.size() ? costs->values[slot] : 0.0});
+    }
+    for (const auto &[id, fact] : processor.preview_colors) {
+        std::array<std::uint8_t, 4> rgba{};
+        for (std::size_t index = 0; index < 4; ++index)
+            rgba[index] = static_cast<std::uint8_t>(
+                std::max(0.0f, std::min(1.0f, fact.color_rgba[index])) * 255.0f);
+        std::optional<FilamentSlotId> filament;
+        if (fact.filament_id < completed_map.tools.size())
+            filament = FilamentSlotId{fact.filament_id};
+        preview->colors.push_back({id, rgba, public_color_source(fact.source),
+                                   filament, fact.name});
+    }
+
+    std::map<std::uint32_t, std::size_t> layer_positions;
+    Slic3r::Vec3f previous = Slic3r::Vec3f::Zero();
+    double accumulated_time = 0.0;
+    std::uint64_t event_id = 0;
+    preview->moves.reserve(processor.moves.size());
+    for (const auto &core : processor.moves) {
+        if (core.internal_only) {
+            previous = core.position;
+            continue;
+        }
+        auto layer_it = layer_positions.find(core.layer_id);
+        if (layer_it == layer_positions.end()) {
+            layer_it = layer_positions.emplace(core.layer_id, preview->layers.size()).first;
+            preview->layers.push_back({core.layer_id,
+                                       static_cast<std::uint64_t>(preview->moves.size()),
+                                       0, core.print_z, core.height, 0.0});
+        }
+        const std::size_t layer_pos = layer_it->second;
+        auto &layer = preview->layers[layer_pos];
+        ++layer.move_count;
+        layer.duration_s += core.time[static_cast<std::size_t>(Slic3r::ToolpathTimeMode::Normal)];
+        if (layer.height_mm == 0.0) layer.height_mm = core.height;
+
+        std::optional<FilamentSlotId> filament;
+        std::optional<ToolId> tool;
+        const std::size_t slot = static_cast<std::size_t>(core.extruder_id);
+        if (slot < completed_map.tools.size()) {
+            filament = FilamentSlotId{static_cast<std::uint32_t>(slot)};
+            tool = completed_map.tools[slot];
+        }
+        const auto move_id = static_cast<std::uint64_t>(preview->moves.size());
+        const double move_time =
+            core.time[static_cast<std::size_t>(Slic3r::ToolpathTimeMode::Normal)];
+        accumulated_time += move_time;
+        PreviewMove move{
+            move_id, core.gcode_id, core.layer_id, std::nullopt, std::nullopt, tool,
+            filament, core.cp_color_id == 0 ? std::optional<std::uint32_t>{}
+                                            : std::optional<std::uint32_t>{core.cp_color_id},
+            public_move_type(core.type), PreviewPathKind::linear,
+            public_extrusion_role(core.extrusion_role),
+            {previous.x(), previous.y(), previous.z()},
+            {core.position.x(), core.position.y(), core.position.z()}, std::nullopt,
+            core.delta_extruder, core.feedrate, core.actual_feedrate, core.width,
+            core.height, core.mm3_per_mm, core.travel_dist, core.fan_speed,
+            core.temperature, core.pressure_advance, core.acceleration, core.jerk,
+            move_time, core.layer_duration, core.print_z, std::nullopt};
+        preview->moves.push_back(std::move(move));
+        const PreviewEventType event_type = event_type_for_move(core.type);
+        if (event_type != PreviewEventType::unknown) {
+            preview->events.push_back({event_id++, move_id, event_type, tool, filament,
+                                       core.print_z, accumulated_time, {}});
+        }
+        previous = core.position;
+    }
+    const std::uint64_t bytes = estimate_preview_bytes(*preview);
+    if (bytes > limits.preview_bytes)
+        return failure<std::shared_ptr<const SlicePreview>>(
+            ErrorCode::resource_limit_exceeded,
+            "Preview byte limit exceeded", "/limits/preview_bytes");
+    return detail::ResultAccess::success(
+        std::static_pointer_cast<const SlicePreview>(preview));
 }
 
 std::atomic<std::uint64_t> next_job_directory {1};
@@ -556,9 +886,44 @@ void run_slice(const std::shared_ptr<detail::SliceJobState> &job,
         SliceStatistics statistics{
             elapsed, layer_count(print),
             filament_usage(print, config, completed_map.tools.size())};
+        std::shared_ptr<const SlicePreview> preview;
+        std::optional<std::filesystem::path> preview_artifact_path;
+        if (resolved.output.preview != PreviewDelivery::none) {
+            auto converted = build_preview(processor, *project, config, completed_map,
+                                           context->options.limits);
+            if (!converted.has_value()) {
+                complete_failure(job, events,
+                    converted.error_code().value_or(ErrorCode::resource_limit_exceeded),
+                    converted.diagnostics().front().message,
+                    converted.diagnostics().front().field,
+                    std::move(result_diagnostics));
+                return;
+            }
+            if (resolved.output.preview == PreviewDelivery::artifact) {
+                auto published = publish_preview_artifact(
+                    *converted.value(), *resolved.output.preview_artifact_path,
+                    job_directory.path(), context->options.limits.preview_bytes,
+                    context->options.limits.temporary_disk_bytes);
+                if (!published.has_value()) {
+                    complete_failure(job, events,
+                        published.error_code().value_or(ErrorCode::io),
+                        published.diagnostics().front().message,
+                        published.diagnostics().front().field,
+                        std::move(result_diagnostics));
+                    return;
+                }
+                preview_artifact_path = std::move(published).value();
+            } else {
+                preview = std::move(converted).value();
+            }
+        }
         auto result = std::make_shared<const SliceResult>(SliceResult{
-            std::move(output.bytes), resolved.configuration, std::move(completed_map),
-            std::move(statistics), std::move(result_diagnostics)});
+            resolved.output.include_gcode
+                ? std::optional<std::string>(std::move(output.bytes))
+                : std::optional<std::string>{},
+            std::move(preview), std::move(preview_artifact_path),
+            resolved.configuration, std::move(completed_map), std::move(statistics),
+            std::move(result_diagnostics)});
         events.emit(SliceEventKind::completed, 100);
         events.close();
         finish_job(job, detail::ResultAccess::success<std::shared_ptr<const SliceResult>>(

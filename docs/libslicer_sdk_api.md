@@ -11,17 +11,28 @@ libslicer v1 是供其他 App 直接链接的 C++17 FFF 切片 SDK。它提供�
 
 1. 浏览、创建、编辑和删除 printer、process、filament 预设；
 2. 加载、查看、修改并保存 Orca/Bambu 兼容的 FFF project 3MF；
-3. 读取和修改 project、plate、object、part、layer-range 的分层配置；
-4. 按 Orca 配置语义执行 FFF 校验、切片和 G-code 导出；
-5. 返回诊断、统计和最终耗材映射。
+3. 接收 App 已解析好的 mesh/scene，构建可切片 Project；
+4. 读取和修改 project、plate、object、part、layer-range 的分层配置；
+5. 按 Orca 配置语义执行 FFF 校验、切片和 G-code 导出；
+6. 从同一次权威切片中返回诊断、统计、最终耗材映射和可选 toolpath preview。
 
-v1 不提供 GUI、OpenGL、toolpath preview、模型导入、模型编辑、排版、云/设备连接、上传、
-SLA、后处理脚本或 C ABI。STL、OBJ、STEP 和 generic 3MF 不属于 v1 输入。
+v1 不提供 GUI、OpenGL 渲染、STL/OBJ/STEP importer、generic 3MF importer、模型编辑、自动排版、
+云/设备连接、上传、SLA、后处理脚本或 C ABI。STL、OBJ、STEP 文件解析不属于 v1 输入；其他
+App 如需支持这些格式，必须在 App 侧完成解析，并把已解析的 triangle mesh/scene DTO 交给
+`ProjectBuilder`。
 
 `Project::load()` 只接受 Orca/Bambu project 3MF。文件必须包含可恢复的 project config、
 至少一个 plate、模型/instance 上下文，且 active printer technology 为 FFF。generic 3MF、
 G-code-only 3MF、SLA project 3MF 和扩展名伪装文件在 load 阶段返回 `unsupported`，不得发布
 部分工程。
+
+SDK 的两个正式 project 输入路径是：
+
+- `Project::load()`：加载 Orca/Bambu 兼容 project 3MF，并保留其完整切片上下文；
+- `ProjectBuilder`：接收 App 已解析的 scene/mesh/config/preset selection，构建新的 Project。
+
+两条路径构建出的 Project 后续都必须走同一套 `ProjectSnapshot -> SliceRequest -> SliceEngine`
+闭环。SDK 不提供绕过 Project 的第二套切片入口。
 
 构建树内公开 CMake target 为 `libslicer::sdk_v1`，公开头文件位于 `<libslicer/v1/...>`。安装态
 `find_package(libslicer CONFIG)` 属于 release packaging 行为，必须受兼容性 baseline gate 控制。
@@ -126,6 +137,7 @@ private:
   friend class Project;
   friend class ProjectSnapshot;
   friend class ProjectEdit;
+  friend class ProjectBuilder;
 };
 
 class ObjectId {
@@ -139,6 +151,7 @@ private:
   friend class Project;
   friend class ProjectSnapshot;
   friend class ProjectEdit;
+  friend class ProjectBuilder;
 };
 
 class PartId {
@@ -152,6 +165,21 @@ private:
   friend class Project;
   friend class ProjectSnapshot;
   friend class ProjectEdit;
+  friend class ProjectBuilder;
+};
+
+class InstanceId {
+public:
+  std::uint64_t value() const noexcept;
+  friend bool operator==(const InstanceId&, const InstanceId&) noexcept;
+private:
+  struct Binding;
+  explicit InstanceId(std::shared_ptr<const Binding>);
+  std::shared_ptr<const Binding> binding_;
+  friend class Project;
+  friend class ProjectSnapshot;
+  friend class ProjectEdit;
+  friend class ProjectBuilder;
 };
 
 struct FilamentSlotId {
@@ -426,11 +454,17 @@ JSON 文档必须携带 schema id/version。JSON 字符串不作为主要业务�
 ## 6. Context 和资源限制
 
 ```cpp
+class PresetRepository;
+class ProjectBuilder;
+class SliceEngine;
+
 struct ResourceLimits {
   std::uint64_t project_input_bytes;
   std::uint64_t project_uncompressed_bytes;
   std::uint64_t model_triangles;
   std::uint64_t gcode_bytes;
+  std::uint64_t preview_bytes;
+  std::uint64_t preview_moves;
   std::uint64_t temporary_disk_bytes;
 };
 
@@ -446,6 +480,7 @@ class SdkContext {
 public:
   static Result<SdkContext> create(ContextOptions);
   Result<PresetRepository> presets();
+  Result<ProjectBuilder> create_project_builder();
   Result<SliceEngine> create_slice_engine();
 };
 ```
@@ -514,7 +549,10 @@ v1 的“持久化”承诺是进程可观察且新 Context 可读取，不承�
 - `model_triangles`：成功 materialize 的唯一 mesh geometry facet 数，instance 不重复计数；
 - `temporary_disk_bytes`：同一时刻全部 SDK-owned temporary files 的 aggregate live-byte
   high-water，覆盖写不累计历史写入量；
-- `gcode_bytes`：输出 sink 已 commit 的原始 byte 总数。
+- `gcode_bytes`：G-code 输出 sink 已 commit 的原始 byte 总数；
+- `preview_bytes`：内存 preview DTO 或 preview artifact 已 commit 的 payload byte 总数，不包含
+  调用方传入路径字符串；
+- `preview_moves`：preview move record 的总数。
 
 每项在下一次增长会使对应计数大于 limit 之前拒绝；等于 limit 允许。
 
@@ -718,7 +756,7 @@ v1 公共对象模型不接收设备、AMS 或 physical filament topology，因�
 未来若增加 auto mapping，必须新增带完整强类型物理耗材拓扑的公开输入，并另行冻结；不能在
 现有方法中偷偷改变 auto mode 语义。
 
-## 10. Orca 3MF 工程模型和事务
+## 10. Project 输入、工程模型和事务
 
 ```cpp
 struct PlateInfo { PlateId id; std::string name; ConfigPatch overrides; bool locked; };
@@ -735,6 +773,42 @@ struct SlotRemap {
   std::vector<std::optional<FilamentSlotId>> old_to_new;
 };
 
+struct Vec3d { double x, y, z; };
+
+struct Triangle {
+  std::uint32_t a;
+  std::uint32_t b;
+  std::uint32_t c;
+};
+
+struct Matrix4d {
+  std::array<double, 16> row_major;
+};
+
+struct MeshData {
+  std::vector<Vec3d> vertices_mm;
+  std::vector<Triangle> triangles;
+};
+
+struct MeshPartInput {
+  std::string name;
+  MeshData mesh;
+  ConfigPatch overrides;
+};
+
+struct ObjectInput {
+  std::string name;
+  std::vector<MeshPartInput> parts;
+  ConfigPatch overrides;
+};
+
+struct InstanceInput {
+  ObjectId object;
+  Matrix4d transform;
+};
+
+class Project;
+
 class ProjectSnapshot {
 public:
   ProjectRevision revision() const;
@@ -742,6 +816,7 @@ public:
   std::vector<PlateInfo> plates() const;
   std::vector<ObjectInfo> objects() const;
   std::vector<PartInfo> parts() const;
+  Result<std::vector<InstanceId>> instances(PlateId) const;
   Result<std::vector<LayerRange>> layer_ranges(ObjectId) const;
   PresetSelection project_selected_presets() const;
 
@@ -767,6 +842,21 @@ public:
   void discard() noexcept;
 };
 
+class ProjectBuilder {
+public:
+  Result<void> set_selected_presets(PresetSelection);
+  Result<void> set_project_overrides(ConfigPatch);
+  Result<void> set_project_filament_map(FilamentMapOverride);
+
+  Result<PlateId> add_plate(std::string name, ConfigPatch overrides = {});
+  Result<ObjectId> add_object(ObjectInput);
+  Result<InstanceId> add_instance(PlateId, ObjectId, Matrix4d transform);
+  Result<void> set_layer_ranges(ObjectId, std::vector<LayerRange>);
+
+  Result<Project> build();
+  void discard() noexcept;
+};
+
 class Project {
 public:
   static Result<Project> load(SdkContext&, const std::filesystem::path&);
@@ -776,6 +866,30 @@ public:
                     ProjectRevision expected) const;
 };
 ```
+
+`ProjectBuilder` 是外部 App 输入已解析 mesh/scene 的唯一正式入口。它不解析文件、不生成
+generic 3MF、不做自动排版，也不提供 mesh 编辑 API。调用方负责 STL/OBJ/STEP/数据库模型的读取、
+修复和排版；SDK 只接收已确定的 vertices、triangles、plate、object、part、instance、preset
+selection 和配置 patch。
+
+builder 坐标和几何规则固定如下：
+
+- `MeshData::vertices_mm` 的坐标单位始终是 mm，SDK 不做 inch/meter 等单位猜测；
+- `Triangle::{a,b,c}` 是 0 基 vertex index，必须全部小于 `vertices_mm.size()`；
+- 所有 double 字段必须有限，NaN/Inf 返回 `invalid_argument`，field 指向对应公开字段；
+- 空 object、空 parts、空 mesh、越界 triangle、退化三角形和超过 `model_triangles` limit 的输入
+  必须拒绝；退化规则以 core 可稳定 materialize 的最小合法 triangle 为准，不能在切片中途崩溃；
+- `Matrix4d::row_major` 是 4x4 row-major affine transform。不可逆、包含 NaN/Inf 或会产生
+  非有限坐标的 transform 返回 `invalid_argument`；
+- `add_instance()` 只把既有 object 放到目标 plate；它不复制 object mesh，也不做 build-volume
+  自动修正；
+- `build()` 必须完整校验 preset selection、manual filament map、配置 patch 和 geometry 后一次性
+  发布 Project。失败不返回部分 Project；
+- builder 生成的 `Project` 与 3MF load 生成的 `Project` 使用同一 `ProjectSnapshot`、
+  `ProjectEdit`、`SliceRequest` 和 `SliceEngine` 行为。
+
+builder 不暴露也不接受 `Slic3r::Model`、`TriangleMesh`、`ModelObject`、`ModelVolume` 等 core 私有
+类型。外部调用方不能通过 include Orca 私有头来构造 ProjectSnapshot。
 
 `ProjectEdit` 是唯一工程写入口。所有 staged 修改只有一次 commit；失败时工程和 revision 均
 不变，成功返回新 revision。`discard()` 丢弃 staged state；commit 或 discard 后 editor 进入
@@ -832,10 +946,19 @@ struct TemporarySliceSelection {
   FilamentMapOverride complete_manual_map;
 };
 
+enum class PreviewDelivery { none, memory, artifact };
+
+struct SliceOutputOptions {
+  bool include_gcode = true;
+  PreviewDelivery preview = PreviewDelivery::none;
+  std::optional<std::filesystem::path> preview_artifact_path;
+};
+
 struct SliceRequest {
   ProjectSnapshot project;
   PlateId plate;
   std::optional<TemporarySliceSelection> temporary_selection;
+  SliceOutputOptions output;
 };
 
 struct SliceInspection {
@@ -875,8 +998,161 @@ struct SliceStatistics {
   std::vector<FilamentUsage> filament_usage;
 };
 
+enum class PreviewMoveType {
+  travel,
+  extrude,
+  retract,
+  unretract,
+  tool_change,
+  color_change,
+  custom,
+  unknown
+};
+
+enum class PreviewPathKind { linear, arc, unknown };
+
+enum class PreviewExtrusionRole {
+  none,
+  perimeter,
+  external_perimeter,
+  overhang_perimeter,
+  internal_infill,
+  solid_infill,
+  top_solid_infill,
+  bridge_infill,
+  support_material,
+  support_interface,
+  skirt,
+  brim,
+  wipe_tower,
+  custom,
+  unknown
+};
+
+enum class PreviewColorSource { filament, color_change, custom, unknown };
+
+struct PreviewColor {
+  std::uint32_t id;
+  std::array<std::uint8_t, 4> rgba;
+  PreviewColorSource source;
+  std::optional<FilamentSlotId> filament;
+  std::string name;
+};
+
+struct PreviewMetadata {
+  std::string key;
+  std::string value;
+};
+
+struct PreviewObject {
+  ObjectId object;
+  std::string name;
+};
+
+struct PreviewInstance {
+  InstanceId instance;
+  ObjectId object;
+  std::optional<PlateId> plate;
+  Matrix4d transform;
+};
+
+struct PreviewLayer {
+  std::uint32_t id;
+  std::uint64_t move_begin;
+  std::uint64_t move_count;
+  double print_z_mm;
+  double height_mm;
+  double duration_s;
+};
+
+struct PreviewTool {
+  ToolId tool;
+  std::optional<FilamentSlotId> primary_filament;
+  double nozzle_diameter_mm;
+  Vec3d offset_mm;
+};
+
+struct PreviewFilament {
+  FilamentSlotId slot;
+  ToolId mapped_tool;
+  std::array<std::uint8_t, 4> rgba;
+  double diameter_mm;
+  double density_g_cm3;
+  double cost_per_kg;
+};
+
+struct PreviewMove {
+  std::uint64_t id;
+  std::optional<std::uint64_t> gcode_id;
+  std::uint32_t layer_id;
+  std::optional<ObjectId> object;
+  std::optional<InstanceId> instance;
+  std::optional<ToolId> tool;
+  std::optional<FilamentSlotId> filament;
+  std::optional<std::uint32_t> color_id;
+  PreviewMoveType type;
+  PreviewPathKind path_kind;
+  PreviewExtrusionRole extrusion_role;
+  Vec3d start_mm;
+  Vec3d end_mm;
+  std::optional<Vec3d> arc_center_mm;
+  double extrusion_delta_mm;
+  double feedrate_mm_s;
+  double actual_feedrate_mm_s;
+  double width_mm;
+  double height_mm;
+  double mm3_per_mm;
+  double distance_mm;
+  double fan_speed_percent;
+  double temperature_c;
+  double pressure_advance;
+  double acceleration_mm_s2;
+  double jerk_mm_s;
+  double time_s;
+  double layer_duration_s;
+  double print_z_mm;
+  std::optional<double> joint_angle_end_rad;
+};
+
+enum class PreviewEventType {
+  tool_change,
+  color_change,
+  pause,
+  custom_gcode,
+  warning,
+  unknown
+};
+
+struct PreviewEvent {
+  std::uint64_t id;
+  std::optional<std::uint64_t> move_id;
+  PreviewEventType type;
+  std::optional<ToolId> tool;
+  std::optional<FilamentSlotId> filament;
+  double print_z_mm;
+  double time_s;
+  std::string message;
+};
+
+struct SlicePreview {
+  std::string schema_id;
+  std::uint32_t schema_version;
+  std::string coordinate_space;
+  std::vector<PreviewMetadata> metadata;
+  std::vector<PreviewLayer> layers;
+  std::vector<PreviewTool> tools;
+  std::vector<PreviewFilament> filaments;
+  std::vector<PreviewColor> colors;
+  std::vector<PreviewObject> objects;
+  std::vector<PreviewInstance> instances;
+  std::vector<PreviewMove> moves;
+  std::vector<PreviewEvent> events;
+};
+
 struct SliceResult {
-  std::string gcode_bytes;
+  std::optional<std::string> gcode_bytes;
+  std::shared_ptr<const SlicePreview> preview;
+  std::optional<std::filesystem::path> preview_artifact_path;
   EffectiveConfiguration effective_configuration;
   EffectiveFilamentMap effective_filament_map;
   SliceStatistics statistics;
@@ -901,6 +1177,31 @@ public:
 作为一个原子对象出现，缺任一部分都无法构造请求，且不写回 Project。temporary map mode 不是
 manual、长度/ToolId 范围不合法或持久 effective map 为 auto 时，`inspect()`/`submit()` 按第 9 节
 失败。
+
+`SliceOutputOptions` 控制本次切片产物：
+
+- 默认只返回 G-code，不生成 preview；
+- `include_gcode=false && preview=PreviewDelivery::none` 是 `invalid_argument`；
+- `include_gcode=true` 时成功结果的 `SliceResult::gcode_bytes` 必须有值，且 byte count 与实际
+  输出完全一致；
+- `include_gcode=false` 时成功结果的 `SliceResult::gcode_bytes` 必须为 `std::nullopt`；
+- `preview=memory` 时 `SliceResult::preview` 非空，`preview_artifact_path` 为空；
+- `preview=artifact` 时必须提供 `preview_artifact_path`，成功后该路径存在完整 artifact，
+  `SliceResult::preview_artifact_path` 等于最终路径，`preview` 可为空；
+- `preview=none` 时不得额外计算或保留 preview 数据；
+- 支持 preview-only，也支持同一次 slice 同时输出 G-code 和 preview。
+
+preview 是 SDK 自己的公共 DTO/产物语义，复用旧 `.orcapv v2` 的字段含义，但不承诺旧 worker
+wire ABI，也不暴露 `GCodeProcessorResult`、worker protocol 或任何 `Slic3r::*` 类型。preview 必须
+由本次 `process/export` 产生的权威 `GCodeProcessorResult` 转换得到；禁止通过重新解析
+`gcode_bytes` 作为 fallback。G-code 与 preview 同时请求时，二者必须来自同一次冻结输入和同一次
+core 切片。
+
+object/instance 归属只在 core 能可靠证明时填写。无法证明、被过滤或没有对应公开 entity 时，
+`PreviewMove::object`/`instance` 使用 `std::nullopt`，不得猜测或伪造 ID；调用方以 optional 是否有值
+作为归属 flag。`SlicePreview::objects`/`instances` 只列出可由冻结 ProjectSnapshot 证明的公开
+entity；artifact 中对应 ID 仅表示同一次 SliceResult 所属 project 的公开 ID 值，不是跨工程身份。
+preview 坐标空间固定为 Orca plate world mm，`SlicePreview::coordinate_space` 必须返回稳定字符串。
 
 `inspect()` 执行与 submit 完全相同的同步解析和校验，只返回本次请求将使用的
 `EffectiveConfiguration` 与 `EffectiveFilamentMap`，不创建 job。`submit()` 必须在返回前同步
@@ -927,23 +1228,28 @@ callback 中调用该 job 的 `wait()`。callback 第一次抛异常时 SDK 捕�
 `slicing_failed`；未被其他 code 覆盖的 SDK 异常是 `internal`。同一失败点不得在
 `invalid_configuration` 与 `slicing_failed` 之间任选。
 
-`gcode_bytes` 由 `std::string::size()` 定界，不追加 NUL，不验证或转换 UTF-8。SDK 不执行
+`gcode_bytes` 有值时由 `std::string::size()` 定界，不追加 NUL，不验证或转换 UTF-8。SDK 不执行
 post-process 脚本；配置中存在非空 post-process 时返回 `invalid_configuration`。
+
+preview 内存结果和 artifact 均受 `preview_bytes` 与 `preview_moves` 限制；artifact 写入同时计入
+`temporary_disk_bytes`。任一 preview 限制或 artifact 写入超限返回 `resource_limit_exceeded`，
+不得返回半截 preview、半截 artifact 或部分 SliceResult。取消或失败时 artifact 路径不得留下
+可被误认为成功结果的完整文件；实现应使用临时文件加原子发布或等价机制。
 
 ## 12. 线程和内存所有权
 
 - `SdkContext`、`PresetRepository`、`PresetView`、`ProjectSnapshot`、`ConfigSchema`、
   `EffectiveConfiguration`、`SliceInspection` 和完成后的 `SliceResult` 可复制并安全并发读；
-- `PresetEditor` 和 `ProjectEdit` 只能由创建它的线程串行使用；
+- `PresetEditor`、`ProjectEdit` 和 `ProjectBuilder` 只能由创建它的线程串行使用；
 - `Project` 允许并发 snapshot/save/begin_edit，但 revision 冲突必须显式返回；
 - `SliceEngine::inspect()`/`submit()`、`SliceJob::cancel()` 和 `SliceJob::wait()` 遵守第 11 节语义；
-- 按值返回的 string、vector、ConfigValue、snapshot 和 result 拥有自己的生命周期，不借用
+- 按值返回的 string、vector、ConfigValue、mesh DTO、preview DTO、snapshot 和 result 拥有自己的生命周期，不借用
   core 指针；
 - `Result::diagnostics()`、`ConfigPatch/ConfigValues::entries()`、
   `EffectiveConfiguration::schema()/values()` 的 const-reference getter
   返回对其公开 owner state 的只读借用；引用只在 owner 未被销毁、移动赋值或重新赋值期间
   有效，调用方需要独立生命周期时必须复制；
-- `PresetRepository`、`PresetView`、`PresetEditor`、`Project`、`ProjectEdit`、
+- `PresetRepository`、`PresetView`、`PresetEditor`、`Project`、`ProjectEdit`、`ProjectBuilder`、
   `SliceEngine` 和已提交 `SliceJob` 都强持有其所需 context
   state；销毁最初的 SdkContext 或创建它们的 parent handle 后仍可按本文继续使用，直至这些
   handle 自身释放；
