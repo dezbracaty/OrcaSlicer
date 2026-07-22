@@ -10,7 +10,7 @@ file(REMOVE_RECURSE "${_build_dir}" "${_install_prefix}")
 
 set(_build_args
     --build "@CMAKE_BINARY_DIR@"
-    --target orcaslicer-worker
+    --target libslicer_sdk_v1
 )
 if(NOT LIBSLICER_SMOKE_CONFIG STREQUAL "")
     list(APPEND _build_args --config "${LIBSLICER_SMOKE_CONFIG}")
@@ -18,10 +18,10 @@ endif()
 
 execute_process(
     COMMAND "@CMAKE_COMMAND@" ${_build_args}
-    RESULT_VARIABLE _build_worker_result
+    RESULT_VARIABLE _build_sdk_result
 )
-if(NOT _build_worker_result EQUAL 0)
-    message(FATAL_ERROR "orcaslicer-worker build failed before find_package smoke")
+if(NOT _build_sdk_result EQUAL 0)
+    message(FATAL_ERROR "libslicer SDK build failed before find_package smoke")
 endif()
 
 set(_install_args
@@ -38,6 +38,34 @@ execute_process(
 )
 if(NOT _install_result EQUAL 0)
     message(FATAL_ERROR "libslicer install failed before find_package smoke")
+endif()
+
+file(GLOB_RECURSE _installed_headers
+    RELATIVE "${_install_prefix}"
+    "${_install_prefix}/@CMAKE_INSTALL_INCLUDEDIR@/*")
+set(_expected_headers
+    "@CMAKE_INSTALL_INCLUDEDIR@/libslicer/v1/Config.hpp"
+    "@CMAKE_INSTALL_INCLUDEDIR@/libslicer/v1/ConfigSchema.hpp"
+    "@CMAKE_INSTALL_INCLUDEDIR@/libslicer/v1/Context.hpp"
+    "@CMAKE_INSTALL_INCLUDEDIR@/libslicer/v1/Preset.hpp"
+    "@CMAKE_INSTALL_INCLUDEDIR@/libslicer/v1/Project.hpp"
+    "@CMAKE_INSTALL_INCLUDEDIR@/libslicer/v1/Result.hpp"
+    "@CMAKE_INSTALL_INCLUDEDIR@/libslicer/v1/Slice.hpp"
+    "@CMAKE_INSTALL_INCLUDEDIR@/libslicer/v1/Version.hpp"
+    "@CMAKE_INSTALL_INCLUDEDIR@/libslicer/v1/json.hpp")
+list(SORT _installed_headers)
+list(SORT _expected_headers)
+if(NOT _installed_headers STREQUAL _expected_headers)
+    message(FATAL_ERROR
+        "Default install contains headers outside the v1 public surface: ${_installed_headers}")
+endif()
+
+file(GLOB _installed_cmake_packages
+    RELATIVE "${_install_prefix}/@CMAKE_INSTALL_LIBDIR@/cmake"
+    "${_install_prefix}/@CMAKE_INSTALL_LIBDIR@/cmake/*")
+if(NOT _installed_cmake_packages STREQUAL "libslicer")
+    message(FATAL_ERROR
+        "Default install contains non-libslicer CMake packages: ${_installed_cmake_packages}")
 endif()
 
 set(_configure_args

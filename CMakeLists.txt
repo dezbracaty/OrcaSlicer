@@ -85,6 +85,10 @@ option(SLIC3R_STATIC "Link fetched dependencies statically where supported" ${SL
 option(SLIC3R_PCH "Use precompiled headers" ON)
 option(SLIC3R_ASAN "Enable ASan on Clang and GCC" OFF)
 option(LIBSLICER_BUILD_TESTS "Build libslicer tests" ${LIBSLICER_IS_TOP_LEVEL})
+option(LIBSLICER_BUILD_LEGACY_SDK "Build legacy ConfigSDK and worker targets" OFF)
+option(LIBSLICER_INSTALL_SDK_V1
+    "Install the libslicer SDK v1 package. Keep OFF until the v1 compatibility baseline is frozen."
+    OFF)
 
 if (APPLE)
     set(CMAKE_FIND_FRAMEWORK LAST)
@@ -258,12 +262,16 @@ endfunction()
 slic3r_remap_configs(IlmBase::Half RelWithDebInfo Release)
 slic3r_remap_configs(Blosc::blosc RelWithDebInfo Release)
 
-add_subdirectory(deps_src)
-add_subdirectory(src/libslic3r)
+# Implementation dependencies participate in the build through target
+# dependencies, but their own install rules are not part of the public SDK.
+add_subdirectory(deps_src EXCLUDE_FROM_ALL)
+add_subdirectory(src/libslic3r EXCLUDE_FROM_ALL)
 
 set_target_properties(libslic3r PROPERTIES OUTPUT_NAME libslicer)
 add_library(libslicer::libslicer ALIAS libslic3r)
 add_custom_target(libslicer DEPENDS libslic3r)
+
+add_subdirectory(src/libslicer_sdk)
 
 # Public, DTO-only ConfigSDK shared library. The same ConfigSDK.cpp is also
 # compiled into libslic3r for in-tree callers (worker/tests) with full symbol
@@ -272,6 +280,7 @@ add_custom_target(libslicer DEPENDS libslic3r)
 # symbols. No single binary links both, so there is no duplicate-symbol clash.
 # External consumers link this target and include <libslic3r/ConfigSDK.hpp> only
 # — no Orca internal headers or transitive link dependencies.
+if(LIBSLICER_BUILD_LEGACY_SDK)
 add_library(libslicer_config_sdk SHARED
     src/libslic3r/ConfigSDK.cpp
     src/libslicer_worker/src/NanoSVG.cpp
@@ -315,27 +324,48 @@ install(TARGETS libslicer_config_sdk
 
 add_subdirectory(src/libslicer_worker)
 add_subdirectory(src/orcaslicer_worker)
+endif()
 
 set(LIBSLICER_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/libslicer")
 
-configure_package_config_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/libslicerConfig.cmake.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfig.cmake"
-    INSTALL_DESTINATION "${LIBSLICER_CMAKE_INSTALL_DIR}"
-    PATH_VARS CMAKE_INSTALL_BINDIR
-)
+if(LIBSLICER_INSTALL_SDK_V1)
+    configure_package_config_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/libslicerConfig.cmake.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfig.cmake"
+        INSTALL_DESTINATION "${LIBSLICER_CMAKE_INSTALL_DIR}"
+        PATH_VARS CMAKE_INSTALL_BINDIR
+    )
 
-write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfigVersion.cmake"
-    VERSION "${SoftFever_VERSION}"
-    COMPATIBILITY SameMajorVersion
-)
+    write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfigVersion.cmake"
+        VERSION "1.0.0"
+        COMPATIBILITY SameMajorVersion
+    )
 
-install(EXPORT libslicerTargets
-    NAMESPACE libslicer::
-    DESTINATION "${LIBSLICER_CMAKE_INSTALL_DIR}"
-)
+    install(TARGETS libslicer_sdk_v1
+        EXPORT libslicerTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
 
+    install(EXPORT libslicerTargets
+        NAMESPACE libslicer::
+        DESTINATION "${LIBSLICER_CMAKE_INSTALL_DIR}"
+    )
+
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/libslicer/v1"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/libslicer"
+        FILES_MATCHING PATTERN "*.hpp"
+    )
+
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfigVersion.cmake"
+        DESTINATION "${LIBSLICER_CMAKE_INSTALL_DIR}"
+    )
+endif()
+
+if(LIBSLICER_BUILD_LEGACY_SDK)
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/libslic3r/ConfigSDK.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/libslic3r/OrcaCoreTypes.hpp"
@@ -344,14 +374,10 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/libslic3r/OrcaToolpathTypes.hpp"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/libslic3r"
 )
-
-install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfig.cmake"
-    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfigVersion.cmake"
-    DESTINATION "${LIBSLICER_CMAKE_INSTALL_DIR}"
-)
+endif()
 
 if(LIBSLICER_BUILD_TESTS)
     enable_testing()
-    add_subdirectory(tests)
+    # Test framework install rules are not part of the SDK package either.
+    add_subdirectory(tests EXCLUDE_FROM_ALL)
 endif()

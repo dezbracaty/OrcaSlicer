@@ -6267,8 +6267,11 @@ void GCode::GCodeOutputStream::write(const char *what)
 {
     if (what != nullptr) {
         const char* gcode = what;
-        if (this->f)
-            fwrite(gcode, 1, ::strlen(gcode), this->f);
+        const std::size_t size = ::strlen(gcode);
+        if (this->f) {
+            reserve_raw_gcode_export_bytes(static_cast<std::uint64_t>(size));
+            fwrite(gcode, 1, size, this->f);
+        }
         //FIXME don't allocate a string, maybe process a batch of lines?
         m_processor.process_buffer(std::string(gcode));
     }

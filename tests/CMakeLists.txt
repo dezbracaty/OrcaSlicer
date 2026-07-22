@@ -51,7 +51,7 @@ function(orcaslicer_discover_tests TARGET)
 endfunction()
 
 add_subdirectory(libslic3r)
-add_subdirectory(worker)
+add_subdirectory(libslicer_sdk)
 
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/add_subdirectory/run_smoke.cmake.in
@@ -73,10 +73,12 @@ add_test(
 )
 set_tests_properties(cmake_add_subdirectory_smoke PROPERTIES LABELS "CMake")
 
-add_test(
-    NAME cmake_find_package_smoke
-    COMMAND ${CMAKE_COMMAND}
-        "-DLIBSLICER_SMOKE_CONFIG=$<CONFIG>"
-        -P ${CMAKE_CURRENT_BINARY_DIR}/cmake/find_package/run_smoke.cmake
-)
-set_tests_properties(cmake_find_package_smoke PROPERTIES LABELS "CMake")
+if(LIBSLICER_INSTALL_SDK_V1)
+    add_test(
+        NAME cmake_find_package_smoke
+        COMMAND ${CMAKE_COMMAND}
+            "-DLIBSLICER_SMOKE_CONFIG=$<CONFIG>"
+            -P ${CMAKE_CURRENT_BINARY_DIR}/cmake/find_package/run_smoke.cmake
+    )
+    set_tests_properties(cmake_find_package_smoke PROPERTIES LABELS "CMake")
+endif()

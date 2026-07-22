@@ -57,6 +57,65 @@ static const Slic3r::Vec3f DEFAULT_EXTRUDER_OFFSET = Slic3r::Vec3f::Zero();
 
 namespace Slic3r {
 
+namespace {
+
+struct GCodeExportBudgetState {
+    bool active {false};
+    std::uint64_t final_limit {0};
+    std::uint64_t temporary_limit {0};
+    std::uint64_t raw_committed {0};
+    std::uint64_t final_committed {0};
+};
+
+thread_local GCodeExportBudgetState g_gcode_export_budget;
+
+bool exceeds(std::uint64_t current, std::uint64_t growth, std::uint64_t limit)
+{
+    return current > limit || growth > limit - current;
+}
+
+} // namespace
+
+void begin_bounded_gcode_export(std::uint64_t final_output_bytes,
+                                std::uint64_t temporary_disk_bytes)
+{
+    g_gcode_export_budget = {true, final_output_bytes, temporary_disk_bytes, 0, 0};
+}
+
+void end_bounded_gcode_export() noexcept
+{
+    g_gcode_export_budget = {};
+}
+
+void reserve_raw_gcode_export_bytes(std::uint64_t bytes)
+{
+    auto &budget = g_gcode_export_budget;
+    if (!budget.active) return;
+    if (exceeds(budget.raw_committed, bytes, budget.temporary_limit))
+        throw GCodeExportLimitExceeded(
+            GCodeExportLimitKind::temporary_disk,
+            "G-code raw output exceeds the temporary disk byte limit");
+    budget.raw_committed += bytes;
+}
+
+void reserve_final_gcode_export_bytes(std::uint64_t bytes)
+{
+    auto &budget = g_gcode_export_budget;
+    if (!budget.active) return;
+    if (exceeds(budget.final_committed, bytes, budget.final_limit))
+        throw GCodeExportLimitExceeded(
+            GCodeExportLimitKind::final_output,
+            "G-code output exceeds the final byte limit");
+    if (budget.raw_committed > budget.temporary_limit ||
+        budget.final_committed > budget.temporary_limit - budget.raw_committed ||
+        exceeds(budget.raw_committed + budget.final_committed, bytes,
+                budget.temporary_limit))
+        throw GCodeExportLimitExceeded(
+            GCodeExportLimitKind::temporary_disk,
+            "G-code export exceeds the aggregate temporary disk byte limit");
+    budget.final_committed += bytes;
+}
+
 const std::vector<std::string> GCodeProcessor::Reserved_Tags = {
     " FEATURE: ",
     " WIPE_START",
@@ -932,6 +991,8 @@ private:
     {
         if (!out_string.empty()) {
             if (true) {
+                reserve_final_gcode_export_bytes(
+                    static_cast<std::uint64_t>(out_string.length()));
                 fwrite((const void*) out_string.c_str(), 1, out_string.length(), out.f);
                 if (ferror(out.f)) {
                     out.close();

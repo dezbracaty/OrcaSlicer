@@ -1,14 +1,17 @@
 @PACKAGE_INIT@
 
-include(CMakeFindDependencyMacro)
-find_dependency(Eigen3 5.0.1)
-find_dependency(Threads)
-
 include("${CMAKE_CURRENT_LIST_DIR}/libslicerTargets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/libslicerPrivateArchives.cmake")
 
-set_and_check(LIBSLICER_ORCASLICER_WORKER_EXECUTABLE
-    "@PACKAGE_CMAKE_INSTALL_BINDIR@/orcaslicer-worker")
-
-set(LIBSLICER_WORKER_EXECUTABLE "${LIBSLICER_ORCASLICER_WORKER_EXECUTABLE}")
+set(_libslicer_private_archive_dir
+    "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/libslicer/private")
+foreach(_libslicer_private_archive IN LISTS _libslicer_private_archive_names)
+    set_property(TARGET libslicer::sdk_v1 APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES
+        "${_libslicer_private_archive_dir}/${_libslicer_private_archive}")
+endforeach()
+unset(_libslicer_private_archive)
+unset(_libslicer_private_archive_dir)
+unset(_libslicer_private_archive_names)
 
 check_required_components(libslicer)

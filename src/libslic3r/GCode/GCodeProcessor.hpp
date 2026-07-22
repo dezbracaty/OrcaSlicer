@@ -16,10 +16,33 @@
 #include <string>
 #include <string_view>
 #include <optional>
+#include <stdexcept>
 
 namespace Slic3r {
 
 class Print;
+
+// Internal byte budget used by file-based G-code export. The budget is
+// thread-local because an export and both of its raw/post-process passes execute
+// synchronously on one coordinated core thread. Calls made without an active
+// budget retain the historical unbounded core behavior.
+enum class GCodeExportLimitKind { final_output, temporary_disk };
+
+class GCodeExportLimitExceeded : public std::runtime_error
+{
+public:
+    GCodeExportLimitExceeded(GCodeExportLimitKind kind, const char *message)
+        : std::runtime_error(message), kind_(kind) {}
+    GCodeExportLimitKind kind() const noexcept { return kind_; }
+private:
+    GCodeExportLimitKind kind_;
+};
+
+void begin_bounded_gcode_export(std::uint64_t final_output_bytes,
+                                std::uint64_t temporary_disk_bytes);
+void end_bounded_gcode_export() noexcept;
+void reserve_raw_gcode_export_bytes(std::uint64_t bytes);
+void reserve_final_gcode_export_bytes(std::uint64_t bytes);
 
 // slice warnings enum strings
 #define NOZZLE_HRC_CHECKER                                          "the_actual_nozzle_hrc_smaller_than_the_required_nozzle_hrc"
