@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 namespace libslicer::v1 {
@@ -26,11 +27,14 @@ struct ValueDescriptor::State {
 };
 
 struct ConfigSchema::State {
-    std::string                    schema_id;
-    std::uint32_t                  schema_version;
-    std::vector<OptionDescriptor>  options;
-    std::set<std::string>          typed_owned_options;
-    detail::OptionEvaluator        evaluator;
+    std::string                                   schema_id;
+    std::uint32_t                                 schema_version;
+    std::vector<OptionDescriptor>                 options;
+    std::unordered_map<std::string, std::size_t>  option_index;
+    std::size_t                                   option_index_build_count;
+    std::size_t                                   option_index_mutation_count;
+    std::set<std::string>                         typed_owned_options;
+    detail::OptionEvaluator                       evaluator;
 };
 
 ListDescriptor::ListDescriptor(std::shared_ptr<const State> state) : state_(std::move(state)) {}
@@ -58,11 +62,9 @@ std::uint32_t ConfigSchema::schema_version() const noexcept { return state_->sch
 
 std::optional<OptionDescriptor> ConfigSchema::find(const OptionId &option) const
 {
-    const auto it = std::find_if(state_->options.begin(), state_->options.end(),
-                                 [&option](const OptionDescriptor &descriptor) {
-                                     return descriptor.id == option;
-                                 });
-    return it == state_->options.end() ? std::nullopt : std::optional<OptionDescriptor>{*it};
+    const OptionDescriptor *descriptor =
+        detail::ConfigSchemaAccess::find_descriptor(*this, option);
+    return descriptor ? std::optional<OptionDescriptor>{*descriptor} : std::nullopt;
 }
 
 std::vector<OptionDescriptor> ConfigSchema::options() const { return state_->options; }
@@ -260,7 +262,7 @@ Result<void> detail::ConfigSchemaAccess::validate_structure(
         return context_result;
 
     for (const ConfigEntry &entry : patch.entries()) {
-        const auto descriptor = schema.find(entry.option);
+        const OptionDescriptor *descriptor = find_descriptor(schema, entry.option);
         const std::string field = "/configuration/" + json_pointer_segment(entry.option.value());
         if (!descriptor)
             return detail::ResultAccess::failure(ErrorCode::invalid_configuration,
@@ -327,7 +329,7 @@ Result<OptionEvaluation> ConfigSchema::evaluate_option(
         return detail::ResultAccess::failure<OptionEvaluation>(*structure.error_code(),
                                                                structure.diagnostics().front().message,
                                                                structure.diagnostics().front().field);
-    if (!find(option))
+    if (!detail::ConfigSchemaAccess::find_descriptor(*this, option))
         return detail::ResultAccess::failure<OptionEvaluation>(ErrorCode::invalid_argument,
                                                                "Unknown configuration option",
                                                                "/option");
@@ -342,6 +344,21 @@ bool detail::ConfigSchemaAccess::is_generic_option(const ConfigSchema &schema,
                                                     const OptionId &option)
 {
     return schema.state_->typed_owned_options.count(option.value()) == 0;
+}
+
+const OptionDescriptor *detail::ConfigSchemaAccess::find_descriptor(
+    const ConfigSchema &schema, const OptionId &option)
+{
+    return find_descriptor(schema, option.value());
+}
+
+const OptionDescriptor *detail::ConfigSchemaAccess::find_descriptor(
+    const ConfigSchema &schema, const std::string &option)
+{
+    const auto found = schema.state_->option_index.find(option);
+    if (found == schema.state_->option_index.end())
+        return nullptr;
+    return &schema.state_->options[found->second];
 }
 
 ValueDescriptor detail::ConfigSchemaAccess::scalar(
@@ -366,15 +383,41 @@ ValueDescriptor detail::ConfigSchemaAccess::list(ValueDescriptor item, std::size
         {}, {}, std::move(list_descriptor)}));
 }
 
-ConfigSchema detail::ConfigSchemaAccess::make(std::string schema_id, std::uint32_t schema_version,
-                                               std::vector<OptionDescriptor> options,
-                                               std::vector<std::string> typed_owned_options,
-                                               OptionEvaluator evaluator)
+Result<ConfigSchema> detail::ConfigSchemaAccess::make(
+    std::string schema_id, std::uint32_t schema_version,
+    std::vector<OptionDescriptor> options,
+    std::vector<std::string> typed_owned_options,
+    OptionEvaluator evaluator)
 {
+    std::unordered_map<std::string, std::size_t> option_index;
+    option_index.reserve(options.size());
+    for (std::size_t index = 0; index < options.size(); ++index) {
+        const std::string id = options[index].id.value();
+        if (!option_index.emplace(id, index).second) {
+            return ResultAccess::failure<ConfigSchema>(
+                ErrorCode::internal, "Configuration schema contains a duplicate option",
+                "/schema/options/" + json_pointer_segment(id));
+        }
+    }
+
     std::set<std::string> typed_owned(typed_owned_options.begin(), typed_owned_options.end());
-    return ConfigSchema(std::make_shared<const ConfigSchema::State>(ConfigSchema::State{
-        std::move(schema_id), schema_version, std::move(options), std::move(typed_owned),
-        std::move(evaluator)}));
+    return ResultAccess::success(ConfigSchema(
+        std::make_shared<const ConfigSchema::State>(ConfigSchema::State{
+            std::move(schema_id), schema_version, std::move(options),
+            std::move(option_index), 1, 0, std::move(typed_owned),
+            std::move(evaluator)})));
+}
+
+std::size_t detail::ConfigSchemaAccess::option_index_build_count(
+    const ConfigSchema &schema) noexcept
+{
+    return schema.state_->option_index_build_count;
+}
+
+std::size_t detail::ConfigSchemaAccess::option_index_mutation_count(
+    const ConfigSchema &schema) noexcept
+{
+    return schema.state_->option_index_mutation_count;
 }
 
 } // namespace libslicer::v1

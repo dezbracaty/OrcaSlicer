@@ -10,6 +10,7 @@
 #include "libslic3r/Utils.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <deque>
@@ -18,9 +19,109 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 
 namespace libslicer::v1 {
+
+#ifdef LIBSLICER_SDK_TESTING
+namespace detail::testing {
+namespace {
+
+struct StageBarrierState {
+    struct Slot {
+        std::uint64_t generation {0};
+        bool active {false};
+        bool reached {false};
+        bool released {false};
+    };
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::array<Slot, 5> slots;
+};
+
+StageBarrierState &stage_barrier_state()
+{
+    static StageBarrierState state;
+    return state;
+}
+
+std::size_t stage_index(SliceStage stage)
+{
+    return static_cast<std::size_t>(stage);
+}
+
+} // namespace
+
+StageBarrier::StageBarrier(SliceStage stage) : stage_(stage)
+{
+    auto &state = stage_barrier_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto &slot = state.slots[stage_index(stage_)];
+    if (slot.active)
+        throw std::logic_error(
+            "Only one SDK test stage barrier may be active per stage");
+    slot.active = true;
+    slot.reached = false;
+    slot.released = false;
+    generation_ = ++slot.generation;
+}
+
+StageBarrier::~StageBarrier()
+{
+    auto &state = stage_barrier_state();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        auto &slot = state.slots[stage_index(stage_)];
+        if (slot.generation != generation_) return;
+        slot.released = true;
+        slot.active = false;
+        ++slot.generation;
+    }
+    state.condition.notify_all();
+}
+
+bool StageBarrier::wait_until_reached(std::chrono::milliseconds timeout)
+{
+    auto &state = stage_barrier_state();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    auto &slot = state.slots[stage_index(stage_)];
+    state.condition.wait_for(lock, timeout, [&] {
+        return slot.generation != generation_ || slot.reached;
+    });
+    return slot.generation == generation_ && slot.reached;
+}
+
+void StageBarrier::release()
+{
+    auto &state = stage_barrier_state();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        auto &slot = state.slots[stage_index(stage_)];
+        if (slot.generation != generation_) return;
+        slot.released = true;
+    }
+    state.condition.notify_all();
+}
+
+void wait_at_stage(SliceStage stage)
+{
+    auto &state = stage_barrier_state();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    auto &slot = state.slots[stage_index(stage)];
+    if (!slot.active) return;
+    const std::uint64_t generation = slot.generation;
+    slot.reached = true;
+    state.condition.notify_all();
+    state.condition.wait(lock, [&] {
+        return slot.generation != generation || slot.released;
+    });
+}
+
+} // namespace detail::testing
+#endif
+
 namespace {
 
 template<class T>
@@ -258,9 +359,11 @@ void complete_failure(const std::shared_ptr<detail::SliceJobState> &job,
                       std::string message, std::string field,
                       std::vector<Diagnostic> diagnostics = {})
 {
+    const Diagnostic terminal_diagnostic{
+        code, Severity::error, message, field};
     events.emit(code == ErrorCode::cancelled ? SliceEventKind::cancelled
                                               : SliceEventKind::failed,
-                100);
+                100, terminal_diagnostic);
     events.close();
     auto callback = callback_diagnostics(job);
     diagnostics.insert(diagnostics.end(), std::make_move_iterator(callback.begin()),
@@ -751,6 +854,20 @@ void run_slice(const std::shared_ptr<detail::SliceJobState> &job,
     std::atomic<bool> report_slicing_progress {false};
     std::mutex diagnostics_mutex;
     std::vector<Diagnostic> result_diagnostics;
+#ifdef LIBSLICER_SDK_TESTING
+    detail::testing::wait_at_stage(detail::testing::SliceStage::queued);
+    if (cancellation_requested(job)) {
+        complete_failure(job, events, ErrorCode::cancelled,
+                         "Slice job was cancelled", "/job");
+        return;
+    }
+    detail::testing::wait_at_stage(detail::testing::SliceStage::preparing);
+    if (cancellation_requested(job)) {
+        complete_failure(job, events, ErrorCode::cancelled,
+                         "Slice job was cancelled", "/job");
+        return;
+    }
+#endif
     events.emit(SliceEventKind::preparing, 0);
 
     try {
@@ -827,6 +944,11 @@ void run_slice(const std::shared_ptr<detail::SliceJobState> &job,
         });
         print.apply(model, config, false);
 
+#ifdef LIBSLICER_SDK_TESTING
+        detail::testing::wait_at_stage(detail::testing::SliceStage::validating);
+        if (cancellation_requested(job))
+            throw Slic3r::CanceledException();
+#endif
         phase = SlicePhase::validating;
         events.emit(SliceEventKind::validating, 10);
         Slic3r::StringObjectException warning;
@@ -848,6 +970,11 @@ void run_slice(const std::shared_ptr<detail::SliceJobState> &job,
         }
         if (cancellation_requested(job)) print.cancel();
 
+#ifdef LIBSLICER_SDK_TESTING
+        detail::testing::wait_at_stage(detail::testing::SliceStage::slicing);
+        if (cancellation_requested(job))
+            throw Slic3r::CanceledException();
+#endif
         phase = SlicePhase::slicing;
         report_slicing_progress.store(true, std::memory_order_relaxed);
         events.emit(SliceEventKind::slicing, 15);
@@ -855,6 +982,11 @@ void run_slice(const std::shared_ptr<detail::SliceJobState> &job,
         report_slicing_progress.store(false, std::memory_order_relaxed);
         if (cancellation_requested(job)) print.cancel();
 
+#ifdef LIBSLICER_SDK_TESTING
+        detail::testing::wait_at_stage(detail::testing::SliceStage::exporting);
+        if (cancellation_requested(job))
+            throw Slic3r::CanceledException();
+#endif
         phase = SlicePhase::exporting;
         events.emit(SliceEventKind::exporting, 85);
         JobDirectory job_directory(context->options.temporary_dir);
@@ -975,29 +1107,99 @@ Result<void> SliceJob::cancel()
     return detail::ResultAccess::success();
 }
 
+namespace {
+
+Result<std::shared_ptr<const SliceResult>> copy_terminal_outcome_locked(
+    const detail::SliceJobState &state)
+{
+    if (state.unhandled_exception)
+        std::rethrow_exception(state.unhandled_exception);
+    if (!state.outcome)
+        return failure<std::shared_ptr<const SliceResult>>(
+            ErrorCode::internal,
+            "Slice job finished without a result or diagnostic", "/job");
+    if (!state.outcome->has_value() && state.outcome->diagnostics().empty())
+        return failure<std::shared_ptr<const SliceResult>>(
+            state.outcome->error_code().value_or(ErrorCode::internal),
+            "Slice job failed without a diagnostic", "/job");
+    return *state.outcome;
+}
+
+template<class T>
+Result<T> callback_wait_conflict(const char *operation)
+{
+    return failure<T>(
+        ErrorCode::conflict,
+        std::string(operation) + " cannot be called from this job's callback",
+        "/callback");
+}
+
+} // namespace
+
 Result<std::shared_ptr<const SliceResult>> SliceJob::wait()
 {
     std::unique_lock<std::mutex> lock(state_->mutex);
     if (state_->callback_thread == std::this_thread::get_id() && state_->callback_active)
-        return failure<std::shared_ptr<const SliceResult>>(
-            ErrorCode::conflict, "wait() cannot be called from this job's callback", "/callback");
+        return callback_wait_conflict<std::shared_ptr<const SliceResult>>("wait()");
     state_->condition.wait(lock, [&] { return state_->finished; });
-    if (state_->unhandled_exception)
-        std::rethrow_exception(state_->unhandled_exception);
-    return *state_->outcome;
+    return copy_terminal_outcome_locked(*state_);
+}
+
+Result<std::optional<std::shared_ptr<const SliceResult>>> SliceJob::wait_for(
+    std::chrono::milliseconds timeout)
+{
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    if (state_->callback_thread == std::this_thread::get_id() && state_->callback_active)
+        return callback_wait_conflict<
+            std::optional<std::shared_ptr<const SliceResult>>>("wait_for()");
+    if (timeout.count() < 0)
+        return failure<std::optional<std::shared_ptr<const SliceResult>>>(
+            ErrorCode::invalid_argument,
+            "wait_for() timeout must be non-negative", "/timeout");
+
+    if (!state_->condition.wait_for(lock, timeout, [&] { return state_->finished; }))
+        return detail::ResultAccess::success(
+            std::optional<std::shared_ptr<const SliceResult>>{});
+
+    auto terminal = copy_terminal_outcome_locked(*state_);
+    if (!terminal.has_value())
+        return forward_failure<std::optional<std::shared_ptr<const SliceResult>>>(terminal);
+    return detail::ResultAccess::success(
+        std::optional<std::shared_ptr<const SliceResult>>(terminal.value()),
+        terminal.diagnostics());
 }
 
 SliceEngine::SliceEngine(std::shared_ptr<detail::SliceEngineState> state) : state_(std::move(state)) {}
 
 Result<SliceInspection> SliceEngine::inspect(const SliceRequest &request) const
 {
-    auto frozen = freeze_slice_input(state_, request);
-    if (!frozen.has_value()) return forward_failure<SliceInspection>(frozen);
-    auto diagnostics = frozen.diagnostics();
-    auto input = std::move(frozen).value();
-    return detail::ResultAccess::success(
-        SliceInspection{std::move(input.configuration), std::move(input.filament_map)},
-        std::move(diagnostics));
+    try {
+        std::optional<detail::TemporarySliceSelection> temporary;
+        if (request.temporary_selection) {
+            temporary.emplace(detail::TemporarySliceSelection{
+                request.temporary_selection->selection,
+                request.temporary_selection->complete_manual_map});
+        }
+        auto frozen = detail::resolve_slice_input(
+            state_->context, request.project, request.plate, std::move(temporary),
+            detail::SliceInputMode::inspect);
+        if (!frozen.has_value()) return forward_failure<SliceInspection>(frozen);
+        auto diagnostics = frozen.diagnostics();
+        auto input = std::move(frozen).value();
+        return detail::ResultAccess::success(
+            SliceInspection{std::move(input.configuration), std::move(input.filament_map)},
+            std::move(diagnostics));
+    } catch (const std::bad_alloc &) {
+        throw;
+    } catch (const std::filesystem::filesystem_error &error) {
+        return failure<SliceInspection>(ErrorCode::io, error.what(), "/project");
+    } catch (const std::exception &error) {
+        return failure<SliceInspection>(ErrorCode::internal, error.what(), "/internal");
+    } catch (...) {
+        return failure<SliceInspection>(
+            ErrorCode::internal, "Unclassified exception escaped slice inspection",
+            "/internal");
+    }
 }
 
 Result<SliceJob> SliceEngine::submit(SliceRequest request, SliceCallback callback)

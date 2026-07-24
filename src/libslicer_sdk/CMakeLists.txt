@@ -5,6 +5,7 @@ add_library(libslicer_sdk_v1 STATIC
     OrcaConfigAdapter.cpp
     Preset.cpp
     Project.cpp
+    RuntimeCoordinator.cpp
     Slice.cpp
     NanoSVG.cpp
 )
@@ -272,6 +273,9 @@ target_compile_definitions(libslicer_sdk_v1
         LIBSLICER_PACKAGE_VERSION_MAJOR=1
         LIBSLICER_PACKAGE_VERSION_MINOR=0
 )
+if(LIBSLICER_BUILD_TESTS)
+    target_compile_definitions(libslicer_sdk_v1 PRIVATE LIBSLICER_SDK_TESTING)
+endif()
 
 set_target_properties(libslicer_sdk_v1 PROPERTIES
     EXPORT_NAME sdk_v1

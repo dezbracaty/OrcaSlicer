@@ -27,11 +27,31 @@ Result<Slic3r::ConfigOptionUniquePtr> value_to_core_option(
 
 Result<ConfigValues> core_config_to_values(const Slic3r::ConfigBase &config);
 
+struct FusedConfigConversion {
+    ConfigValues effective;
+    ConfigPatch  overrides;
+};
+
+Result<FusedConfigConversion> core_config_to_values_and_diff(
+    const Slic3r::ConfigBase &inherited,
+    const Slic3r::ConfigBase &effective,
+    const ConfigSchema &schema);
+
 Result<ConfigPatch> core_config_diff_to_patch(const Slic3r::ConfigBase &inherited,
                                               const Slic3r::ConfigBase &effective,
                                               const ConfigSchema &schema);
 
 Result<void> apply_patch_to_core_config(const ConfigPatch &patch,
                                         Slic3r::DynamicPrintConfig &config);
+
+#ifdef LIBSLICER_SDK_TESTING
+struct ConfigAdapterTestStats {
+    std::uint64_t schema_build_ns {0};
+};
+
+void reset_config_adapter_test_stats();
+ConfigAdapterTestStats config_adapter_test_stats();
+std::uintptr_t config_value_identity_for_testing(const ConfigValue &value);
+#endif
 
 } // namespace libslicer::v1::detail

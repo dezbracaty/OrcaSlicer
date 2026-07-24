@@ -4,6 +4,16 @@
 
 #include "libslic3r/PresetBundle.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <nlohmann/json.hpp>
+#include <thread>
+
 using namespace Slic3r;
 
 namespace {
@@ -77,7 +87,317 @@ struct RenameTestCollection : public PresetCollection
     using PresetCollection::update_map_system_profile_renamed;
 };
 
+struct SystemLoadObserverReset {
+    ~SystemLoadObserverReset() { set_system_preset_load_test_observer({}); }
+};
+
+void write_json(const std::filesystem::path &path, const nlohmann::json &value)
+{
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream output(path, std::ios::binary);
+    REQUIRE(output.good());
+    output << value.dump(2);
+    REQUIRE(output.good());
+}
+
+void write_minimal_vendor_root(
+    const std::filesystem::path &profiles,
+    const std::string &vendor,
+    const std::vector<std::pair<std::string, std::string>> &processes = {})
+{
+    nlohmann::json root{
+        {"name", vendor},
+        {"version", "1.0.0"},
+        {"process_list", nlohmann::json::array()}
+    };
+    for (const auto &[name, sub_path] : processes)
+        root["process_list"].push_back({{"name", name}, {"sub_path", sub_path}});
+    write_json(profiles / (vendor + ".json"), root);
+}
+
+void write_system_process(const std::filesystem::path &profiles,
+                          const std::string &vendor,
+                          const std::string &file_name,
+                          const std::string &preset_name,
+                          const std::string &inherits = {},
+                          const std::string &renamed_from = {})
+{
+    PresetBundle defaults;
+    const std::filesystem::path path =
+        profiles / vendor / "process" / file_name;
+    write_print_preset(defaults.prints.default_preset().config,
+                       fs::path(path.string()), preset_name, inherits);
+
+    std::ifstream input(path, std::ios::binary);
+    REQUIRE(input.good());
+    nlohmann::json value = nlohmann::json::parse(input);
+    value["type"] = "process";
+    value["from"] = "system";
+    value["instantiation"] = "true";
+    if (inherits.empty())
+        value.erase(BBL_JSON_KEY_INHERITS);
+    if (!renamed_from.empty())
+        value[ORCA_JSON_KEY_RENAMED_FROM] = renamed_from;
+    write_json(path, value);
+}
+
 } // namespace
+
+TEST_CASE("Explicit system preset loader reports a structured missing Orca dependency",
+          "[Preset][Bundle][SystemLoader]")
+{
+    TempPresetDir temp_dir;
+    PresetBundle bundle;
+
+    const std::filesystem::path profiles(temp_dir.path.string());
+    const SystemPresetLoadResult loaded =
+        bundle.load_system_presets_from_json_at(
+            profiles,
+            ForwardCompatibilitySubstitutionRule::Disable,
+            SystemPresetLoadPolicy::SdkStrict);
+
+    REQUIRE(loaded.issues.size() == 1);
+    CHECK(loaded.issues.front().kind ==
+          SystemPresetIssueKind::missing_dependency);
+    CHECK(loaded.issues.front().vendor == PresetBundle::ORCA_FILAMENT_LIBRARY);
+    CHECK(loaded.issues.front().path ==
+          std::filesystem::canonical(profiles) /
+              "OrcaFilamentLibrary.json");
+    CHECK_FALSE(loaded.issues.front().message.empty());
+    CHECK(bundle.has_defauls_only());
+}
+
+TEST_CASE("Explicit system preset loader maps malformed Orca JSON to a parse issue",
+          "[Preset][Bundle][SystemLoader]")
+{
+    TempPresetDir temp_dir;
+    const std::filesystem::path profiles(temp_dir.path.string());
+    const std::filesystem::path orca =
+        profiles / "OrcaFilamentLibrary.json";
+    {
+        std::ofstream output(orca, std::ios::binary);
+        output << "{";
+    }
+
+    PresetBundle bundle;
+    const SystemPresetLoadResult loaded =
+        bundle.load_system_presets_from_json_at(
+            profiles,
+            ForwardCompatibilitySubstitutionRule::Disable,
+            SystemPresetLoadPolicy::SdkStrict);
+
+    REQUIRE(loaded.issues.size() == 1);
+    CHECK(loaded.issues.front().kind == SystemPresetIssueKind::parse);
+    CHECK(loaded.issues.front().vendor == PresetBundle::ORCA_FILAMENT_LIBRARY);
+    CHECK(loaded.issues.front().path ==
+          std::filesystem::canonical(orca));
+    CHECK_FALSE(loaded.issues.front().message.empty());
+    CHECK(bundle.has_defauls_only());
+}
+
+TEST_CASE("Strict system loader reports malformed non-Orca JSON as parse without message classification",
+          "[Preset][Bundle][SystemLoader]")
+{
+    TempPresetDir temp_dir;
+    const std::filesystem::path profiles(temp_dir.path.string());
+    write_minimal_vendor_root(profiles, PresetBundle::ORCA_FILAMENT_LIBRARY);
+    {
+        std::ofstream output(profiles / "BrokenVendor.json", std::ios::binary);
+        output << "{";
+    }
+
+    PresetBundle bundle;
+    const SystemPresetLoadResult loaded =
+        bundle.load_system_presets_from_json_at(
+            profiles,
+            ForwardCompatibilitySubstitutionRule::Disable,
+            SystemPresetLoadPolicy::SdkStrict);
+
+    REQUIRE(loaded.issues.size() == 1);
+    CHECK(loaded.issues.front().kind == SystemPresetIssueKind::parse);
+    CHECK(loaded.issues.front().vendor == "BrokenVendor");
+    CHECK(loaded.issues.front().path ==
+          std::filesystem::canonical(profiles / "BrokenVendor.json"));
+    CHECK_FALSE(loaded.issues.front().message.empty());
+}
+
+TEST_CASE("GUI validation rethrows the first non-Orca failure in stable vendor order",
+          "[Preset][Bundle][SystemLoader]")
+{
+    TempPresetDir temp_dir;
+    const std::filesystem::path profiles(temp_dir.path.string());
+    write_minimal_vendor_root(profiles, PresetBundle::ORCA_FILAMENT_LIBRARY);
+    {
+        std::ofstream output(profiles / "ZVendor.json", std::ios::binary);
+        output << "{";
+    }
+    {
+        std::ofstream output(profiles / "AVendor.json", std::ios::binary);
+        output << "{";
+    }
+
+    PresetBundle bundle;
+    bundle.set_is_validation_mode(true);
+    try {
+        (void)bundle.load_system_presets_from_json_at(
+            profiles,
+            ForwardCompatibilitySubstitutionRule::Disable,
+            SystemPresetLoadPolicy::GuiBestEffort);
+        FAIL("GuiBestEffort validation must rethrow a vendor parse failure");
+    } catch (const std::exception &error) {
+        const std::string message = error.what();
+        CHECK(message.find("AVendor.json") != std::string::npos);
+        CHECK(message.find("ZVendor.json") == std::string::npos);
+    }
+}
+
+TEST_CASE("Strict system loader reports duplicates from deterministic merge",
+          "[Preset][Bundle][SystemLoader]")
+{
+    TempPresetDir temp_dir;
+    const std::filesystem::path profiles(temp_dir.path.string());
+    write_minimal_vendor_root(profiles, PresetBundle::ORCA_FILAMENT_LIBRARY);
+    write_minimal_vendor_root(
+        profiles, "AVendor", {{"Shared Process", "process/shared.json"}});
+    write_minimal_vendor_root(
+        profiles, "BVendor", {{"Shared Process", "process/shared.json"}});
+    write_system_process(
+        profiles, "AVendor", "shared.json", "Shared Process");
+    write_system_process(
+        profiles, "BVendor", "shared.json", "Shared Process");
+
+    PresetBundle bundle;
+    const SystemPresetLoadResult loaded =
+        bundle.load_system_presets_from_json_at(
+            profiles,
+            ForwardCompatibilitySubstitutionRule::Disable,
+            SystemPresetLoadPolicy::SdkStrict);
+
+    const auto duplicate = std::find_if(
+        loaded.issues.begin(), loaded.issues.end(),
+        [](const SystemPresetLoadIssue &issue) {
+            return issue.kind == SystemPresetIssueKind::duplicate;
+        });
+    REQUIRE(duplicate != loaded.issues.end());
+    CHECK(duplicate->vendor == "BVendor");
+    CHECK_FALSE(duplicate->message.empty());
+}
+
+TEST_CASE("Strict system loader explicitly validates alias ambiguity and cycles",
+          "[Preset][Bundle][SystemLoader]")
+{
+    SECTION("ambiguous alias") {
+        TempPresetDir temp_dir;
+        const std::filesystem::path profiles(temp_dir.path.string());
+        write_minimal_vendor_root(profiles, PresetBundle::ORCA_FILAMENT_LIBRARY);
+        write_minimal_vendor_root(
+            profiles, "AliasVendor",
+            {{"First", "process/first.json"},
+             {"Second", "process/second.json"}});
+        write_system_process(
+            profiles, "AliasVendor", "first.json", "First", {}, "Legacy");
+        write_system_process(
+            profiles, "AliasVendor", "second.json", "Second", {}, "Legacy");
+
+        PresetBundle bundle;
+        const SystemPresetLoadResult loaded =
+            bundle.load_system_presets_from_json_at(
+                profiles,
+                ForwardCompatibilitySubstitutionRule::Disable,
+                SystemPresetLoadPolicy::SdkStrict);
+        CHECK(std::any_of(
+            loaded.issues.begin(), loaded.issues.end(),
+            [](const SystemPresetLoadIssue &issue) {
+                return issue.kind == SystemPresetIssueKind::alias_ambiguous;
+            }));
+    }
+
+    SECTION("alias cycle") {
+        TempPresetDir temp_dir;
+        const std::filesystem::path profiles(temp_dir.path.string());
+        write_minimal_vendor_root(profiles, PresetBundle::ORCA_FILAMENT_LIBRARY);
+        write_minimal_vendor_root(
+            profiles, "AliasVendor",
+            {{"First", "process/first.json"},
+             {"Second", "process/second.json"}});
+        write_system_process(
+            profiles, "AliasVendor", "first.json", "First", {}, "Second");
+        write_system_process(
+            profiles, "AliasVendor", "second.json", "Second", {}, "First");
+
+        PresetBundle bundle;
+        const SystemPresetLoadResult loaded =
+            bundle.load_system_presets_from_json_at(
+                profiles,
+                ForwardCompatibilitySubstitutionRule::Disable,
+                SystemPresetLoadPolicy::SdkStrict);
+        CHECK(std::any_of(
+            loaded.issues.begin(), loaded.issues.end(),
+            [](const SystemPresetLoadIssue &issue) {
+                return issue.kind == SystemPresetIssueKind::alias_cycle;
+            }));
+    }
+}
+
+TEST_CASE("System loader preserves Orca-first, parallel parse, and stable merge order",
+          "[Preset][Bundle][SystemLoader]")
+{
+    TempPresetDir temp_dir;
+    const std::filesystem::path profiles(temp_dir.path.string());
+    write_minimal_vendor_root(profiles, PresetBundle::ORCA_FILAMENT_LIBRARY);
+    write_minimal_vendor_root(profiles, "ZVendor");
+    write_minimal_vendor_root(profiles, "AVendor");
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::size_t active_vendor_loads = 0;
+    std::size_t maximum_active_vendor_loads = 0;
+    std::size_t started_vendor_loads = 0;
+    bool orca_finished = false;
+    bool vendor_started_before_orca = false;
+    std::vector<std::string> merge_order;
+    SystemLoadObserverReset reset;
+    set_system_preset_load_test_observer(
+        [&](SystemPresetLoadTestEvent event, const std::string &vendor) {
+            std::unique_lock<std::mutex> lock(mutex);
+            switch (event) {
+            case SystemPresetLoadTestEvent::orca_load_finished:
+                orca_finished = true;
+                break;
+            case SystemPresetLoadTestEvent::vendor_load_started:
+                vendor_started_before_orca |= !orca_finished;
+                ++active_vendor_loads;
+                ++started_vendor_loads;
+                maximum_active_vendor_loads =
+                    std::max(maximum_active_vendor_loads, active_vendor_loads);
+                condition.notify_all();
+                condition.wait_for(lock, std::chrono::seconds(2), [&] {
+                    return started_vendor_loads >= 2;
+                });
+                break;
+            case SystemPresetLoadTestEvent::vendor_load_finished:
+                --active_vendor_loads;
+                break;
+            case SystemPresetLoadTestEvent::vendor_merge_started:
+                merge_order.push_back(vendor);
+                break;
+            default:
+                break;
+            }
+        });
+
+    PresetBundle bundle;
+    const SystemPresetLoadResult loaded =
+        bundle.load_system_presets_from_json_at(
+            profiles,
+            ForwardCompatibilitySubstitutionRule::Disable,
+            SystemPresetLoadPolicy::SdkStrict);
+
+    CHECK(loaded.issues.empty());
+    CHECK_FALSE(vendor_started_before_orca);
+    CHECK(maximum_active_vendor_loads >= 2);
+    CHECK(merge_order == std::vector<std::string>{"AVendor", "ZVendor"});
+}
 
 TEST_CASE("Preset identity is canonicalized from load path", "[Preset][Identity]")
 {
@@ -297,4 +617,3 @@ TEST_CASE("Removed Generic parent is normalized into a loaded filament's inherit
     REQUIRE(bundle.filaments.get_preset_parent(*child) != nullptr);
     CHECK(bundle.filaments.get_preset_parent(*child)->name == "Generic PLA @System");
 }
-

@@ -5,6 +5,12 @@
 v1 发布。默认构建不得安装稳定 SDK package，只有显式开启 `LIBSLICER_INSTALL_SDK_V1` 才允许
 生成安装包用于预发布验证。
 
+实施状态：本次修订冻结的是目标契约。当前工作树中的 `RuntimeCoordinator`、共享 internal
+system loader 和不可变 schema option index 均只有未验收候选；修复后 profiling 的 cold create
+仍为 `24.553 s`，超过 `15 s` Gate。第二阶段 record conversion 优化尚未实施。
+`SdkContext::create()` 成功即完整 catalog 可用的公共语义及全部 public v1 header 保持不变；
+第二阶段实现、兼容性测试、真实性能与内存 Gate 全部通过前不得标记性能修复为已完成。
+
 ## 1. 目的和范围
 
 libslicer v1 是供其他 App 直接链接的 C++17 FFF 切片 SDK。它提供以下公共能力：
@@ -406,6 +412,12 @@ printer values；编辑 filament preset 时必须提供 printer 与 process valu
 的规则使用 `filament_count`。project/plate/object/part/layer-range 的 context 使用
 `SliceEngine::inspect()`/`submit()` 同步捕获的 printer/process values 和工程逻辑耗材数量。
 
+`ConfigSchema::find()` 的公共语义冻结为：按 `OptionId::value()` 的完整 bytes、大小写敏感精确
+匹配；存在时返回与 `options()` 中对应 entry 值相等的 `OptionDescriptor`，不存在时返回
+`std::nullopt`。重复查询不得改变结果，`options()` 的内容与顺序不得因内部索引而变化。本轮性能
+修复只能改变 private state 和 internal adapter 的查找方式，不新增或修改任何 public 方法、返回
+类型、header、schema id/version 或 descriptor 字段。
+
 `validate_and_normalize()` 原子完成 shape/scope/nullability/range/reference 检查、把 candidate
 patch 合并到完整 base 后执行跨 option/context 校验，并返回 canonical、无重复且保留输入顺序的
 patch；失败不返回部分 patch。调用方不需要在四个相互重叠的方法之间选择。
@@ -485,7 +497,8 @@ public:
 };
 ```
 
-目录角色和 preset catalog 快照是公共行为：
+目录角色、process runtime 配置和 preset catalog 快照是公共行为。本节不新增 public 方法或
+修改 public headers；`SdkContext::create()`、`presets()`、`Project::load()` 等签名保持不变。
 
 - `resources_dir` 是只读的 SDK 资源根目录。SDK 从中读取内置 system/vendor profiles 和其他
   Orca 资源，绝不向其中写入；
@@ -494,10 +507,43 @@ public:
   只能写入该 store。store 的内部子目录布局不是公共 API；
 - `preset_dirs` 是按调用方给定顺序扫描的附加只读 preset catalog 根目录。SDK 绝不修改其中的
   文件；其中的 repository preset 作为 `PresetOrigin::vendor` 暴露，不能 edit/erase；
-- 全局扫描顺序固定为 `resources_dir`、`data_dir` user store、`preset_dirs[0]` 到
-  `preset_dirs[N-1]`；每个根目录内按 canonical path 的 UTF-8 byte sequence 升序扫描；
+- `temporary_dir` 是 SDK 临时文件根目录。SDK 只能在该根目录下创建 SDK-owned 临时内容；
+- catalog 的来源优先级和 strict diagnostic 顺序固定为 `resources_dir`、`data_dir` user store、
+  `preset_dirs[0]` 到 `preset_dirs[N-1]`；这一定义不授权 SDK 另建串行 vendor loader。每个来源
+  内部的输入及最终 merge 必须使用稳定、确定性的 canonical UTF-8 byte 顺序；
+- `SdkContext::create()` 在成功返回前完整建立 FFF schema 和 preset catalog。它必须验证
+  `resources_dir`、`resources_dir/profiles`、`data_dir`、`temporary_dir` 和每个
+  `preset_dirs`，完整执行 preset 解析、继承、identity/alias/dependency 校验及 repository
+  合并。格式错误返回 `invalid_configuration`，I/O/权限错误返回 `io`，重复身份返回
+  `conflict`；失败时不发布 `SdkContext`、空 catalog 或 default-only catalog；
+- 历史 GUI 应用初始化阶段调用完整 `PresetBundle::load_presets(AppConfig&)`，这一事实只作为
+  “应用生命周期内建立并长期复用一个 bundle”的历史证据。**SDK 禁止调用该完整入口**，也不得
+  构造 headless `AppConfig` 模拟 GUI 的 user preset、selection 或配置迁移生命周期；
+- 首个 canonical catalog key 的 create 必须调用从当前 core
+  `load_system_presets_from_json()` 抽取的 libslic3r internal 显式目录 system loader，以
+  `resources_dir/profiles` 和 strict policy 为参数。该入口不是 libslicer public API，不修改或
+  安装任何 `<libslicer/v1/...>` 头；GUI 保留原 wrapper，并继续以 GUI data root 下的
+  `system` 目录和 best-effort policy 取得原有累计结果；
+- 共享的 core system loader 保持 `OrcaFilamentLibrary` 先同步加载；其成功完成后，其余 vendor
+  才在独立 bundle 中走 core 既有并行路径。non-Orca vendor 在调度前按 canonical vendor key 的
+  UTF-8 byte 顺序排序，所有解析完成后按同一顺序 merge。SDK 可以在 core load 前后增加严格来源、
+  identity、alias、user-store 和 diagnostic 验证，但不得在 SDK 内重新实现串行逐 vendor 全量
+  循环；
+- core system loader 的结构化 issue 至少区分 `io`、`parse`、`duplicate`、`alias_cycle`、
+  `alias_ambiguous`、`missing_dependency` 和 `invalid_identity`，并保留确定性的
+  `vendor`、`path`、`message`；存在目标使用 canonical path，缺失目标使用 canonical profiles
+  root 下的 lexically-normalized expected path。SDK strict policy 中任一 issue 都使 create 失败，
+  staged catalog 不发布；公共映射固定为：`io -> (io, /resources_dir)`、
+  `parse -> (invalid_configuration, /resources_dir)`、
+  `duplicate -> (conflict, /resources_dir)`、
+  `alias_cycle -> (invalid_configuration, /resources_dir)`、
+  `alias_ambiguous -> (conflict, /resources_dir)`、
+  `missing_dependency -> (not_found, /resources_dir)`、
+  `invalid_identity -> (invalid_configuration, /resources_dir)`。公共 `Diagnostic.message` 保留
+  core issue 的 `message`，不得改成泛化的“preset load failed”；`vendor`/`path` 用于确定性排序、
+  日志和内部测试，不新增公共字段；
 - preset 的唯一身份是 `(PresetKind, PresetOrigin, PresetRef::id())`。不同 origin 的相同 kind/id
-  可以共存；任意已配置来源中出现相同身份时不做覆盖，也没有“后者/前者优先”，
+  可以共存；任意已配置来源中出现相同身份时不做覆盖，也没有“前者/后者优先”，
   `SdkContext::create()` 返回 `conflict`。diagnostic field 对应后扫描来源：内置资源为
   `/resources_dir`，user store 为 `/data_dir`，附加目录为 `/preset_dirs/{index}`；
 - 从 Orca profile 加载的 `PresetRef::id()` 固定为 profile JSON `name` 经 Orca-compatible string
@@ -513,19 +559,145 @@ public:
   阶段拒绝并指向来源字段。全部 origin 均未匹配时返回 `not_found`。legacy
   selection 错误的 field 都是 `/project/selected_presets/printer`、
   `/project/selected_presets/process` 或 `/project/selected_presets/filaments/{index}`；
-- `SdkContext::create()` 在成功返回前完整建立 catalog 快照，并验证 `resources_dir` 与每个
-  `preset_dirs` 可读、`data_dir` 可创建且 user preset store 可写。格式错误返回
-  `invalid_configuration`，I/O/权限错误返回 `io`，重复身份返回 `conflict`；失败时不发布
-  SdkContext。目录读取、解析、权限和 user-store 创建失败的 diagnostic field 精确指向产生
-  错误的 `/resources_dir`、`/data_dir` 或 `/preset_dirs/{index}`；
-- Context 创建后不监听、轮询或自动发现目录中的外部文件变化。repository 自身成功提交的变化
-  立即进入该 Context 的新 catalog generation；其他进程或直接文件修改只有新建 SdkContext
-  才会载入。现有 Context 的 edit/create/erase 在持久化前必须重新验证目标的存在状态和完整
-  内容版本：修改、删除、同路径替换，以及 create 捕获“不存在”后被外部创建，均返回
-  `conflict`，field 为 `/preset/storage_revision`，不得静默覆盖；
+- `resources_dir`、`data_dir` 和保持调用顺序的有序 `preset_dirs` 在目录验证后分别转为
+  canonical path，构成精确的进程级 catalog key。`preset_dirs` 不排序、不去重；元素顺序是 key
+  的一部分。第一次 key 的初始化由进程级 `RuntimeCoordinator` single-flight 执行；
+- 同 key 的 sequential/concurrent `SdkContext::create()` 复用同一个完整 schema/catalog
+  `SharedRuntime`。已有 live `SharedRuntime` 时，不同 key 返回 `conflict`，不得并存第二份
+  catalog、切换全局 resources/data、重载 catalog 或 fallback；
+- catalog key 冲突按 `/resources_dir`、`/data_dir`、`/preset_dirs`、
+  `/preset_dirs/{index}` 的固定顺序报告首个不一致字段。`preset_dirs` 长度不同指向
+  `/preset_dirs`，元素或顺序不同指向首个 `/preset_dirs/{index}`；
+- `ResourceLimits` 与 canonical `temporary_dir` 都是每个 `SdkContext` 的 context-local policy，
+  不属于 catalog key。相同 key、不同合法 limits 或 temporary directory 的 Context 共享同一
+  `SharedRuntime`，但各自创建的 Project/Slice handle 必须继续使用其来源 Context 的 limits 和
+  temporary root，不能借用另一 Context 的预算或临时目录；
+- 首次同配置并发 create 恰好执行一个 loader；其余调用等待同一 generation，并取得同一
+  success state 或逐字段相同的 failure diagnostics。不同 key 在某一 attempt 正在
+  `Initializing` 时立即返回 `conflict`，不等待该 attempt；
+- 目录/options 的纯 preflight 失败不创建 initialization attempt。初始化必须使用仅 attempt
+  可见的 staged schema/bundle/catalog；全部 core load、SDK strict validation、user store 和
+  `preset_dirs` 合并成功后才原子发布 `SharedRuntime` 并增加成功 generation。失败不得发布
+  半成品、default-only 或空 catalog，也不得增加成功 generation；
+- 同一波等待者取得该 attempt 的同一失败；失败完成后 coordinator 清除 attempt，不保留失败 key
+  或 candidate。SDK 内部不得偷偷重试。下一次显式 `SdkContext::create()` 才能从全新 staged
+  state 真实重试同 key；由于失败没有 live runtime，下一次显式 create 也可以选择其他 key。
+  重试不得读取失败 attempt 的 bundle/cache 或可变残留；
+- catalog 成功发布后由进程级 coordinator 长期持有，不因最后一个 `SdkContext` 或 handle
+  释放而销毁或在下一次 create 时重建。`SdkContext`、`PresetRepository`、`Project`、
+  `ProjectSnapshot`、`SliceEngine`、已提交 job 及其他依赖 runtime 的公开 handle 都持有
+  runtime/context lease；销毁原始 `SdkContext` 不使这些 handle 失效；
+- `SdkContext::presets()` 只返回已由成功 create 建立的完整 repository handle，不触发加载。
+  `Project::load()`、`ProjectBuilder`、`inspect()` 和 `submit()` 复用同一个 catalog，不得重新
+  枚举或加载 vendor；
+- 锁边界是可验收约束：coordinator registry mutex 只用于 key/attempt/live runtime 查表和原子
+  发布，绝不在其下做文件 I/O、core load 或等待；core runtime mutex 保护进程级 Orca
+  resources/data 激活和 core loader；catalog mutex 只保护已经发布的 catalog/generation。
+  线程等待 single-flight attempt 时只能等待 attempt 自己的同步原语，禁止持有 registry 或
+  catalog mutex；
+- Context/runtime 不监听、轮询或自动发现目录中的外部文件变化。现有 Context 的
+  edit/create/erase 在持久化前
+  必须重新验证目标的存在状态和完整内容版本：修改、删除、同路径替换，以及 create 捕获“不存在”
+  后被外部创建，均返回 `conflict`，field 为 `/preset/storage_revision`，不得静默覆盖；
 - 指向同一 canonical `data_dir` user store 的多个 Context/进程对同一 identity 并发执行 SDK
   transaction 时采用 compare-and-swap 语义：若都捕获同一旧状态，恰好一个成功，其余返回
   `conflict`。这不承诺协调绕过 SDK 直接写文件且不遵守 SDK 锁协议的并发 writer。
+
+性能是 v1 release Gate，不通过时不能用后台初始化掩盖。以 GPlatform 当前测试机、Debug 构建、
+同一份 production resources 为基准，schema index 修复后的 profiling 记录如下；wall time 与
+CPU time 属于不同口径，不得相加、相减或用分项 CPU time 冒充端到端耗时：
+
+| 现状证据 | 观测值 |
+| --- | ---: |
+| cold `SdkContext::create()` wall time | `24.553 s` |
+| shared core system loader wall time | `5.262 s` |
+| `append_collection` wall time | `19.275 s` |
+| printer record conversion wall time | `1.709 s` |
+| process record conversion wall time | `9.082 s` |
+| filament record conversion wall time | `8.484 s` |
+| inherited values conversion sampled CPU time | `5.783 CPU-s` |
+| effective values conversion sampled CPU time | `5.808 CPU-s` |
+| diff/patch conversion sampled CPU time | `5.190 CPU-s` |
+
+证据表明 schema index 已移除原线性 lookup 热点，但完整 catalog record conversion 仍主导 cold
+create。只共享 inherited values 的理论结果约为 `18.77 s`，仍不能通过 `15 s` Gate，因此第二
+阶段必须同时消除重复 inherited/effective conversion，并保留完整 eager catalog。目标必须同时
+满足：
+
+- cold `SdkContext::create()` 完整 schema/catalog 初始化不超过 `15000 ms`；
+- runtime 已 `Ready` 后，相同配置的后续 `SdkContext::create()` 不超过 `100 ms`，并且 loader
+  计数不增加；
+- cold create 进程 peak RSS 不超过 `2.2 GB`（`2,200,000,000` bytes）；该上限由修复后
+  profiling baseline 约 `1.906 GB` 的 `115%` 取整得到；
+- 每个测试进程的 system loader invocation count 必须恰好为 `1`；
+- runtime 已 `Ready` 后，GPlatform `firehorse.3mf` 的 `Project::load()` 不超过 `10000 ms`；
+- runtime 已 `Ready` 后，从 GPlatform production import action 触发到导入后
+  `screenshot.capture` 证明模型可见不超过 `15000 ms`。
+
+所有时间单位固定为毫秒，计时采用 monotonic clock。cold create 的边界是紧邻
+`SdkContext::create(options)` 调用前到其返回后，包含 preflight、canonicalization、
+single-flight、schema、core system loader、SDK strict validation/merge 和原子 publish；reuse
+边界同样覆盖完整 create 调用。测试必须记录测试机型号/CPU 与核心数、内存、OS、构建类型、
+编译器、线程设置、resources/preset tree hash、资源总字节数和 vendor 数量，并记录 schema、
+core preset load、Orca-first、并行 vendor parse、确定性 merge、user store/`preset_dirs`、SDK
+strict validation、publish/reuse、Project load 和 import-to-screenshot 分段；不得只报告总时间。
+
+cold/reuse/Project load/RSS release authority 固定为 dedicated `libslicer_sdk_cold_gate`
+executable 的三次独立 CTest 进程，不得使用 shell `time`、父进程采样或微基准代替。CLI 固定为
+`--resources <path> --data-root <path> --fixture <firehorse.3mf> --result <json>`。每个 child
+必须在同一进程执行一次 cold create、一次 same-key Ready reuse，再在该 Ready runtime 上执行
+一次 `Project::load(fixture)`，自行验证 cold `<=15000 ms`、reuse `<=100 ms`、
+project load `<=10000 ms`、loader invocation count `==1`、peak RSS `<=2200000000` bytes；
+任何失败返回非零。三个 CTest 均固定 `RUN_SERIAL TRUE`、`TIMEOUT 60`，不可并行。平台 peak RSS
+口径和结构化结果字段由 compatibility PRE-07 冻结。
+
+第二阶段只优化 SDK internal record conversion。public API、eager full catalog、strict/no
+fallback、Orca-first、non-Orca vendor 并行 parse、stable merge、system loader 和
+`RuntimeCoordinator` 均保持不变。实现必须先按原 printer/process/filament collection 及
+collection 内顺序，为每条 record 分配 global ordinal、`EffectiveArtifactSlot` 和
+`RecordCandidateStatus`。所有 record-local freeze、parent/default、identity、duplicate 和
+conversion 错误最终都归并到对应 ordinal status；
+freeze 不得因 record-local 错误提前返回。单线程 freeze 检出 duplicate 时记录该 ordinal，
+不发布 record，并继续收集仍可安全处理的其他 ordinal。最终统一按 global ordinal 选择最小失败
+作为唯一 public primary error。只有无法归属任何 record 的 allocator、arena 或 attempt-global
+initialization 错误才允许立即失败。
+
+每个 child record 的 inherited values 必须共享其真实 parent record 的 immutable effective
+`ConfigValues`；root/default record 只允许按实际 default config authority identity 转换一次并
+共享。禁止按 preset/default 名称猜测 identity，也禁止在不同 config authority 或值不相等时
+复用。internal fused conversion 必须单次遍历 effective config，同时构建完整 effective values
+与 changed generic patch，changed entry 必须复用同一次转换得到的 `ConfigValue`；其成功/失败、
+diagnostics、字段和值顺序必须与原 `core_config_to_values()` +
+`core_config_diff_to_patch()` 完全等价。
+
+所有 lazy parent/default resolution 和可能创建 core option 的 helper 必须在任何 record worker
+启动前由单线程完成。冻结输入只持 attempt-lifetime lease 保护下的 stable const
+`Slic3r::DynamicPrintConfig`/preset config pointer 和小 metadata，不持完整 `ConfigValues`，
+也不得一次 owning-copy 全部 catalog。无法证明稳定 immutable 的 config，只能按 dependency
+batch 为最多 `4` 个 in-flight record 建立 owning copy，并在该 batch join 后释放。
+bundle/catalog attempt 在全部 record arena join、结果检查和 commit 完成前必须保持不变。
+
+record executor 固定为独立 `tbb::task_arena`，production
+`max_concurrency=min(4, record_count)`，永远不超过 `4`。system loader 的 TBB 工作必须已经
+join/quiescent，才能创建并执行 record arena。每个 dependency batch 在 arena 内完成
+`parallel_for`/`parallel_invoke` 并 join 后才能进入下一批；adapter 内部禁止再开并行。worker
+只允许对 frozen config 直接执行 const `keys()`/`optptr()` 读取，并只写本 ordinal slot；禁止调用
+`Preset`、parent/default 或其他 core helper。worker 异常捕获到对应 slot；arena 离开前必须 join，
+销毁后才允许 commit。
+
+effective artifact DAG 与 record validity 必须分离。每个 ordinal 无论是否已有 metadata、
+revision 或 duplicate error，都继续独立转换 effective artifact；child 只依赖 parent
+`EffectiveArtifactSlot`，不依赖 parent record 是否 valid。只有 parent effective conversion
+失败时，child 才记录 dependency conversion failure。即使 child ordinal 小于 parent，executor
+也可先计算 parent artifact，但不得发布 parent record，最终错误选择仍只按 global ordinal，
+不按执行顺序。
+
+`RecordCandidateStatus` 是唯一 public record candidate staging owner；
+`EffectiveArtifactSlot` 只拥有 DAG conversion artifact。frozen inputs 不持完整
+`ConfigValues`。任一 record-local status 失败都不发布任何 record；全部成功后才按 ordinal 将
+candidates move 到初始为空的 `catalog.records`，保持 duplicate、revision、record order 和
+catalog digest 不变。详细依赖调度、test seam、RSS gate 和 write set 见 internal design 与
+compatibility tests；本段只描述待实施目标，不表示代码已完成。
 
 user preset create/edit commit 必须先通过单一原子提交点持久化新内容，再发布新的内存
 revision/catalog generation；erase 必须通过同一原子提交点移除 catalog 中的 identity，再发布
@@ -644,6 +816,11 @@ revision 视图；只有 user preset 可通过 `edit()` 修改或通过 `erase()
 user preset。parent 与 child 必须同 kind，并由 revision 固定。编辑器打开时捕获自身、父链
 和 schema revision；commit 时任一依赖变化均返回 `conflict`。
 
+`PresetRepository` 只能来自成功 `SdkContext::create()` 已建立的完整 runtime catalog。其
+`schema()` 与共享 `SharedRuntime` 的 schema 相同；调用方仅为取得已 inspection 工程的 schema
+时不应额外调用 `presets()`，应该从
+`SliceInspection::effective_configuration.schema()` 读取。
+
 `create()` 的 `id` 直接成为 `PresetRef::id()`，`display_name` 成为 `PresetSummary::name`；两者
 必须是非空、无内嵌 NUL 的有效 UTF-8，且不 trim、不做 Unicode normalization。id 按 byte-exact、
 case-sensitive 比较且创建后不可变；display name 不参与 identity，允许重复。创建 editor 时
@@ -737,19 +914,28 @@ map 索引与 0 基 logical filament slot 一一对应，值为 1 基 physical T
 plate local map 覆盖。切片入口的 atomic temporary selection 不写回工程，且必须和覆盖全部新
 logical slots 的 complete manual map 一起出现；具体请求见第 11 节。
 
-任一 mode 的 `tools.size()` 必须恰好等于当前 selection 的 logical filament count，且每个
-`ToolId` 非零；多个 logical slots 允许引用同一 ToolId。结构/长度/零值错误返回
+manual mode 的 `tools.size()` 必须恰好等于当前 selection 的 logical filament count，且每个
+`ToolId` 非零；多个 logical slots 允许引用同一 ToolId。manual 结构/长度/零值错误返回
 `invalid_argument`，field 为 `/filament_map/tools` 或 `/filament_map/tools/{index}`；超过当前
-printer physical tool count 返回 `invalid_configuration` 并指向对应 index。auto mode 中 tools
-只是需要无损保存的最近映射/候选映射，不是 SDK 承诺重新计算后的最终值；set/load/save 仍要求
-它是完整且范围合法的列表，但切片 inspect/submit 按下述规则拒绝 auto mode。
+printer physical tool count 返回 `invalid_configuration` 并指向对应 index。
+
+auto mode 中 tools 是需要无损保存的最近映射/候选映射，不是 SDK 承诺重新计算后的最终值。
+auto tools vector 是 dense prefix：长度为 `0..logical filament count`，只表达从 logical slot 0
+开始连续前 N 个 slots 的已有 `ToolId`。load/snapshot/save 可以保留短于 logical filament count
+的 dense-prefix tools vector；已有 `ToolId` 必须非零，并在已知 printer physical tool count 时
+保持合法。SDK 不得补齐 auto tools，不得把 auto map 改写成 manual map。
 
 v1 公共对象模型不接收设备、AMS 或 physical filament topology，因此 v1 只承诺 manual map
 切片：
 
 - load/snapshot/save 必须无损保留 `auto_for_flush` 和 `auto_for_match` mode 及已有 tools；
 - `effective_filament_map()` 可以返回继承后仍为 auto 的持久化状态；
-- `SliceEngine::inspect()` 或 `submit()` 解析到 auto mode 时返回 `unsupported`；
+- `SliceEngine::inspect()` 解析到 auto mode 时成功返回 `EffectiveConfiguration` 和
+  `EffectiveFilamentMap`，diagnostics 必须包含且只包含一个 field 为 `/filament_map/mode`
+  的 auto-map not slice-compatible warning：`code=unsupported`、`severity=warning`。允许
+  同时存在其他字段的独立 warnings；
+- `SliceEngine::submit()` 解析到 auto mode 时返回 `unsupported`，field 为
+  `/filament_map/mode`；
 - SDK 不得把 auto mode 静默改成 manual 后继续切片；
 - App 可在同一 ProjectEdit 中显式改为 manual 并提交完整 map 后切片。
 
@@ -867,6 +1053,11 @@ public:
 };
 ```
 
+`Project::load()` 使用创建来源 Context 已完成的完整 runtime catalog；它不得重新枚举或加载
+vendor，也不要求调用方先额外调用 `presets()`。Project/Snapshot 强持有 context/runtime lease；
+repository 后续发布新 generation 不修改已存在 Project 的 selection、preset revision、
+effective config 或切片输入。
+
 `ProjectBuilder` 是外部 App 输入已解析 mesh/scene 的唯一正式入口。它不解析文件、不生成
 generic 3MF、不做自动排版，也不提供 mesh 编辑 API。调用方负责 STL/OBJ/STEP/数据库模型的读取、
 修复和排版；SDK 只接收已确定的 vertices、triangles、plate、object、part、instance、preset
@@ -883,8 +1074,12 @@ builder 坐标和几何规则固定如下：
   非有限坐标的 transform 返回 `invalid_argument`；
 - `add_instance()` 只把既有 object 放到目标 plate；它不复制 object mesh，也不做 build-volume
   自动修正；
-- `build()` 必须完整校验 preset selection、manual filament map、配置 patch 和 geometry 后一次性
-  发布 Project。失败不返回部分 Project；
+- `build()` 必须完整校验 preset selection、filament map、配置 patch 和 geometry 后一次性
+  发布 Project。调用方未设置 map 时返回 `invalid_argument /filament_map`。Builder/Edit 接受
+  合法的 complete manual map，也接受合法的 project/plate persistent auto partial map；auto
+  tools 必须是 dense prefix，且只校验已有 positive `ToolId` 和已知 printer tool 上限。只有
+  `SliceEngine::submit()` 强制 complete manual map，不得在 builder/edit 中生成默认 `ToolId` 或
+  将 auto 静默改成 manual。失败不返回部分 Project；
 - builder 生成的 `Project` 与 3MF load 生成的 `Project` 使用同一 `ProjectSnapshot`、
   `ProjectEdit`、`SliceRequest` 和 `SliceEngine` 行为。
 
@@ -912,9 +1107,13 @@ preset/custom G-code references。无法安全迁移的隐藏数据不猜测改�
 - 上述迁移覆盖 project、plate、object、part、layer-range；内部还必须以同一 reference 规则迁移
   project-embedded preset overrides 和 structured custom G-code。隐藏引用被删除时返回
   `invalid_configuration`，不得把内部字段变成新的 v1 公共 CRUD；
-- project map 和每个已有 local map override 先按 slot index 迁移，删除项丢弃。只要存在新增
-  slot，调用方必须在同一事务中分别提交完整的新 project map，并为每个已有 local override
-  提交完整新 map；不得猜测新增 slot 的 ToolId；
+- project map 和每个已有 local map override 先按 slot index 迁移，删除项丢弃。manual map
+  只要存在新增 slot，调用方必须在同一事务中分别提交完整的新 project map，并为每个已有
+  local override 提交覆盖全部 logical slots 的新 map。auto map 不补齐新增 slot；迁移后的已有
+  tools 只有仍能表达为 dense prefix 时才保留。例如旧 slot 0 remap 到新 slot 2 会形成非前缀缺口，
+  若调用方未在同一 ProjectEdit 中显式提交新的合法 auto vector 或 complete manual map 覆盖该
+  map，commit 返回 `invalid_configuration`，field 固定为 `/filament_map/tools`。不得猜测新增 slot
+  的 ToolId；
 - raw G-code 受 slot 变化影响且无法证明安全时，commit 返回 `unsupported`。
 
 ProjectEdit mutator 允许暂存上述尚未修复的跨字段状态，完整的 dangling-reference、map 和
@@ -1163,6 +1362,8 @@ class SliceJob {
 public:
   Result<void> cancel();
   Result<std::shared_ptr<const SliceResult>> wait();
+  Result<std::optional<std::shared_ptr<const SliceResult>>>
+      wait_for(std::chrono::milliseconds timeout);
 };
 
 class SliceEngine {
@@ -1172,11 +1373,19 @@ public:
 };
 ```
 
+实现状态：`wait_for()` 已进入 v1 public header 与实现，并由 compatibility tests 覆盖其有界等待、
+轮询、终态复制、callback 冲突及取消观察语义。
+
 `SliceRequest` 直接携带不可变工程 snapshot 和目标 plate。`temporary_selection` 为空时使用工程
 固定的 selection 与 effective map；有值时 selection 与覆盖全部新 logical slots 的 manual map
-作为一个原子对象出现，缺任一部分都无法构造请求，且不写回 Project。temporary map mode 不是
-manual、长度/ToolId 范围不合法或持久 effective map 为 auto 时，`inspect()`/`submit()` 按第 9 节
-失败。
+作为一个原子对象出现，缺任一部分都无法构造请求，且不写回 Project。temporary auto 不得因为
+inspection 只返回 UI effective state 而被接受。只有来自 project/plate 持久状态的 auto map 可被
+`inspect()` 接受，并返回 effective state；diagnostics 必须包含 exactly one `/filament_map/mode`
+not slice-compatible warning，且允许其他字段独立 warnings。`submit()` 对同一持久 auto map 返回
+`unsupported /filament_map/mode`。temporary map mode 不是 manual 时固定返回
+`invalid_argument`，field 为
+`/temporary_selection/complete_manual_map/mode`；长度不完整或包含 `ToolId{0}` 同样返回
+`invalid_argument`，field 为 `/temporary_selection/complete_manual_map/tools` 或对应 index。
 
 `SliceOutputOptions` 控制本次切片产物：
 
@@ -1203,8 +1412,9 @@ object/instance 归属只在 core 能可靠证明时填写。无法证明、被�
 entity；artifact 中对应 ID 仅表示同一次 SliceResult 所属 project 的公开 ID 值，不是跨工程身份。
 preview 坐标空间固定为 Orca plate world mm，`SlicePreview::coordinate_space` 必须返回稳定字符串。
 
-`inspect()` 执行与 submit 完全相同的同步解析和校验，只返回本次请求将使用的
-`EffectiveConfiguration` 与 `EffectiveFilamentMap`，不创建 job。`submit()` 必须在返回前同步
+`inspect()` 执行与 submit 共享的同步解析，但不执行 slice-compatible manual-only gate；它只返回
+本次请求将使用的 `EffectiveConfiguration` 与 `EffectiveFilamentMap`，不创建 job，不返回其他产物。
+`submit()` 必须在返回前同步
 捕获 preset revisions、合成 global+plate configuration、验证 manual map，并冻结工程 snapshot、
 目标 plate 和解析结果；随后 job 只使用该冻结输入。submit 后 Project 或 repository 的变化不得
 改变 job。切片同时使用工程快照保存的分层 object/part/layer-range 与内部 instance/custom
@@ -1212,11 +1422,16 @@ G-code/embedded preset 数据。
 
 每个 engine 最多一个 active job；忙时 `submit()` 返回 `busy`，不进入第二个公开队列。
 `cancel()` 幂等。`wait()` 可重复、可并发调用；只有 completed 返回 SliceResult，失败或取消
-不返回部分结果。
+不返回部分结果。`wait_for()` 是有界终态观察 API，不是取消实现机制；它与 `wait()`
+共享同一终态语义；`timeout == 0` 是非阻塞轮询；负 timeout 返回 `invalid_argument`，field
+固定为 `/timeout`；timeout 到期且 job 未终态时成功返回 `std::nullopt`，不得改变 job 状态。
+v1 取消验收必须使用 `cancel()` 加 `wait_for()` 证明取消可被有界等待；实现不得只提供可能
+永久阻塞的 `cancel(); wait()` 路径。
 
-callback 按单调事件顺序调用，恰有一个终态事件。callback 可调用 `cancel()`，不得在同一
-callback 中调用该 job 的 `wait()`。callback 第一次抛异常时 SDK 捕获异常、停用该 callback，
-继续 job，并在最终 `wait()` Result diagnostics 中追加且只追加一个
+callback 按单调事件顺序调用，恰有一个终态事件。callback 可调用 `cancel()`。在同一 job 的
+callback 内调用 `wait()` 或 `wait_for()` 均必须立即返回 `conflict`，field 为 `/callback`，不得阻塞。
+callback 第一次抛异常时 SDK 捕获异常、停用该 callback，继续 job，并在最终 `wait()` Result
+diagnostics 中追加且只追加一个
 `{ErrorCode::internal, Severity::warning, ..., "/callback"}`；不递归投递 warning event，异常不
 越过 SDK 边界。
 
@@ -1240,9 +1455,13 @@ preview 内存结果和 artifact 均受 `preview_bytes` 与 `preview_moves` 限�
 
 - `SdkContext`、`PresetRepository`、`PresetView`、`ProjectSnapshot`、`ConfigSchema`、
   `EffectiveConfiguration`、`SliceInspection` 和完成后的 `SliceResult` 可复制并安全并发读；
+- 同一 runtime 配置的并发首次 `SdkContext::create()` 只执行一次完整初始化；等待者观察同一
+  成功 `SharedRuntime` 或同一 failure diagnostics。runtime 成功发布前不存在可用于
+  `presets()`、`Project::load()`、`inspect()` 或 `submit()` 的 Context；
 - `PresetEditor`、`ProjectEdit` 和 `ProjectBuilder` 只能由创建它的线程串行使用；
 - `Project` 允许并发 snapshot/save/begin_edit，但 revision 冲突必须显式返回；
-- `SliceEngine::inspect()`/`submit()`、`SliceJob::cancel()` 和 `SliceJob::wait()` 遵守第 11 节语义；
+- `SliceEngine::inspect()`/`submit()`、`SliceJob::cancel()`、`SliceJob::wait()` 和
+  `SliceJob::wait_for()` 遵守第 11 节语义；
 - 按值返回的 string、vector、ConfigValue、mesh DTO、preview DTO、snapshot 和 result 拥有自己的生命周期，不借用
   core 指针；
 - `Result::diagnostics()`、`ConfigPatch/ConfigValues::entries()`、

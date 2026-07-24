@@ -227,12 +227,24 @@ FilamentMapOverride project_map(const detail::ProjectData &data)
     return {public_map_mode(data.project_config), std::move(tools)};
 }
 
+bool has_local_map_override(const Slic3r::PlateData &plate)
+{
+    return !plate.filament_maps.empty() ||
+           (plate.config.has("filament_map_mode") &&
+            public_map_mode(plate.config) != FilamentMapMode::manual);
+}
+
 Result<void> validate_map(const FilamentMapOverride &map, std::size_t slots,
                           const std::string &field)
 {
-    if (map.tools.size() != slots)
+    if (map.mode == FilamentMapMode::manual && map.tools.size() != slots)
         return detail::ResultAccess::failure(ErrorCode::invalid_argument,
                                              "Filament map must cover every logical slot", field + "/tools");
+    if (map.mode != FilamentMapMode::manual && map.tools.size() > slots)
+        return detail::ResultAccess::failure(
+            ErrorCode::invalid_argument,
+            "Auto filament map cannot contain more tools than logical slots",
+            field + "/tools");
     for (std::size_t index = 0; index < map.tools.size(); ++index)
         if (map.tools[index].value == 0)
             return detail::ResultAccess::failure(ErrorCode::invalid_argument,
@@ -373,14 +385,50 @@ Result<void> validate_patch_for_commit(const ConfigSchema &schema, const ConfigP
                                          diagnostic.message, nested);
 }
 
-void migrate_map(const std::vector<int> &original, const SlotRemap &remap,
-                 std::size_t new_count, std::vector<int> &output)
+Result<std::vector<int>> migrate_map(const std::vector<int> &original,
+                                     FilamentMapMode mode,
+                                     const SlotRemap &remap,
+                                     std::size_t new_count)
 {
-    output.assign(new_count, 0);
     const std::size_t count = std::min(original.size(), remap.old_to_new.size());
-    for (std::size_t old_slot = 0; old_slot < count; ++old_slot)
-        if (remap.old_to_new[old_slot])
-            output[remap.old_to_new[old_slot]->value] = original[old_slot];
+    if (mode == FilamentMapMode::manual) {
+        std::vector<std::optional<int>> target_tools(new_count);
+        for (std::size_t old_slot = 0; old_slot < count; ++old_slot)
+            if (remap.old_to_new[old_slot])
+                target_tools[remap.old_to_new[old_slot]->value] =
+                    original[old_slot];
+        std::vector<int> output;
+        output.reserve(new_count);
+        for (const auto &tool : target_tools) {
+            if (!tool)
+                return failure<std::vector<int>>(
+                    ErrorCode::invalid_configuration,
+                    "Manual filament map must cover every target slot",
+                    "/filament_map/tools");
+            output.push_back(*tool);
+        }
+        return detail::ResultAccess::success(std::move(output));
+    }
+
+    std::vector<std::optional<int>> target_tools(new_count);
+    std::size_t retained = 0;
+    for (std::size_t old_slot = 0; old_slot < count; ++old_slot) {
+        if (!remap.old_to_new[old_slot]) continue;
+        target_tools[remap.old_to_new[old_slot]->value] = original[old_slot];
+        ++retained;
+    }
+
+    std::vector<int> output;
+    output.reserve(retained);
+    for (std::size_t target = 0; target < retained; ++target) {
+        if (!target_tools[target])
+            return failure<std::vector<int>>(
+                ErrorCode::invalid_configuration,
+                "Auto filament map migration would create a non-prefix gap",
+                "/filament_map/tools");
+        output.push_back(*target_tools[target]);
+    }
+    return detail::ResultAccess::success(std::move(output));
 }
 
 template<class EditorState>
@@ -662,7 +710,7 @@ Result<std::optional<FilamentMapOverride>> ProjectSnapshot::local_filament_map_o
     if (!position) return failure<std::optional<FilamentMapOverride>>(
         ErrorCode::not_found, "Plate was not found", "/entity");
     const auto &plate = state_->data->plates[*position];
-    if (plate.filament_maps.empty())
+    if (!has_local_map_override(plate))
         return detail::ResultAccess::success(std::optional<FilamentMapOverride>{});
     std::vector<ToolId> tools;
     for (int tool : plate.filament_maps) tools.push_back({static_cast<std::uint32_t>(tool)});
@@ -1019,7 +1067,7 @@ Result<Project> Project::load(SdkContext &context, const std::filesystem::path &
             loaded_tools_valid.diagnostics().front().message,
             loaded_tools_valid.diagnostics().front().field);
     for (std::size_t index = 0; index < data->plates.size(); ++index) {
-        if (data->plates[index].filament_maps.empty()) continue;
+        if (!has_local_map_override(data->plates[index])) continue;
         FilamentMapOverride local{
             data->plates[index].config.has("filament_map_mode")
                 ? public_map_mode(data->plates[index].config) : project_map(*data).mode, {}};
@@ -1457,15 +1505,18 @@ Result<Project> ProjectBuilder::build()
     if (!valid.has_value())
         return detail::ResultAccess::failure<Project>(*valid.error_code(),
             valid.diagnostics().front().message, valid.diagnostics().front().field);
+    if (!state_->project_filament_map)
+        return detail::ResultAccess::failure<Project>(
+            ErrorCode::invalid_argument,
+            "ProjectBuilder requires an explicit filament map",
+            "/filament_map");
 
     const std::size_t slot_count = state_->selection->filaments.size();
     Slic3r::DynamicPrintConfig project_config = state_->project_config;
-    const FilamentMapOverride map = state_->project_filament_map.value_or(
-        FilamentMapOverride{FilamentMapMode::manual,
-                            std::vector<ToolId>(slot_count, ToolId{1})});
+    const FilamentMapOverride &map = *state_->project_filament_map;
     auto map_valid = validate_map(map, slot_count, "/filament_map");
     if (!map_valid.has_value())
-        return detail::ResultAccess::failure<Project>(ErrorCode::invalid_configuration,
+        return detail::ResultAccess::failure<Project>(*map_valid.error_code(),
             map_valid.diagnostics().front().message, map_valid.diagnostics().front().field);
     const std::size_t tool_count = selected_printer_config
         ? physical_tool_count(*selected_printer_config) : 0;
@@ -1736,8 +1787,9 @@ Result<void> ProjectEdit::set_local_filament_map_override(
         target.config.set_key_value("filament_map_mode",
             new Slic3r::ConfigOptionEnum<Slic3r::FilamentMapMode>(core_map_mode(map->mode)));
     } else {
-        state_->staged->plates[*position].filament_maps.clear();
-        state_->staged->plates[*position].config.erase("filament_map_mode");
+        auto &target = state_->staged->plates[*position];
+        target.filament_maps.clear();
+        target.config.erase("filament_map_mode");
     }
     state_->local_map_set.insert(plate.value());
     return detail::ResultAccess::success();
@@ -1868,11 +1920,25 @@ Result<ProjectRevision> ProjectEdit::commit()
         for (std::size_t index = 0; index < candidate->plates.size(); ++index) {
             const auto plate_id = static_cast<std::uint64_t>(candidate->plates[index].plate_index + 1);
             if (!state_->local_map_set.count(plate_id)) {
-                if (state_->base->plates[index].filament_maps.empty())
+                if (!has_local_map_override(state_->base->plates[index])) {
                     candidate->plates[index].filament_maps.clear();
-                else
-                    migrate_map(state_->base->plates[index].filament_maps, remap, new_count,
-                                candidate->plates[index].filament_maps);
+                    candidate->plates[index].config.erase("filament_map_mode");
+                } else {
+                    const FilamentMapMode local_mode =
+                        state_->base->plates[index].config.has("filament_map_mode")
+                        ? public_map_mode(state_->base->plates[index].config)
+                        : project_map(*state_->base).mode;
+                    auto migrated = migrate_map(
+                        state_->base->plates[index].filament_maps,
+                        local_mode, remap, new_count);
+                    if (!migrated.has_value())
+                        return failure<ProjectRevision>(
+                            *migrated.error_code(),
+                            migrated.diagnostics().front().message,
+                            migrated.diagnostics().front().field);
+                    candidate->plates[index].filament_maps =
+                        std::move(migrated).value();
+                }
             }
             const int core_index = candidate->plates[index].plate_index;
             auto found = candidate->model.plates_custom_gcodes.find(core_index);
@@ -1903,10 +1969,15 @@ Result<ProjectRevision> ProjectEdit::commit()
             std::vector<int> old_tools;
             old_tools.reserve(original.tools.size());
             for (ToolId tool : original.tools) old_tools.push_back(static_cast<int>(tool.value));
-            std::vector<int> new_tools;
-            migrate_map(old_tools, remap, new_count, new_tools);
+            auto new_tools = migrate_map(
+                old_tools, original.mode, remap, new_count);
+            if (!new_tools.has_value())
+                return failure<ProjectRevision>(
+                    *new_tools.error_code(),
+                    new_tools.diagnostics().front().message,
+                    new_tools.diagnostics().front().field);
             FilamentMapOverride migrated{original.mode, {}};
-            for (int tool : new_tools)
+            for (int tool : new_tools.value())
                 migrated.tools.push_back({static_cast<std::uint32_t>(tool)});
             apply_project_map(*candidate, migrated);
         }
@@ -2063,7 +2134,7 @@ Result<ProjectRevision> ProjectEdit::commit()
                                       map_valid.diagnostics().front().message,
                                       map_valid.diagnostics().front().field);
     for (std::size_t index = 0; index < candidate->plates.size(); ++index) {
-        if (candidate->plates[index].filament_maps.empty()) continue;
+        if (!has_local_map_override(candidate->plates[index])) continue;
         FilamentMapOverride local{candidate->plates[index].config.has("filament_map_mode")
                                       ? public_map_mode(candidate->plates[index].config)
                                       : project_map(*candidate).mode,
@@ -2107,7 +2178,7 @@ Result<ProjectRevision> ProjectEdit::commit()
         return failure<ProjectRevision>(*bounds_valid.error_code(),
             bounds_valid.diagnostics().front().message, bounds_valid.diagnostics().front().field);
     for (std::size_t index = 0; index < candidate->plates.size(); ++index) {
-        if (candidate->plates[index].filament_maps.empty()) continue;
+        if (!has_local_map_override(candidate->plates[index])) continue;
         FilamentMapOverride local{candidate->plates[index].config.has("filament_map_mode")
                                       ? public_map_mode(candidate->plates[index].config)
                                       : project_map(*candidate).mode, {}};
@@ -2264,10 +2335,69 @@ EffectiveConfiguration::Provenance EffectiveConfiguration::provenance() const
 
 namespace {
 
+Result<Slic3r::DynamicPrintConfig> build_full_fff_config(
+    const detail::PresetCatalogState &catalog,
+    const PresetSelection &selection,
+    const Slic3r::DynamicPrintConfig &process_config,
+    const Slic3r::DynamicPrintConfig &printer_config,
+    const std::vector<Slic3r::DynamicPrintConfig> &filament_configs,
+    const Slic3r::DynamicPrintConfig &project_config,
+    const Slic3r::DynamicPrintConfig *plate_config,
+    const EffectiveFilamentMap &map,
+    const std::string &map_field)
+{
+    if (!catalog.bundle)
+        return failure<Slic3r::DynamicPrintConfig>(
+            ErrorCode::invalid_configuration,
+            "Preset catalog has no default filament preset",
+            "/presets/default_filament");
+
+    Slic3r::DynamicPrintConfig config;
+    config.apply(Slic3r::FullPrintConfig::defaults());
+    config.apply(process_config);
+    const Slic3r::DynamicPrintConfig default_filament =
+        catalog.bundle->filaments.default_preset().config;
+    config.apply(default_filament);
+    config.apply(printer_config);
+    config.apply(project_config);
+    apply_selected_filaments(config, default_filament, filament_configs);
+    if (plate_config) config.apply(*plate_config);
+    for (const char *key : {"compatible_prints", "compatible_prints_condition",
+                            "compatible_printers", "compatible_printers_condition",
+                            "inherits", "different_settings_to_system"})
+        config.erase(key);
+    config.option<Slic3r::ConfigOptionEnumGeneric>("printer_technology", true)->value =
+        Slic3r::ptFFF;
+
+    const std::size_t tool_count = physical_tool_count(config);
+    for (std::size_t index = 0; index < map.tools.size(); ++index)
+        if (tool_count == 0 || map.tools[index].value > tool_count)
+            return failure<Slic3r::DynamicPrintConfig>(
+                ErrorCode::invalid_configuration,
+                "Filament map references an unavailable physical tool",
+                map_field + "/tools/" + std::to_string(index));
+
+    std::vector<int> core_map;
+    for (ToolId tool : map.tools) core_map.push_back(static_cast<int>(tool.value));
+    config.set_key_value("filament_map", new Slic3r::ConfigOptionInts(std::move(core_map)));
+    config.set_key_value("filament_map_mode",
+        new Slic3r::ConfigOptionEnum<Slic3r::FilamentMapMode>(core_map_mode(map.mode)));
+    config.option<Slic3r::ConfigOptionString>("printer_settings_id", true)->value =
+        selection.printer.ref.id();
+    config.option<Slic3r::ConfigOptionString>("print_settings_id", true)->value =
+        selection.process.ref.id();
+    auto &filament_ids = config.option<Slic3r::ConfigOptionStrings>(
+        "filament_settings_id", true)->values;
+    filament_ids.clear();
+    for (const auto &filament : selection.filaments) filament_ids.push_back(filament.ref.id());
+    return detail::ResultAccess::success(std::move(config));
+}
+
 Result<detail::FrozenSliceInput> resolve_impl(
     const std::shared_ptr<detail::ContextState> &context,
     const ProjectSnapshot &snapshot, PlateId plate,
-    const PresetSelection &selection, EffectiveFilamentMap map)
+    const PresetSelection &selection, EffectiveFilamentMap map,
+    detail::SliceInputMode mode, const std::string &map_field)
 {
     if (detail::ProjectSnapshotAccess::context(snapshot) != context)
         return failure<detail::FrozenSliceInput>(
@@ -2281,12 +2411,18 @@ Result<detail::FrozenSliceInput> resolve_impl(
     if (!plate_index)
         return failure<detail::FrozenSliceInput>(ErrorCode::not_found,
                                            "Plate was not found", "/plate");
-    if (map.mode != FilamentMapMode::manual)
+    std::vector<Diagnostic> diagnostics;
+    if (map.mode != FilamentMapMode::manual &&
+        mode == detail::SliceInputMode::submit)
         return failure<detail::FrozenSliceInput>(ErrorCode::unsupported,
                                            "v1 slicing requires a manual filament map",
                                            "/filament_map/mode");
+    if (map.mode != FilamentMapMode::manual)
+        diagnostics.push_back({ErrorCode::unsupported, Severity::warning,
+                               "Auto filament map is not slice-compatible in SDK v1",
+                               "/filament_map/mode"});
     auto map_valid = validate_map(FilamentMapOverride{map.mode, map.tools},
-                                  selection.filaments.size(), "/filament_map");
+                                  selection.filaments.size(), map_field);
     if (!map_valid.has_value())
         return failure<detail::FrozenSliceInput>(*map_valid.error_code(),
                                            map_valid.diagnostics().front().message,
@@ -2351,46 +2487,17 @@ Result<detail::FrozenSliceInput> resolve_impl(
         filament_records.push_back(std::move(filament).value());
     }
 
-    Slic3r::DynamicPrintConfig config;
-    config.apply(Slic3r::FullPrintConfig::defaults());
-    config.apply(process.value().core);
-    const Slic3r::DynamicPrintConfig default_filament =
-        catalog->bundle ? catalog->bundle->filaments.default_preset().config
-                        : Slic3r::DynamicPrintConfig{};
-    config.apply(default_filament);
-    config.apply(printer.value().core);
-    config.apply(project_data->project_config);
-    apply_selected_filaments(config, default_filament, filament_configs);
-    config.apply(project_data->plates[*plate_index].config);
-    for (const char *key : {"compatible_prints", "compatible_prints_condition",
-                            "compatible_printers", "compatible_printers_condition",
-                            "inherits", "different_settings_to_system"})
-        config.erase(key);
-    config.option<Slic3r::ConfigOptionEnumGeneric>("printer_technology", true)->value =
-        Slic3r::ptFFF;
+    auto config = build_full_fff_config(*catalog, selection, process.value().core,
+                                        printer.value().core, filament_configs,
+                                        project_data->project_config,
+                                        &project_data->plates[*plate_index].config, map,
+                                        map_field);
+    if (!config.has_value())
+        return failure<detail::FrozenSliceInput>(
+            *config.error_code(), config.diagnostics().front().message,
+            config.diagnostics().front().field);
 
-    const std::size_t tools = physical_tool_count(config);
-    for (std::size_t index = 0; index < map.tools.size(); ++index)
-        if (tools == 0 || map.tools[index].value > tools)
-            return failure<detail::FrozenSliceInput>(
-                ErrorCode::invalid_configuration, "Filament map references an unavailable physical tool",
-                "/filament_map/tools/" + std::to_string(index));
-
-    std::vector<int> core_map;
-    for (ToolId tool : map.tools) core_map.push_back(static_cast<int>(tool.value));
-    config.set_key_value("filament_map", new Slic3r::ConfigOptionInts(std::move(core_map)));
-    config.set_key_value("filament_map_mode",
-        new Slic3r::ConfigOptionEnum<Slic3r::FilamentMapMode>(Slic3r::fmmManual));
-    config.option<Slic3r::ConfigOptionString>("printer_settings_id", true)->value =
-        selection.printer.ref.id();
-    config.option<Slic3r::ConfigOptionString>("print_settings_id", true)->value =
-        selection.process.ref.id();
-    auto &filament_ids = config.option<Slic3r::ConfigOptionStrings>(
-        "filament_settings_id", true)->values;
-    filament_ids.clear();
-    for (const auto &filament : selection.filaments) filament_ids.push_back(filament.ref.id());
-
-    auto values = detail::core_config_to_values(config);
+    auto values = detail::core_config_to_values(config.value());
     if (!values.has_value())
         return failure<detail::FrozenSliceInput>(*values.error_code(),
                                            values.diagnostics().front().message,
@@ -2403,23 +2510,40 @@ Result<detail::FrozenSliceInput> resolve_impl(
     EffectiveConfiguration::Provenance provenance{
         snapshot.revision(), plate, std::move(provenance_presets)};
     EffectiveConfiguration effective = detail::EffectiveConfigurationAccess::make(
-        catalog->schema, std::move(values).value(), std::move(provenance), std::move(config));
+        catalog->schema, std::move(values).value(), std::move(provenance),
+        std::move(config).value());
     return detail::ResultAccess::success(detail::FrozenSliceInput{
-        context, snapshot, plate, std::move(effective), std::move(map), {}});
+        context, snapshot, plate, std::move(effective), std::move(map), {}},
+        std::move(diagnostics));
 }
 
 } // namespace
 
 Result<detail::FrozenSliceInput> detail::resolve_slice_input(
     std::shared_ptr<detail::ContextState> context, ProjectSnapshot project, PlateId plate,
-    std::optional<detail::TemporarySliceSelection> temporary_selection)
+    std::optional<detail::TemporarySliceSelection> temporary_selection,
+    SliceInputMode mode)
 {
     if (temporary_selection) {
+        if (temporary_selection->complete_manual_map.mode != FilamentMapMode::manual)
+            return failure<detail::FrozenSliceInput>(
+                ErrorCode::invalid_argument,
+                "Temporary filament map must use manual mode",
+                "/temporary_selection/complete_manual_map/mode");
+        auto map_valid = validate_map(
+            temporary_selection->complete_manual_map,
+            temporary_selection->selection.filaments.size(),
+            "/temporary_selection/complete_manual_map");
+        if (!map_valid.has_value())
+            return failure<detail::FrozenSliceInput>(
+                *map_valid.error_code(), map_valid.diagnostics().front().message,
+                map_valid.diagnostics().front().field);
         EffectiveFilamentMap map{temporary_selection->complete_manual_map.mode,
                                  temporary_selection->complete_manual_map.tools,
                                  EffectiveFilamentMap::Source::temporary};
         return resolve_impl(context, project, plate, temporary_selection->selection,
-                            std::move(map));
+                            std::move(map), mode,
+                            "/temporary_selection/complete_manual_map");
     }
 
     auto map = project.effective_filament_map(plate);
@@ -2428,7 +2552,8 @@ Result<detail::FrozenSliceInput> detail::resolve_slice_input(
                                                  map.diagnostics().front().message,
                                                  map.diagnostics().front().field);
     return resolve_impl(context, project, plate, project.project_selected_presets(),
-                        std::move(map).value());
+                        std::move(map).value(), mode, "/filament_map");
 }
+
 
 } // namespace libslicer::v1

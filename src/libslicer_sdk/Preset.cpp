@@ -3,22 +3,27 @@
 #include "ConfigSchemaInternal.hpp"
 #include "OrcaConfigAdapter.hpp"
 #include "PresetInternal.hpp"
-#include "RuntimeCoordinator.hpp"
 
 #include "libslic3r/Utils.hpp"
 
 #include <nlohmann/json.hpp>
 #include <openssl/sha.h>
+#include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <set>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -939,41 +944,794 @@ PresetRef public_ref(const Slic3r::Preset &preset)
     throw Slic3r::ConfigurationError("Project preset cannot enter repository catalog");
 }
 
-void append_collection(PresetCatalogState &catalog, const Slic3r::PresetCollection &collection)
+enum class RecordFailureStage {
+    freeze,
+    parent_default,
+    effective_conversion,
+    identity,
+    duplicate,
+    dependency_conversion
+};
+
+struct RecordFailure {
+    RecordFailureStage stage;
+    ErrorCode          code;
+    std::string        message;
+    std::string        field;
+};
+
+struct FrozenPresetRecordInput {
+    std::size_t ordinal;
+    const Slic3r::Preset *source {nullptr};
+    const Slic3r::DynamicPrintConfig *effective_core {nullptr};
+    const Slic3r::DynamicPrintConfig *baseline_core {nullptr};
+    std::optional<std::size_t> parent_ordinal;
+    std::optional<std::size_t> default_owner_ordinal;
+    PresetRevision revision {0};
+    std::optional<PresetRef> ref;
+    std::optional<SelectedPreset> parent_summary;
+    std::optional<PresetKey> key;
+    std::string name;
+    std::string vendor;
+};
+
+struct EffectiveArtifactSlot {
+    std::optional<ConfigValues> effective;
+    std::optional<ConfigValues> default_values;
+    std::optional<RecordFailure> effective_failure;
+    std::optional<RecordFailure> default_failure;
+};
+
+struct RecordCandidateStatus {
+    std::optional<RecordFailure> failure;
+    std::optional<ConfigPatch> overrides;
+    std::optional<PresetRecord> candidate;
+};
+
+int failure_priority(RecordFailureStage stage)
 {
-    std::map<const Slic3r::Preset *, PresetRevision> revisions;
+    switch (stage) {
+    case RecordFailureStage::freeze: return 0;
+    case RecordFailureStage::parent_default: return 1;
+    case RecordFailureStage::effective_conversion: return 2;
+    case RecordFailureStage::dependency_conversion: return 3;
+    case RecordFailureStage::identity: return 4;
+    case RecordFailureStage::duplicate: return 5;
+    }
+    return std::numeric_limits<int>::max();
+}
+
+void record_failure(RecordCandidateStatus &status, RecordFailure failure)
+{
+    if (!status.failure ||
+        failure_priority(failure.stage) < failure_priority(status.failure->stage))
+        status.failure = std::move(failure);
+}
+
+RecordFailure conversion_failure(RecordFailureStage stage,
+                                 const std::string &preset_name,
+                                 const Result<FusedConfigConversion> &result)
+{
+    const Diagnostic &diagnostic = result.diagnostics().front();
+    return {stage,
+            result.error_code().value_or(ErrorCode::invalid_configuration),
+            "Unable to convert preset configuration '" + preset_name +
+                "': " + diagnostic.message,
+            "/resources_dir"};
+}
+
+RecordFailure values_conversion_failure(const std::string &preset_name,
+                                        const Result<ConfigValues> &result)
+{
+    const Diagnostic &diagnostic = result.diagnostics().front();
+    return {RecordFailureStage::parent_default,
+            result.error_code().value_or(ErrorCode::invalid_configuration),
+            "Unable to convert default preset configuration for '" +
+                preset_name + "': " + diagnostic.message,
+            "/resources_dir"};
+}
+
+#ifdef LIBSLICER_SDK_TESTING
+
+std::mutex &record_scheduler_test_mutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+RecordSchedulerTestControl &record_scheduler_test_control_storage()
+{
+    static RecordSchedulerTestControl control;
+    return control;
+}
+
+RecordSchedulerTestStats &record_scheduler_test_stats_storage()
+{
+    static RecordSchedulerTestStats stats;
+    return stats;
+}
+
+RecordFailureStage public_test_stage(RecordFailureInjectionStage stage)
+{
+    switch (stage) {
+    case RecordFailureInjectionStage::freeze: return RecordFailureStage::freeze;
+    case RecordFailureInjectionStage::parent_default:
+        return RecordFailureStage::parent_default;
+    case RecordFailureInjectionStage::identity: return RecordFailureStage::identity;
+    case RecordFailureInjectionStage::duplicate: return RecordFailureStage::duplicate;
+    case RecordFailureInjectionStage::effective_conversion:
+        return RecordFailureStage::effective_conversion;
+    }
+    return RecordFailureStage::freeze;
+}
+
+std::optional<RecordFailureInjectionStage> injected_stage(
+    const RecordSchedulerTestControl &control, std::size_t ordinal)
+{
+    const auto found = std::find_if(
+        control.failures.begin(), control.failures.end(),
+        [ordinal](const RecordFailureInjection &failure) {
+            return failure.ordinal == ordinal;
+        });
+    return found == control.failures.end()
+        ? std::nullopt
+        : std::optional<RecordFailureInjectionStage>{found->stage};
+}
+
+#endif
+
+struct RecordSchedulerSettings {
+    std::size_t worker_limit {4};
+#ifdef LIBSLICER_SDK_TESTING
+    RecordSchedulerTestControl test;
+#endif
+};
+
+RecordSchedulerSettings record_scheduler_settings()
+{
+    RecordSchedulerSettings settings;
+#ifdef LIBSLICER_SDK_TESTING
+    std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+    settings.test = record_scheduler_test_control_storage();
+    if (settings.test.worker_limit == 1 || settings.test.worker_limit == 2 ||
+        settings.test.worker_limit == 4)
+        settings.worker_limit = settings.test.worker_limit;
+    record_scheduler_test_stats_storage().configured_worker_limit =
+        settings.worker_limit;
+    record_scheduler_test_stats_storage().system_loader_quiescent_before_arena =
+        true;
+#endif
+    return settings;
+}
+
+bool inject_failure(const RecordSchedulerSettings &settings,
+                    std::size_t ordinal, RecordFailureStage stage)
+{
+#ifdef LIBSLICER_SDK_TESTING
+    const auto injected = injected_stage(settings.test, ordinal);
+    return injected && public_test_stage(*injected) == stage;
+#else
+    (void)settings;
+    (void)ordinal;
+    (void)stage;
+    return false;
+#endif
+}
+
+void update_peak(std::atomic<std::size_t> &peak, std::size_t value)
+{
+    std::size_t current = peak.load(std::memory_order_relaxed);
+    while (current < value &&
+           !peak.compare_exchange_weak(current, value,
+                                       std::memory_order_relaxed))
+        ;
+}
+
+template<class Function>
+void run_record_batch(tbb::task_arena &arena, std::size_t count,
+                      std::atomic<std::size_t> &active,
+                      std::atomic<std::size_t> &peak,
+                      Function function)
+{
+#ifdef LIBSLICER_SDK_TESTING
+    {
+        std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+        ++record_scheduler_test_stats_storage().dependency_batches_started;
+    }
+#endif
+    arena.execute([&] {
+        tbb::parallel_for(tbb::blocked_range<std::size_t>(0, count),
+            [&](const tbb::blocked_range<std::size_t> &range) {
+                for (std::size_t index = range.begin(); index < range.end(); ++index) {
+                    const std::size_t now =
+                        active.fetch_add(1, std::memory_order_relaxed) + 1;
+                    update_peak(peak, now);
+                    try {
+                        function(index);
+                    } catch (...) {
+                        active.fetch_sub(1, std::memory_order_relaxed);
+                        throw;
+                    }
+                    active.fetch_sub(1, std::memory_order_relaxed);
+                }
+            });
+    });
+#ifdef LIBSLICER_SDK_TESTING
+    {
+        std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+        ++record_scheduler_test_stats_storage().dependency_batches_joined;
+    }
+#endif
+}
+
+void freeze_collection(
+    const Slic3r::PresetCollection &collection,
+    PresetRevision &next_revision,
+    std::vector<FrozenPresetRecordInput> &inputs,
+    std::vector<RecordCandidateStatus> &statuses,
+    std::map<const Slic3r::DynamicPrintConfig *, std::size_t> &default_owners,
+    std::set<PresetKey> &identities,
+    const RecordSchedulerSettings &settings)
+{
+    const std::size_t first_ordinal = inputs.size();
+    std::map<const Slic3r::Preset *, std::size_t> ordinals;
     for (const Slic3r::Preset &preset : collection.get_presets()) {
         if (preset.is_project_embedded || preset.printer_technology() == Slic3r::ptSLA)
             continue;
-        revisions[&preset] = catalog.next_revision++;
+        const std::size_t ordinal = inputs.size();
+        ordinals.emplace(&preset, ordinal);
+        inputs.push_back({ordinal, &preset, &preset.config, nullptr,
+                          std::nullopt, std::nullopt, next_revision++,
+                          std::nullopt, std::nullopt, std::nullopt,
+                          preset.name,
+                          preset.vendor ? preset.vendor->name : std::string{}});
+        statuses.emplace_back();
     }
 
-    for (const Slic3r::Preset &preset : collection.get_presets()) {
-        if (!revisions.count(&preset)) continue;
-        const Slic3r::Preset *parent = collection.get_preset_parent(preset);
-        if (parent && !revisions.count(parent)) parent = nullptr;
-        const Slic3r::DynamicPrintConfig &inherited_core = parent
-            ? parent->config : collection.default_preset_for(preset.config).config;
-        auto inherited = core_config_to_values(inherited_core);
-        auto effective = core_config_to_values(preset.config);
-        auto overrides = core_config_diff_to_patch(inherited_core, preset.config, catalog.schema);
-        if (!inherited.has_value() || !effective.has_value() || !overrides.has_value())
-            throw Slic3r::ConfigurationError("Unable to convert preset configuration: " + preset.name);
+    for (std::size_t ordinal = first_ordinal; ordinal < inputs.size(); ++ordinal) {
+        FrozenPresetRecordInput &input = inputs[ordinal];
+        RecordCandidateStatus &status = statuses[ordinal];
+        if (inject_failure(settings, ordinal,
+                           RecordFailureStage::freeze)) {
+            record_failure(status, {RecordFailureStage::freeze,
+                                    ErrorCode::invalid_configuration,
+                                    "Injected record freeze failure",
+                                    "/resources_dir"});
+        }
 
-        std::optional<SelectedPreset> parent_summary;
-        if (parent)
-            parent_summary = SelectedPreset{public_ref(*parent), revisions.at(parent)};
-        PresetRef ref = public_ref(preset);
-        PresetSummary summary{ref, preset.name,
-                              preset.vendor ? preset.vendor->name : std::string{},
-                              std::move(parent_summary), revisions.at(&preset)};
-        PresetRecord record{summary, std::move(inherited).value(), std::move(effective).value(),
-                            std::move(overrides).value(), std::make_shared<Slic3r::Preset>(preset)};
+        const Slic3r::Preset *parent = nullptr;
+        try {
+            parent = collection.get_preset_parent(*input.source);
+            if (parent && !ordinals.count(parent)) parent = nullptr;
+            if (parent) {
+                input.parent_ordinal = ordinals.at(parent);
+                input.baseline_core = &parent->config;
+                input.parent_summary = SelectedPreset{
+                    public_ref(*parent),
+                    inputs[*input.parent_ordinal].revision};
+#ifdef LIBSLICER_SDK_TESTING
+                if (ordinal < *input.parent_ordinal) {
+                    std::lock_guard<std::mutex> lock(
+                        record_scheduler_test_mutex());
+                    RecordSchedulerTestStats &stats =
+                        record_scheduler_test_stats_storage();
+                    if (!stats.reverse_dependency_child_ordinal) {
+                        stats.reverse_dependency_child_ordinal = ordinal;
+                        stats.reverse_dependency_parent_ordinal =
+                            *input.parent_ordinal;
+                    }
+                }
+#endif
+            } else {
+                const Slic3r::Preset &authority =
+                    collection.default_preset_for(input.source->config);
+                input.baseline_core = &authority.config;
+                const auto inserted =
+                    default_owners.emplace(input.baseline_core, ordinal);
+                input.default_owner_ordinal = inserted.first->second;
+            }
+            if (inject_failure(settings, ordinal,
+                               RecordFailureStage::parent_default)) {
+                record_failure(status, {RecordFailureStage::parent_default,
+                                        ErrorCode::invalid_configuration,
+                                        "Injected parent/default freeze failure",
+                                        "/resources_dir"});
+            }
+        } catch (const std::exception &error) {
+            record_failure(status, {RecordFailureStage::parent_default,
+                                    ErrorCode::invalid_configuration,
+                                    error.what(), "/resources_dir"});
+        }
+
+        try {
+            input.ref = public_ref(*input.source);
+            input.key = PresetKey{input.ref->kind(), input.ref->origin(),
+                                  input.ref->id()};
+            if (inject_failure(settings, ordinal,
+                               RecordFailureStage::identity)) {
+                record_failure(status, {RecordFailureStage::identity,
+                                        ErrorCode::invalid_configuration,
+                                        "Injected preset identity failure",
+                                        "/resources_dir"});
+            }
+            if (!identities.insert(*input.key).second ||
+                inject_failure(settings, ordinal,
+                               RecordFailureStage::duplicate)) {
+                record_failure(status, {
+                    RecordFailureStage::duplicate,
+                    ErrorCode::invalid_configuration,
+                    "Duplicate preset identity: " + input.ref->id(),
+                    "/resources_dir"});
+            }
+        } catch (const std::exception &error) {
+            record_failure(status, {RecordFailureStage::identity,
+                                    ErrorCode::invalid_configuration,
+                                    error.what(), "/resources_dir"});
+        }
+    }
+}
+
+Result<void> append_system_collections(PresetCatalogState &catalog)
+{
+    const RecordSchedulerSettings settings = record_scheduler_settings();
+#ifdef LIBSLICER_SDK_TESTING
+    const auto freeze_started = std::chrono::steady_clock::now();
+#endif
+    std::vector<FrozenPresetRecordInput> inputs;
+    std::vector<RecordCandidateStatus> statuses;
+    std::map<const Slic3r::DynamicPrintConfig *, std::size_t> default_owners;
+    std::set<PresetKey> identities;
+    PresetRevision next_revision = catalog.next_revision;
+
+    freeze_collection(catalog.bundle->printers, next_revision, inputs, statuses,
+                      default_owners, identities, settings);
+    freeze_collection(catalog.bundle->prints, next_revision, inputs, statuses,
+                      default_owners, identities, settings);
+    freeze_collection(catalog.bundle->filaments, next_revision, inputs, statuses,
+                      default_owners, identities, settings);
+#ifdef LIBSLICER_SDK_TESTING
+    {
+        std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+        record_scheduler_test_stats_storage().freeze_ns =
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - freeze_started).count());
+    }
+#endif
+
+    if (inputs.empty())
+        return ResultAccess::success();
+
+    std::vector<EffectiveArtifactSlot> artifacts(inputs.size());
+    std::vector<std::size_t> default_owner_ordinals;
+    default_owner_ordinals.reserve(default_owners.size());
+    for (const auto &entry : default_owners)
+        default_owner_ordinals.push_back(entry.second);
+    std::sort(default_owner_ordinals.begin(), default_owner_ordinals.end());
+
+    const std::size_t arena_limit =
+        std::min(settings.worker_limit, inputs.size());
+    std::atomic<std::size_t> active_workers {0};
+    std::atomic<std::size_t> peak_workers {0};
+    std::atomic<std::size_t> in_flight_candidates {0};
+    std::atomic<std::size_t> peak_in_flight_candidates {0};
+
+#ifdef LIBSLICER_SDK_TESTING
+    {
+        std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+        record_scheduler_test_stats_storage().arena_max_concurrency = arena_limit;
+    }
+#endif
+
+    try {
+        {
+            tbb::task_arena arena(static_cast<int>(arena_limit));
+#ifdef LIBSLICER_SDK_TESTING
+            const auto default_started = std::chrono::steady_clock::now();
+#endif
+            run_record_batch(
+                arena, default_owner_ordinals.size(), active_workers, peak_workers,
+                [&](std::size_t batch_index) {
+                    const std::size_t ordinal =
+                        default_owner_ordinals[batch_index];
+                    const FrozenPresetRecordInput &input = inputs[ordinal];
+                    EffectiveArtifactSlot &artifact = artifacts[ordinal];
+                    try {
+                        if (!input.baseline_core) {
+                            artifact.default_failure = RecordFailure{
+                                RecordFailureStage::parent_default,
+                                ErrorCode::invalid_configuration,
+                                "Default preset configuration is unavailable for '" +
+                                    input.name + "'",
+                                "/resources_dir"};
+                            return;
+                        }
+                        auto converted =
+                            core_config_to_values(*input.baseline_core);
+                        if (!converted.has_value()) {
+                            artifact.default_failure =
+                                values_conversion_failure(input.name, converted);
+                            return;
+                        }
+                        artifact.default_values =
+                            std::move(converted).value();
+#ifdef LIBSLICER_SDK_TESTING
+                        std::lock_guard<std::mutex> lock(
+                            record_scheduler_test_mutex());
+                        ++record_scheduler_test_stats_storage().default_conversions;
+#endif
+                    } catch (const std::exception &error) {
+                        artifact.default_failure = RecordFailure{
+                            RecordFailureStage::parent_default,
+                            ErrorCode::internal, error.what(), "/resources_dir"};
+                    } catch (...) {
+                        artifact.default_failure = RecordFailure{
+                            RecordFailureStage::parent_default,
+                            ErrorCode::internal,
+                            "Unknown default conversion worker failure",
+                            "/resources_dir"};
+                    }
+                });
+#ifdef LIBSLICER_SDK_TESTING
+            {
+                std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+                record_scheduler_test_stats_storage().default_batch_ns =
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() -
+                            default_started).count());
+            }
+            const auto effective_started = std::chrono::steady_clock::now();
+#endif
+
+            run_record_batch(
+                arena, inputs.size(), active_workers, peak_workers,
+                [&](std::size_t ordinal) {
+                    const FrozenPresetRecordInput &input = inputs[ordinal];
+                    EffectiveArtifactSlot &artifact = artifacts[ordinal];
+                    try {
+#ifdef LIBSLICER_SDK_TESTING
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                record_scheduler_test_mutex());
+                            ++record_scheduler_test_stats_storage()
+                                  .effective_artifacts_attempted;
+                        }
+#endif
+                        if (inject_failure(
+                                settings, ordinal,
+                                RecordFailureStage::effective_conversion)) {
+                            artifact.effective_failure = RecordFailure{
+                                RecordFailureStage::effective_conversion,
+                                ErrorCode::invalid_configuration,
+                                "Injected effective conversion failure",
+                                "/resources_dir"};
+                            return;
+                        }
+                        if (!input.effective_core || !input.baseline_core) {
+                            artifact.effective_failure = RecordFailure{
+                                RecordFailureStage::effective_conversion,
+                                ErrorCode::invalid_configuration,
+                                "Frozen preset conversion input is incomplete",
+                                "/resources_dir"};
+                            return;
+                        }
+                        auto converted = core_config_to_values_and_diff(
+                            *input.baseline_core, *input.effective_core,
+                            catalog.schema);
+                        if (!converted.has_value()) {
+                            artifact.effective_failure = conversion_failure(
+                                RecordFailureStage::effective_conversion,
+                                input.name, converted);
+                            return;
+                        }
+                        FusedConfigConversion fused =
+                            std::move(converted).value();
+                        artifact.effective = std::move(fused.effective);
+                        statuses[ordinal].overrides =
+                            std::move(fused.overrides);
+                    } catch (const std::exception &error) {
+                        artifact.effective_failure = RecordFailure{
+                            RecordFailureStage::effective_conversion,
+                            ErrorCode::internal, error.what(), "/resources_dir"};
+                    } catch (...) {
+                        artifact.effective_failure = RecordFailure{
+                            RecordFailureStage::effective_conversion,
+                            ErrorCode::internal,
+                            "Unknown effective conversion worker failure",
+                            "/resources_dir"};
+                    }
+                });
+#ifdef LIBSLICER_SDK_TESTING
+            {
+                std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+                record_scheduler_test_stats_storage().effective_batch_ns =
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() -
+                            effective_started).count());
+            }
+            const auto candidate_started = std::chrono::steady_clock::now();
+#endif
+
+            run_record_batch(
+                arena, inputs.size(), active_workers, peak_workers,
+                [&](std::size_t ordinal) {
+                    FrozenPresetRecordInput &input = inputs[ordinal];
+                    EffectiveArtifactSlot &artifact = artifacts[ordinal];
+                    RecordCandidateStatus &status = statuses[ordinal];
+                    bool candidate_in_flight = false;
+                    try {
+#ifdef LIBSLICER_SDK_TESTING
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                record_scheduler_test_mutex());
+                            ++record_scheduler_test_stats_storage()
+                                  .candidates_attempted;
+                        }
+#endif
+                        if (artifact.effective_failure)
+                            record_failure(status, *artifact.effective_failure);
+
+                        std::optional<ConfigValues> inherited;
+                        if (input.parent_ordinal) {
+                            const EffectiveArtifactSlot &parent =
+                                artifacts[*input.parent_ordinal];
+                            if (parent.effective_failure || !parent.effective) {
+                                record_failure(status, {
+                                    RecordFailureStage::dependency_conversion,
+                                    ErrorCode::invalid_configuration,
+                                    "Parent effective configuration conversion failed for '" +
+                                        input.name + "'",
+                                    "/resources_dir"});
+#ifdef LIBSLICER_SDK_TESTING
+                                std::lock_guard<std::mutex> lock(
+                                    record_scheduler_test_mutex());
+                                ++record_scheduler_test_stats_storage()
+                                      .children_blocked_by_parent_effective_failure;
+#endif
+                            } else {
+                                inherited = *parent.effective;
+#ifdef LIBSLICER_SDK_TESTING
+                                std::lock_guard<std::mutex> lock(
+                                    record_scheduler_test_mutex());
+                                ++record_scheduler_test_stats_storage()
+                                      .parent_effective_shares;
+#endif
+                            }
+                        } else if (input.default_owner_ordinal) {
+                            const EffectiveArtifactSlot &owner =
+                                artifacts[*input.default_owner_ordinal];
+                            if (owner.default_failure || !owner.default_values) {
+                                record_failure(status, owner.default_failure.value_or(
+                                    RecordFailure{
+                                        RecordFailureStage::parent_default,
+                                        ErrorCode::invalid_configuration,
+                                        "Default preset configuration conversion failed for '" +
+                                            input.name + "'",
+                                        "/resources_dir"}));
+                            } else {
+                                inherited = *owner.default_values;
+#ifdef LIBSLICER_SDK_TESTING
+                                std::lock_guard<std::mutex> lock(
+                                    record_scheduler_test_mutex());
+                                ++record_scheduler_test_stats_storage()
+                                      .default_value_shares;
+#endif
+                            }
+                        } else {
+                            record_failure(status, {
+                                RecordFailureStage::parent_default,
+                                ErrorCode::invalid_configuration,
+                                "Preset inheritance authority is unavailable for '" +
+                                    input.name + "'",
+                                "/resources_dir"});
+                        }
+
+                        if (status.failure || !inherited || !artifact.effective ||
+                            !status.overrides || !input.ref || !input.key)
+                            return;
+
+                        const std::size_t in_flight =
+                            in_flight_candidates.fetch_add(
+                                1, std::memory_order_relaxed) + 1;
+                        candidate_in_flight = true;
+                        update_peak(peak_in_flight_candidates, in_flight);
+                        PresetSummary summary{
+                            *input.ref, input.name, input.vendor,
+                            input.parent_summary, input.revision};
+                        status.candidate.emplace(PresetRecord{
+                            std::move(summary), *inherited,
+                            *artifact.effective,
+                            std::move(*status.overrides),
+                            std::make_shared<Slic3r::Preset>(*input.source)});
+                        status.overrides.reset();
+#ifdef LIBSLICER_SDK_TESTING
+                        if (input.parent_ordinal &&
+                            statuses[*input.parent_ordinal].failure) {
+                            std::lock_guard<std::mutex> lock(
+                                record_scheduler_test_mutex());
+                            ++record_scheduler_test_stats_storage()
+                                  .children_completed_from_failed_parent_record;
+                        }
+#endif
+                        in_flight_candidates.fetch_sub(
+                            1, std::memory_order_relaxed);
+                        candidate_in_flight = false;
+#ifdef LIBSLICER_SDK_TESTING
+                        if (status.candidate) {
+                            std::lock_guard<std::mutex> lock(
+                                record_scheduler_test_mutex());
+                            ++record_scheduler_test_stats_storage()
+                                  .candidates_staged;
+                        }
+#endif
+                    } catch (const std::exception &error) {
+                        if (candidate_in_flight)
+                            in_flight_candidates.fetch_sub(
+                                1, std::memory_order_relaxed);
+                        record_failure(status, {
+                            RecordFailureStage::effective_conversion,
+                            ErrorCode::internal, error.what(), "/resources_dir"});
+                    } catch (...) {
+                        if (candidate_in_flight)
+                            in_flight_candidates.fetch_sub(
+                                1, std::memory_order_relaxed);
+                        record_failure(status, {
+                            RecordFailureStage::effective_conversion,
+                            ErrorCode::internal,
+                            "Unknown candidate construction worker failure",
+                            "/resources_dir"});
+                    }
+                });
+#ifdef LIBSLICER_SDK_TESTING
+            {
+                std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+                record_scheduler_test_stats_storage().candidate_batch_ns =
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() -
+                            candidate_started).count());
+            }
+#endif
+        }
+#ifdef LIBSLICER_SDK_TESTING
+        {
+            std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+            RecordSchedulerTestStats &stats =
+                record_scheduler_test_stats_storage();
+            stats.arena_destroyed_before_commit = true;
+            stats.maximum_active_workers =
+                peak_workers.load(std::memory_order_relaxed);
+            stats.in_flight_candidates =
+                in_flight_candidates.load(std::memory_order_relaxed);
+            stats.peak_in_flight_candidates =
+                peak_in_flight_candidates.load(std::memory_order_relaxed);
+        }
+#endif
+    } catch (const std::exception &error) {
+        return ResultAccess::failure(
+            ErrorCode::internal, error.what(), "/runtime/record_arena");
+    } catch (...) {
+        return ResultAccess::failure(
+            ErrorCode::internal, "Unknown record arena failure",
+            "/runtime/record_arena");
+    }
+
+#ifdef LIBSLICER_SDK_TESTING
+    const auto commit_started = std::chrono::steady_clock::now();
+#endif
+    for (std::size_t ordinal = 0; ordinal < statuses.size(); ++ordinal) {
+        if (!statuses[ordinal].failure)
+            continue;
+#ifdef LIBSLICER_SDK_TESTING
+        {
+            std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+            RecordSchedulerTestStats &stats =
+                record_scheduler_test_stats_storage();
+            stats.primary_failure_ordinal = ordinal;
+            switch (statuses[ordinal].failure->stage) {
+            case RecordFailureStage::freeze:
+                stats.primary_failure_stage =
+                    RecordFailureInjectionStage::freeze;
+                break;
+            case RecordFailureStage::parent_default:
+            case RecordFailureStage::dependency_conversion:
+                stats.primary_failure_stage =
+                    RecordFailureInjectionStage::parent_default;
+                break;
+            case RecordFailureStage::identity:
+                stats.primary_failure_stage =
+                    RecordFailureInjectionStage::identity;
+                break;
+            case RecordFailureStage::duplicate:
+                stats.primary_failure_stage =
+                    RecordFailureInjectionStage::duplicate;
+                break;
+            case RecordFailureStage::effective_conversion:
+                stats.primary_failure_stage =
+                    RecordFailureInjectionStage::effective_conversion;
+                break;
+            }
+        }
+#endif
+        const RecordFailure &failure = *statuses[ordinal].failure;
+        for (RecordCandidateStatus &status : statuses)
+            status.overrides.reset();
+        for (RecordCandidateStatus &status : statuses)
+            status.candidate.reset();
+        for (EffectiveArtifactSlot &artifact : artifacts) {
+            artifact.effective.reset();
+            artifact.default_values.reset();
+        }
+#ifdef LIBSLICER_SDK_TESTING
+        {
+            std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+            record_scheduler_test_stats_storage()
+                .status_candidate_owners_after_commit = 0;
+            record_scheduler_test_stats_storage()
+                .artifact_value_owners_after_commit = 0;
+        }
+#endif
+        return ResultAccess::failure(
+            failure.code, failure.message, failure.field);
+    }
+
+    if (!catalog.records.empty())
+        return ResultAccess::failure(
+            ErrorCode::internal,
+            "System preset catalog was published before record commit",
+            "/resources_dir");
+
+    for (std::size_t ordinal = 0; ordinal < statuses.size(); ++ordinal) {
+        if (!statuses[ordinal].candidate || !inputs[ordinal].key)
+            return ResultAccess::failure(
+                ErrorCode::internal,
+                "Record candidate is missing at commit",
+                "/resources_dir");
         const auto inserted = catalog.records.emplace(
-            PresetKey{ref.kind(), ref.origin(), ref.id()}, std::move(record));
+            *inputs[ordinal].key,
+            std::move(*statuses[ordinal].candidate));
         if (!inserted.second)
-            throw Slic3r::ConfigurationError("Duplicate preset identity: " + ref.id());
+            return ResultAccess::failure(
+                ErrorCode::invalid_configuration,
+                "Duplicate preset identity at commit: " +
+                    inputs[ordinal].key->id,
+                "/resources_dir");
+        statuses[ordinal].candidate.reset();
     }
+    catalog.next_revision = next_revision;
+    for (EffectiveArtifactSlot &artifact : artifacts) {
+        artifact.effective.reset();
+        artifact.default_values.reset();
+    }
+
+#ifdef LIBSLICER_SDK_TESTING
+    {
+        std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+        RecordSchedulerTestStats &stats =
+            record_scheduler_test_stats_storage();
+        stats.commit_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - commit_started).count());
+        stats.committed_records = catalog.records.size();
+        stats.status_candidate_owners_after_commit =
+            static_cast<std::size_t>(std::count_if(
+                statuses.begin(), statuses.end(),
+                [](const RecordCandidateStatus &status) {
+                    return status.candidate.has_value() ||
+                           status.overrides.has_value();
+                }));
+        stats.artifact_value_owners_after_commit =
+            static_cast<std::size_t>(std::count_if(
+                artifacts.begin(), artifacts.end(),
+                [](const EffectiveArtifactSlot &artifact) {
+                    return artifact.effective ||
+                           artifact.default_values;
+                }));
+    }
+#endif
+    return ResultAccess::success();
 }
 
 Result<void> prepare_user_store(const std::filesystem::path &user_store)
@@ -1007,6 +1765,39 @@ Result<void> prepare_user_store(const std::filesystem::path &user_store)
 }
 
 } // namespace
+
+#ifdef LIBSLICER_SDK_TESTING
+
+void set_record_scheduler_test_control(RecordSchedulerTestControl control)
+{
+    if (control.worker_limit != 1 && control.worker_limit != 2 &&
+        control.worker_limit != 4)
+        throw std::invalid_argument(
+            "Record scheduler test worker limit must be 1, 2, or 4");
+    std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+    record_scheduler_test_control_storage() = std::move(control);
+}
+
+void reset_record_scheduler_test_control()
+{
+    std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+    record_scheduler_test_control_storage() = {};
+    record_scheduler_test_stats_storage() = {};
+}
+
+RecordSchedulerTestStats record_scheduler_test_stats()
+{
+    std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+    return record_scheduler_test_stats_storage();
+}
+
+std::uintptr_t config_values_identity_for_testing(const ConfigValues &values)
+{
+    return reinterpret_cast<std::uintptr_t>(
+        std::addressof(values.entries()));
+}
+
+#endif
 
 Result<std::uint64_t> persist_user_preset(PresetCatalogState &catalog,
                                           const PresetRecord &record,
@@ -1123,10 +1914,62 @@ Result<std::uint64_t> erase_user_preset(PresetCatalogState &catalog,
     }
 }
 
-Result<std::shared_ptr<PresetCatalogState>> load_preset_catalog(const ContextOptions &options,
-                                                                 ConfigSchema schema)
+ErrorCode public_error_code(Slic3r::SystemPresetIssueKind kind)
 {
-    std::lock_guard<std::mutex> core_lock(runtime_mutex());
+    switch (kind) {
+    case Slic3r::SystemPresetIssueKind::io:
+        return ErrorCode::io;
+    case Slic3r::SystemPresetIssueKind::parse:
+        return ErrorCode::invalid_configuration;
+    case Slic3r::SystemPresetIssueKind::duplicate:
+        return ErrorCode::conflict;
+    case Slic3r::SystemPresetIssueKind::alias_cycle:
+        return ErrorCode::invalid_configuration;
+    case Slic3r::SystemPresetIssueKind::alias_ambiguous:
+        return ErrorCode::conflict;
+    case Slic3r::SystemPresetIssueKind::missing_dependency:
+        return ErrorCode::not_found;
+    case Slic3r::SystemPresetIssueKind::invalid_identity:
+        return ErrorCode::invalid_configuration;
+    }
+    return ErrorCode::internal;
+}
+
+Result<std::shared_ptr<PresetCatalogState>> system_load_failure(
+    const std::vector<Slic3r::SystemPresetLoadIssue> &issues)
+{
+    if (issues.empty())
+        return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(
+            ErrorCode::internal,
+            "System preset loader failed without a structured issue",
+            "/resources_dir");
+
+    std::vector<Diagnostic> additional;
+    additional.reserve(issues.size() - 1);
+    for (std::size_t index = 1; index < issues.size(); ++index) {
+        additional.push_back({
+            public_error_code(issues[index].kind),
+            Severity::error,
+            issues[index].message,
+            "/resources_dir"
+        });
+    }
+    return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(
+        public_error_code(issues.front().kind),
+        issues.front().message,
+        "/resources_dir",
+        std::move(additional));
+}
+
+Result<std::shared_ptr<PresetCatalogState>> load_preset_catalog_with_core_locked(
+    const ContextOptions &options, ConfigSchema schema)
+{
+#ifdef LIBSLICER_SDK_TESTING
+    {
+        std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+        record_scheduler_test_stats_storage() = {};
+    }
+#endif
     const std::string old_resources = Slic3r::resources_dir();
     const std::string old_data = Slic3r::data_dir();
     const std::string old_temporary = Slic3r::temporary_dir();
@@ -1146,7 +1989,15 @@ Result<std::shared_ptr<PresetCatalogState>> load_preset_catalog(const ContextOpt
         Slic3r::set_temporary_dir(options.temporary_dir.string());
 
         auto catalog = std::make_shared<PresetCatalogState>(std::move(schema));
-        catalog->bundle = std::make_shared<Slic3r::PresetBundle>();
+        try {
+            catalog->bundle = std::make_shared<Slic3r::PresetBundle>();
+        } catch (const std::exception &error) {
+            return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(
+                ErrorCode::invalid_configuration,
+                std::string("Failed to construct libslic3r default preset bundle: ") +
+                    error.what(),
+                "/presets/default_bundle");
+        }
         catalog->user_store = options.data_dir / "libslicer_sdk_v1" / "user_store";
         auto prepared_store = prepare_user_store(catalog->user_store);
         if (!prepared_store.has_value())
@@ -1154,46 +2005,32 @@ Result<std::shared_ptr<PresetCatalogState>> load_preset_catalog(const ContextOpt
                 *prepared_store.error_code(), prepared_store.diagnostics().front().message,
                 prepared_store.diagnostics().front().field);
 
-        std::filesystem::path profiles = options.resources_dir / "profiles";
-        if (!std::filesystem::is_directory(profiles)) profiles = options.resources_dir;
-        std::vector<std::string> vendors;
-        for (const auto &entry : std::filesystem::directory_iterator(profiles))
-            if (entry.is_regular_file() && entry.path().extension() == ".json")
-                vendors.push_back(entry.path().stem().string());
-        std::sort(vendors.begin(), vendors.end());
-        const auto orca = std::find(vendors.begin(), vendors.end(), "OrcaFilamentLibrary");
-        if (orca != vendors.end()) std::rotate(vendors.begin(), orca, std::next(orca));
-        if (!vendors.empty()) {
-            catalog->bundle->load_vendor_configs_from_json(
-                profiles.string(), vendors.front(), Slic3r::PresetBundle::LoadSystem,
-                Slic3r::ForwardCompatibilitySubstitutionRule::Disable);
+        const std::filesystem::path profiles = options.resources_dir / "profiles";
+#ifdef LIBSLICER_SDK_TESTING
+        const auto system_loader_started = std::chrono::steady_clock::now();
+#endif
+        Slic3r::SystemPresetLoadResult system_load =
+            catalog->bundle->load_system_presets_from_json_at(
+                profiles,
+                Slic3r::ForwardCompatibilitySubstitutionRule::Disable,
+                Slic3r::SystemPresetLoadPolicy::SdkStrict);
+#ifdef LIBSLICER_SDK_TESTING
+        {
+            std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+            record_scheduler_test_stats_storage().system_loader_ns =
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() -
+                        system_loader_started).count());
         }
-        std::vector<std::unique_ptr<Slic3r::PresetBundle>> vendor_bundles(
-            vendors.empty() ? 0 : vendors.size() - 1);
-        std::vector<std::string> vendor_errors(vendor_bundles.size());
-        tbb::parallel_for(std::size_t{0}, vendor_bundles.size(), [&](std::size_t index) {
-            try {
-                auto loaded = std::make_unique<Slic3r::PresetBundle>();
-                loaded->load_vendor_configs_from_json(
-                    profiles.string(), vendors[index + 1], Slic3r::PresetBundle::LoadSystem,
-                    Slic3r::ForwardCompatibilitySubstitutionRule::Disable,
-                    catalog->bundle.get());
-                vendor_bundles[index] = std::move(loaded);
-            } catch (const std::exception &error) {
-                vendor_errors[index] = error.what();
-            }
-        });
-        for (std::size_t index = 0; index < vendor_bundles.size(); ++index) {
-            if (!vendor_errors[index].empty())
-                return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(
-                    ErrorCode::invalid_configuration, vendor_errors[index], "/resources_dir");
-            const auto duplicates = catalog->bundle->merge_vendor_bundle_for_headless_use(
-                std::move(*vendor_bundles[index]));
-            if (!duplicates.empty())
-                return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(
-                    ErrorCode::conflict, "Duplicate preset identity in resources catalog: " +
-                    duplicates.front(), "/resources_dir");
-        }
+#endif
+        if (!system_load.issues.empty())
+            return system_load_failure(system_load.issues);
+        if (catalog->bundle->has_defauls_only())
+            return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(
+                ErrorCode::invalid_configuration,
+                "System preset loader produced a default-only catalog",
+                "/resources_dir");
 
         Slic3r::PresetsConfigSubstitutions substitutions;
         for (std::size_t index = 0; index < options.preset_dirs.size(); ++index) {
@@ -1222,15 +2059,31 @@ Result<std::shared_ptr<PresetCatalogState>> load_preset_catalog(const ContextOpt
         }
 
         try {
-            append_collection(*catalog, catalog->bundle->printers);
-            append_collection(*catalog, catalog->bundle->prints);
-            append_collection(*catalog, catalog->bundle->filaments);
+            auto appended = append_system_collections(*catalog);
+            if (!appended.has_value())
+                return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(
+                    appended.error_code().value_or(ErrorCode::invalid_configuration),
+                    appended.diagnostics().front().message,
+                    appended.diagnostics().front().field);
         } catch (const std::exception &error) {
             return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(
                 ErrorCode::invalid_configuration, error.what(), "/resources_dir");
         }
         try {
+#ifdef LIBSLICER_SDK_TESTING
+            const auto user_store_started = std::chrono::steady_clock::now();
+#endif
             load_user_manifest(*catalog);
+#ifdef LIBSLICER_SDK_TESTING
+            {
+                std::lock_guard<std::mutex> lock(record_scheduler_test_mutex());
+                record_scheduler_test_stats_storage().user_store_ns =
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() -
+                            user_store_started).count());
+            }
+#endif
         } catch (const std::exception &error) {
             return ResultAccess::failure<std::shared_ptr<PresetCatalogState>>(
                 ErrorCode::invalid_configuration, error.what(), "/data_dir");

@@ -23,17 +23,25 @@ struct ConfigSchemaAccess {
                                 bool value_nullable = false,
                                 bool fixed_length = false);
 
-    static ConfigSchema make(std::string schema_id,
-                             std::uint32_t schema_version,
-                             std::vector<OptionDescriptor> options,
-                             std::vector<std::string> typed_owned_options,
-                             OptionEvaluator evaluator);
+    static Result<ConfigSchema> make(std::string schema_id,
+                                     std::uint32_t schema_version,
+                                     std::vector<OptionDescriptor> options,
+                                     std::vector<std::string> typed_owned_options,
+                                     OptionEvaluator evaluator);
+
+    static const OptionDescriptor *find_descriptor(const ConfigSchema &schema,
+                                                   const OptionId &option);
+    static const OptionDescriptor *find_descriptor(const ConfigSchema &schema,
+                                                   const std::string &option);
 
     static Result<void> validate_structure(const ConfigSchema &schema,
                                            const ConfigPatch &patch,
                                            const ConfigValidationContext &context);
 
     static bool is_generic_option(const ConfigSchema &schema, const OptionId &option);
+
+    static std::size_t option_index_build_count(const ConfigSchema &schema) noexcept;
+    static std::size_t option_index_mutation_count(const ConfigSchema &schema) noexcept;
 };
 
 } // namespace libslicer::v1::detail

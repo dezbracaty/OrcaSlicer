@@ -5,6 +5,8 @@
 #include "libslic3r/Preset.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cfloat>
 #include <cmath>
 #include <functional>
@@ -16,6 +18,16 @@
 #include <utility>
 
 namespace libslicer::v1::detail {
+
+#ifdef LIBSLICER_SDK_TESTING
+namespace {
+std::atomic<std::uint64_t> &schema_build_ns_storage()
+{
+    static std::atomic<std::uint64_t> value {0};
+    return value;
+}
+} // namespace
+#endif
 
 const FilamentReferenceRule *filament_reference_rule(const std::string &canonical_option_id)
 {
@@ -1345,6 +1357,20 @@ Result<Slic3r::ConfigOptionUniquePtr> value_to_core_option(
 
 Result<ConfigSchema> build_orca_fff_schema()
 {
+#ifdef LIBSLICER_SDK_TESTING
+    const auto schema_started = std::chrono::steady_clock::now();
+    struct SchemaTimer {
+        std::chrono::steady_clock::time_point started;
+        ~SchemaTimer()
+        {
+            schema_build_ns_storage().store(
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - started).count()),
+                std::memory_order_relaxed);
+        }
+    } schema_timer{schema_started};
+#endif
     try {
         static const std::set<std::string> printer = option_set(Slic3r::Preset::printer_options());
         static const std::set<std::string> process = option_set(Slic3r::Preset::print_options());
@@ -1387,10 +1413,10 @@ Result<ConfigSchema> build_orca_fff_schema()
                                        ownership == InternalOptionOwnership::generic_config});
         }
         OptionEvaluator evaluator = make_fff_rule_evaluator(fff_rule_registry_version, descriptors);
-        return ResultAccess::success(ConfigSchemaAccess::make(
+        return ConfigSchemaAccess::make(
             "orca.fff.config", fff_rule_registry_version, std::move(descriptors),
             std::move(typed_owned_options),
-            std::move(evaluator)));
+            std::move(evaluator));
     } catch (const std::exception &error) {
         return ResultAccess::failure<ConfigSchema>(ErrorCode::internal, error.what(), "/schema");
     }
@@ -1417,13 +1443,53 @@ Result<ConfigValues> core_config_to_values(const Slic3r::ConfigBase &config)
     return ResultAccess::success(ConfigValuesAccess::make(std::move(entries)));
 }
 
+Result<FusedConfigConversion> core_config_to_values_and_diff(
+    const Slic3r::ConfigBase &inherited,
+    const Slic3r::ConfigBase &effective,
+    const ConfigSchema &schema)
+{
+    std::vector<ConfigEntry> entries;
+    ConfigPatch patch;
+    const auto keys = effective.keys();
+    entries.reserve(keys.size());
+    for (const std::string &key : keys) {
+        const auto *definition = Slic3r::print_config_def.get(key);
+        const auto *current = effective.optptr(key);
+        if (!definition || !current)
+            return failure<FusedConfigConversion>(
+                ErrorCode::invalid_configuration,
+                "Core configuration contains an unknown option", key);
+
+        auto converted = core_option_to_value(*definition, *current);
+        if (!converted.has_value())
+            return ResultAccess::failure<FusedConfigConversion>(
+                *converted.error_code(),
+                converted.diagnostics().front().message,
+                converted.diagnostics().front().field);
+
+        ConfigValue value = std::move(converted).value();
+        const OptionDescriptor *descriptor =
+            ConfigSchemaAccess::find_descriptor(schema, key);
+        if (descriptor && descriptor->editable &&
+            ownership_for(key) == InternalOptionOwnership::generic_config) {
+            const auto *base = inherited.optptr(key);
+            if (!base || *current != *base)
+                patch.set(OptionId(key), value);
+        }
+        entries.push_back({OptionId(key), std::move(value)});
+    }
+    return ResultAccess::success(FusedConfigConversion{
+        ConfigValuesAccess::make(std::move(entries)), std::move(patch)});
+}
+
 Result<ConfigPatch> core_config_diff_to_patch(const Slic3r::ConfigBase &inherited,
                                               const Slic3r::ConfigBase &effective,
                                               const ConfigSchema &schema)
 {
     ConfigPatch patch;
     for (const std::string &key : effective.keys()) {
-        const auto descriptor = schema.find(OptionId(key));
+        const OptionDescriptor *descriptor =
+            ConfigSchemaAccess::find_descriptor(schema, key);
         if (!descriptor || !descriptor->editable ||
             ownership_for(key) != InternalOptionOwnership::generic_config)
             continue;
@@ -1444,6 +1510,30 @@ Result<ConfigPatch> core_config_diff_to_patch(const Slic3r::ConfigBase &inherite
     }
     return ResultAccess::success(std::move(patch));
 }
+
+#ifdef LIBSLICER_SDK_TESTING
+struct ConfigValueAccess {
+    static std::uintptr_t identity(const ConfigValue &value)
+    {
+        return reinterpret_cast<std::uintptr_t>(value.state_.get());
+    }
+};
+
+void reset_config_adapter_test_stats()
+{
+    schema_build_ns_storage().store(0, std::memory_order_relaxed);
+}
+
+ConfigAdapterTestStats config_adapter_test_stats()
+{
+    return {schema_build_ns_storage().load(std::memory_order_relaxed)};
+}
+
+std::uintptr_t config_value_identity_for_testing(const ConfigValue &value)
+{
+    return ConfigValueAccess::identity(value);
+}
+#endif
 
 Result<void> apply_patch_to_core_config(const ConfigPatch &patch,
                                         Slic3r::DynamicPrintConfig &config)

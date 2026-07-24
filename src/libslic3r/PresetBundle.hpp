@@ -5,13 +5,17 @@
 #include "AppConfig.hpp"
 #include "enum_bitmask.hpp"
 
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <optional>
 #include <array>
 #include <boost/filesystem/path.hpp>
 #include <unordered_set>
+#include <vector>
 
 #define DEFAULT_USER_FOLDER_NAME "default"
 #define BUNDLE_STRUCTURE_JSON_NAME "bundle_structure.json"
@@ -79,6 +83,47 @@ enum BundleType{
     Local,
     Subscribed,
 };
+
+enum class SystemPresetLoadPolicy {
+    GuiBestEffort,
+    SdkStrict
+};
+
+enum class SystemPresetIssueKind {
+    io,
+    parse,
+    duplicate,
+    alias_cycle,
+    alias_ambiguous,
+    missing_dependency,
+    invalid_identity
+};
+
+struct SystemPresetLoadIssue {
+    SystemPresetIssueKind kind;
+    std::string           vendor;
+    std::filesystem::path path;
+    std::string           message;
+};
+
+struct SystemPresetLoadResult {
+    PresetsConfigSubstitutions         substitutions;
+    std::vector<SystemPresetLoadIssue> issues;
+};
+
+enum class SystemPresetLoadTestEvent {
+    orca_load_started,
+    orca_load_finished,
+    vendor_load_started,
+    vendor_load_finished,
+    vendor_merge_started,
+    vendor_merge_finished
+};
+
+using SystemPresetLoadTestObserver =
+    std::function<void(SystemPresetLoadTestEvent, const std::string &)>;
+
+void set_system_preset_load_test_observer(SystemPresetLoadTestObserver observer);
 
 // Orca: Bundle metadata structure for imported preset bundles
 struct BundleMetadata
@@ -184,6 +229,11 @@ public:
     // select preferred presets, if any exist
     PresetsConfigSubstitutions load_presets(AppConfig &config, ForwardCompatibilitySubstitutionRule rule,
                                             const PresetPreferences& preferred_selection = PresetPreferences());
+
+    SystemPresetLoadResult load_system_presets_from_json_at(
+        const std::filesystem::path &profiles_dir,
+        ForwardCompatibilitySubstitutionRule compatibility_rule,
+        SystemPresetLoadPolicy policy);
 
     // Load selections (current print, current filaments, current printer) from config.ini
     // This is done just once on application start up.

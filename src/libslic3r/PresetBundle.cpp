@@ -2,6 +2,9 @@
 #include <ctime>
 
 #include "PresetBundle.hpp"
+
+#include <exception>
+#include <functional>
 #include "PrintConfig.hpp"
 #include "libslic3r.h"
 #include "I18N.hpp"
@@ -2161,130 +2164,445 @@ void PresetBundle::remove_users_preset(AppConfig &config, std::map<std::string, 
 }
 
 
-//BBS: add json related logic, load system presets from json
-std::pair<PresetsConfigSubstitutions, std::string> PresetBundle::load_system_presets_from_json(ForwardCompatibilitySubstitutionRule compatibility_rule)
+namespace {
+
+std::mutex &system_preset_load_test_observer_mutex()
 {
-    //BBS: add config related logs
-    BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" enter, compatibility_rule %1%")%compatibility_rule;
-    if (compatibility_rule == ForwardCompatibilitySubstitutionRule::EnableSystemSilent)
-        // Loading system presets, don't log substitutions.
-        compatibility_rule = ForwardCompatibilitySubstitutionRule::EnableSilent;
-    else if (compatibility_rule == ForwardCompatibilitySubstitutionRule::EnableSilentDisableSystem)
-        // Loading system presets, throw on unknown option value.
-        compatibility_rule = ForwardCompatibilitySubstitutionRule::Disable;
+    static std::mutex mutex;
+    return mutex;
+}
 
-    // Here the vendor specific read only Config Bundles are stored.
-    //BBS: change directory by design
-    boost::filesystem::path     dir = (boost::filesystem::path(data_dir()) / PRESET_SYSTEM_DIR).make_preferred();
-    if (validation_mode)
-        dir = (boost::filesystem::path(data_dir())).make_preferred();
+SystemPresetLoadTestObserver &system_preset_load_test_observer()
+{
+    static SystemPresetLoadTestObserver observer;
+    return observer;
+}
 
-    PresetsConfigSubstitutions  substitutions;
-    std::string                 errors_cummulative;
-    bool                        first = true;
-    std::vector<std::string> vendor_names;
-    // store all vendor names in vendor_names
-    for (auto& dir_entry : boost::filesystem::directory_iterator(dir)) {
-        std::string vendor_file = dir_entry.path().string();
-        if (!Slic3r::is_json_file(vendor_file))
+void notify_system_preset_load_test_observer(SystemPresetLoadTestEvent event,
+                                             const std::string &vendor)
+{
+    SystemPresetLoadTestObserver observer;
+    {
+        std::lock_guard<std::mutex> lock(system_preset_load_test_observer_mutex());
+        observer = system_preset_load_test_observer();
+    }
+    if (observer)
+        observer(event, vendor);
+}
+
+std::filesystem::path normalized_issue_path(const std::filesystem::path &path)
+{
+    std::error_code error;
+    const std::filesystem::path canonical = std::filesystem::canonical(path, error);
+    if (!error)
+        return canonical;
+    error.clear();
+    const std::filesystem::path absolute = std::filesystem::absolute(path, error);
+    return (error ? path : absolute).lexically_normal();
+}
+
+bool valid_utf8_identity(const std::string &value)
+{
+    if (value.empty() || value.find('\0') != std::string::npos)
+        return false;
+    const auto *bytes = reinterpret_cast<const unsigned char *>(value.data());
+    std::size_t index = 0;
+    while (index < value.size()) {
+        const unsigned char lead = bytes[index++];
+        if (lead < 0x80)
             continue;
-
-        std::string vendor_name = dir_entry.path().filename().string();
-
-        // Remove the .json suffix.
-        vendor_name.erase(vendor_name.size() - 5);
-        vendor_names.push_back(vendor_name);
+        std::size_t continuation = 0;
+        std::uint32_t codepoint = 0;
+        if ((lead & 0xe0) == 0xc0) {
+            continuation = 1;
+            codepoint = lead & 0x1f;
+        } else if ((lead & 0xf0) == 0xe0) {
+            continuation = 2;
+            codepoint = lead & 0x0f;
+        } else if ((lead & 0xf8) == 0xf0) {
+            continuation = 3;
+            codepoint = lead & 0x07;
+        } else {
+            return false;
+        }
+        if (index + continuation > value.size())
+            return false;
+        for (std::size_t offset = 0; offset < continuation; ++offset) {
+            const unsigned char byte = bytes[index++];
+            if ((byte & 0xc0) != 0x80)
+                return false;
+            codepoint = (codepoint << 6) | (byte & 0x3f);
+        }
+        if ((continuation == 1 && codepoint < 0x80) ||
+            (continuation == 2 && codepoint < 0x800) ||
+            (continuation == 3 && codepoint < 0x10000) ||
+            codepoint > 0x10ffff ||
+            (codepoint >= 0xd800 && codepoint <= 0xdfff))
+            return false;
     }
-    // Separate ORCA_FILAMENT_LIBRARY from other vendors. It must be loaded
-    // first because other vendors' filaments may inherit from it via the
-    // `base_bundle` lookup in parse_subfile. The remaining vendors are
-    // independent (no cross-vendor inheritance) and can be loaded in parallel.
-    std::string orca_lib_vendor;
-    std::vector<std::string> other_vendors;
-    other_vendors.reserve(vendor_names.size());
-    for (auto& vn : vendor_names) {
-        if (vn == ORCA_FILAMENT_LIBRARY)
-            orca_lib_vendor = vn;
-        else if (!(validation_mode && !vendor_to_validate.empty() && vn != vendor_to_validate))
-            other_vendors.push_back(vn);
-    }
+    return true;
+}
 
-    // Step 1: Load ORCA_FILAMENT_LIBRARY into `this` synchronously.
-    if (!orca_lib_vendor.empty()) {
-        try {
-            append(substitutions, this->load_vendor_configs_from_json(dir.string(), orca_lib_vendor, PresetBundle::LoadSystem, compatibility_rule).first);
-            first = false;
-        } catch (const std::runtime_error &err) {
-            if (validation_mode)
-                throw err;
-            errors_cummulative += err.what();
-            errors_cummulative += "\n";
+std::filesystem::path vendor_issue_path(const std::filesystem::path &profiles_dir,
+                                        const std::string &vendor)
+{
+    return normalized_issue_path(
+        vendor.empty() ? profiles_dir : profiles_dir / (vendor + ".json"));
+}
+
+void append_authority_issues(const PresetCollection &collection,
+                             const std::filesystem::path &profiles_dir,
+                             std::vector<SystemPresetLoadIssue> &issues)
+{
+    std::map<std::string, std::string> renamed_targets;
+    std::map<std::string, std::string> renamed_vendors;
+
+    for (const Preset &preset : collection.get_presets()) {
+        if (preset.is_default || preset.is_project_embedded)
+            continue;
+        const std::string vendor = preset.vendor == nullptr ? std::string{} : preset.vendor->id;
+        if (!valid_utf8_identity(preset.name)) {
+            issues.push_back({
+                SystemPresetIssueKind::invalid_identity,
+                vendor,
+                vendor_issue_path(profiles_dir, vendor),
+                "System preset has an empty or invalid UTF-8 canonical name"
+            });
+            continue;
+        }
+        for (const std::string &renamed_from : preset.renamed_from) {
+            if (!valid_utf8_identity(renamed_from)) {
+                issues.push_back({
+                    SystemPresetIssueKind::invalid_identity,
+                    vendor,
+                    vendor_issue_path(profiles_dir, vendor),
+                    "System preset renamed_from contains an empty or invalid UTF-8 identity"
+                });
+                continue;
+            }
+            const auto inserted = renamed_targets.emplace(renamed_from, preset.name);
+            if (!inserted.second && inserted.first->second != preset.name) {
+                issues.push_back({
+                    SystemPresetIssueKind::alias_ambiguous,
+                    vendor,
+                    vendor_issue_path(profiles_dir, vendor),
+                    "Historical preset identity '" + renamed_from +
+                        "' resolves to both '" + inserted.first->second +
+                        "' and '" + preset.name + "'"
+                });
+            } else {
+                renamed_vendors.emplace(renamed_from, vendor);
+            }
         }
     }
 
-    // Step 2: Load remaining vendors in parallel. Each gets its own
-    // PresetBundle and uses `this` (which contains ORCA_FILAMENT_LIBRARY)
-    // as the base_bundle for cross-bundle inheritance lookups.
-    std::vector<std::unique_ptr<PresetBundle>>      parallel_bundles(other_vendors.size());
-    std::vector<PresetsConfigSubstitutions>         parallel_substitutions(other_vendors.size());
-    std::vector<std::string>                        parallel_errors(other_vendors.size());
+    enum class VisitState { visiting, complete };
+    std::map<std::string, VisitState> states;
+    std::set<std::string> reported_cycles;
+    std::function<void(const std::string &)> visit = [&](const std::string &identity) {
+        const auto edge = renamed_targets.find(identity);
+        if (edge == renamed_targets.end())
+            return;
+        const auto state = states.find(identity);
+        if (state != states.end()) {
+            if (state->second == VisitState::visiting &&
+                reported_cycles.insert(identity).second) {
+                const std::string vendor = renamed_vendors[identity];
+                issues.push_back({
+                    SystemPresetIssueKind::alias_cycle,
+                    vendor,
+                    vendor_issue_path(profiles_dir, vendor),
+                    "Historical preset identity cycle contains '" + identity + "'"
+                });
+            }
+            return;
+        }
+        states.emplace(identity, VisitState::visiting);
+        visit(edge->second);
+        states[identity] = VisitState::complete;
+    };
+    for (const auto &edge : renamed_targets)
+        visit(edge.first);
+}
 
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, other_vendors.size()),
-        [&](const tbb::blocked_range<size_t>& range) {
-            for (size_t i = range.begin(); i < range.end(); ++i) {
+void sort_system_preset_issues(std::vector<SystemPresetLoadIssue> &issues)
+{
+    std::sort(issues.begin(), issues.end(),
+        [](const SystemPresetLoadIssue &lhs, const SystemPresetLoadIssue &rhs) {
+            if (lhs.vendor != rhs.vendor)
+                return lhs.vendor < rhs.vendor;
+            const std::string lhs_path = lhs.path.generic_u8string();
+            const std::string rhs_path = rhs.path.generic_u8string();
+            if (lhs_path != rhs_path)
+                return lhs_path < rhs_path;
+            if (lhs.kind != rhs.kind)
+                return lhs.kind < rhs.kind;
+            return lhs.message < rhs.message;
+        });
+}
+
+} // namespace
+
+void set_system_preset_load_test_observer(SystemPresetLoadTestObserver observer)
+{
+    std::lock_guard<std::mutex> lock(system_preset_load_test_observer_mutex());
+    system_preset_load_test_observer() = std::move(observer);
+}
+
+SystemPresetLoadResult PresetBundle::load_system_presets_from_json_at(
+    const std::filesystem::path &profiles_dir,
+    ForwardCompatibilitySubstitutionRule compatibility_rule,
+    SystemPresetLoadPolicy policy)
+{
+    BOOST_LOG_TRIVIAL(debug) << __FUNCTION__
+        << boost::format(" enter, profiles_dir %1%, compatibility_rule %2%, policy %3%")
+            % profiles_dir.string() % compatibility_rule % static_cast<int>(policy);
+
+    if (compatibility_rule == ForwardCompatibilitySubstitutionRule::EnableSystemSilent)
+        compatibility_rule = ForwardCompatibilitySubstitutionRule::EnableSilent;
+    else if (compatibility_rule == ForwardCompatibilitySubstitutionRule::EnableSilentDisableSystem)
+        compatibility_rule = ForwardCompatibilitySubstitutionRule::Disable;
+
+    SystemPresetLoadResult result;
+    const std::filesystem::path normalized_profiles = normalized_issue_path(profiles_dir);
+    std::vector<std::string> vendor_names;
+    std::map<std::string, std::exception_ptr> preflight_exceptions;
+    try {
+        for (const std::filesystem::directory_entry &entry :
+             std::filesystem::directory_iterator(profiles_dir)) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".json")
+                continue;
+
+            const std::string vendor = entry.path().stem().string();
+            std::ifstream input(entry.path(), std::ios::binary);
+            if (!input) {
+                const std::string message =
+                    "Cannot read system preset vendor file: " +
+                    normalized_issue_path(entry.path()).string();
+                result.issues.push_back({
+                    SystemPresetIssueKind::io,
+                    vendor,
+                    normalized_issue_path(entry.path()),
+                    message
+                });
+                preflight_exceptions.emplace(
+                    vendor, std::make_exception_ptr(std::runtime_error(message)));
+                continue;
+            }
+            vendor_names.push_back(vendor);
+        }
+    } catch (const std::exception &error) {
+        result.issues.push_back({
+            SystemPresetIssueKind::io,
+            {},
+            normalized_profiles,
+            error.what()
+        });
+        this->reset(false);
+        sort_system_preset_issues(result.issues);
+        return result;
+    }
+
+    std::sort(vendor_names.begin(), vendor_names.end());
+    const auto unreadable_orca =
+        preflight_exceptions.find(ORCA_FILAMENT_LIBRARY);
+    if (unreadable_orca != preflight_exceptions.end()) {
+        if (policy == SystemPresetLoadPolicy::GuiBestEffort && validation_mode)
+            std::rethrow_exception(unreadable_orca->second);
+        this->reset(false);
+        sort_system_preset_issues(result.issues);
+        return result;
+    }
+
+    const auto orca = std::find(vendor_names.begin(), vendor_names.end(),
+                                ORCA_FILAMENT_LIBRARY);
+    if (orca == vendor_names.end()) {
+        result.issues.push_back({
+            SystemPresetIssueKind::missing_dependency,
+            ORCA_FILAMENT_LIBRARY,
+            vendor_issue_path(normalized_profiles, ORCA_FILAMENT_LIBRARY),
+            "Required OrcaFilamentLibrary vendor JSON is missing"
+        });
+        this->reset(false);
+        sort_system_preset_issues(result.issues);
+        return result;
+    }
+
+    const std::string orca_vendor = *orca;
+    vendor_names.erase(orca);
+    if (validation_mode && !vendor_to_validate.empty()) {
+        vendor_names.erase(
+            std::remove_if(vendor_names.begin(), vendor_names.end(),
+                [&](const std::string &vendor) {
+                    return vendor != vendor_to_validate;
+                }),
+            vendor_names.end());
+    }
+
+    bool orca_failed = false;
+    try {
+        notify_system_preset_load_test_observer(
+            SystemPresetLoadTestEvent::orca_load_started, orca_vendor);
+        auto loaded = this->load_vendor_configs_from_json(
+            normalized_profiles.string(), orca_vendor, PresetBundle::LoadSystem,
+            compatibility_rule);
+        notify_system_preset_load_test_observer(
+            SystemPresetLoadTestEvent::orca_load_finished, orca_vendor);
+        append(result.substitutions, std::move(loaded.first));
+        if (policy == SystemPresetLoadPolicy::SdkStrict && this->has_errors()) {
+            orca_failed = true;
+            result.issues.push_back({
+                SystemPresetIssueKind::parse,
+                orca_vendor,
+                vendor_issue_path(normalized_profiles, orca_vendor),
+                "OrcaFilamentLibrary contains invalid preset data"
+            });
+        }
+    } catch (const std::exception &error) {
+        notify_system_preset_load_test_observer(
+            SystemPresetLoadTestEvent::orca_load_finished, orca_vendor);
+        if (policy == SystemPresetLoadPolicy::GuiBestEffort && validation_mode)
+            throw;
+        orca_failed = true;
+        result.issues.push_back({
+            SystemPresetIssueKind::parse,
+            orca_vendor,
+            vendor_issue_path(normalized_profiles, orca_vendor),
+            error.what()
+        });
+    }
+
+    if (orca_failed) {
+        this->reset(false);
+        sort_system_preset_issues(result.issues);
+        return result;
+    }
+
+    std::vector<std::unique_ptr<PresetBundle>> parallel_bundles(vendor_names.size());
+    std::vector<PresetsConfigSubstitutions> parallel_substitutions(vendor_names.size());
+    std::vector<std::vector<SystemPresetLoadIssue>> parallel_issues(vendor_names.size());
+    std::vector<std::exception_ptr> parallel_exceptions(vendor_names.size());
+
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, vendor_names.size()),
+        [&](const tbb::blocked_range<size_t> &range) {
+            for (size_t index = range.begin(); index < range.end(); ++index) {
+                const std::string &vendor = vendor_names[index];
                 auto bundle = std::make_unique<PresetBundle>();
                 bundle->set_is_validation_mode(validation_mode);
                 try {
-                    auto result = bundle->load_vendor_configs_from_json(
-                        dir.string(), other_vendors[i], PresetBundle::LoadSystem,
+                    notify_system_preset_load_test_observer(
+                        SystemPresetLoadTestEvent::vendor_load_started, vendor);
+                    auto loaded = bundle->load_vendor_configs_from_json(
+                        normalized_profiles.string(), vendor, PresetBundle::LoadSystem,
                         compatibility_rule, this);
-                    parallel_substitutions[i] = std::move(result.first);
-                    parallel_bundles[i] = std::move(bundle);
-                } catch (const std::runtime_error &err) {
-                    parallel_errors[i] = err.what();
+                    notify_system_preset_load_test_observer(
+                        SystemPresetLoadTestEvent::vendor_load_finished, vendor);
+                    parallel_substitutions[index] = std::move(loaded.first);
+                    if (policy == SystemPresetLoadPolicy::SdkStrict &&
+                        bundle->has_errors()) {
+                        parallel_issues[index].push_back({
+                            SystemPresetIssueKind::parse,
+                            vendor,
+                            vendor_issue_path(normalized_profiles, vendor),
+                            "Vendor contains invalid preset data"
+                        });
+                    } else {
+                        parallel_bundles[index] = std::move(bundle);
+                    }
+                } catch (const std::exception &error) {
+                    notify_system_preset_load_test_observer(
+                        SystemPresetLoadTestEvent::vendor_load_finished, vendor);
+                    parallel_exceptions[index] = std::current_exception();
+                    parallel_issues[index].push_back({
+                        SystemPresetIssueKind::parse,
+                        vendor,
+                        vendor_issue_path(normalized_profiles, vendor),
+                        error.what()
+                    });
                 }
             }
         });
 
-    // Step 3: Sequentially merge the parallel-loaded bundles into `this`.
-    // The merge order is the original vendor order so any duplicate-warning
-    // output stays stable across runs.
-    for (size_t i = 0; i < other_vendors.size(); ++i) {
-        if (!parallel_errors[i].empty()) {
-            if (validation_mode)
-                throw std::runtime_error(parallel_errors[i]);
-            errors_cummulative += parallel_errors[i];
-            errors_cummulative += "\n";
-            continue;
-        }
-        if (!parallel_bundles[i])
+    if (policy == SystemPresetLoadPolicy::GuiBestEffort && validation_mode) {
+        std::map<std::string, std::exception_ptr> validation_exceptions =
+            preflight_exceptions;
+        for (size_t index = 0; index < vendor_names.size(); ++index)
+            if (parallel_exceptions[index])
+                validation_exceptions.emplace(
+                    vendor_names[index], parallel_exceptions[index]);
+        for (const auto &entry : validation_exceptions)
+            std::rethrow_exception(entry.second);
+    }
+
+    for (size_t index = 0; index < vendor_names.size(); ++index) {
+        append(result.issues, std::move(parallel_issues[index]));
+        if (!parallel_bundles[index])
             continue;
 
-        const std::string& vendor_name = other_vendors[i];
-        append(substitutions, std::move(parallel_substitutions[i]));
-        std::vector<std::string> duplicates = this->merge_presets(std::move(*parallel_bundles[i]));
-        first = false;
+        append(result.substitutions, std::move(parallel_substitutions[index]));
+        notify_system_preset_load_test_observer(
+            SystemPresetLoadTestEvent::vendor_merge_started, vendor_names[index]);
+        const std::vector<std::string> duplicates =
+            this->merge_presets(std::move(*parallel_bundles[index]));
+        notify_system_preset_load_test_observer(
+            SystemPresetLoadTestEvent::vendor_merge_finished, vendor_names[index]);
         if (!duplicates.empty()) {
-            errors_cummulative += "Found duplicated settings in vendor " + vendor_name + "'s json file lists: ";
-            for (size_t j = 0; j < duplicates.size(); ++j) {
-                if (j > 0)
-                    errors_cummulative += ", ";
-                errors_cummulative += duplicates[j];
+            std::string message =
+                "Found duplicated settings in vendor " + vendor_names[index] +
+                "'s json file lists: ";
+            for (size_t duplicate_index = 0;
+                 duplicate_index < duplicates.size(); ++duplicate_index) {
+                if (duplicate_index > 0)
+                    message += ", ";
+                message += duplicates[duplicate_index];
                 ++m_errors;
-                BOOST_LOG_TRIVIAL(error) << "Found duplicated preset: " + duplicates[j] + " in vendor: " + vendor_name + ": ";
+                BOOST_LOG_TRIVIAL(error)
+                    << "Found duplicated preset: " + duplicates[duplicate_index] +
+                       " in vendor: " + vendor_names[index] + ": ";
             }
+            result.issues.push_back({
+                SystemPresetIssueKind::duplicate,
+                vendor_names[index],
+                vendor_issue_path(normalized_profiles, vendor_names[index]),
+                std::move(message)
+            });
         }
     }
 
-    if (first) {
-		// No config bundle loaded, reset.
-		this->reset(false);
-	}
+    this->update_system_maps();
+    append_authority_issues(this->prints, normalized_profiles, result.issues);
+    append_authority_issues(this->filaments, normalized_profiles, result.issues);
+    append_authority_issues(this->printers, normalized_profiles, result.issues);
+    append_authority_issues(this->sla_prints, normalized_profiles, result.issues);
+    append_authority_issues(this->sla_materials, normalized_profiles, result.issues);
+    sort_system_preset_issues(result.issues);
 
-	this->update_system_maps();
-    //BBS: add config related logs
-    BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" finished, errors_cummulative %1%")%errors_cummulative;
-    return std::make_pair(std::move(substitutions), errors_cummulative);
+    BOOST_LOG_TRIVIAL(debug) << __FUNCTION__
+        << boost::format(" finished, substitutions %1%, issues %2%")
+            % result.substitutions.size() % result.issues.size();
+    return result;
+}
+
+// BBS: GUI compatibility wrapper. The shared implementation receives the
+// directory explicitly; GUI-specific path derivation and cumulative errors
+// remain at this boundary.
+std::pair<PresetsConfigSubstitutions, std::string>
+PresetBundle::load_system_presets_from_json(
+    ForwardCompatibilitySubstitutionRule compatibility_rule)
+{
+    std::filesystem::path profiles_dir =
+        std::filesystem::path(data_dir()) / PRESET_SYSTEM_DIR;
+    if (validation_mode)
+        profiles_dir = std::filesystem::path(data_dir());
+
+    SystemPresetLoadResult loaded = load_system_presets_from_json_at(
+        profiles_dir, compatibility_rule, SystemPresetLoadPolicy::GuiBestEffort);
+    std::string cumulative_errors;
+    for (const SystemPresetLoadIssue &issue : loaded.issues) {
+        cumulative_errors += issue.message;
+        cumulative_errors += '\n';
+    }
+    return {std::move(loaded.substitutions), std::move(cumulative_errors)};
 }
 
 std::pair<PresetsConfigSubstitutions, std::string> PresetBundle::load_system_models_from_json(ForwardCompatibilitySubstitutionRule compatibility_rule)

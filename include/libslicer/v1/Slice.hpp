@@ -230,6 +230,8 @@ class SliceJob {
 public:
     Result<void> cancel();
     Result<std::shared_ptr<const SliceResult>> wait();
+    Result<std::optional<std::shared_ptr<const SliceResult>>>
+        wait_for(std::chrono::milliseconds timeout);
 
 private:
     explicit SliceJob(std::shared_ptr<detail::SliceJobState> state);

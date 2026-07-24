@@ -10,6 +10,10 @@
 #include <optional>
 #include <thread>
 
+#ifdef LIBSLICER_SDK_TESTING
+#include "SliceTesting.hpp"
+#endif
+
 namespace Slic3r { class Print; }
 
 namespace libslicer::v1::detail {

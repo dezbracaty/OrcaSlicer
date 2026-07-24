@@ -16,6 +16,11 @@
 
 namespace libslicer::v1::detail {
 
+enum class SliceInputMode {
+    inspect,
+    submit
+};
+
 struct ContextAccess {
     static std::shared_ptr<ContextState> state(SdkContext &context) { return context.state_; }
 };
@@ -108,7 +113,8 @@ struct FrozenSliceInput {
 
 Result<FrozenSliceInput> resolve_slice_input(
     std::shared_ptr<ContextState> context, ProjectSnapshot project, PlateId plate,
-    std::optional<TemporarySliceSelection> temporary_selection = std::nullopt);
+    std::optional<TemporarySliceSelection> temporary_selection = std::nullopt,
+    SliceInputMode mode = SliceInputMode::submit);
 
 } // namespace libslicer::v1::detail
 
