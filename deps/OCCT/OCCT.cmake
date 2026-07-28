@@ -74,6 +74,78 @@ message(STATUS "")
 file(MAKE_DIRECTORY "${FETCH_CACHE_DIR}")
 file(MAKE_DIRECTORY "${OCCT_CACHE_DIR}")
 
+# A cache directory name identifies the intended architecture and build type,
+# but it does not prove that the existing objects were configured for them.
+# Follow the same rule as GPlatform's fetch_vtk: validate the actual CMakeCache
+# before accepting either a build tree or its install tree.
+if(APPLE AND (EXISTS "${OCCT_BUILD_DIR}" OR EXISTS "${OCCT_INSTALL_DIR}"))
+    set(_occt_cache_file "${OCCT_BUILD_DIR}/CMakeCache.txt")
+    set(_occt_cache_abi_valid TRUE)
+    set(_occt_cache_abi_error "")
+
+    if(NOT EXISTS "${_occt_cache_file}")
+        set(_occt_cache_abi_valid FALSE)
+        set(_occt_cache_abi_error "missing ${_occt_cache_file}")
+    else()
+        foreach(_occt_cache_name
+                CMAKE_BUILD_TYPE
+                CMAKE_OSX_ARCHITECTURES
+                CMAKE_OSX_DEPLOYMENT_TARGET
+                CMAKE_OSX_SYSROOT)
+            file(STRINGS "${_occt_cache_file}" _occt_cache_lines
+                REGEX "^${_occt_cache_name}:[^=]*=")
+            list(LENGTH _occt_cache_lines _occt_cache_line_count)
+            if(NOT _occt_cache_line_count EQUAL 1)
+                set(_occt_cache_abi_valid FALSE)
+                set(_occt_cache_abi_error
+                    "${_occt_cache_name}: expected one cache entry, found ${_occt_cache_line_count}")
+                break()
+            endif()
+            list(GET _occt_cache_lines 0 _occt_cache_line)
+            string(REGEX REPLACE "^[^=]*=" "" _occt_cache_value
+                "${_occt_cache_line}")
+
+            if(_occt_cache_name STREQUAL "CMAKE_BUILD_TYPE")
+                set(_occt_expected_value "${OCCT_ACTUAL_BUILD_TYPE}")
+            elseif(_occt_cache_name STREQUAL "CMAKE_OSX_ARCHITECTURES")
+                set(_occt_expected_value "${CMAKE_OSX_ARCHITECTURES}")
+            elseif(_occt_cache_name STREQUAL "CMAKE_OSX_DEPLOYMENT_TARGET")
+                set(_occt_expected_value "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+            else()
+                set(_occt_expected_value "${CMAKE_OSX_SYSROOT}")
+            endif()
+
+            if(NOT "${_occt_cache_value}" STREQUAL "${_occt_expected_value}")
+                set(_occt_cache_abi_valid FALSE)
+                set(_occt_cache_abi_error
+                    "${_occt_cache_name}='${_occt_cache_value}', expected '${_occt_expected_value}'")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    if(_occt_cache_abi_valid)
+        message(STATUS
+            "✅ OCCT macOS ABI cache verified: deployment=${CMAKE_OSX_DEPLOYMENT_TARGET}, "
+            "architectures=${CMAKE_OSX_ARCHITECTURES}")
+    else()
+        message(STATUS
+            "♻️  OCCT macOS ABI cache is incompatible (${_occt_cache_abi_error}); "
+            "removing only ${OCCT_BUILD_DIR} and ${OCCT_INSTALL_DIR}")
+        file(REMOVE_RECURSE "${OCCT_BUILD_DIR}" "${OCCT_INSTALL_DIR}")
+    endif()
+
+    unset(_occt_cache_file)
+    unset(_occt_cache_abi_valid)
+    unset(_occt_cache_abi_error)
+    unset(_occt_cache_name)
+    unset(_occt_cache_lines)
+    unset(_occt_cache_line_count)
+    unset(_occt_cache_line)
+    unset(_occt_cache_value)
+    unset(_occt_expected_value)
+endif()
+
 # 检查OCCT库的状态 - 分别检查各个组件的存在性
 set(HAS_INSTALL FALSE)
 set(HAS_BUILD FALSE)

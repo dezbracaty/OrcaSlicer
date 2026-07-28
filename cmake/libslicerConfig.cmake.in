@@ -5,6 +5,29 @@ find_dependency(Threads)
 
 include("${CMAKE_CURRENT_LIST_DIR}/libslicerTargets.cmake")
 
+# libslicer is a single-configuration package and is Release by default,
+# independently of the consuming application's configuration. Explicitly map
+# every standard consumer configuration to the configuration installed by this
+# package so a Debug app links the verified Release artifacts.
+set(LIBSLICER_PACKAGE_BUILD_TYPE "@CMAKE_BUILD_TYPE@")
+string(TOUPPER "${LIBSLICER_PACKAGE_BUILD_TYPE}"
+    _libslicer_package_build_type_upper)
+foreach(_libslicer_target
+        libslicer::config_sdk
+        libslicer::worker_client
+        libslicer::orcaslicer_worker)
+    if(TARGET "${_libslicer_target}")
+        foreach(_consumer_config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+            set_property(TARGET "${_libslicer_target}" PROPERTY
+                "MAP_IMPORTED_CONFIG_${_consumer_config}"
+                "${_libslicer_package_build_type_upper}")
+        endforeach()
+    endif()
+endforeach()
+unset(_consumer_config)
+unset(_libslicer_target)
+unset(_libslicer_package_build_type_upper)
+
 set_and_check(LIBSLICER_ORCASLICER_WORKER_EXECUTABLE
     "@PACKAGE_CMAKE_INSTALL_BINDIR@/orcaslicer-worker")
 
