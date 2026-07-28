@@ -727,6 +727,19 @@ void apply_filament_slot_metadata(const FilamentSlotRequest& slot, DynamicPrintC
     set_single_string_vector(config, "filament_type", slot.filament_type);
 }
 
+void rebuild_filament_slot_string_vector(DynamicPrintConfig& config,
+                                         const std::string& key,
+                                         const std::vector<Preset>& filament_presets)
+{
+    std::vector<std::string> values;
+    values.reserve(filament_presets.size());
+    for (const Preset& preset : filament_presets) {
+        const auto* option = preset.config.opt<ConfigOptionStrings>(key);
+        values.push_back(option == nullptr || option->values.empty() ? std::string{} : option->values.front());
+    }
+    config.option<ConfigOptionStrings>(key, true)->values = std::move(values);
+}
+
 bool load_vendor_bundle_dir(PresetBundle& bundle,
                             const std::filesystem::path& vendor_dir,
                             ForwardCompatibilitySubstitutionRule rule,
@@ -1634,11 +1647,13 @@ ConfigResolutionResult resolve_fff_config(const ConfigResolutionRequest& request
         if (!apply_overrides_json(request.project_overrides_json, merged, override_policy, issues))
             filament_ok = false;
         merged.normalize_fdm(used_filaments);
+        rebuild_filament_slot_string_vector(merged, "filament_colour", filament_presets_overridden);
 
         // Same pipeline without any of the *_overrides_json layers, for normalized_diff_json.
         baseline = PresetBundle::construct_full_config(printer_baseline, process_baseline, DynamicPrintConfig(),
                                                         filament_presets_raw, request.apply_extruder, std::nullopt);
         baseline.normalize_fdm(used_filaments);
+        rebuild_filament_slot_string_vector(baseline, "filament_colour", filament_presets_raw);
     } catch (const std::exception& e) {
         add_issue(&issues, "preset_resolution_failed", "", e.what());
         return result;
