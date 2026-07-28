@@ -264,6 +264,13 @@ json numeric_string_to_json(std::string value, bool integer)
     return value;
 }
 
+json float_or_percent_string_to_json(const std::string& value)
+{
+    if (!value.empty() && value.back() == '%')
+        return value;
+    return numeric_string_to_json(value, false);
+}
+
 json point_string_to_json(const std::string& value)
 {
     const size_t sep = value.find_first_of("x,");
@@ -290,16 +297,25 @@ json vector_option_to_json(const ConfigOptionVectorBase& option)
             out.push_back(value);
             break;
         case coInts:
-        case coEnums:
             out.push_back(numeric_string_to_json(value, true));
+            break;
+        case coEnums:
+            // ConfigSDK's public JSON contract uses the stable enum key, never
+            // the internal integer ordinal. ConfigOptionEnumsGeneric::vserialize()
+            // already resolves each ordinal through its enum key map.
+            out.push_back(value);
             break;
         case coBools:
             out.push_back(value == "1" || value == "true");
             break;
         case coFloats:
         case coPercents:
-        case coFloatsOrPercents:
             out.push_back(numeric_string_to_json(value, false));
+            break;
+        case coFloatsOrPercents:
+            // This is a tagged union: retaining '%' distinguishes a ratio
+            // from an absolute distance across SDK/App round-trips.
+            out.push_back(float_or_percent_string_to_json(value));
             break;
         case coPoints:
             out.push_back(point_string_to_json(value));
@@ -321,12 +337,16 @@ json option_to_json(const ConfigOption& option)
     case coBool:
         return option.getBool();
     case coInt:
-    case coEnum:
         return option.getInt();
+    case coEnum:
+        // Integer enum storage is an Orca implementation detail. Public JSON
+        // carries the schema key so extract -> App -> resolve is lossless.
+        return option.serialize();
     case coFloat:
     case coPercent:
-    case coFloatOrPercent:
         return option.getFloat();
+    case coFloatOrPercent:
+        return float_or_percent_string_to_json(option.serialize());
     case coString:
         if (const auto* string_option = dynamic_cast<const ConfigOptionString*>(&option); string_option != nullptr)
             return string_option->value;

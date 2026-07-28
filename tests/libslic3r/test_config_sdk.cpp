@@ -271,6 +271,9 @@ TEST_CASE("Config SDK parses strict JSON and emits canonical typed values", "[Co
         "printer_settings_id": "Printer A",
         "print_settings_id": "Process A",
         "brim_width": 5,
+        "bed_temperature_formula": 0,
+        "extruder_type": [0, 1],
+        "bridge_line_width": "100%",
         "unknown_parse_key": 1
     })json";
 
@@ -289,6 +292,9 @@ TEST_CASE("Config SDK parses strict JSON and emits canonical typed values", "[Co
     REQUIRE(canonical.at("printer_settings_id") == "Printer A");
     REQUIRE(canonical.at("print_settings_id") == "Process A");
     REQUIRE(canonical.at("brim_width") == 5);
+    REQUIRE(canonical.at("bed_temperature_formula") == "by_first_filament");
+    REQUIRE(canonical.at("extruder_type") == json::array({"Direct Drive", "Bowden"}));
+    REQUIRE(canonical.at("bridge_line_width") == "100%");
     REQUIRE_FALSE(canonical.contains("unknown_parse_key"));
 }
 
@@ -744,6 +750,8 @@ TEST_CASE("Firehorse project extraction resolves and validates its complete BBL 
     REQUIRE(extracted.process_preset_id == "0.20mm Standard @BBL X1C");
     REQUIRE(extracted.filament_slots.size() == 2);
     REQUIRE_FALSE(extracted.project_config_json.empty());
+    const json printer_overrides = json::parse(extracted.printer_overrides_json);
+    REQUIRE(printer_overrides.at("bed_temperature_formula") == "by_first_filament");
 
     ConfigResolutionRequest resolution_request;
     resolution_request.resources_dir = repo_resources_dir();
@@ -771,6 +779,8 @@ TEST_CASE("Firehorse project extraction resolves and validates its complete BBL 
     REQUIRE(full_config.at("printer_model") == "Bambu Lab X1 Carbon");
     REQUIRE(full_config.at("printer_settings_id") == extracted.printer_preset_id);
     REQUIRE(full_config.at("print_settings_id") == extracted.process_preset_id);
+    REQUIRE(full_config.at("bed_temperature_formula") == "by_first_filament");
+    REQUIRE(full_config.at("bridge_line_width") == "100%");
     REQUIRE(full_config.at("filament_settings_id").is_array());
     REQUIRE(full_config.at("filament_settings_id").size() == extracted.filament_slots.size());
     REQUIRE(full_config.at("filament_colour").is_array());

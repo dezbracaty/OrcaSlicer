@@ -110,6 +110,8 @@ enum class PresetKind
 
 struct ConfigEnumOption
 {
+    // Stable value used by every canonical ConfigSDK JSON output. Enum
+    // ordinals are internal Orca storage and are never emitted.
     std::string value;
     std::string label;
 };
@@ -152,6 +154,12 @@ struct ConfigParseOptions
 
 struct ConfigParseResult
 {
+    // Canonical JSON emits ConfigValueType::Enum values as the matching
+    // ConfigEnumOption::value string (and enum vectors as arrays of those
+    // strings). Parsers still accept integer enum ordinals as non-canonical
+    // input, but never reproduce them in canonical output. Float-or-percent
+    // values use JSON numbers for absolute values and strings ending in '%'
+    // for percentages so the unit discriminator survives every round-trip.
     std::string canonical_json;
     std::vector<ConfigIssue> issues;
 };
@@ -189,6 +197,8 @@ struct ConfigResolutionRequest
 
 struct ConfigResolutionResult
 {
+    // Both JSON documents use the same canonical enum representation described
+    // by ConfigParseResult::canonical_json.
     std::string full_config_json;
     std::string normalized_diff_json;
     std::vector<ConfigIssue> issues;
