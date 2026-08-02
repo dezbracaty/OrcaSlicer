@@ -14,10 +14,10 @@ cmake --preset macos-arm64-release
 cmake --build --preset macos-arm64-release
 ```
 
-The macOS arm64 release artifact is:
+The macOS arm64 internal core artifact is:
 
 ```bash
-build-libslicer/release/arm64/src/libslic3r/liblibslicer.a
+build-libslicer/release/arm64/src/libslic3r/liblibslicer_core.a
 ```
 
 Other presets are available in `CMakePresets.json` for macOS, Linux, and
@@ -33,14 +33,19 @@ ctest --test-dir build-libslicer/release/arm64 --output-on-failure
 ```
 
 When consumed from another CMake project with `add_subdirectory`, tests are
-disabled by default. Link against the namespaced target:
+disabled by default. Link raw internal APIs against `libslicer::core`:
 
 ```cmake
 set(LIBSLICER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(external/libslicer)
 
-target_link_libraries(my_app PRIVATE libslicer::libslicer)
+target_link_libraries(my_app PRIVATE libslicer::core)
 ```
+
+Application integrations should install this project and consume the stable
+facade package using `find_package(libslicer CONFIG REQUIRED)`, then link
+`libslicer::libslicer`. The facade deliberately hides OrcaSlicer's internal
+third-party dependency graph.
 
 Applications using profile or resource-backed APIs must initialize runtime
 paths before loading presets or related data:

@@ -117,6 +117,9 @@ namespace Slic3r {
 
 extern Semver SEMVER;
 
+// Internal facade anchor. Public consumers use <libslicer/Library.hpp>.
+const char* core_version() noexcept;
+
 // On MSVC, std::deque degenerates to a list of pointers, which defeats its purpose of reducing allocator load and memory fragmentation.
 template<class T, class Allocator = std::allocator<T>>
 using deque =

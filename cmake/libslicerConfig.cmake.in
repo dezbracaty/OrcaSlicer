@@ -1,0 +1,19 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/libslicerTargets.cmake")
+
+# The package is built in one configuration (Release by default), independently
+# from the consuming application. Map every standard consumer configuration to
+# the installed artifact instead of allowing CMake to guess a stale path.
+set(LIBSLICER_PACKAGE_BUILD_TYPE "@CMAKE_BUILD_TYPE@")
+string(TOUPPER "${LIBSLICER_PACKAGE_BUILD_TYPE}"
+    _libslicer_package_build_type_upper)
+foreach(_consumer_config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set_property(TARGET libslicer::libslicer PROPERTY
+        "MAP_IMPORTED_CONFIG_${_consumer_config}"
+        "${_libslicer_package_build_type_upper}")
+endforeach()
+unset(_consumer_config)
+unset(_libslicer_package_build_type_upper)
+
+check_required_components(libslicer)

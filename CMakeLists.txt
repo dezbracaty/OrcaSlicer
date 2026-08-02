@@ -17,6 +17,7 @@ endif()
 
 include("version.inc")
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 if (APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "11.3" CACHE STRING "Minimum macOS deployment version" FORCE)
@@ -259,10 +260,47 @@ slic3r_remap_configs(Blosc::blosc RelWithDebInfo Release)
 
 add_subdirectory(deps_src)
 add_subdirectory(src/libslic3r)
+add_subdirectory(src/libslicer_api)
 
-set_target_properties(libslic3r PROPERTIES OUTPUT_NAME libslicer)
-add_library(libslicer::libslicer ALIAS libslic3r)
-add_custom_target(libslicer DEPENDS libslic3r)
+set_target_properties(libslic3r PROPERTIES OUTPUT_NAME libslicer_core)
+add_library(libslicer::core ALIAS libslic3r)
+add_library(libslicer::libslicer ALIAS libslicer_api)
+add_custom_target(libslicer DEPENDS libslicer_api)
+
+set(LIBSLICER_INSTALL_CMAKEDIR
+    "${CMAKE_INSTALL_LIBDIR}/cmake/libslicer"
+    CACHE STRING "Install directory for the libslicer CMake package")
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/libslicerConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfig.cmake"
+    INSTALL_DESTINATION "${LIBSLICER_INSTALL_CMAKEDIR}"
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfigVersion.cmake"
+    VERSION "${SoftFever_VERSION}"
+    COMPATIBILITY SameMajorVersion
+)
+
+install(TARGETS libslicer_api
+    EXPORT libslicerTargets
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/libslicer"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+)
+install(EXPORT libslicerTargets
+    FILE libslicerTargets.cmake
+    NAMESPACE libslicer::
+    DESTINATION "${LIBSLICER_INSTALL_CMAKEDIR}"
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfigVersion.cmake"
+    DESTINATION "${LIBSLICER_INSTALL_CMAKEDIR}"
+)
 
 if(LIBSLICER_BUILD_TESTS)
     enable_testing()

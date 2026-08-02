@@ -13,7 +13,7 @@ target_compile_definitions(libslicer_consumer_smoke
     PRIVATE
         TEST_LIBSLICER_RESOURCES_DIR="${CMAKE_CURRENT_LIST_DIR}/../../../resources"
 )
-target_link_libraries(libslicer_consumer_smoke PRIVATE libslicer::libslicer)
+target_link_libraries(libslicer_consumer_smoke PRIVATE libslicer::core)
 
 add_custom_target(run_libslicer_consumer_smoke
     COMMAND libslicer_consumer_smoke
