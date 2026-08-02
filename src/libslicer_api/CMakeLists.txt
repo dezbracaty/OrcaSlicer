@@ -1,4 +1,5 @@
 add_library(libslicer_api SHARED
+    Config.cpp
     Library.cpp
 )
 
@@ -10,7 +11,10 @@ set_target_properties(libslicer_api PROPERTIES
 )
 
 target_compile_features(libslicer_api PUBLIC cxx_std_17)
-target_compile_definitions(libslicer_api PRIVATE LIBSLICER_BUILDING_LIBRARY)
+target_compile_definitions(libslicer_api PRIVATE
+    LIBSLICER_BUILDING_LIBRARY
+    LIBSLICER_DEFAULT_RESOURCE_DIR="${CMAKE_INSTALL_FULL_DATADIR}/libslicer"
+)
 target_include_directories(libslicer_api
     PUBLIC
         $<BUILD_INTERFACE:${LIBSLICER_SOURCE_DIR}/include>

@@ -2,6 +2,8 @@
 
 include("${CMAKE_CURRENT_LIST_DIR}/libslicerTargets.cmake")
 
+set_and_check(LIBSLICER_RESOURCE_DIR "@PACKAGE_LIBSLICER_INSTALL_RESOURCEDIR@")
+
 # The package is built in one configuration (Release by default), independently
 # from the consuming application. Map every standard consumer configuration to
 # the installed artifact instead of allowing CMake to guess a stale path.

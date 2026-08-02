@@ -270,11 +270,15 @@ add_custom_target(libslicer DEPENDS libslicer_api)
 set(LIBSLICER_INSTALL_CMAKEDIR
     "${CMAKE_INSTALL_LIBDIR}/cmake/libslicer"
     CACHE STRING "Install directory for the libslicer CMake package")
+set(LIBSLICER_INSTALL_RESOURCEDIR
+    "${CMAKE_INSTALL_DATADIR}/libslicer"
+    CACHE STRING "Install directory for libslicer-owned preset resources")
 
 configure_package_config_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/libslicerConfig.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfig.cmake"
     INSTALL_DESTINATION "${LIBSLICER_INSTALL_CMAKEDIR}"
+    PATH_VARS LIBSLICER_INSTALL_RESOURCEDIR
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/libslicerConfigVersion.cmake"
@@ -290,6 +294,25 @@ install(TARGETS libslicer_api
 )
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/libslicer"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+)
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/OrcaFilamentLibrary.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Flashforge.json"
+    DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/profiles"
+)
+install(DIRECTORY
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/OrcaFilamentLibrary"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Flashforge"
+    DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/profiles"
+)
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/images/bed_cool.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/images/bed_engineering.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/images/bed_high_templ.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/images/bed_pei.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/images/bed_pei_cool.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/images/bed_cool_supertack.png"
+    DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/images"
 )
 install(EXPORT libslicerTargets
     FILE libslicerTargets.cmake

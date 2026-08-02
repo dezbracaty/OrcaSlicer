@@ -51,6 +51,7 @@ function(orcaslicer_discover_tests TARGET)
 endfunction()
 
 add_subdirectory(libslic3r)
+add_subdirectory(libslicer_api)
 
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/add_subdirectory/run_smoke.cmake.in
