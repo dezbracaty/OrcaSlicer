@@ -314,6 +314,10 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/images/bed_cool_supertack.png"
     DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/images"
 )
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/info/nozzle_info.json"
+    DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/info"
+)
 install(EXPORT libslicerTargets
     FILE libslicerTargets.cmake
     NAMESPACE libslicer::

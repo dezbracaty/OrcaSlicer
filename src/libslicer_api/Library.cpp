@@ -1,17 +1,29 @@
+#define NANOSVG_IMPLEMENTATION
+#include <nanosvg/nanosvg.h>
+
 #include <libslicer/Library.hpp>
 
 #include <libslic3r/PresetBundle.hpp>
+#include <libslic3r/Model.hpp>
+#include <libslic3r/Print.hpp>
 #include <libslic3r/PrintConfig.hpp>
+#include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/Utils.hpp>
 #include <libslic3r/libslic3r.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iterator>
 #include <limits>
+#include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 #if defined(__APPLE__)
@@ -220,6 +232,505 @@ std::vector<std::pair<std::string, std::string>> serialized_values(const Slic3r:
     return values;
 }
 
+Slic3r::DynamicPrintConfig dynamic_config(const ConfigSnapshot& snapshot)
+{
+    Slic3r::DynamicPrintConfig config;
+    config.apply(Slic3r::FullPrintConfig::defaults());
+    for (const auto& [key, value] : snapshot.values()) {
+        if (Slic3r::print_config_def.get(key) != nullptr) {
+            config.set_deserialize_strict(key, value);
+        }
+    }
+    return config;
+}
+
+Slic3r::Vec2d build_plate_center(const Slic3r::DynamicPrintConfig& config)
+{
+    const auto* area = config.option<Slic3r::ConfigOptionPoints>("printable_area");
+    if (area == nullptr || area->values.empty()) {
+        return {100.0, 100.0};
+    }
+    double min_x = std::numeric_limits<double>::max();
+    double min_y = std::numeric_limits<double>::max();
+    double max_x = std::numeric_limits<double>::lowest();
+    double max_y = std::numeric_limits<double>::lowest();
+    for (const auto& point : area->values) {
+        min_x = std::min(min_x, point.x());
+        min_y = std::min(min_y, point.y());
+        max_x = std::max(max_x, point.x());
+        max_y = std::max(max_y, point.y());
+    }
+    return {(min_x + max_x) * 0.5, (min_y + max_y) * 0.5};
+}
+
+std::string temporary_gcode_path()
+{
+    static std::atomic<unsigned long long> sequence{0};
+    const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    return (fs::temp_directory_path() /
+            ("libslicer_" + std::to_string(timestamp) + "_" +
+             std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + ".gcode")).string();
+}
+
+bool cancellation_requested(const SliceCallbacks& callbacks)
+{
+    return callbacks.is_cancelled && callbacks.is_cancelled();
+}
+
+void report_progress(const SliceCallbacks& callbacks, float progress, std::string_view stage)
+{
+    if (callbacks.progress) {
+        callbacks.progress(std::max(0.0f, std::min(progress, 1.0f)), stage);
+    }
+}
+
+ToolpathColorValue parse_color(std::string value)
+{
+    ToolpathColorValue color;
+    if (!value.empty() && value.front() == '#') {
+        value.erase(value.begin());
+    }
+    if (value.size() != 6 && value.size() != 8) {
+        color.red = 1.0f;
+        color.green = 0.5f;
+        color.blue = 0.0f;
+        return color;
+    }
+    try {
+        const auto component = [&value](std::size_t offset) {
+            return static_cast<float>(std::stoul(value.substr(offset, 2), nullptr, 16)) / 255.0f;
+        };
+        color.red = component(0);
+        color.green = component(2);
+        color.blue = component(4);
+        color.alpha = value.size() == 8 ? component(6) : 1.0f;
+    } catch (...) {
+        color.red = 1.0f;
+        color.green = 0.5f;
+        color.blue = 0.0f;
+        color.alpha = 1.0f;
+    }
+    return color;
+}
+
+ToolpathPoint to_toolpath_point(const Slic3r::Vec3f& value)
+{
+    return {value.x(), value.y(), value.z()};
+}
+
+bool finite_point(const Slic3r::Vec3f& value)
+{
+    return std::isfinite(value.x()) && std::isfinite(value.y()) && std::isfinite(value.z());
+}
+
+double point_distance(const ToolpathPoint& first, const ToolpathPoint& second)
+{
+    const double x = static_cast<double>(second.x) - first.x;
+    const double y = static_cast<double>(second.y) - first.y;
+    const double z = static_cast<double>(second.z) - first.z;
+    return std::sqrt(x * x + y * y + z * z);
+}
+
+void include_point(ToolpathBounds& bounds, const ToolpathPoint& point)
+{
+    if (!bounds.valid) {
+        bounds.minimum = point;
+        bounds.maximum = point;
+        bounds.valid = true;
+        return;
+    }
+    bounds.minimum.x = std::min(bounds.minimum.x, point.x);
+    bounds.minimum.y = std::min(bounds.minimum.y, point.y);
+    bounds.minimum.z = std::min(bounds.minimum.z, point.z);
+    bounds.maximum.x = std::max(bounds.maximum.x, point.x);
+    bounds.maximum.y = std::max(bounds.maximum.y, point.y);
+    bounds.maximum.z = std::max(bounds.maximum.z, point.z);
+}
+
+std::optional<ToolpathMotionKind> to_motion_kind(Slic3r::EMoveType type)
+{
+    switch (type) {
+    case Slic3r::EMoveType::Travel:  return ToolpathMotionKind::Travel;
+    case Slic3r::EMoveType::Extrude: return ToolpathMotionKind::Extrusion;
+    case Slic3r::EMoveType::Wipe:    return ToolpathMotionKind::Wipe;
+    default:                         return std::nullopt;
+    }
+}
+
+std::optional<ToolpathEventKind> to_event_kind(Slic3r::EMoveType type)
+{
+    switch (type) {
+    case Slic3r::EMoveType::Seam:         return ToolpathEventKind::Seam;
+    case Slic3r::EMoveType::Tool_change:  return ToolpathEventKind::ToolChange;
+    case Slic3r::EMoveType::Color_change: return ToolpathEventKind::ColorChange;
+    case Slic3r::EMoveType::Pause_Print:  return ToolpathEventKind::Pause;
+    case Slic3r::EMoveType::Custom_GCode: return ToolpathEventKind::CustomGCode;
+    default:                              return std::nullopt;
+    }
+}
+
+ToolpathExtrusionRole to_extrusion_role(Slic3r::ExtrusionRole role)
+{
+    switch (role) {
+    case Slic3r::erNone:                     return ToolpathExtrusionRole::None;
+    case Slic3r::erPerimeter:                return ToolpathExtrusionRole::InnerWall;
+    case Slic3r::erExternalPerimeter:        return ToolpathExtrusionRole::OuterWall;
+    case Slic3r::erOverhangPerimeter:        return ToolpathExtrusionRole::OverhangWall;
+    case Slic3r::erInternalInfill:           return ToolpathExtrusionRole::SparseInfill;
+    case Slic3r::erSolidInfill:              return ToolpathExtrusionRole::InternalSolidInfill;
+    case Slic3r::erTopSolidInfill:           return ToolpathExtrusionRole::TopSurface;
+    case Slic3r::erBottomSurface:            return ToolpathExtrusionRole::BottomSurface;
+    case Slic3r::erIroning:                  return ToolpathExtrusionRole::Ironing;
+    case Slic3r::erBridgeInfill:             return ToolpathExtrusionRole::Bridge;
+    case Slic3r::erInternalBridgeInfill:     return ToolpathExtrusionRole::InternalBridge;
+    case Slic3r::erGapFill:                  return ToolpathExtrusionRole::GapInfill;
+    case Slic3r::erSkirt:                    return ToolpathExtrusionRole::Skirt;
+    case Slic3r::erBrim:                     return ToolpathExtrusionRole::Brim;
+    case Slic3r::erSupportMaterial:          return ToolpathExtrusionRole::Support;
+    case Slic3r::erSupportMaterialInterface: return ToolpathExtrusionRole::SupportInterface;
+    case Slic3r::erSupportTransition:        return ToolpathExtrusionRole::SupportTransition;
+    case Slic3r::erWipeTower:                return ToolpathExtrusionRole::WipeTower;
+    case Slic3r::erCustom:                   return ToolpathExtrusionRole::Custom;
+    case Slic3r::erMixed:                    return ToolpathExtrusionRole::Mixed;
+    default:                                 return ToolpathExtrusionRole::None;
+    }
+}
+
+std::vector<int> filament_tool_map(const Slic3r::DynamicPrintConfig* config,
+                                   std::size_t filament_count)
+{
+    std::vector<int> result(filament_count, 0);
+    if (config == nullptr) {
+        for (std::size_t index = 0; index < filament_count; ++index) {
+            result[index] = static_cast<int>(index);
+        }
+        return result;
+    }
+    if (const auto* option = config->option<Slic3r::ConfigOptionInts>("filament_map")) {
+        for (std::size_t index = 0; index < std::min(filament_count, option->values.size()); ++index) {
+            result[index] = std::max(0, option->values[index] - 1);
+        }
+    }
+    return result;
+}
+
+std::shared_ptr<ToolpathPreview> make_toolpath_preview(
+    const Slic3r::GCodeProcessorResult& source,
+    const Slic3r::DynamicPrintConfig* config,
+    const std::string& source_path)
+{
+    auto preview = std::make_shared<ToolpathPreview>();
+    preview->source_path = source_path;
+
+    std::size_t filament_count = std::max({
+        source.filaments_count,
+        source.extruder_colors.size(),
+        source.filament_diameters.size(),
+        source.filament_densities.size(),
+        source.filament_costs.size()
+    });
+    for (const auto& move : source.moves) {
+        filament_count = std::max(filament_count, static_cast<std::size_t>(move.extruder_id) + 1);
+    }
+    filament_count = std::max<std::size_t>(filament_count, 1);
+    const auto tool_by_filament = filament_tool_map(config, filament_count);
+
+    std::size_t tool_count = 1;
+    for (const int tool : tool_by_filament) {
+        tool_count = std::max(tool_count, static_cast<std::size_t>(std::max(0, tool)) + 1);
+    }
+    const Slic3r::ConfigOptionFloats* nozzle_diameters = config == nullptr
+        ? nullptr
+        : config->option<Slic3r::ConfigOptionFloats>("nozzle_diameter");
+    if (nozzle_diameters != nullptr) {
+        tool_count = std::max(tool_count, nozzle_diameters->values.size());
+    }
+    preview->tools.reserve(tool_count);
+    for (std::size_t index = 0; index < tool_count; ++index) {
+        ToolpathTool tool;
+        tool.id = static_cast<std::uint16_t>(index);
+        for (std::size_t filament = 0; filament < tool_by_filament.size(); ++filament) {
+            if (tool_by_filament[filament] == static_cast<int>(index)) {
+                tool.primary_filament_id = static_cast<std::uint16_t>(filament);
+                break;
+            }
+        }
+        if (nozzle_diameters != nullptr && index < nozzle_diameters->values.size()) {
+            tool.nozzle_diameter_mm = static_cast<float>(nozzle_diameters->values[index]);
+        }
+        preview->tools.push_back(tool);
+    }
+
+    preview->filaments.reserve(filament_count);
+    for (std::size_t index = 0; index < filament_count; ++index) {
+        ToolpathFilament filament;
+        filament.id = static_cast<std::uint16_t>(index);
+        filament.tool_id = static_cast<std::uint16_t>(tool_by_filament[index]);
+        filament.color = parse_color(index < source.extruder_colors.size()
+                                         ? source.extruder_colors[index]
+                                         : std::string{"#FF8000"});
+        if (index < source.filament_diameters.size()) filament.diameter_mm = source.filament_diameters[index];
+        if (index < source.filament_densities.size()) filament.density_g_cm3 = source.filament_densities[index];
+        if (index < source.filament_costs.size()) filament.cost_per_kg = source.filament_costs[index];
+        preview->filaments.push_back(filament);
+    }
+
+    std::map<std::uint16_t, std::uint16_t> color_filament;
+    for (const auto& move : source.moves) {
+        color_filament.emplace(move.cp_color_id, static_cast<std::uint16_t>(move.extruder_id));
+    }
+    for (const auto& [color_id, filament_id] : color_filament) {
+        ToolpathColor color;
+        color.id = color_id;
+        color.filament_id = filament_id;
+        color.source = color_id < filament_count
+            ? ToolpathColorSource::Filament
+            : ToolpathColorSource::ColorChange;
+        color.color = filament_id < preview->filaments.size()
+            ? preview->filaments[filament_id].color
+            : parse_color("#FF8000");
+        color.name = color.source == ToolpathColorSource::Filament
+            ? "Filament " + std::to_string(static_cast<unsigned int>(filament_id) + 1)
+            : "Color " + std::to_string(static_cast<unsigned int>(color_id) + 1);
+        preview->colors.push_back(std::move(color));
+    }
+
+    struct LayerBuilder {
+        std::vector<ToolpathSegment> segments;
+        std::vector<ToolpathEvent> events;
+        float print_z_mm{0.0f};
+        float height_mm{0.0f};
+        float duration_seconds{0.0f};
+        bool has_print_z{false};
+        bool has_height{false};
+    };
+
+    float min_speed = std::numeric_limits<float>::max();
+    float min_height = std::numeric_limits<float>::max();
+    float min_width = std::numeric_limits<float>::max();
+    float min_flow = std::numeric_limits<float>::max();
+    std::map<std::uint32_t, LayerBuilder> layer_builders;
+    std::optional<ToolpathPoint> previous_position;
+    std::unordered_set<std::uint32_t> logical_motion_commands;
+    std::uint64_t next_run_id = 0;
+    bool previous_was_motion = false;
+    ToolpathMotionKind previous_motion = ToolpathMotionKind::Travel;
+    ToolpathExtrusionRole previous_role = ToolpathExtrusionRole::None;
+    std::uint32_t previous_layer = invalid_toolpath_id;
+    std::uint32_t previous_object = invalid_toolpath_id;
+    std::uint16_t previous_tool = invalid_toolpath_small_id;
+    std::uint16_t previous_color = invalid_toolpath_small_id;
+
+    for (const auto& input : source.moves) {
+        const std::uint32_t source_layer = input.layer_id;
+        auto& layer = layer_builders[source_layer];
+        layer.duration_seconds += input.time[static_cast<std::size_t>(
+            Slic3r::PrintEstimatedStatistics::ETimeMode::Normal)];
+
+        const std::uint16_t filament_id = input.extruder_id;
+        const std::uint16_t tool_id = input.extruder_id < tool_by_filament.size()
+            ? static_cast<std::uint16_t>(tool_by_filament[input.extruder_id])
+            : invalid_toolpath_small_id;
+        const std::uint32_t object_id = input.object_label_id >= 0
+            ? static_cast<std::uint32_t>(input.object_label_id)
+            : invalid_toolpath_id;
+        const auto motion = to_motion_kind(input.type);
+        const bool has_end = finite_point(input.position);
+        const ToolpathPoint end = has_end ? to_toolpath_point(input.position) : ToolpathPoint{};
+
+        if (motion && previous_position && has_end &&
+            point_distance(*previous_position, end) > 0.000001) {
+            const ToolpathExtrusionRole role = *motion == ToolpathMotionKind::Extrusion
+                ? to_extrusion_role(input.extrusion_role)
+                : ToolpathExtrusionRole::None;
+            const bool continues_run = previous_was_motion &&
+                previous_motion == *motion &&
+                previous_role == role &&
+                previous_layer == source_layer &&
+                previous_object == object_id &&
+                previous_tool == tool_id &&
+                previous_color == input.cp_color_id;
+            if (!continues_run) {
+                ++next_run_id;
+            }
+
+            ToolpathSegment segment;
+            segment.run_id = next_run_id;
+            segment.source_command_id = input.gcode_id;
+            segment.object_id = object_id;
+            segment.tool_id = tool_id;
+            segment.filament_id = filament_id;
+            segment.color_id = input.cp_color_id;
+            segment.motion = *motion;
+            segment.extrusion_role = role;
+            segment.start_mm = *previous_position;
+            segment.end_mm = end;
+            segment.nominal_speed_mm_s = input.feedrate;
+            segment.actual_speed_mm_s = input.actual_feedrate > 0.0f
+                ? input.actual_feedrate
+                : input.feedrate;
+            segment.print_z_mm = input.print_z;
+
+            const double distance = point_distance(segment.start_mm, segment.end_mm);
+            if (*motion == ToolpathMotionKind::Extrusion) {
+                segment.width_mm = std::max(0.0f, input.width);
+                segment.height_mm = std::max(0.0f, input.height);
+                segment.mm3_per_mm = std::max(0.0f, input.mm3_per_mm);
+                const double volume = distance * segment.mm3_per_mm;
+                const float diameter = filament_id < preview->filaments.size() &&
+                        preview->filaments[filament_id].diameter_mm > 0.0f
+                    ? preview->filaments[filament_id].diameter_mm
+                    : 1.75f;
+                const double filament_area =
+                    0.25 * 3.14159265358979323846 * diameter * diameter;
+                segment.extrusion_delta_mm = filament_area > 0.0
+                    ? static_cast<float>(volume / filament_area)
+                    : 0.0f;
+
+                preview->statistics.total_print_distance_mm += distance;
+                preview->statistics.total_extrusion_volume_mm3 += volume;
+                preview->statistics.total_extrusion_mm += segment.extrusion_delta_mm;
+                if (segment.height_mm > 0.0f) {
+                    min_height = std::min(min_height, segment.height_mm);
+                    preview->statistics.max_layer_height_mm =
+                        std::max(preview->statistics.max_layer_height_mm, segment.height_mm);
+                    if (!layer.has_height) {
+                        layer.height_mm = segment.height_mm;
+                        layer.has_height = true;
+                    }
+                }
+                if (segment.width_mm > 0.0f) {
+                    min_width = std::min(min_width, segment.width_mm);
+                    preview->statistics.max_width_mm =
+                        std::max(preview->statistics.max_width_mm, segment.width_mm);
+                }
+                if (!layer.has_print_z) {
+                    layer.print_z_mm = segment.print_z_mm > 0.0f
+                        ? segment.print_z_mm
+                        : segment.end_mm.z;
+                    layer.has_print_z = true;
+                }
+            } else {
+                preview->statistics.total_travel_distance_mm += distance;
+            }
+
+            const float speed = segment.actual_speed_mm_s;
+            if (speed > 0.0f) {
+                min_speed = std::min(min_speed, speed);
+                preview->statistics.max_speed_mm_s =
+                    std::max(preview->statistics.max_speed_mm_s, speed);
+            }
+            const float flow = *motion == ToolpathMotionKind::Extrusion
+                ? segment.mm3_per_mm * speed
+                : 0.0f;
+            if (flow > 0.0f) {
+                min_flow = std::min(min_flow, flow);
+                preview->statistics.max_volumetric_flow_mm3_s =
+                    std::max(preview->statistics.max_volumetric_flow_mm3_s, flow);
+            }
+
+            logical_motion_commands.insert(input.gcode_id);
+            include_point(preview->bounds, segment.start_mm);
+            include_point(preview->bounds, segment.end_mm);
+            layer.segments.push_back(std::move(segment));
+
+            previous_was_motion = true;
+            previous_motion = *motion;
+            previous_role = role;
+            previous_layer = source_layer;
+            previous_object = object_id;
+            previous_tool = tool_id;
+            previous_color = input.cp_color_id;
+        } else {
+            previous_was_motion = false;
+        }
+
+        if (const auto event_kind = to_event_kind(input.type); event_kind && has_end) {
+            ToolpathEvent event;
+            event.kind = *event_kind;
+            event.after_segment = layer.segments.size();
+            event.source_command_id = input.gcode_id;
+            event.tool_id = tool_id;
+            event.filament_id = filament_id;
+            event.position_mm = end;
+            event.print_z_mm = input.print_z;
+            event.time_seconds = input.time[static_cast<std::size_t>(
+                Slic3r::PrintEstimatedStatistics::ETimeMode::Normal)];
+            layer.events.push_back(std::move(event));
+        }
+
+        if (has_end) {
+            previous_position = end;
+        }
+    }
+
+    preview->layers.reserve(layer_builders.size());
+    preview->segments.reserve(source.moves.size());
+    for (auto& [source_layer, builder] : layer_builders) {
+        (void)source_layer;
+        ToolpathLayer layer;
+        layer.index = static_cast<std::uint32_t>(preview->layers.size());
+        layer.segment_begin = preview->segments.size();
+        layer.segment_count = builder.segments.size();
+        layer.event_begin = preview->events.size();
+        layer.event_count = builder.events.size();
+        layer.print_z_mm = builder.print_z_mm;
+        layer.height_mm = builder.height_mm;
+        layer.duration_seconds = builder.duration_seconds;
+
+        for (auto& segment : builder.segments) {
+            segment.id = preview->segments.size();
+            segment.layer_index = layer.index;
+            preview->segments.push_back(std::move(segment));
+        }
+        for (auto& event : builder.events) {
+            event.after_segment += layer.segment_begin;
+            event.layer_index = layer.index;
+            preview->events.push_back(std::move(event));
+        }
+        preview->layers.push_back(layer);
+    }
+
+    std::map<ToolpathExtrusionRole, ToolpathFeatureStatistics> feature_stats;
+    std::map<ToolpathExtrusionRole, std::uint64_t> last_feature_run;
+    for (const auto& segment : preview->segments) {
+        if (segment.motion != ToolpathMotionKind::Extrusion ||
+            segment.extrusion_role == ToolpathExtrusionRole::None) {
+            continue;
+        }
+        auto& feature = feature_stats[segment.extrusion_role];
+        feature.role = segment.extrusion_role;
+        ++feature.render_segment_count;
+        if (last_feature_run[segment.extrusion_role] != segment.run_id) {
+            ++feature.path_count;
+            last_feature_run[segment.extrusion_role] = segment.run_id;
+        }
+        const double distance = point_distance(segment.start_mm, segment.end_mm);
+        feature.length_mm += distance;
+        feature.extrusion_volume_mm3 += distance * segment.mm3_per_mm;
+    }
+    for (const auto& [role, feature] : feature_stats) {
+        (void)role;
+        preview->statistics.features.push_back(feature);
+    }
+
+    preview->statistics.total_layers = preview->layers.size();
+    preview->statistics.logical_motion_count = logical_motion_commands.size();
+    preview->statistics.render_segment_count = preview->segments.size();
+    preview->statistics.total_time_seconds =
+        source.print_statistics.modes[static_cast<std::size_t>(
+            Slic3r::PrintEstimatedStatistics::ETimeMode::Normal)].time;
+    preview->statistics.min_speed_mm_s =
+        min_speed == std::numeric_limits<float>::max() ? 0.0f : min_speed;
+    preview->statistics.min_layer_height_mm =
+        min_height == std::numeric_limits<float>::max() ? 0.0f : min_height;
+    preview->statistics.min_width_mm =
+        min_width == std::numeric_limits<float>::max() ? 0.0f : min_width;
+    preview->statistics.min_volumetric_flow_mm3_s =
+        min_flow == std::numeric_limits<float>::max() ? 0.0f : min_flow;
+    return preview;
+}
+
 } // namespace
 
 class Library::Impl
@@ -248,6 +759,9 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
         auto library = std::unique_ptr<Library>(new Library());
         library->impl_->resource_directory = locate_resource_directory(options.resource_directory);
         Slic3r::set_resources_dir(library->impl_->resource_directory);
+        const fs::path data_directory = fs::temp_directory_path() / "libslicer";
+        fs::create_directories(data_directory);
+        Slic3r::set_data_dir(data_directory.string());
 
         const fs::path profiles_directory = fs::path(library->impl_->resource_directory) / "profiles";
         std::vector<std::string> vendors = options.vendors.empty() ?
@@ -368,29 +882,63 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
 
         const Slic3r::Preset& active_printer = selected.printers.get_edited_preset();
         std::string process_name = selection.process_preset_id;
-        if (process_name.empty()) {
+        if (!process_name.empty()) {
+            const Slic3r::Preset* requested = selected.prints.find_preset(process_name, false);
+            if (requested == nullptr) {
+                result.diagnostics.push_back({"process", "Unknown process preset: " + process_name});
+                return result;
+            }
+            if (!requested->is_visible || !requested->is_compatible) {
+                result.diagnostics.push_back({"process", "Process preset is incompatible with the selected machine: " + process_name});
+                return result;
+            }
+        } else {
             process_name = active_printer.config.opt_string("default_print_profile");
-        }
-        if (process_name.empty() || selected.prints.find_preset(process_name, false) == nullptr) {
-            process_name = first_compatible_preset_name(selected.prints);
+            const Slic3r::Preset* preferred = process_name.empty()
+                ? nullptr
+                : selected.prints.find_preset(process_name, false);
+            if (preferred == nullptr || !preferred->is_visible || !preferred->is_compatible) {
+                process_name = first_compatible_preset_name(selected.prints);
+            }
         }
         if (process_name.empty()) {
             throw std::runtime_error("Selected machine has no compatible process preset");
         }
         selected.prints.select_preset_by_name(process_name, true);
+        selected.update_compatible(Slic3r::PresetSelectCompatibleType::Always);
 
         std::vector<std::string> filament_names = selection.filament_preset_ids;
-        if (filament_names.empty()) {
+        if (!filament_names.empty()) {
+            for (const std::string& filament_name : filament_names) {
+                const Slic3r::Preset* requested = selected.filaments.find_preset(filament_name, false);
+                if (requested == nullptr) {
+                    result.diagnostics.push_back({"filament", "Unknown filament preset: " + filament_name});
+                    return result;
+                }
+                if (!requested->is_visible || !requested->is_compatible) {
+                    result.diagnostics.push_back({"filament", "Filament preset is incompatible with the selected machine and process: " + filament_name});
+                    return result;
+                }
+            }
+        } else {
             if (const auto* defaults = active_printer.config.option<Slic3r::ConfigOptionStrings>("default_filament_profile")) {
                 filament_names = defaults->values;
             }
-        }
-        if (filament_names.empty() || selected.filaments.find_preset(filament_names.front(), false) == nullptr) {
-            const std::string fallback = first_compatible_preset_name(selected.filaments);
-            if (fallback.empty()) {
-                throw std::runtime_error("Selected machine has no compatible filament preset");
+            const bool defaults_valid = !filament_names.empty() &&
+                std::all_of(filament_names.begin(), filament_names.end(), [&selected](const std::string& name) {
+                    const Slic3r::Preset* preset = selected.filaments.find_preset(name, false);
+                    return preset != nullptr && preset->is_visible && preset->is_compatible;
+                });
+            if (!defaults_valid) {
+                const std::string default_name = first_compatible_preset_name(selected.filaments);
+                if (default_name.empty()) {
+                    throw std::runtime_error("Selected machine has no compatible filament preset");
+                }
+                filament_names = {default_name};
             }
-            filament_names = {fallback};
+        }
+        if (filament_names.empty()) {
+                throw std::runtime_error("Selected machine has no compatible filament preset");
         }
         selected.filaments.select_preset_by_name(filament_names.front(), true);
         selected.filament_presets = filament_names;
@@ -411,6 +959,257 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
         result.success = true;
     } catch (const std::exception& error) {
         result.diagnostics.push_back({"selection", error.what()});
+    }
+    return result;
+}
+
+SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& callbacks) const
+{
+    SliceResult result;
+    std::string generated_temporary_path;
+    const auto discard_generated_temporary = [&generated_temporary_path]() {
+        if (generated_temporary_path.empty()) {
+            return;
+        }
+        std::error_code error;
+        fs::remove(generated_temporary_path, error);
+        generated_temporary_path.clear();
+    };
+    try {
+        if (request.objects.empty()) {
+            result.diagnostics.push_back({"input", "Slice request contains no models", false});
+            return result;
+        }
+        if (!request.config.valid()) {
+            result.diagnostics.push_back({"config", "Slice request has no initialized configuration", false});
+            return result;
+        }
+        if (cancellation_requested(callbacks)) {
+            result.cancelled = true;
+            return result;
+        }
+
+        report_progress(callbacks, 0.02f, "Loading models");
+        Slic3r::Model plate_model;
+        for (const SliceObjectInput& input : request.objects) {
+            const std::string& path = input.model_path;
+            std::error_code error;
+            if (!fs::is_regular_file(path, error) || error) {
+                result.diagnostics.push_back({"model", "Model file does not exist: " + path, false});
+                return result;
+            }
+            Slic3r::Model source = Slic3r::Model::read_from_file(path);
+            if (!input.support_enforcer_paths.empty() && source.objects.size() != 1) {
+                result.diagnostics.push_back({
+                    "support",
+                    "A model with support enforcers must contain exactly one printable object: " + path,
+                    false});
+                return result;
+            }
+            Slic3r::ModelObject* support_target = nullptr;
+            for (const Slic3r::ModelObject* object : source.objects) {
+                Slic3r::ModelObject* added = plate_model.add_object(*object);
+                if (support_target == nullptr) {
+                    support_target = added;
+                }
+            }
+
+            if (!input.support_enforcer_paths.empty()) {
+                const Slic3r::Transform3d target_instance = support_target->instances.empty()
+                    ? Slic3r::Transform3d::Identity()
+                    : support_target->instances.front()->get_matrix();
+                const Slic3r::Transform3d world_to_target = target_instance.inverse();
+
+                for (const std::string& support_path : input.support_enforcer_paths) {
+                    std::error_code support_error;
+                    if (!fs::is_regular_file(support_path, support_error) || support_error) {
+                        result.diagnostics.push_back({
+                            "support", "Support enforcer file does not exist: " + support_path, false});
+                        return result;
+                    }
+                    Slic3r::Model support_source = Slic3r::Model::read_from_file(support_path);
+                    for (const Slic3r::ModelObject* object : support_source.objects) {
+                        const std::size_t instance_count = std::max<std::size_t>(1, object->instances.size());
+                        for (std::size_t instance_index = 0; instance_index < instance_count; ++instance_index) {
+                            Slic3r::TriangleMesh mesh = object->mesh();
+                            if (!object->instances.empty()) {
+                                mesh.transform(object->instances[instance_index]->get_matrix());
+                            }
+                            mesh.transform(world_to_target);
+                            support_target->add_volume(
+                                std::move(mesh), Slic3r::ModelVolumeType::SUPPORT_ENFORCER, false);
+                        }
+                    }
+                    if (cancellation_requested(callbacks)) {
+                        result.cancelled = true;
+                        return result;
+                    }
+                }
+                support_target->invalidate_bounding_box();
+            }
+            if (cancellation_requested(callbacks)) {
+                result.cancelled = true;
+                return result;
+            }
+        }
+        if (plate_model.objects.empty()) {
+            result.diagnostics.push_back({"model", "Loaded models contain no printable objects", false});
+            return result;
+        }
+
+        Slic3r::DynamicPrintConfig config = dynamic_config(request.config);
+        if (request.center_on_build_plate) {
+            plate_model.center_instances_around_point(build_plate_center(config));
+        }
+
+        report_progress(callbacks, 0.08f, "Validating print");
+        Slic3r::Print print;
+        print.set_status_callback([&](const Slic3r::PrintBase::SlicingStatus& status) {
+            if (cancellation_requested(callbacks)) {
+                print.cancel();
+            }
+            const float engine_progress = status.percent < 0 ? 0.0f : static_cast<float>(status.percent) / 100.0f;
+            report_progress(callbacks, 0.08f + engine_progress * 0.78f, status.text);
+        });
+        print.apply(plate_model, config);
+
+        Slic3r::StringObjectException warning;
+        const Slic3r::StringObjectException validation_error = print.validate(&warning);
+        if (!warning.string.empty()) {
+            result.diagnostics.push_back({"validation", warning.string, true});
+        }
+        if (!validation_error.string.empty()) {
+            result.diagnostics.push_back({"validation", validation_error.string, false});
+            return result;
+        }
+        if (cancellation_requested(callbacks)) {
+            result.cancelled = true;
+            return result;
+        }
+
+        report_progress(callbacks, 0.1f, "Slicing model");
+        print.process();
+        if (cancellation_requested(callbacks)) {
+            result.cancelled = true;
+            return result;
+        }
+
+        const bool library_temporary = request.output_gcode_path.empty();
+        std::string output_path = library_temporary ? temporary_gcode_path() : request.output_gcode_path;
+        if (library_temporary) {
+            generated_temporary_path = output_path;
+        }
+        const fs::path output_parent = fs::path(output_path).parent_path();
+        if (!output_parent.empty()) {
+            fs::create_directories(output_parent);
+        }
+
+        report_progress(callbacks, 0.88f, "Exporting G-code");
+        Slic3r::GCodeProcessorResult processor_result;
+        result.output.path = print.export_gcode(output_path, &processor_result);
+        result.output.ownership = library_temporary
+            ? OutputArtifactOwnership::LibraryTemporary
+            : OutputArtifactOwnership::CallerOwned;
+        std::error_code file_error;
+        if (result.output.path.empty() || !fs::is_regular_file(result.output.path, file_error) || file_error ||
+            fs::file_size(result.output.path, file_error) == 0 || file_error) {
+            result.diagnostics.push_back({"output", "Slicer did not generate a valid G-code file", false});
+            discard_generated_temporary();
+            result.output.path.clear();
+            return result;
+        }
+
+        const auto& statistics = print.print_statistics();
+        result.summary.filament_used_mm = statistics.total_used_filament;
+        result.summary.filament_weight_g = statistics.total_weight;
+        std::unordered_set<unsigned int> logical_motion_commands;
+        for (const auto& move : processor_result.moves) {
+            result.summary.layer_count = std::max(result.summary.layer_count,
+                                                  static_cast<std::size_t>(move.layer_id) + 1);
+            if (to_motion_kind(move.type)) {
+                logical_motion_commands.insert(move.gcode_id);
+            }
+        }
+        result.summary.logical_motion_count = logical_motion_commands.size();
+        result.summary.estimated_time_seconds =
+            processor_result.print_statistics.modes[static_cast<std::size_t>(
+                Slic3r::PrintEstimatedStatistics::ETimeMode::Normal)].time;
+
+        if (request.generate_preview) {
+            report_progress(callbacks, 0.96f, "Preparing toolpath preview");
+            result.preview = make_toolpath_preview(processor_result, &config, result.output.path);
+            if (!result.preview || result.preview->layers.empty() ||
+                result.preview->segments.empty()) {
+                result.diagnostics.push_back({"preview", "Slicer generated no drawable toolpath preview", false});
+                discard_generated_temporary();
+                result.output.path.clear();
+                result.preview.reset();
+                return result;
+            }
+            result.summary.logical_motion_count =
+                result.preview->statistics.logical_motion_count;
+            result.summary.render_segment_count = result.preview->segments.size();
+        }
+
+        result.success = true;
+        generated_temporary_path.clear();
+        report_progress(callbacks, 1.0f, "Slicing completed");
+    } catch (const Slic3r::CanceledException&) {
+        result.cancelled = true;
+        discard_generated_temporary();
+        result.output.path.clear();
+    } catch (const std::exception& error) {
+        result.diagnostics.push_back({"slice", error.what(), false});
+        discard_generated_temporary();
+        result.output.path.clear();
+    }
+    return result;
+}
+
+GCodePreviewResult Library::load_gcode_preview(const GCodePreviewRequest& request,
+                                               const SliceCallbacks& callbacks) const
+{
+    GCodePreviewResult result;
+    try {
+        std::error_code file_error;
+        if (request.gcode_path.empty() ||
+            !fs::is_regular_file(request.gcode_path, file_error) || file_error) {
+            result.diagnostics.push_back({"input", "G-code file does not exist: " + request.gcode_path, false});
+            return result;
+        }
+        if (cancellation_requested(callbacks)) {
+            result.cancelled = true;
+            return result;
+        }
+
+        report_progress(callbacks, 0.05f, "Loading G-code");
+        Slic3r::GCodeProcessor processor;
+        processor.process_file(request.gcode_path, [&callbacks]() {
+            if (cancellation_requested(callbacks)) {
+                throw Slic3r::CanceledException();
+            }
+        });
+        if (cancellation_requested(callbacks)) {
+            result.cancelled = true;
+            return result;
+        }
+
+        report_progress(callbacks, 0.9f, "Preparing toolpath preview");
+        result.preview = make_toolpath_preview(processor.get_result(), nullptr, request.gcode_path);
+        if (!result.preview || result.preview->layers.empty() ||
+            result.preview->segments.empty()) {
+            result.diagnostics.push_back({"preview", "G-code contains no drawable toolpath", false});
+            result.preview.reset();
+            return result;
+        }
+        result.success = true;
+        report_progress(callbacks, 1.0f, "G-code preview ready");
+    } catch (const Slic3r::CanceledException&) {
+        result.cancelled = true;
+        result.preview.reset();
+    } catch (const std::exception& error) {
+        result.diagnostics.push_back({"gcode", error.what(), false});
+        result.preview.reset();
     }
     return result;
 }

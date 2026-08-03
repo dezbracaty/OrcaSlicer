@@ -3045,9 +3045,25 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
     if (producers_enabled && process_producers_tags(comment))
         return;
 
+    // A generated G-code file is the source of truth for its tag dialect.
+    // Printer metadata may classify a non-Bambu profile as "compatible"
+    // while the exporter has emitted Orca/Bambu-style FEATURE, CHANGE_LAYER,
+    // LAYER_HEIGHT and LINE_WIDTH tags. Accept both dialects here so a file
+    // exported by this processor can always be loaded back losslessly.
+    const auto matching_tag = [comment](ETags tag) -> std::string_view {
+        const auto index = static_cast<unsigned char>(tag);
+        const std::string& orca_tag = Reserved_Tags[index];
+        if (boost::starts_with(comment, orca_tag))
+            return orca_tag;
+        const std::string& compatible_tag = Reserved_Tags_compatible[index];
+        if (boost::starts_with(comment, compatible_tag))
+            return compatible_tag;
+        return {};
+    };
+
     // extrusion role tag
-    if (boost::starts_with(comment, reserved_tag(ETags::Role))) {
-        set_extrusion_role(ExtrusionEntity::string_to_role(comment.substr(reserved_tag(ETags::Role).length())));
+    if (const std::string_view tag = matching_tag(ETags::Role); !tag.empty()) {
+        set_extrusion_role(ExtrusionEntity::string_to_role(comment.substr(tag.length())));
         if (m_extrusion_role == erExternalPerimeter)
             m_seams_detector.activate(true);
         m_processing_start_custom_gcode = (m_extrusion_role == erCustom && m_g1_line_id == 0);
@@ -3138,14 +3154,14 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
 
     if (!producers_enabled || m_producer == EProducer::OrcaSlicer) {
         // height tag
-        if (boost::starts_with(comment, reserved_tag(ETags::Height))) {
-            if (!parse_number(comment.substr(reserved_tag(ETags::Height).size()), m_forced_height))
+        if (const std::string_view tag = matching_tag(ETags::Height); !tag.empty()) {
+            if (!parse_number(comment.substr(tag.size()), m_forced_height))
                 BOOST_LOG_TRIVIAL(error) << "GCodeProcessor encountered an invalid value for Height (" << comment << ").";
             return;
         }
         // width tag
-        if (boost::starts_with(comment, reserved_tag(ETags::Width))) {
-            if (!parse_number(comment.substr(reserved_tag(ETags::Width).size()), m_forced_width))
+        if (const std::string_view tag = matching_tag(ETags::Width); !tag.empty()) {
+            if (!parse_number(comment.substr(tag.size()), m_forced_width))
                 BOOST_LOG_TRIVIAL(error) << "GCodeProcessor encountered an invalid value for Width (" << comment << ").";
             return;
         }
@@ -3249,7 +3265,12 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
     }
 
     // layer change tag
-    if (comment == reserved_tag(ETags::Layer_Change)) {
+    const auto is_exact_tag = [comment](ETags tag) {
+        const auto index = static_cast<unsigned char>(tag);
+        return comment == Reserved_Tags[index] ||
+               comment == Reserved_Tags_compatible[index];
+    };
+    if (is_exact_tag(ETags::Layer_Change)) {
         ++m_layer_id;
         return;
     }

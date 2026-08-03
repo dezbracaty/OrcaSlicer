@@ -11,6 +11,7 @@ target_link_libraries(libslicer_api_tests
 target_include_directories(libslicer_api_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_definitions(libslicer_api_tests PRIVATE
     LIBSLICER_TEST_RESOURCE_DIR="${CMAKE_SOURCE_DIR}/resources"
+    LIBSLICER_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data"
 )
 set_property(TARGET libslicer_api_tests PROPERTY FOLDER "tests")
 

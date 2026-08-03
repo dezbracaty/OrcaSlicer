@@ -174,7 +174,8 @@ const Catalog& catalog()
 class ConfigSnapshot::Impl
 {
 public:
-    explicit Impl(std::vector<std::pair<std::string, std::string>> input) : entries(std::move(input))
+    explicit Impl(std::vector<std::pair<std::string, std::string>> input, bool initialized)
+        : entries(std::move(input)), valid(initialized)
     {
         for (const auto& [key, value] : entries) {
             index.emplace(key, value);
@@ -183,10 +184,11 @@ public:
 
     std::vector<std::pair<std::string, std::string>> entries;
     std::unordered_map<std::string, std::string> index;
+    bool valid{false};
 };
 
-ConfigSnapshot::ConfigSnapshot() : impl_(std::make_unique<Impl>(decltype(Impl::entries){})) {}
-ConfigSnapshot::ConfigSnapshot(std::vector<std::pair<std::string, std::string>> values) : impl_(std::make_unique<Impl>(std::move(values)))
+ConfigSnapshot::ConfigSnapshot() : impl_(std::make_unique<Impl>(decltype(Impl::entries){}, false)) {}
+ConfigSnapshot::ConfigSnapshot(std::vector<std::pair<std::string, std::string>> values) : impl_(std::make_unique<Impl>(std::move(values), true))
 {}
 ConfigSnapshot::ConfigSnapshot(const ConfigSnapshot& other) : impl_(std::make_unique<Impl>(*other.impl_)) {}
 ConfigSnapshot::ConfigSnapshot(ConfigSnapshot&&) noexcept = default;
@@ -199,6 +201,8 @@ ConfigSnapshot& ConfigSnapshot::operator=(const ConfigSnapshot& other)
 }
 ConfigSnapshot& ConfigSnapshot::operator=(ConfigSnapshot&&) noexcept = default;
 ConfigSnapshot::~ConfigSnapshot()                                    = default;
+
+bool ConfigSnapshot::valid() const noexcept { return impl_->valid; }
 
 std::optional<std::string> ConfigSnapshot::value(std::string_view key) const
 {

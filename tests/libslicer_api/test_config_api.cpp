@@ -4,7 +4,9 @@
 #include <libslicer/Library.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <set>
 #include <string_view>
 #include <vector>
@@ -112,9 +114,11 @@ TEST_CASE("configuration edits return only changed items and stay atomic", "[lib
 
 TEST_CASE("configuration snapshot is independent", "[libslicer_api][config]")
 {
+    CHECK_FALSE(libslicer::ConfigSnapshot{}.valid());
     auto config = libslicer::Config::defaults();
     REQUIRE(config.set("layer_height", "0.18").success);
     const auto snapshot = config.snapshot();
+    CHECK(snapshot.valid());
 
     REQUIRE(config.set("layer_height", "0.22").success);
     CHECK(snapshot.value("layer_height") == "0.18");
@@ -176,4 +180,153 @@ TEST_CASE("library owns machine presets and builds a selected configuration", "[
     REQUIRE_FALSE(created.selection.filament_preset_ids.empty());
     CHECK(created.config->snapshot().value("nozzle_diameter") == "0.4");
     CHECK(created.config->snapshot().value("printable_height") == "220");
+
+    selection.process_preset_id = "missing process preset";
+    const auto missing_process = library->create_config(selection);
+    CHECK_FALSE(missing_process.success);
+    REQUIRE_FALSE(missing_process.diagnostics.empty());
+    CHECK(missing_process.diagnostics.front().key == "process");
+
+    selection.process_preset_id.clear();
+    selection.filament_preset_ids = {"missing filament preset"};
+    const auto missing_filament = library->create_config(selection);
+    CHECK_FALSE(missing_filament.success);
+    REQUIRE_FALSE(missing_filament.diagnostics.empty());
+    CHECK(missing_filament.diagnostics.front().key == "filament");
+}
+
+TEST_CASE("library slices a model with a preset-backed configuration", "[libslicer_api][slice]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "Flashforge AD5X";
+    selection.machine_variant_id = "0.4";
+    auto created = library->create_config(selection);
+    REQUIRE(created.success);
+    REQUIRE(created.config != nullptr);
+
+    const std::filesystem::path output =
+        std::filesystem::temp_directory_path() / "libslicer_api_20mm_cube.gcode";
+    std::error_code remove_error;
+    std::filesystem::remove(output, remove_error);
+
+    libslicer::SliceRequest request;
+    request.objects = {{std::string(LIBSLICER_TEST_DATA_DIR) + "/20mm_cube.obj", {}}};
+    const auto missing_config = library->slice(request);
+    CHECK_FALSE(missing_config.success);
+    REQUIRE_FALSE(missing_config.diagnostics.empty());
+    CHECK(missing_config.diagnostics.front().code == "config");
+
+    request.config = created.config->snapshot();
+    request.output_gcode_path = output.string();
+
+    float last_progress = 0.0f;
+    libslicer::SliceCallbacks callbacks;
+    callbacks.progress = [&last_progress](float progress, std::string_view) {
+        CHECK(progress >= 0.0f);
+        CHECK(progress <= 1.0f);
+        last_progress = std::max(last_progress, progress);
+    };
+    const auto sliced = library->slice(request, callbacks);
+    const std::string diagnostic = sliced.diagnostics.empty() ? std::string{} : sliced.diagnostics.front().message;
+    INFO(diagnostic);
+    REQUIRE(sliced.success);
+    CHECK_FALSE(sliced.cancelled);
+    CHECK(sliced.output.path == output.string());
+    CHECK(sliced.output.ownership == libslicer::OutputArtifactOwnership::CallerOwned);
+    CHECK(std::filesystem::file_size(output) > 0);
+    CHECK(sliced.summary.layer_count > 0);
+    CHECK(sliced.summary.logical_motion_count > 0);
+    CHECK(sliced.summary.render_segment_count > 0);
+    REQUIRE(sliced.preview != nullptr);
+    CHECK(sliced.preview->statistics.total_layers == sliced.summary.layer_count);
+    CHECK(sliced.preview->statistics.logical_motion_count == sliced.summary.logical_motion_count);
+    CHECK(sliced.preview->statistics.render_segment_count == sliced.summary.render_segment_count);
+    CHECK(sliced.preview->schema_version == libslicer::toolpath_schema_version);
+    CHECK_FALSE(sliced.preview->segments.empty());
+    CHECK(sliced.preview->bounds.valid);
+    CHECK_FALSE(sliced.preview->layers.empty());
+    CHECK_FALSE(sliced.preview->colors.empty());
+    CHECK(last_progress == 1.0f);
+
+    const auto count_extrusion_role = [](const libslicer::ToolpathPreview& preview,
+                                         libslicer::ToolpathExtrusionRole role) {
+        return std::count_if(preview.segments.begin(), preview.segments.end(), [role](const auto& segment) {
+            return segment.motion == libslicer::ToolpathMotionKind::Extrusion &&
+                segment.extrusion_role == role && segment.extrusion_delta_mm > 0.0f;
+        });
+    };
+    const auto sliced_sparse_infill = count_extrusion_role(
+        *sliced.preview, libslicer::ToolpathExtrusionRole::SparseInfill);
+    const auto sliced_solid_infill = count_extrusion_role(
+        *sliced.preview, libslicer::ToolpathExtrusionRole::InternalSolidInfill);
+    CHECK(sliced_sparse_infill > 0);
+    CHECK(sliced_solid_infill > 0);
+    CHECK(std::all_of(sliced.preview->segments.begin(), sliced.preview->segments.end(), [](const auto& segment) {
+        const auto finite = [](float value) { return std::isfinite(value); };
+        const bool endpoints_valid = finite(segment.start_mm.x) && finite(segment.start_mm.y) &&
+            finite(segment.start_mm.z) && finite(segment.end_mm.x) && finite(segment.end_mm.y) &&
+            finite(segment.end_mm.z);
+        const bool is_extrusion = segment.motion == libslicer::ToolpathMotionKind::Extrusion;
+        const bool role_valid = is_extrusion ||
+            segment.extrusion_role == libslicer::ToolpathExtrusionRole::None;
+        const bool dimensions_valid = is_extrusion ||
+            (segment.width_mm == 0.0f && segment.height_mm == 0.0f &&
+             segment.mm3_per_mm == 0.0f && segment.extrusion_delta_mm == 0.0f);
+        return endpoints_valid && role_valid && dimensions_valid;
+    }));
+    for (std::size_t index = 1; index < sliced.preview->segments.size(); ++index) {
+        const auto& previous = sliced.preview->segments[index - 1];
+        const auto& current = sliced.preview->segments[index];
+        if (previous.run_id != current.run_id)
+            continue;
+        CHECK(previous.layer_index == current.layer_index);
+        CHECK(previous.motion == current.motion);
+        CHECK(previous.extrusion_role == current.extrusion_role);
+        CHECK(std::abs(previous.end_mm.x - current.start_mm.x) < 0.000001f);
+        CHECK(std::abs(previous.end_mm.y - current.start_mm.y) < 0.000001f);
+        CHECK(std::abs(previous.end_mm.z - current.start_mm.z) < 0.000001f);
+    }
+    for (std::size_t layer_index = 0; layer_index < sliced.preview->layers.size(); ++layer_index) {
+        const auto& layer = sliced.preview->layers[layer_index];
+        CHECK(layer.index == layer_index);
+        CHECK(layer.segment_begin + layer.segment_count <= sliced.preview->segments.size());
+        CHECK(layer.event_begin + layer.event_count <= sliced.preview->events.size());
+        if (layer_index + 1 < sliced.preview->layers.size()) {
+            CHECK(layer.segment_begin + layer.segment_count ==
+                  sliced.preview->layers[layer_index + 1].segment_begin);
+        }
+    }
+    const auto sparse_stats = std::find_if(
+        sliced.preview->statistics.features.begin(), sliced.preview->statistics.features.end(),
+        [](const auto& feature) {
+            return feature.role == libslicer::ToolpathExtrusionRole::SparseInfill;
+        });
+    REQUIRE(sparse_stats != sliced.preview->statistics.features.end());
+    CHECK(sparse_stats->path_count > 0);
+    CHECK(sparse_stats->length_mm > 0.0);
+    CHECK(sparse_stats->extrusion_volume_mm3 > 0.0);
+
+    std::ifstream gcode(output);
+    const std::string content((std::istreambuf_iterator<char>(gcode)), std::istreambuf_iterator<char>());
+    CHECK(content.find("G1") != std::string::npos);
+
+    libslicer::GCodePreviewRequest preview_request;
+    preview_request.gcode_path = output.string();
+    const auto imported = library->load_gcode_preview(preview_request);
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview != nullptr);
+    CHECK(imported.preview->statistics.total_layers == sliced.preview->statistics.total_layers);
+    CHECK(imported.preview->statistics.render_segment_count > 0);
+    CHECK(imported.preview->source_path == output.string());
+    CHECK(count_extrusion_role(*imported.preview,
+                               libslicer::ToolpathExtrusionRole::SparseInfill) > 0);
+    CHECK(count_extrusion_role(*imported.preview,
+                               libslicer::ToolpathExtrusionRole::InternalSolidInfill) > 0);
+    std::filesystem::remove(output, remove_error);
 }

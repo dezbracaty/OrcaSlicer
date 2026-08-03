@@ -2,7 +2,9 @@
 
 #include "Config.hpp"
 #include "Export.hpp"
+#include "Toolpath.hpp"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -86,6 +88,89 @@ struct ConfigCreateResult
     explicit operator bool() const noexcept { return success; }
 };
 
+struct SliceObjectInput
+{
+    // The model and its support enforcers must use the same coordinate space.
+    std::string model_path;
+    std::vector<std::string> support_enforcer_paths;
+};
+
+enum class OutputArtifactOwnership
+{
+    // Created because no output path was requested. The consumer must retain
+    // it while needed and remove it when the last preview releases it.
+    LibraryTemporary,
+    // Written to a path explicitly supplied by the caller. The library never
+    // removes this path.
+    CallerOwned
+};
+
+struct OutputArtifact
+{
+    std::string path;
+    OutputArtifactOwnership ownership{OutputArtifactOwnership::CallerOwned};
+};
+
+struct SliceRequest
+{
+    // Each support mesh is associated with exactly one printable object.
+    std::vector<SliceObjectInput> objects;
+    ConfigSnapshot config;
+    std::string output_gcode_path;
+    bool center_on_build_plate{true};
+    bool generate_preview{true};
+};
+
+struct SliceSummary
+{
+    double estimated_time_seconds{0.0};
+    double filament_used_mm{0.0};
+    double filament_weight_g{0.0};
+    std::size_t layer_count{0};
+    std::size_t logical_motion_count{0};
+    std::size_t render_segment_count{0};
+};
+
+struct SliceDiagnostic
+{
+    std::string code;
+    std::string message;
+    bool warning{false};
+};
+
+struct SliceCallbacks
+{
+    std::function<void(float progress, std::string_view stage)> progress;
+    std::function<bool()> is_cancelled;
+};
+
+struct SliceResult
+{
+    bool success{false};
+    bool cancelled{false};
+    OutputArtifact output;
+    SliceSummary summary;
+    ToolpathPreviewPtr preview;
+    std::vector<SliceDiagnostic> diagnostics;
+
+    explicit operator bool() const noexcept { return success; }
+};
+
+struct GCodePreviewRequest
+{
+    std::string gcode_path;
+};
+
+struct GCodePreviewResult
+{
+    bool success{false};
+    bool cancelled{false};
+    ToolpathPreviewPtr preview;
+    std::vector<SliceDiagnostic> diagnostics;
+
+    explicit operator bool() const noexcept { return success; }
+};
+
 class LIBSLICER_API Library final
 {
 public:
@@ -102,6 +187,9 @@ public:
     const std::vector<MachineModelOption>& machine_models() const noexcept;
     const std::vector<BuildPlateOption>& build_plate_options() const noexcept;
     ConfigCreateResult create_config(const ConfigSelection& selection) const;
+    SliceResult slice(const SliceRequest& request, const SliceCallbacks& callbacks = {}) const;
+    GCodePreviewResult load_gcode_preview(const GCodePreviewRequest& request,
+                                          const SliceCallbacks& callbacks = {}) const;
 
 private:
     Library();

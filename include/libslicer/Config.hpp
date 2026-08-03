@@ -79,6 +79,7 @@ public:
     ConfigSnapshot& operator=(ConfigSnapshot&&) noexcept;
     ~ConfigSnapshot();
 
+    bool valid() const noexcept;
     std::optional<std::string> value(std::string_view key) const;
     const std::vector<std::pair<std::string, std::string>>& values() const noexcept;
 
