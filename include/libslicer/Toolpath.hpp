@@ -10,7 +10,7 @@ namespace libslicer {
 
 inline constexpr std::uint32_t invalid_toolpath_id = 0xffffffffu;
 inline constexpr std::uint16_t invalid_toolpath_small_id = 0xffffu;
-inline constexpr std::uint32_t toolpath_schema_version = 1u;
+inline constexpr std::uint32_t toolpath_schema_version = 2u;
 
 struct ToolpathPoint
 {
@@ -75,6 +75,33 @@ enum class ToolpathColorSource : std::uint8_t
     Custom
 };
 
+enum class ToolpathViewType : std::uint8_t
+{
+    Summary = 0,
+    FeatureType,
+    Filament,
+    Speed,
+    ActualSpeed,
+    Acceleration,
+    Jerk,
+    LayerHeight,
+    LineWidth,
+    VolumetricFlow,
+    ActualVolumetricFlow,
+    LayerTime,
+    LayerTimeLogarithmic,
+    FanSpeed,
+    Temperature,
+    PressureAdvance
+};
+
+enum class ToolpathOptionKind : std::uint8_t
+{
+    Travel = 0,
+    Wipe,
+    Seam
+};
+
 struct ToolpathTool
 {
     std::uint16_t id{invalid_toolpath_small_id};
@@ -128,6 +155,13 @@ struct ToolpathSegment
     float height_mm{0.0f};
     float mm3_per_mm{0.0f};
     float print_z_mm{0.0f};
+    float duration_seconds{0.0f};
+    float layer_duration_seconds{0.0f};
+    float fan_speed_percent{0.0f};
+    float temperature_c{0.0f};
+    float pressure_advance{0.0f};
+    float acceleration_mm_s2{0.0f};
+    float jerk_mm_s{0.0f};
 };
 
 struct ToolpathLayer
@@ -170,6 +204,27 @@ struct ToolpathFeatureStatistics
     std::size_t path_count{0};
     double length_mm{0.0};
     double extrusion_volume_mm3{0.0};
+    double duration_seconds{0.0};
+    double filament_length_m{0.0};
+    double filament_weight_g{0.0};
+};
+
+struct ToolpathOptionStatistics
+{
+    ToolpathOptionKind kind{ToolpathOptionKind::Travel};
+    std::size_t occurrence_count{0};
+    double duration_seconds{0.0};
+    double distance_mm{0.0};
+};
+
+struct ToolpathFilamentUsage
+{
+    std::uint16_t filament_id{invalid_toolpath_small_id};
+    double model_volume_mm3{0.0};
+    double support_volume_mm3{0.0};
+    double flushed_volume_mm3{0.0};
+    double tower_volume_mm3{0.0};
+    double total_volume_mm3{0.0};
 };
 
 struct ToolpathStatistics
@@ -182,15 +237,38 @@ struct ToolpathStatistics
     double total_extrusion_volume_mm3{0.0};
     double total_print_distance_mm{0.0};
     double total_travel_distance_mm{0.0};
+    double total_filament_length_mm{0.0};
+    double total_filament_weight_g{0.0};
+    double total_filament_cost{0.0};
+    std::size_t total_filament_changes{0};
+    std::size_t total_tool_changes{0};
     float min_speed_mm_s{0.0f};
     float max_speed_mm_s{0.0f};
+    float min_actual_speed_mm_s{0.0f};
+    float max_actual_speed_mm_s{0.0f};
     float min_layer_height_mm{0.0f};
     float max_layer_height_mm{0.0f};
     float min_width_mm{0.0f};
     float max_width_mm{0.0f};
     float min_volumetric_flow_mm3_s{0.0f};
     float max_volumetric_flow_mm3_s{0.0f};
+    float min_actual_volumetric_flow_mm3_s{0.0f};
+    float max_actual_volumetric_flow_mm3_s{0.0f};
+    float min_layer_time_seconds{0.0f};
+    float max_layer_time_seconds{0.0f};
+    float min_fan_speed_percent{0.0f};
+    float max_fan_speed_percent{0.0f};
+    float min_temperature_c{0.0f};
+    float max_temperature_c{0.0f};
+    float min_pressure_advance{0.0f};
+    float max_pressure_advance{0.0f};
+    float min_acceleration_mm_s2{0.0f};
+    float max_acceleration_mm_s2{0.0f};
+    float min_jerk_mm_s{0.0f};
+    float max_jerk_mm_s{0.0f};
     std::vector<ToolpathFeatureStatistics> features;
+    std::vector<ToolpathOptionStatistics> options;
+    std::vector<ToolpathFilamentUsage> filament_usage;
 };
 
 struct ToolpathPreview
@@ -203,6 +281,7 @@ struct ToolpathPreview
     std::vector<ToolpathTool> tools;
     std::vector<ToolpathFilament> filaments;
     std::vector<ToolpathColor> colors;
+    std::vector<ToolpathViewType> supported_view_types;
     ToolpathStatistics statistics;
     ToolpathBounds bounds;
 };

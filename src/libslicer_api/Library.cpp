@@ -421,6 +421,24 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
 {
     auto preview = std::make_shared<ToolpathPreview>();
     preview->source_path = source_path;
+    preview->supported_view_types = {
+        ToolpathViewType::Summary,
+        ToolpathViewType::FeatureType,
+        ToolpathViewType::Filament,
+        ToolpathViewType::Speed,
+        ToolpathViewType::ActualSpeed,
+        ToolpathViewType::Acceleration,
+        ToolpathViewType::Jerk,
+        ToolpathViewType::LayerHeight,
+        ToolpathViewType::LineWidth,
+        ToolpathViewType::VolumetricFlow,
+        ToolpathViewType::ActualVolumetricFlow,
+        ToolpathViewType::LayerTime,
+        ToolpathViewType::LayerTimeLogarithmic,
+        ToolpathViewType::FanSpeed,
+        ToolpathViewType::Temperature,
+        ToolpathViewType::PressureAdvance
+    };
 
     std::size_t filament_count = std::max({
         source.filaments_count,
@@ -506,9 +524,16 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
     };
 
     float min_speed = std::numeric_limits<float>::max();
+    float min_actual_speed = std::numeric_limits<float>::max();
     float min_height = std::numeric_limits<float>::max();
     float min_width = std::numeric_limits<float>::max();
     float min_flow = std::numeric_limits<float>::max();
+    float min_actual_flow = std::numeric_limits<float>::max();
+    float min_fan_speed = std::numeric_limits<float>::max();
+    float min_temperature = std::numeric_limits<float>::max();
+    float min_pressure_advance = std::numeric_limits<float>::max();
+    float min_acceleration = std::numeric_limits<float>::max();
+    float min_jerk = std::numeric_limits<float>::max();
     std::map<std::uint32_t, LayerBuilder> layer_builders;
     std::optional<ToolpathPoint> previous_position;
     std::unordered_set<std::uint32_t> logical_motion_commands;
@@ -570,6 +595,14 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
                 ? input.actual_feedrate
                 : input.feedrate;
             segment.print_z_mm = input.print_z;
+            segment.duration_seconds = input.time[static_cast<std::size_t>(
+                Slic3r::PrintEstimatedStatistics::ETimeMode::Normal)];
+            segment.layer_duration_seconds = input.layer_duration;
+            segment.fan_speed_percent = input.fan_speed;
+            segment.temperature_c = input.temperature;
+            segment.pressure_advance = input.pressure_advance;
+            segment.acceleration_mm_s2 = input.acceleration;
+            segment.jerk_mm_s = input.jerk;
 
             const double distance = point_distance(segment.start_mm, segment.end_mm);
             if (*motion == ToolpathMotionKind::Extrusion) {
@@ -614,11 +647,17 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
                 preview->statistics.total_travel_distance_mm += distance;
             }
 
-            const float speed = segment.actual_speed_mm_s;
+            const float speed = segment.nominal_speed_mm_s;
             if (speed > 0.0f) {
                 min_speed = std::min(min_speed, speed);
                 preview->statistics.max_speed_mm_s =
                     std::max(preview->statistics.max_speed_mm_s, speed);
+            }
+            const float actual_speed = segment.actual_speed_mm_s;
+            if (actual_speed > 0.0f) {
+                min_actual_speed = std::min(min_actual_speed, actual_speed);
+                preview->statistics.max_actual_speed_mm_s =
+                    std::max(preview->statistics.max_actual_speed_mm_s, actual_speed);
             }
             const float flow = *motion == ToolpathMotionKind::Extrusion
                 ? segment.mm3_per_mm * speed
@@ -628,6 +667,30 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
                 preview->statistics.max_volumetric_flow_mm3_s =
                     std::max(preview->statistics.max_volumetric_flow_mm3_s, flow);
             }
+            const float actual_flow = *motion == ToolpathMotionKind::Extrusion
+                ? segment.mm3_per_mm * actual_speed
+                : 0.0f;
+            if (actual_flow > 0.0f) {
+                min_actual_flow = std::min(min_actual_flow, actual_flow);
+                preview->statistics.max_actual_volumetric_flow_mm3_s =
+                    std::max(preview->statistics.max_actual_volumetric_flow_mm3_s, actual_flow);
+            }
+            const auto include_positive_range = [](float value, float& minimum, float& maximum) {
+                if (value > 0.0f) {
+                    minimum = std::min(minimum, value);
+                    maximum = std::max(maximum, value);
+                }
+            };
+            include_positive_range(segment.fan_speed_percent, min_fan_speed,
+                                   preview->statistics.max_fan_speed_percent);
+            include_positive_range(segment.temperature_c, min_temperature,
+                                   preview->statistics.max_temperature_c);
+            include_positive_range(segment.pressure_advance, min_pressure_advance,
+                                   preview->statistics.max_pressure_advance);
+            include_positive_range(segment.acceleration_mm_s2, min_acceleration,
+                                   preview->statistics.max_acceleration_mm_s2);
+            include_positive_range(segment.jerk_mm_s, min_jerk,
+                                   preview->statistics.max_jerk_mm_s);
 
             logical_motion_commands.insert(input.gcode_id);
             include_point(preview->bounds, segment.start_mm);
@@ -678,6 +741,15 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
         layer.height_mm = builder.height_mm;
         layer.duration_seconds = builder.duration_seconds;
 
+        if (layer.duration_seconds > 0.0f) {
+            preview->statistics.min_layer_time_seconds =
+                preview->statistics.min_layer_time_seconds <= 0.0f
+                    ? layer.duration_seconds
+                    : std::min(preview->statistics.min_layer_time_seconds, layer.duration_seconds);
+            preview->statistics.max_layer_time_seconds =
+                std::max(preview->statistics.max_layer_time_seconds, layer.duration_seconds);
+        }
+
         for (auto& segment : builder.segments) {
             segment.id = preview->segments.size();
             segment.layer_index = layer.index;
@@ -708,6 +780,13 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
         const double distance = point_distance(segment.start_mm, segment.end_mm);
         feature.length_mm += distance;
         feature.extrusion_volume_mm3 += distance * segment.mm3_per_mm;
+        feature.duration_seconds += segment.duration_seconds;
+    }
+    for (const auto& [source_role, filament] : source.print_statistics.used_filaments_per_role) {
+        auto& feature = feature_stats[to_extrusion_role(source_role)];
+        feature.role = to_extrusion_role(source_role);
+        feature.filament_length_m += filament.first;
+        feature.filament_weight_g += filament.second;
     }
     for (const auto& [role, feature] : feature_stats) {
         (void)role;
@@ -720,14 +799,92 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
     preview->statistics.total_time_seconds =
         source.print_statistics.modes[static_cast<std::size_t>(
             Slic3r::PrintEstimatedStatistics::ETimeMode::Normal)].time;
+    preview->statistics.total_travel_distance_mm = source.print_statistics.total_travel_distance;
+    preview->statistics.total_filament_changes = source.print_statistics.total_filament_changes;
+    preview->statistics.total_tool_changes = source.print_statistics.total_extruder_changes;
     preview->statistics.min_speed_mm_s =
         min_speed == std::numeric_limits<float>::max() ? 0.0f : min_speed;
+    preview->statistics.min_actual_speed_mm_s =
+        min_actual_speed == std::numeric_limits<float>::max() ? 0.0f : min_actual_speed;
     preview->statistics.min_layer_height_mm =
         min_height == std::numeric_limits<float>::max() ? 0.0f : min_height;
     preview->statistics.min_width_mm =
         min_width == std::numeric_limits<float>::max() ? 0.0f : min_width;
     preview->statistics.min_volumetric_flow_mm3_s =
         min_flow == std::numeric_limits<float>::max() ? 0.0f : min_flow;
+    preview->statistics.min_actual_volumetric_flow_mm3_s =
+        min_actual_flow == std::numeric_limits<float>::max() ? 0.0f : min_actual_flow;
+    preview->statistics.min_fan_speed_percent =
+        min_fan_speed == std::numeric_limits<float>::max() ? 0.0f : min_fan_speed;
+    preview->statistics.min_temperature_c =
+        min_temperature == std::numeric_limits<float>::max() ? 0.0f : min_temperature;
+    preview->statistics.min_pressure_advance =
+        min_pressure_advance == std::numeric_limits<float>::max() ? 0.0f : min_pressure_advance;
+    preview->statistics.min_acceleration_mm_s2 =
+        min_acceleration == std::numeric_limits<float>::max() ? 0.0f : min_acceleration;
+    preview->statistics.min_jerk_mm_s =
+        min_jerk == std::numeric_limits<float>::max() ? 0.0f : min_jerk;
+
+    const auto normal_time = static_cast<std::size_t>(
+        Slic3r::PrintEstimatedStatistics::ETimeMode::Normal);
+    ToolpathOptionStatistics travel;
+    travel.kind = ToolpathOptionKind::Travel;
+    travel.occurrence_count = source.print_statistics.total_travel_moves;
+    travel.distance_mm = source.print_statistics.total_travel_distance;
+    ToolpathOptionStatistics wipe;
+    wipe.kind = ToolpathOptionKind::Wipe;
+    ToolpathOptionStatistics seam;
+    seam.kind = ToolpathOptionKind::Seam;
+    seam.distance_mm = source.print_statistics.total_seam_gap_distance +
+        source.print_statistics.total_seam_scarf_distance;
+    for (const auto& move : source.moves) {
+        if (move.type == Slic3r::EMoveType::Travel) {
+            travel.duration_seconds += move.time[normal_time];
+        } else if (move.type == Slic3r::EMoveType::Wipe) {
+            ++wipe.occurrence_count;
+            wipe.duration_seconds += move.time[normal_time];
+            wipe.distance_mm += move.travel_dist;
+        } else if (move.type == Slic3r::EMoveType::Seam) {
+            ++seam.occurrence_count;
+            seam.duration_seconds += move.time[normal_time];
+        }
+    }
+    if (travel.occurrence_count > 0) preview->statistics.options.push_back(travel);
+    if (wipe.occurrence_count > 0) preview->statistics.options.push_back(wipe);
+    if (seam.occurrence_count > 0) preview->statistics.options.push_back(seam);
+
+    const auto map_value = [](const auto& values, std::size_t index) {
+        const auto it = values.find(index);
+        return it == values.end() ? 0.0 : it->second;
+    };
+    for (std::size_t index = 0; index < filament_count; ++index) {
+        ToolpathFilamentUsage usage;
+        usage.filament_id = static_cast<std::uint16_t>(index);
+        usage.model_volume_mm3 = map_value(source.print_statistics.model_volumes_per_extruder, index);
+        usage.support_volume_mm3 = map_value(source.print_statistics.support_volumes_per_extruder, index);
+        usage.flushed_volume_mm3 = map_value(source.print_statistics.flush_per_filament, index);
+        usage.tower_volume_mm3 = map_value(source.print_statistics.wipe_tower_volumes_per_extruder, index);
+        usage.total_volume_mm3 = map_value(source.print_statistics.total_volumes_per_extruder, index);
+        if (usage.total_volume_mm3 <= 0.0) {
+            usage.total_volume_mm3 = usage.model_volume_mm3 + usage.support_volume_mm3 +
+                usage.flushed_volume_mm3 + usage.tower_volume_mm3;
+        }
+        if (usage.total_volume_mm3 <= 0.0 && usage.model_volume_mm3 <= 0.0 &&
+            usage.support_volume_mm3 <= 0.0 && usage.flushed_volume_mm3 <= 0.0 &&
+            usage.tower_volume_mm3 <= 0.0) {
+            continue;
+        }
+        preview->statistics.filament_usage.push_back(usage);
+
+        const auto& filament = preview->filaments[index];
+        const double diameter = filament.diameter_mm > 0.0f ? filament.diameter_mm : 1.75;
+        const double area = 0.25 * 3.14159265358979323846 * diameter * diameter;
+        const double length_mm = area > 0.0 ? usage.total_volume_mm3 / area : 0.0;
+        const double weight_g = usage.total_volume_mm3 * filament.density_g_cm3 / 1000.0;
+        preview->statistics.total_filament_length_mm += length_mm;
+        preview->statistics.total_filament_weight_g += weight_g;
+        preview->statistics.total_filament_cost += weight_g * filament.cost_per_kg / 1000.0;
+    }
     return preview;
 }
 

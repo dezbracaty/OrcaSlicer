@@ -248,6 +248,25 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     CHECK(sliced.preview->statistics.logical_motion_count == sliced.summary.logical_motion_count);
     CHECK(sliced.preview->statistics.render_segment_count == sliced.summary.render_segment_count);
     CHECK(sliced.preview->schema_version == libslicer::toolpath_schema_version);
+    const std::vector<libslicer::ToolpathViewType> expected_view_types = {
+        libslicer::ToolpathViewType::Summary,
+        libslicer::ToolpathViewType::FeatureType,
+        libslicer::ToolpathViewType::Filament,
+        libslicer::ToolpathViewType::Speed,
+        libslicer::ToolpathViewType::ActualSpeed,
+        libslicer::ToolpathViewType::Acceleration,
+        libslicer::ToolpathViewType::Jerk,
+        libslicer::ToolpathViewType::LayerHeight,
+        libslicer::ToolpathViewType::LineWidth,
+        libslicer::ToolpathViewType::VolumetricFlow,
+        libslicer::ToolpathViewType::ActualVolumetricFlow,
+        libslicer::ToolpathViewType::LayerTime,
+        libslicer::ToolpathViewType::LayerTimeLogarithmic,
+        libslicer::ToolpathViewType::FanSpeed,
+        libslicer::ToolpathViewType::Temperature,
+        libslicer::ToolpathViewType::PressureAdvance
+    };
+    CHECK(sliced.preview->supported_view_types == expected_view_types);
     CHECK_FALSE(sliced.preview->segments.empty());
     CHECK(sliced.preview->bounds.valid);
     CHECK_FALSE(sliced.preview->layers.empty());
@@ -278,7 +297,11 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
         const bool dimensions_valid = is_extrusion ||
             (segment.width_mm == 0.0f && segment.height_mm == 0.0f &&
              segment.mm3_per_mm == 0.0f && segment.extrusion_delta_mm == 0.0f);
-        return endpoints_valid && role_valid && dimensions_valid;
+        const bool scalar_values_valid = finite(segment.duration_seconds) &&
+            finite(segment.layer_duration_seconds) && finite(segment.fan_speed_percent) &&
+            finite(segment.temperature_c) && finite(segment.pressure_advance) &&
+            finite(segment.acceleration_mm_s2) && finite(segment.jerk_mm_s);
+        return endpoints_valid && role_valid && dimensions_valid && scalar_values_valid;
     }));
     for (std::size_t index = 1; index < sliced.preview->segments.size(); ++index) {
         const auto& previous = sliced.preview->segments[index - 1];
@@ -311,6 +334,16 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     CHECK(sparse_stats->path_count > 0);
     CHECK(sparse_stats->length_mm > 0.0);
     CHECK(sparse_stats->extrusion_volume_mm3 > 0.0);
+    CHECK(sparse_stats->duration_seconds > 0.0);
+    CHECK(sparse_stats->filament_length_m > 0.0);
+    CHECK(sparse_stats->filament_weight_g > 0.0);
+    CHECK_FALSE(sliced.preview->statistics.filament_usage.empty());
+    CHECK(sliced.preview->statistics.total_filament_length_mm > 0.0);
+    CHECK(sliced.preview->statistics.total_filament_weight_g > 0.0);
+    CHECK_FALSE(sliced.preview->statistics.options.empty());
+    CHECK(sliced.preview->statistics.max_actual_speed_mm_s > 0.0f);
+    CHECK(sliced.preview->statistics.max_actual_volumetric_flow_mm3_s > 0.0f);
+    CHECK(sliced.preview->statistics.max_layer_time_seconds > 0.0f);
 
     std::ifstream gcode(output);
     const std::string content((std::istreambuf_iterator<char>(gcode)), std::istreambuf_iterator<char>());
@@ -321,8 +354,13 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     const auto imported = library->load_gcode_preview(preview_request);
     REQUIRE(imported.success);
     REQUIRE(imported.preview != nullptr);
+    CHECK(imported.preview->schema_version == libslicer::toolpath_schema_version);
+    CHECK(imported.preview->supported_view_types == expected_view_types);
     CHECK(imported.preview->statistics.total_layers == sliced.preview->statistics.total_layers);
     CHECK(imported.preview->statistics.render_segment_count > 0);
+    CHECK_FALSE(imported.preview->statistics.features.empty());
+    CHECK_FALSE(imported.preview->statistics.filament_usage.empty());
+    CHECK(imported.preview->statistics.total_filament_length_mm > 0.0);
     CHECK(imported.preview->source_path == output.string());
     CHECK(count_extrusion_role(*imported.preview,
                                libslicer::ToolpathExtrusionRole::SparseInfill) > 0);
