@@ -164,6 +164,11 @@ TEST_CASE("library owns machine presets and builds a selected configuration", "[
     CHECK(nozzle->printable_width == 220.0);
     CHECK(nozzle->printable_depth == 220.0);
     CHECK(nozzle->printable_height == 220.0);
+    REQUIRE(nozzle->printable_area.size() == 4);
+    CHECK(nozzle->printable_area.front().x == 0.0);
+    CHECK(nozzle->printable_area.front().y == 0.0);
+    CHECK(nozzle->printable_area[2].x == 220.0);
+    CHECK(nozzle->printable_area[2].y == 220.0);
     CHECK_FALSE(nozzle->printer_preset_id.empty());
 
     libslicer::ConfigSelection selection;

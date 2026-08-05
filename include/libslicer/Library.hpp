@@ -14,6 +14,12 @@ namespace libslicer {
 
 LIBSLICER_API const char* version() noexcept;
 
+struct PrintableAreaPoint
+{
+    double x{0.0};
+    double y{0.0};
+};
+
 struct MachineVariantOption
 {
     std::string id;
@@ -22,6 +28,7 @@ struct MachineVariantOption
     double printable_width{0.0};
     double printable_depth{0.0};
     double printable_height{0.0};
+    std::vector<PrintableAreaPoint> printable_area;
     std::string printer_preset_id;
 };
 

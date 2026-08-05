@@ -135,11 +135,14 @@ void populate_printable_volume(const Slic3r::DynamicPrintConfig& config,
 {
     const auto* area = config.option<Slic3r::ConfigOptionPoints>("printable_area");
     if (area != nullptr && !area->values.empty()) {
+        option.printable_area.clear();
+        option.printable_area.reserve(area->values.size());
         double min_x = std::numeric_limits<double>::max();
         double max_x = std::numeric_limits<double>::lowest();
         double min_y = std::numeric_limits<double>::max();
         double max_y = std::numeric_limits<double>::lowest();
         for (const auto& point : area->values) {
+            option.printable_area.push_back({point.x(), point.y()});
             min_x = std::min(min_x, point.x());
             max_x = std::max(max_x, point.x());
             min_y = std::min(min_y, point.y());
