@@ -124,6 +124,10 @@ struct SliceRequest
     std::vector<SliceObjectInput> objects;
     ConfigSnapshot config;
     std::string output_gcode_path;
+    // A sliced G-code 3MF is a packaged print job containing the generated
+    // G-code and its slicing metadata. Supplying a path also enables it.
+    bool generate_gcode_3mf{false};
+    std::string output_gcode_3mf_path;
     bool center_on_build_plate{true};
     bool generate_preview{true};
 };
@@ -156,6 +160,7 @@ struct SliceResult
     bool success{false};
     bool cancelled{false};
     OutputArtifact output;
+    OutputArtifact gcode_3mf;
     SliceSummary summary;
     ToolpathPreviewPtr preview;
     std::vector<SliceDiagnostic> diagnostics;

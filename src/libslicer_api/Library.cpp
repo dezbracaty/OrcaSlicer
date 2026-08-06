@@ -8,6 +8,7 @@
 #include <libslic3r/Print.hpp>
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/GCode/GCodeProcessor.hpp>
+#include <libslic3r/Format/bbs_3mf.hpp>
 #include <libslic3r/Utils.hpp>
 #include <libslic3r/libslic3r.h>
 
@@ -266,13 +267,89 @@ Slic3r::Vec2d build_plate_center(const Slic3r::DynamicPrintConfig& config)
     return {(min_x + max_x) * 0.5, (min_y + max_y) * 0.5};
 }
 
-std::string temporary_gcode_path()
+std::string temporary_output_path(std::string_view suffix)
 {
     static std::atomic<unsigned long long> sequence{0};
     const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
     return (fs::temp_directory_path() /
             ("libslicer_" + std::to_string(timestamp) + "_" +
-             std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + ".gcode")).string();
+             std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + std::string(suffix))).string();
+}
+
+bool store_gcode_3mf(const std::string& output_path,
+                     Slic3r::Model& model,
+                     Slic3r::DynamicPrintConfig& config,
+                     const std::string& gcode_path,
+                     Slic3r::GCodeProcessorResult& processor_result,
+                     const Slic3r::PrintStatistics& statistics,
+                     bool support_used)
+{
+    Slic3r::PlateData plate;
+    plate.plate_index = 0;
+    for (std::size_t object_index = 0; object_index < model.objects.size(); ++object_index) {
+        const auto* object = model.objects[object_index];
+        for (std::size_t instance_index = 0; instance_index < object->instances.size(); ++instance_index) {
+            plate.objects_and_instances.emplace_back(static_cast<int>(object_index),
+                                                     static_cast<int>(instance_index));
+        }
+    }
+    plate.config.apply(config);
+    plate.printer_model_id = config.opt_serialize("printer_model");
+    plate.nozzle_diameters = config.opt_serialize("nozzle_diameter");
+    plate.gcode_file = gcode_path;
+    plate.gcode_prediction = Slic3r::get_time_dhms(
+        static_cast<float>(processor_result.print_statistics.modes[static_cast<std::size_t>(
+            Slic3r::PrintEstimatedStatistics::ETimeMode::Normal)].time));
+    plate.gcode_weight = std::to_string(statistics.total_weight);
+    plate.is_sliced_valid = true;
+    plate.is_support_used = support_used;
+    plate.toolpath_outside = processor_result.toolpath_outside;
+    plate.is_label_object_enabled = processor_result.label_object_enabled;
+    plate.timelapse_warning_code = processor_result.timelapse_warning_code;
+    plate.filament_maps = processor_result.filament_maps;
+    plate.limit_filament_maps = processor_result.limit_filament_maps;
+    plate.layer_filaments = processor_result.layer_filaments;
+    plate.filament_change_sequence = processor_result.filament_change_sequence;
+    plate.nozzle_change_sequence = processor_result.nozzle_change_sequence;
+    plate.optimal_assignment = processor_result.optimal_assignment;
+    plate.parse_filament_info(&processor_result);
+
+    Slic3r::StoreParams params;
+    params.path = output_path.c_str();
+    params.model = &model;
+    params.plate_data_list = {&plate};
+    params.export_plate_idx = 0;
+    params.config = &config;
+    params.strategy = Slic3r::SaveStrategy::Silence |
+                      Slic3r::SaveStrategy::SplitModel |
+                      Slic3r::SaveStrategy::WithGcode |
+                      Slic3r::SaveStrategy::SkipModel |
+                      Slic3r::SaveStrategy::SkipAuxiliary |
+                      Slic3r::SaveStrategy::Zip64;
+    // The Orca exporter stages metadata beneath Model::get_backup_path() and
+    // does not remove it. This model is private to the current slice, so its
+    // exact staging directory can be released immediately after packaging.
+    const fs::path staging_path = model.get_backup_path();
+    const auto cleanup_staging = [&model, &staging_path] {
+        std::error_code cleanup_error;
+        try {
+            model.remove_backup_path_if_exist();
+        } catch (...) {
+            fs::remove_all(staging_path, cleanup_error);
+            model.set_backup_path("detach");
+        }
+        // Remove now-empty date/root folders without disturbing concurrent jobs.
+        fs::remove(staging_path.parent_path(), cleanup_error);
+        fs::remove(staging_path.parent_path().parent_path(), cleanup_error);
+    };
+    try {
+        const bool stored = Slic3r::store_bbs_3mf(params);
+        cleanup_staging();
+        return stored;
+    } catch (...) {
+        cleanup_staging();
+        throw;
+    }
 }
 
 bool cancellation_requested(const SliceCallbacks& callbacks)
@@ -922,6 +999,9 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
         const fs::path data_directory = fs::temp_directory_path() / "libslicer";
         fs::create_directories(data_directory);
         Slic3r::set_data_dir(data_directory.string());
+        const fs::path working_directory = data_directory / "work";
+        fs::create_directories(working_directory);
+        Slic3r::set_temporary_dir(working_directory.string());
 
         const fs::path profiles_directory = fs::path(library->impl_->resource_directory) / "profiles";
         std::vector<std::string> vendors = options.vendors.empty() ?
@@ -1126,14 +1206,13 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
 SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& callbacks) const
 {
     SliceResult result;
-    std::string generated_temporary_path;
-    const auto discard_generated_temporary = [&generated_temporary_path]() {
-        if (generated_temporary_path.empty()) {
-            return;
+    std::vector<std::string> generated_temporary_paths;
+    const auto discard_generated_temporary = [&generated_temporary_paths]() {
+        for (const std::string& path : generated_temporary_paths) {
+            std::error_code error;
+            fs::remove(path, error);
         }
-        std::error_code error;
-        fs::remove(generated_temporary_path, error);
-        generated_temporary_path.clear();
+        generated_temporary_paths.clear();
     };
     try {
         if (request.objects.empty()) {
@@ -1255,9 +1334,9 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         }
 
         const bool library_temporary = request.output_gcode_path.empty();
-        std::string output_path = library_temporary ? temporary_gcode_path() : request.output_gcode_path;
+        std::string output_path = library_temporary ? temporary_output_path(".gcode") : request.output_gcode_path;
         if (library_temporary) {
-            generated_temporary_path = output_path;
+            generated_temporary_paths.push_back(output_path);
         }
         const fs::path output_parent = fs::path(output_path).parent_path();
         if (!output_parent.empty()) {
@@ -1277,6 +1356,43 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             discard_generated_temporary();
             result.output.path.clear();
             return result;
+        }
+
+        const bool generate_gcode_3mf = request.generate_gcode_3mf || !request.output_gcode_3mf_path.empty();
+        if (generate_gcode_3mf) {
+            const bool package_temporary = request.output_gcode_3mf_path.empty();
+            const std::string package_path = package_temporary
+                ? temporary_output_path(".gcode.3mf")
+                : request.output_gcode_3mf_path;
+            if (package_temporary) {
+                generated_temporary_paths.push_back(package_path);
+            }
+            const fs::path package_parent = fs::path(package_path).parent_path();
+            if (!package_parent.empty()) {
+                fs::create_directories(package_parent);
+            }
+
+            report_progress(callbacks, 0.94f, "Packaging sliced G-code 3MF");
+            if (!store_gcode_3mf(package_path, plate_model, config, result.output.path,
+                                 processor_result, print.print_statistics(),
+                                 print.has_support_material())) {
+                result.diagnostics.push_back({"gcode_3mf", "Slicer could not package the sliced G-code 3MF", false});
+                discard_generated_temporary();
+                result.output.path.clear();
+                return result;
+            }
+            std::error_code package_error;
+            if (!fs::is_regular_file(package_path, package_error) || package_error ||
+                fs::file_size(package_path, package_error) == 0 || package_error) {
+                result.diagnostics.push_back({"gcode_3mf", "Slicer generated an invalid sliced G-code 3MF", false});
+                discard_generated_temporary();
+                result.output.path.clear();
+                return result;
+            }
+            result.gcode_3mf.path = package_path;
+            result.gcode_3mf.ownership = package_temporary
+                ? OutputArtifactOwnership::LibraryTemporary
+                : OutputArtifactOwnership::CallerOwned;
         }
 
         const auto& statistics = print.print_statistics();
@@ -1303,6 +1419,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                 result.diagnostics.push_back({"preview", "Slicer generated no drawable toolpath preview", false});
                 discard_generated_temporary();
                 result.output.path.clear();
+                result.gcode_3mf.path.clear();
                 result.preview.reset();
                 return result;
             }
@@ -1312,16 +1429,18 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         }
 
         result.success = true;
-        generated_temporary_path.clear();
+        generated_temporary_paths.clear();
         report_progress(callbacks, 1.0f, "Slicing completed");
     } catch (const Slic3r::CanceledException&) {
         result.cancelled = true;
         discard_generated_temporary();
         result.output.path.clear();
+        result.gcode_3mf.path.clear();
     } catch (const std::exception& error) {
         result.diagnostics.push_back({"slice", error.what(), false});
         discard_generated_temporary();
         result.output.path.clear();
+        result.gcode_3mf.path.clear();
     }
     return result;
 }

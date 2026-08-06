@@ -217,8 +217,11 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
 
     const std::filesystem::path output =
         std::filesystem::temp_directory_path() / "libslicer_api_20mm_cube.gcode";
+    const std::filesystem::path packaged_output =
+        std::filesystem::temp_directory_path() / "libslicer_api_20mm_cube.gcode.3mf";
     std::error_code remove_error;
     std::filesystem::remove(output, remove_error);
+    std::filesystem::remove(packaged_output, remove_error);
 
     libslicer::SliceRequest request;
     request.objects = {{std::string(LIBSLICER_TEST_DATA_DIR) + "/20mm_cube.obj", {}}};
@@ -229,6 +232,7 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
 
     request.config = created.config->snapshot();
     request.output_gcode_path = output.string();
+    request.output_gcode_3mf_path = packaged_output.string();
 
     float last_progress = 0.0f;
     libslicer::SliceCallbacks callbacks;
@@ -244,7 +248,19 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     CHECK_FALSE(sliced.cancelled);
     CHECK(sliced.output.path == output.string());
     CHECK(sliced.output.ownership == libslicer::OutputArtifactOwnership::CallerOwned);
+    CHECK(sliced.gcode_3mf.path == packaged_output.string());
+    CHECK(sliced.gcode_3mf.ownership == libslicer::OutputArtifactOwnership::CallerOwned);
     CHECK(std::filesystem::file_size(output) > 0);
+    CHECK(std::filesystem::file_size(packaged_output) > 0);
+    std::ifstream packaged_stream(packaged_output, std::ios::binary);
+    char zip_signature[4]{};
+    packaged_stream.read(zip_signature, sizeof(zip_signature));
+    CHECK(std::string(zip_signature, sizeof(zip_signature)) == std::string("PK\x03\x04", 4));
+    packaged_stream.clear();
+    packaged_stream.seekg(0);
+    const std::string packaged_content((std::istreambuf_iterator<char>(packaged_stream)),
+                                       std::istreambuf_iterator<char>());
+    CHECK(packaged_content.find("Metadata/plate_1.gcode") != std::string::npos);
     CHECK(sliced.summary.layer_count > 0);
     CHECK(sliced.summary.logical_motion_count > 0);
     CHECK(sliced.summary.render_segment_count > 0);
@@ -372,4 +388,5 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     CHECK(count_extrusion_role(*imported.preview,
                                libslicer::ToolpathExtrusionRole::InternalSolidInfill) > 0);
     std::filesystem::remove(output, remove_error);
+    std::filesystem::remove(packaged_output, remove_error);
 }
