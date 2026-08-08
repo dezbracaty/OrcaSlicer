@@ -261,6 +261,9 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     const std::string packaged_content((std::istreambuf_iterator<char>(packaged_stream)),
                                        std::istreambuf_iterator<char>());
     CHECK(packaged_content.find("Metadata/plate_1.gcode") != std::string::npos);
+    CHECK(packaged_content.find("Metadata/plate_1.gcode.md5") != std::string::npos);
+    CHECK(packaged_content.find("Metadata/plate_1.png") != std::string::npos);
+    CHECK(packaged_content.find("Metadata/plate_1_small.png") != std::string::npos);
     CHECK(sliced.summary.layer_count > 0);
     CHECK(sliced.summary.logical_motion_count > 0);
     CHECK(sliced.summary.render_segment_count > 0);

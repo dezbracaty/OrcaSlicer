@@ -8,12 +8,18 @@
 #include <libslic3r/Print.hpp>
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/GCode/GCodeProcessor.hpp>
+#include <libslic3r/GCode/ThumbnailData.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
 #include <libslic3r/Utils.hpp>
 #include <libslic3r/libslic3r.h>
+#include <libslic3r/miniz_extension.hpp>
+
+#include <openssl/evp.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -276,6 +282,143 @@ std::string temporary_output_path(std::string_view suffix)
              std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + std::string(suffix))).string();
 }
 
+bool extract_zip_entry(mz_zip_archive& archive, const char* name, std::vector<unsigned char>& data)
+{
+    const int index = mz_zip_reader_locate_file(&archive, name, nullptr, 0);
+    mz_zip_archive_file_stat stat;
+    if (index < 0 || !mz_zip_reader_file_stat(&archive, static_cast<mz_uint>(index), &stat) ||
+        stat.m_is_directory || stat.m_uncomp_size == 0 ||
+        stat.m_uncomp_size > static_cast<mz_uint64>(std::numeric_limits<std::size_t>::max())) {
+        return false;
+    }
+    data.resize(static_cast<std::size_t>(stat.m_uncomp_size));
+    return mz_zip_reader_extract_to_mem(&archive, static_cast<mz_uint>(index), data.data(), data.size(), 0);
+}
+
+struct DigestWriter {
+    EVP_MD_CTX* context{nullptr};
+    mz_uint64 next_offset{0};
+};
+
+std::size_t update_digest(void* opaque, mz_uint64 offset, const void* buffer, std::size_t size)
+{
+    auto& writer = *static_cast<DigestWriter*>(opaque);
+    if (writer.context == nullptr || offset != writer.next_offset ||
+        EVP_DigestUpdate(writer.context, buffer, size) != 1) {
+        return 0;
+    }
+    writer.next_offset += size;
+    return size;
+}
+
+bool validate_gcode_3mf(const std::string& path, std::string& error)
+{
+    mz_zip_archive archive;
+    mz_zip_zero_struct(&archive);
+    if (!Slic3r::open_zip_reader(&archive, path)) {
+        error = "the generated file is not a readable ZIP archive";
+        return false;
+    }
+    struct ArchiveCloser {
+        mz_zip_archive& archive;
+        ~ArchiveCloser() { Slic3r::close_zip_reader(&archive); }
+    } closer{archive};
+
+    if (!mz_zip_validate_archive(&archive, MZ_ZIP_FLAG_VALIDATE_LOCATE_FILE_FLAG)) {
+        error = "the generated ZIP archive failed CRC validation";
+        return false;
+    }
+
+    constexpr std::array<const char*, 10> required_entries = {
+        "[Content_Types].xml",
+        "_rels/.rels",
+        "3D/3dmodel.model",
+        "Metadata/project_settings.config",
+        "Metadata/model_settings.config",
+        "Metadata/slice_info.config",
+        "Metadata/plate_1.gcode",
+        "Metadata/plate_1.gcode.md5",
+        "Metadata/plate_1.png",
+        "Metadata/plate_1_small.png",
+    };
+    for (const char* entry : required_entries) {
+        mz_zip_archive_file_stat stat;
+        const int index = mz_zip_reader_locate_file(&archive, entry, nullptr, 0);
+        if (index < 0 || !mz_zip_reader_file_stat(&archive, static_cast<mz_uint>(index), &stat) ||
+            stat.m_is_directory || stat.m_uncomp_size == 0) {
+            error = std::string("the generated archive is missing required entry ") + entry;
+            return false;
+        }
+    }
+
+    std::vector<unsigned char> relationship_bytes;
+    if (!extract_zip_entry(archive, "_rels/.rels", relationship_bytes)) {
+        error = "the generated archive contains no readable root relationships";
+        return false;
+    }
+    const std::string relationships(relationship_bytes.begin(), relationship_bytes.end());
+    for (const char* target : {"/3D/3dmodel.model", "/Metadata/plate_1.png",
+                               "/Metadata/plate_1_small.png"}) {
+        if (relationships.find(std::string("Target=\"") + target + '"') == std::string::npos) {
+            error = std::string("the generated archive has no relationship to ") + target;
+            return false;
+        }
+    }
+
+    constexpr std::array<unsigned char, 8> png_signature = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+    for (const char* thumbnail : {"Metadata/plate_1.png", "Metadata/plate_1_small.png"}) {
+        std::vector<unsigned char> bytes;
+        if (!extract_zip_entry(archive, thumbnail, bytes) || bytes.size() < png_signature.size() ||
+            !std::equal(png_signature.begin(), png_signature.end(), bytes.begin())) {
+            error = std::string("the generated archive contains an invalid PNG entry ") + thumbnail;
+            return false;
+        }
+    }
+
+    std::vector<unsigned char> expected_digest_bytes;
+    if (!extract_zip_entry(archive, "Metadata/plate_1.gcode.md5", expected_digest_bytes)) {
+        error = "the generated archive contains no readable G-code checksum";
+        return false;
+    }
+    std::string expected_digest(expected_digest_bytes.begin(), expected_digest_bytes.end());
+    expected_digest.erase(std::remove_if(expected_digest.begin(), expected_digest.end(),
+                                         [](unsigned char value) { return std::isspace(value) != 0; }),
+                          expected_digest.end());
+    std::transform(expected_digest.begin(), expected_digest.end(), expected_digest.begin(),
+                   [](unsigned char value) { return static_cast<char>(std::toupper(value)); });
+
+    const int gcode_index = mz_zip_reader_locate_file(&archive, "Metadata/plate_1.gcode", nullptr, 0);
+    EVP_MD_CTX* digest_context = EVP_MD_CTX_new();
+    if (gcode_index < 0 || digest_context == nullptr || EVP_DigestInit_ex(digest_context, EVP_md5(), nullptr) != 1) {
+        EVP_MD_CTX_free(digest_context);
+        error = "the generated archive G-code checksum could not be initialized";
+        return false;
+    }
+    DigestWriter writer{digest_context};
+    const bool extracted = mz_zip_reader_extract_to_callback(
+        &archive, static_cast<mz_uint>(gcode_index), update_digest, &writer, 0);
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned int digest_size = 0;
+    const bool finalized = extracted && EVP_DigestFinal_ex(digest_context, digest.data(), &digest_size) == 1;
+    EVP_MD_CTX_free(digest_context);
+    if (!finalized || digest_size != 16) {
+        error = "the generated archive G-code checksum could not be calculated";
+        return false;
+    }
+    static constexpr char hex_digits[] = "0123456789ABCDEF";
+    std::string actual_digest;
+    actual_digest.reserve(digest_size * 2);
+    for (unsigned int index = 0; index < digest_size; ++index) {
+        actual_digest.push_back(hex_digits[digest[index] >> 4]);
+        actual_digest.push_back(hex_digits[digest[index] & 0x0f]);
+    }
+    if (expected_digest != actual_digest) {
+        error = "the generated archive G-code does not match its MD5 checksum";
+        return false;
+    }
+    return true;
+}
+
 bool store_gcode_3mf(const std::string& output_path,
                      Slic3r::Model& model,
                      Slic3r::DynamicPrintConfig& config,
@@ -313,6 +456,16 @@ bool store_gcode_3mf(const std::string& output_path,
     plate.nozzle_change_sequence = processor_result.nozzle_change_sequence;
     plate.optimal_assignment = processor_result.optimal_assignment;
     plate.parse_filament_info(&processor_result);
+    // The GUI normally supplies a rendered plate thumbnail. The headless API
+    // still needs concrete relationship targets, so provide a neutral valid
+    // image instead of emitting dangling OPC relationships.
+    plate.plate_thumbnail.set(256, 256);
+    for (std::size_t index = 0; index < plate.plate_thumbnail.pixels.size(); index += 4) {
+        plate.plate_thumbnail.pixels[index] = 245;
+        plate.plate_thumbnail.pixels[index + 1] = 245;
+        plate.plate_thumbnail.pixels[index + 2] = 245;
+        plate.plate_thumbnail.pixels[index + 3] = 255;
+    }
 
     Slic3r::StoreParams params;
     params.path = output_path.c_str();
@@ -320,6 +473,7 @@ bool store_gcode_3mf(const std::string& output_path,
     params.plate_data_list = {&plate};
     params.export_plate_idx = 0;
     params.config = &config;
+    params.thumbnail_data = {&plate.plate_thumbnail};
     params.strategy = Slic3r::SaveStrategy::Silence |
                       Slic3r::SaveStrategy::SplitModel |
                       Slic3r::SaveStrategy::WithGcode |
@@ -1385,6 +1539,13 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             if (!fs::is_regular_file(package_path, package_error) || package_error ||
                 fs::file_size(package_path, package_error) == 0 || package_error) {
                 result.diagnostics.push_back({"gcode_3mf", "Slicer generated an invalid sliced G-code 3MF", false});
+                discard_generated_temporary();
+                result.output.path.clear();
+                return result;
+            }
+            std::string validation_message;
+            if (!validate_gcode_3mf(package_path, validation_message)) {
+                result.diagnostics.push_back({"gcode_3mf", "Slicer generated an invalid sliced G-code 3MF: " + validation_message, false});
                 discard_generated_temporary();
                 result.output.path.clear();
                 return result;
