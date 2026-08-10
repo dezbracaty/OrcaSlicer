@@ -23,3 +23,13 @@ target_include_directories(libslicer_api
         "${CMAKE_CURRENT_BINARY_DIR}/../libslic3r"
 )
 target_link_libraries(libslicer_api PRIVATE libslic3r)
+
+# libslicer is assembled from static third-party archives. On Darwin, global
+# symbols pulled from those archives would otherwise remain interposable and
+# may bind to a different version loaded by the host process (notably OCCT).
+# Export only the public libslicer namespace so all bundled dependencies stay
+# private to this dylib.
+if(APPLE)
+    target_link_options(libslicer_api PRIVATE
+        "LINKER:-exported_symbol,__Z*9libslicer*")
+endif()
