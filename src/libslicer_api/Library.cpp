@@ -10,6 +10,7 @@
 #include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/GCode/ThumbnailData.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
+#include <libslic3r/PNGReadWrite.hpp>
 #include <libslic3r/Utils.hpp>
 #include <libslic3r/libslic3r.h>
 #include <libslic3r/miniz_extension.hpp>
@@ -414,6 +415,29 @@ bool validate_gcode_3mf(const std::string& path, std::string& error)
             error = std::string("the generated archive contains an invalid PNG entry ") + thumbnail;
             return false;
         }
+        Slic3r::png::ImageColorscale image;
+        if (!Slic3r::png::decode_colored_png({bytes.data(), bytes.size()}, image) ||
+            image.rows == 0 || image.cols == 0 || image.bytes_per_pixel < 3) {
+            error = std::string("the generated archive contains an unreadable thumbnail ") + thumbnail;
+            return false;
+        }
+        const auto pixel_differs = [&image](std::size_t pixel) {
+            for (int component = 0; component < image.bytes_per_pixel; ++component) {
+                if (image.buf[pixel * image.bytes_per_pixel + component] != image.buf[component]) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const std::size_t pixel_count = image.rows * image.cols;
+        bool has_image_content = false;
+        for (std::size_t pixel = 1; pixel < pixel_count && !has_image_content; ++pixel) {
+            has_image_content = pixel_differs(pixel);
+        }
+        if (!has_image_content) {
+            error = std::string("the generated archive contains a blank thumbnail ") + thumbnail;
+            return false;
+        }
     }
 
     std::vector<unsigned char> expected_digest_bytes;
@@ -460,13 +484,240 @@ bool validate_gcode_3mf(const std::string& path, std::string& error)
     return true;
 }
 
+struct ProjectedThumbnailTriangle
+{
+    std::array<Slic3r::Vec3d, 3> world;
+    std::array<Slic3r::Vec3d, 3> projected;
+    double shade{1.0};
+};
+
+std::array<unsigned char, 3> thumbnail_model_color(const Slic3r::DynamicPrintConfig& config)
+{
+    std::string value;
+    if (const auto* colors = config.option<Slic3r::ConfigOptionStrings>("filament_colour");
+        colors != nullptr && !colors->values.empty()) {
+        value = colors->values.front();
+    }
+    if (!value.empty() && value.front() == '#') {
+        value.erase(value.begin());
+    }
+    if (value.size() >= 6) {
+        try {
+            return {
+                static_cast<unsigned char>(std::stoul(value.substr(0, 2), nullptr, 16)),
+                static_cast<unsigned char>(std::stoul(value.substr(2, 2), nullptr, 16)),
+                static_cast<unsigned char>(std::stoul(value.substr(4, 2), nullptr, 16)),
+            };
+        } catch (...) {
+        }
+    }
+    return {42, 132, 210};
+}
+
+double thumbnail_edge(double ax, double ay, double bx, double by, double px, double py)
+{
+    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+}
+
+Slic3r::ThumbnailData render_model_thumbnail(const Slic3r::Model& model,
+                                             const Slic3r::DynamicPrintConfig& config,
+                                             unsigned int width,
+                                             unsigned int height,
+                                             bool transparent_background)
+{
+    Slic3r::ThumbnailData output;
+    if (width == 0 || height == 0) {
+        return output;
+    }
+
+    // Match OrcaSlicer's familiar isometric plate view, but rasterize on the CPU
+    // so the headless library does not acquire a GUI or OpenGL dependency.
+    const Slic3r::Vec3d camera_ray = Slic3r::Vec3d(-1.0, -1.0, -0.8).normalized();
+    const Slic3r::Vec3d screen_right = camera_ray.cross(Slic3r::Vec3d::UnitZ()).normalized();
+    const Slic3r::Vec3d screen_up = screen_right.cross(camera_ray).normalized();
+    const Slic3r::Vec3d light_direction = Slic3r::Vec3d(-0.35, -0.45, 1.0).normalized();
+
+    std::vector<ProjectedThumbnailTriangle> triangles;
+    double min_x = std::numeric_limits<double>::max();
+    double min_y = std::numeric_limits<double>::max();
+    double max_x = std::numeric_limits<double>::lowest();
+    double max_y = std::numeric_limits<double>::lowest();
+
+    for (const Slic3r::ModelObject* object : model.objects) {
+        if (object == nullptr || !object->printable) {
+            continue;
+        }
+        for (const Slic3r::ModelInstance* instance : object->instances) {
+            if (instance == nullptr || !instance->printable) {
+                continue;
+            }
+            for (const Slic3r::ModelVolume* volume : object->volumes) {
+                if (volume == nullptr || !volume->is_model_part()) {
+                    continue;
+                }
+                const auto& mesh = volume->mesh().its;
+                const Slic3r::Transform3d transform = instance->get_matrix() * volume->get_matrix();
+                for (const Slic3r::Vec3i32& indices : mesh.indices) {
+                    ProjectedThumbnailTriangle triangle;
+                    bool valid = true;
+                    for (int corner = 0; corner < 3; ++corner) {
+                        const int vertex_index = indices[corner];
+                        if (vertex_index < 0 || static_cast<std::size_t>(vertex_index) >= mesh.vertices.size()) {
+                            valid = false;
+                            break;
+                        }
+                        const Slic3r::Vec3d world = transform * mesh.vertices[vertex_index].cast<double>();
+                        const Slic3r::Vec3d projected(world.dot(screen_right),
+                                                     world.dot(screen_up),
+                                                     world.dot(camera_ray));
+                        triangle.world[corner] = world;
+                        triangle.projected[corner] = projected;
+                        min_x = std::min(min_x, projected.x());
+                        min_y = std::min(min_y, projected.y());
+                        max_x = std::max(max_x, projected.x());
+                        max_y = std::max(max_y, projected.y());
+                    }
+                    if (!valid) {
+                        continue;
+                    }
+                    Slic3r::Vec3d normal = (triangle.world[1] - triangle.world[0])
+                                               .cross(triangle.world[2] - triangle.world[0]);
+                    const double normal_length = normal.norm();
+                    if (normal_length <= std::numeric_limits<double>::epsilon()) {
+                        continue;
+                    }
+                    normal /= normal_length;
+                    if (normal.dot(-camera_ray) < 0.0) {
+                        normal = -normal;
+                    }
+                    triangle.shade = 0.38 + 0.62 * std::max(0.0, normal.dot(light_direction));
+                    triangles.push_back(std::move(triangle));
+                }
+            }
+        }
+    }
+
+    if (triangles.empty() || !(max_x > min_x) || !(max_y > min_y)) {
+        return output;
+    }
+
+    constexpr unsigned int sample_scale = 2;
+    const unsigned int raster_width = width * sample_scale;
+    const unsigned int raster_height = height * sample_scale;
+    const double margin = std::max(2.0, 0.08 * static_cast<double>(std::min(raster_width, raster_height)));
+    const double available_width = std::max(1.0, static_cast<double>(raster_width) - 2.0 * margin);
+    const double available_height = std::max(1.0, static_cast<double>(raster_height) - 2.0 * margin);
+    const double scale = std::min(available_width / (max_x - min_x),
+                                  available_height / (max_y - min_y));
+    const double offset_x = (static_cast<double>(raster_width) - (max_x - min_x) * scale) * 0.5;
+    const double offset_y = (static_cast<double>(raster_height) - (max_y - min_y) * scale) * 0.5;
+
+    const auto base_color = thumbnail_model_color(config);
+    const std::array<unsigned char, 4> background = transparent_background
+        ? std::array<unsigned char, 4>{255, 255, 255, 0}
+        : std::array<unsigned char, 4>{245, 247, 250, 255};
+    std::vector<unsigned char> pixels(static_cast<std::size_t>(raster_width) * raster_height * 4);
+    for (std::size_t index = 0; index < pixels.size(); index += 4) {
+        std::copy(background.begin(), background.end(), pixels.begin() + static_cast<std::ptrdiff_t>(index));
+    }
+    std::vector<double> depth(static_cast<std::size_t>(raster_width) * raster_height,
+                              std::numeric_limits<double>::infinity());
+
+    for (const ProjectedThumbnailTriangle& triangle : triangles) {
+        std::array<Slic3r::Vec3d, 3> screen;
+        for (int corner = 0; corner < 3; ++corner) {
+            screen[corner] = {
+                offset_x + (triangle.projected[corner].x() - min_x) * scale,
+                offset_y + (triangle.projected[corner].y() - min_y) * scale,
+                triangle.projected[corner].z(),
+            };
+        }
+        const double area = thumbnail_edge(screen[0].x(), screen[0].y(),
+                                           screen[1].x(), screen[1].y(),
+                                           screen[2].x(), screen[2].y());
+        if (std::abs(area) <= std::numeric_limits<double>::epsilon()) {
+            continue;
+        }
+        const int x_begin = std::max(0, static_cast<int>(std::floor(std::min({screen[0].x(), screen[1].x(), screen[2].x()}))));
+        const int x_end = std::min(static_cast<int>(raster_width) - 1,
+                                   static_cast<int>(std::ceil(std::max({screen[0].x(), screen[1].x(), screen[2].x()}))));
+        const int y_begin = std::max(0, static_cast<int>(std::floor(std::min({screen[0].y(), screen[1].y(), screen[2].y()}))));
+        const int y_end = std::min(static_cast<int>(raster_height) - 1,
+                                   static_cast<int>(std::ceil(std::max({screen[0].y(), screen[1].y(), screen[2].y()}))));
+        const std::array<unsigned char, 4> color = {
+            static_cast<unsigned char>(std::clamp(triangle.shade * base_color[0], 0.0, 255.0)),
+            static_cast<unsigned char>(std::clamp(triangle.shade * base_color[1], 0.0, 255.0)),
+            static_cast<unsigned char>(std::clamp(triangle.shade * base_color[2], 0.0, 255.0)),
+            255,
+        };
+        for (int y = y_begin; y <= y_end; ++y) {
+            for (int x = x_begin; x <= x_end; ++x) {
+                const double px = static_cast<double>(x) + 0.5;
+                const double py = static_cast<double>(y) + 0.5;
+                const double w0 = thumbnail_edge(screen[1].x(), screen[1].y(), screen[2].x(), screen[2].y(), px, py) / area;
+                const double w1 = thumbnail_edge(screen[2].x(), screen[2].y(), screen[0].x(), screen[0].y(), px, py) / area;
+                const double w2 = 1.0 - w0 - w1;
+                if (w0 < -0.000001 || w1 < -0.000001 || w2 < -0.000001) {
+                    continue;
+                }
+                const double value = w0 * screen[0].z() + w1 * screen[1].z() + w2 * screen[2].z();
+                const std::size_t pixel_index = static_cast<std::size_t>(y) * raster_width + x;
+                if (value >= depth[pixel_index]) {
+                    continue;
+                }
+                depth[pixel_index] = value;
+                std::copy(color.begin(), color.end(), pixels.begin() + static_cast<std::ptrdiff_t>(pixel_index * 4));
+            }
+        }
+    }
+
+    output.set(width, height);
+    for (unsigned int y = 0; y < height; ++y) {
+        for (unsigned int x = 0; x < width; ++x) {
+            std::array<unsigned int, 4> sum{};
+            for (unsigned int sample_y = 0; sample_y < sample_scale; ++sample_y) {
+                for (unsigned int sample_x = 0; sample_x < sample_scale; ++sample_x) {
+                    const std::size_t source =
+                        (static_cast<std::size_t>(y * sample_scale + sample_y) * raster_width +
+                         x * sample_scale + sample_x) * 4;
+                    for (int component = 0; component < 4; ++component) {
+                        sum[component] += pixels[source + component];
+                    }
+                }
+            }
+            const std::size_t target = (static_cast<std::size_t>(y) * width + x) * 4;
+            for (int component = 0; component < 4; ++component) {
+                output.pixels[target + component] = static_cast<unsigned char>(sum[component] / 4);
+            }
+        }
+    }
+    return output;
+}
+
+Slic3r::ThumbnailsList render_model_thumbnails(const Slic3r::Model& model,
+                                                const Slic3r::DynamicPrintConfig& config,
+                                                const Slic3r::ThumbnailsParams& params)
+{
+    Slic3r::ThumbnailsList thumbnails;
+    thumbnails.reserve(params.sizes.size());
+    for (const Slic3r::Vec2d& size : params.sizes) {
+        thumbnails.push_back(render_model_thumbnail(
+            model, config,
+            static_cast<unsigned int>(std::max(0.0, std::round(size.x()))),
+            static_cast<unsigned int>(std::max(0.0, std::round(size.y()))),
+            params.transparent_background));
+    }
+    return thumbnails;
+}
+
 bool store_gcode_3mf(const std::string& output_path,
                      Slic3r::Model& model,
                      Slic3r::DynamicPrintConfig& config,
                      const std::string& gcode_path,
                      Slic3r::GCodeProcessorResult& processor_result,
                      const Slic3r::PrintStatistics& statistics,
-                     bool support_used)
+                     bool support_used,
+                     Slic3r::ThumbnailData plate_thumbnail)
 {
     Slic3r::PlateData plate;
     plate.plate_index = 0;
@@ -497,16 +748,7 @@ bool store_gcode_3mf(const std::string& output_path,
     plate.nozzle_change_sequence = processor_result.nozzle_change_sequence;
     plate.optimal_assignment = processor_result.optimal_assignment;
     plate.parse_filament_info(&processor_result);
-    // The GUI normally supplies a rendered plate thumbnail. The headless API
-    // still needs concrete relationship targets, so provide a neutral valid
-    // image instead of emitting dangling OPC relationships.
-    plate.plate_thumbnail.set(256, 256);
-    for (std::size_t index = 0; index < plate.plate_thumbnail.pixels.size(); index += 4) {
-        plate.plate_thumbnail.pixels[index] = 245;
-        plate.plate_thumbnail.pixels[index + 1] = 245;
-        plate.plate_thumbnail.pixels[index + 2] = 245;
-        plate.plate_thumbnail.pixels[index + 3] = 255;
-    }
+    plate.plate_thumbnail = std::move(plate_thumbnail);
 
     Slic3r::StoreParams params;
     params.path = output_path.c_str();
@@ -1541,7 +1783,10 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
         report_progress(callbacks, 0.88f, "Exporting G-code");
         Slic3r::GCodeProcessorResult processor_result;
-        result.output.path = print.export_gcode(output_path, &processor_result);
+        const auto thumbnail_callback = [&plate_model, &config](const Slic3r::ThumbnailsParams& params) {
+            return render_model_thumbnails(plate_model, config, params);
+        };
+        result.output.path = print.export_gcode(output_path, &processor_result, thumbnail_callback);
         result.output.ownership = library_temporary
             ? OutputArtifactOwnership::LibraryTemporary
             : OutputArtifactOwnership::CallerOwned;
@@ -1569,9 +1814,17 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             }
 
             report_progress(callbacks, 0.94f, "Packaging sliced G-code 3MF");
+            Slic3r::ThumbnailData plate_thumbnail =
+                render_model_thumbnail(plate_model, config, 256, 256, false);
+            if (!plate_thumbnail.is_valid()) {
+                result.diagnostics.push_back({"gcode_3mf", "Slicer could not render the sliced G-code 3MF thumbnail", false});
+                discard_generated_temporary();
+                result.output.path.clear();
+                return result;
+            }
             if (!store_gcode_3mf(package_path, plate_model, config, result.output.path,
                                  processor_result, print.print_statistics(),
-                                 print.has_support_material())) {
+                                 print.has_support_material(), std::move(plate_thumbnail))) {
                 result.diagnostics.push_back({"gcode_3mf", "Slicer could not package the sliced G-code 3MF", false});
                 discard_generated_temporary();
                 result.output.path.clear();
