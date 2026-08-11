@@ -14,6 +14,8 @@
 #include <libslic3r/libslic3r.h>
 #include <libslic3r/miniz_extension.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <openssl/evp.h>
 
 #include <algorithm>
@@ -242,6 +244,24 @@ std::vector<std::pair<std::string, std::string>> serialized_values(const Slic3r:
     return values;
 }
 
+void normalize_filament_identity(Slic3r::DynamicPrintConfig& config)
+{
+    const auto* variants = config.option<Slic3r::ConfigOptionStrings>("filament_extruder_variant");
+    if (variants == nullptr || variants->values.empty()) {
+        return;
+    }
+
+    auto* self_indices = config.option<Slic3r::ConfigOptionInts>("filament_self_index", true);
+    if (self_indices->values.size() == variants->values.size()) {
+        return;
+    }
+
+    self_indices->values.resize(variants->values.size());
+    for (std::size_t index = 0; index < self_indices->values.size(); ++index) {
+        self_indices->values[index] = static_cast<int>(index + 1);
+    }
+}
+
 Slic3r::DynamicPrintConfig dynamic_config(const ConfigSnapshot& snapshot)
 {
     Slic3r::DynamicPrintConfig config;
@@ -349,6 +369,27 @@ bool validate_gcode_3mf(const std::string& path, std::string& error)
             error = std::string("the generated archive is missing required entry ") + entry;
             return false;
         }
+    }
+
+    std::vector<unsigned char> project_config_bytes;
+    if (!extract_zip_entry(archive, "Metadata/project_settings.config", project_config_bytes)) {
+        error = "the generated archive contains no readable project configuration";
+        return false;
+    }
+    try {
+        const auto project_config = nlohmann::json::parse(
+            project_config_bytes.begin(), project_config_bytes.end());
+        const auto variants = project_config.find("filament_extruder_variant");
+        const auto self_indices = project_config.find("filament_self_index");
+        if (variants != project_config.end() && variants->is_array() && !variants->empty() &&
+            (self_indices == project_config.end() || !self_indices->is_array() ||
+             self_indices->size() != variants->size())) {
+            error = "the generated project configuration has inconsistent filament_extruder_variant and filament_self_index arrays";
+            return false;
+        }
+    } catch (const std::exception& exception) {
+        error = std::string("the generated project configuration is invalid JSON: ") + exception.what();
+        return false;
     }
 
     std::vector<unsigned char> relationship_bytes;
@@ -1451,6 +1492,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         }
 
         Slic3r::DynamicPrintConfig config = dynamic_config(request.config);
+        normalize_filament_identity(config);
         if (request.center_on_build_plate) {
             plate_model.center_instances_around_point(build_plate_center(config));
         }
