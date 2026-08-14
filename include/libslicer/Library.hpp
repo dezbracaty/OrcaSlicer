@@ -4,6 +4,8 @@
 #include "Export.hpp"
 #include "Toolpath.hpp"
 
+#include <array>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -183,6 +185,115 @@ struct GCodePreviewResult
     explicit operator bool() const noexcept { return success; }
 };
 
+struct ProjectImportVertex
+{
+    float x{0.0f};
+    float y{0.0f};
+    float z{0.0f};
+};
+
+struct ProjectImportTriangle
+{
+    std::uint32_t vertex_a{0};
+    std::uint32_t vertex_b{0};
+    std::uint32_t vertex_c{0};
+};
+
+// Compact split-tree annotation used by Orca/Bambu facet painting. Label 0
+// means the volume default; positive labels are one-based filament indices.
+struct ProjectImportFacetLabelRoot
+{
+    std::uint32_t triangle_index{0};
+    std::uint32_t bitstream_start_index{0};
+};
+
+struct ProjectImportFacetLabels
+{
+    std::vector<ProjectImportFacetLabelRoot> roots;
+    std::vector<std::uint8_t> bitstream;
+
+    bool empty() const noexcept { return roots.empty() || bitstream.empty(); }
+};
+
+struct ProjectImportMesh
+{
+    std::string id;
+    std::string name;
+    std::string filament_id;
+    std::vector<ProjectImportVertex> vertices;
+    std::vector<ProjectImportTriangle> triangles;
+    ProjectImportFacetLabels facet_labels;
+};
+
+struct ProjectImportInstance
+{
+    std::string mesh_id;
+    std::string name;
+    // Row-major affine matrix. Coordinates and translations use millimetres.
+    std::array<double, 16> transform{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0};
+    bool printable{true};
+};
+
+struct ProjectImportConfigEntry
+{
+    std::string key;
+    std::string value;
+};
+
+enum class ProjectImportConfigGroup
+{
+    Project,
+    Printer,
+    Process
+};
+
+struct ProjectImportGroupedConfigEntry
+{
+    ProjectImportConfigGroup group{ProjectImportConfigGroup::Project};
+    ProjectImportConfigEntry entry;
+};
+
+struct ProjectImportColor
+{
+    float red{0.8f};
+    float green{0.8f};
+    float blue{0.8f};
+    float alpha{1.0f};
+};
+
+struct ProjectImportFilament
+{
+    std::string id;
+    std::string preset_id;
+    std::string name;
+    std::string vendor;
+    std::string material_type;
+    ProjectImportColor color;
+    std::vector<ProjectImportConfigEntry> settings;
+};
+
+struct ProjectImportRequest
+{
+    std::string path;
+};
+
+struct ProjectImportResult
+{
+    bool success{false};
+    bool cancelled{false};
+    std::vector<ProjectImportMesh> meshes;
+    std::vector<ProjectImportInstance> instances;
+    std::vector<ProjectImportFilament> filaments;
+    std::vector<ProjectImportGroupedConfigEntry> config;
+    std::vector<SliceDiagnostic> diagnostics;
+
+    explicit operator bool() const noexcept { return success; }
+};
+
 class LIBSLICER_API Library final
 {
 public:
@@ -202,6 +313,8 @@ public:
     SliceResult slice(const SliceRequest& request, const SliceCallbacks& callbacks = {}) const;
     GCodePreviewResult load_gcode_preview(const GCodePreviewRequest& request,
                                           const SliceCallbacks& callbacks = {}) const;
+    ProjectImportResult import_project(const ProjectImportRequest& request,
+                                       const SliceCallbacks& callbacks = {}) const;
 
 private:
     Library();

@@ -245,6 +245,157 @@ std::vector<std::pair<std::string, std::string>> serialized_values(const Slic3r:
     return values;
 }
 
+std::vector<std::string> serialized_option_values(const Slic3r::DynamicPrintConfig& config,
+                                                  const std::string& key)
+{
+    const Slic3r::ConfigOption* option = config.option(key);
+    if (option == nullptr) {
+        return {};
+    }
+    if (const auto* vector = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(option)) {
+        return vector->vserialize();
+    }
+    return {option->serialize()};
+}
+
+std::string option_value_at(const Slic3r::DynamicPrintConfig& config,
+                            const std::string& key,
+                            std::size_t index)
+{
+    const auto values = serialized_option_values(config, key);
+    if (values.empty()) {
+        return {};
+    }
+    return values[std::min(index, values.size() - 1)];
+}
+
+int hexadecimal_digit(char value)
+{
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+ProjectImportColor project_import_color(const std::string& value)
+{
+    ProjectImportColor result;
+    if ((value.size() != 7 && value.size() != 9) || value.front() != '#') {
+        return result;
+    }
+    const auto component = [&value](std::size_t offset) -> std::optional<float> {
+        const int high = hexadecimal_digit(value[offset]);
+        const int low = hexadecimal_digit(value[offset + 1]);
+        if (high < 0 || low < 0) return std::nullopt;
+        return static_cast<float>((high << 4) | low) / 255.0f;
+    };
+    const auto red = component(1);
+    const auto green = component(3);
+    const auto blue = component(5);
+    const auto alpha = value.size() == 9 ? component(7) : std::optional<float>{1.0f};
+    if (!red || !green || !blue || !alpha) {
+        return result;
+    }
+    result.red = *red;
+    result.green = *green;
+    result.blue = *blue;
+    result.alpha = *alpha;
+    return result;
+}
+
+std::vector<ProjectImportFilament> project_import_filaments(
+    const Slic3r::DynamicPrintConfig& config,
+    const std::vector<Slic3r::Preset*>& project_presets,
+    std::size_t minimum_count)
+{
+    std::size_t count = minimum_count;
+    for (const std::string& key : {"filament_settings_id", "filament_type",
+                                   "filament_vendor", "filament_colour"}) {
+        count = std::max(count, serialized_option_values(config, key).size());
+    }
+
+    std::vector<ProjectImportFilament> result(count);
+    const std::unordered_set<std::string> filament_keys(
+        Slic3r::Preset::filament_options().begin(),
+        Slic3r::Preset::filament_options().end());
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        auto& filament = result[index];
+        filament.id = "filament-" + std::to_string(index + 1);
+        filament.preset_id = option_value_at(config, "filament_settings_id", index);
+        filament.name = filament.preset_id.empty() ? filament.id : filament.preset_id;
+        filament.vendor = option_value_at(config, "filament_vendor", index);
+        filament.material_type = option_value_at(config, "filament_type", index);
+        filament.color = project_import_color(
+            option_value_at(config, "filament_colour", index));
+
+        for (const std::string& key : filament_keys) {
+            const Slic3r::ConfigOption* option = config.option(key);
+            if (option == nullptr) continue;
+            if (const auto* vector = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(option)) {
+                const auto values = vector->vserialize();
+                if (!values.empty()) {
+                    filament.settings.push_back(
+                        {key, values[std::min(index, values.size() - 1)]});
+                }
+            } else {
+                filament.settings.push_back({key, option->serialize()});
+            }
+        }
+    }
+
+    // Embedded filament presets carry the most faithful per-filament values.
+    // Match them to the active ordered list by preset name and overlay settings.
+    for (const Slic3r::Preset* preset : project_presets) {
+        if (preset == nullptr || preset->type != Slic3r::Preset::TYPE_FILAMENT) continue;
+        const auto found = std::find_if(result.begin(), result.end(), [preset](const auto& filament) {
+            return filament.preset_id == preset->name || filament.name == preset->name;
+        });
+        if (found == result.end()) continue;
+        found->name = preset->name;
+        if (!preset->setting_id.empty()) found->preset_id = preset->setting_id;
+        found->settings.clear();
+        for (const auto& [key, value] : serialized_values(preset->config)) {
+            if (filament_keys.count(key) != 0) {
+                found->settings.push_back({key, value});
+            }
+        }
+        const std::string vendor = option_value_at(preset->config, "filament_vendor", 0);
+        const std::string material = option_value_at(preset->config, "filament_type", 0);
+        const std::string color = option_value_at(preset->config, "filament_colour", 0);
+        if (!vendor.empty()) found->vendor = vendor;
+        if (!material.empty()) found->material_type = material;
+        if (!color.empty()) found->color = project_import_color(color);
+    }
+    return result;
+}
+
+std::vector<ProjectImportGroupedConfigEntry> project_import_config(
+    const Slic3r::DynamicPrintConfig& config)
+{
+    const std::unordered_set<std::string> printer_keys(
+        Slic3r::Preset::printer_options().begin(),
+        Slic3r::Preset::printer_options().end());
+    const std::unordered_set<std::string> process_keys(
+        Slic3r::Preset::print_options().begin(),
+        Slic3r::Preset::print_options().end());
+    const std::unordered_set<std::string> filament_keys(
+        Slic3r::Preset::filament_options().begin(),
+        Slic3r::Preset::filament_options().end());
+
+    std::vector<ProjectImportGroupedConfigEntry> result;
+    for (const auto& [key, value] : serialized_values(config)) {
+        if (filament_keys.count(key) != 0) continue;
+        ProjectImportConfigGroup group = ProjectImportConfigGroup::Project;
+        if (printer_keys.count(key) != 0) {
+            group = ProjectImportConfigGroup::Printer;
+        } else if (process_keys.count(key) != 0 || key == "curr_bed_type") {
+            group = ProjectImportConfigGroup::Process;
+        }
+        result.push_back({group, {key, value}});
+    }
+    return result;
+}
+
 void normalize_filament_identity(Slic3r::DynamicPrintConfig& config)
 {
     const auto* variants = config.option<Slic3r::ConfigOptionStrings>("filament_extruder_variant");
@@ -1945,6 +2096,205 @@ GCodePreviewResult Library::load_gcode_preview(const GCodePreviewRequest& reques
     } catch (const std::exception& error) {
         result.diagnostics.push_back({"gcode", error.what(), false});
         result.preview.reset();
+    }
+    return result;
+}
+
+ProjectImportResult Library::import_project(const ProjectImportRequest& request,
+                                            const SliceCallbacks& callbacks) const
+{
+    ProjectImportResult result;
+    Slic3r::PlateDataPtrs plate_data;
+    std::vector<Slic3r::Preset*> project_presets;
+    const auto release_import_resources = [&]() {
+        Slic3r::release_PlateData_list(plate_data);
+        for (Slic3r::Preset* preset : project_presets) {
+            if (preset != nullptr) {
+                delete preset->loading_substitutions;
+                preset->loading_substitutions = nullptr;
+                delete preset;
+            }
+        }
+        project_presets.clear();
+    };
+
+    try {
+        std::error_code file_error;
+        if (request.path.empty() ||
+            !fs::is_regular_file(request.path, file_error) || file_error) {
+            result.diagnostics.push_back(
+                {"input", "3MF project does not exist: " + request.path, false});
+            release_import_resources();
+            return result;
+        }
+
+        std::string lower_path = request.path;
+        std::transform(lower_path.begin(), lower_path.end(), lower_path.begin(),
+                       [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+        if (lower_path.size() < 4 || lower_path.substr(lower_path.size() - 4) != ".3mf" ||
+            (lower_path.size() >= 10 &&
+             lower_path.substr(lower_path.size() - 10) == ".gcode.3mf")) {
+            result.diagnostics.push_back(
+                {"input", "Project import currently accepts model .3mf files only", false});
+            release_import_resources();
+            return result;
+        }
+        if (cancellation_requested(callbacks)) {
+            result.cancelled = true;
+            release_import_resources();
+            return result;
+        }
+
+        report_progress(callbacks, 0.02f, "Opening 3MF project");
+        Slic3r::DynamicPrintConfig config;
+        Slic3r::ConfigSubstitutionContext substitutions(
+            Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
+        Slic3r::En3mfType file_type = Slic3r::En3mfType::From_Other;
+        Slic3r::Semver file_version;
+        Slic3r::LoadStrategy strategy =
+            Slic3r::LoadStrategy::LoadModel |
+            Slic3r::LoadStrategy::LoadConfig |
+            Slic3r::LoadStrategy::CheckVersion |
+            Slic3r::LoadStrategy::AddDefaultInstances |
+            Slic3r::LoadStrategy::Silence;
+        const Slic3r::Import3mfProgressFn progress =
+            [&callbacks](int stage, int current, int total, bool& cancel) {
+                cancel = cancellation_requested(callbacks);
+                if (cancel) return;
+                const float stage_fraction = total > 0
+                    ? std::clamp(static_cast<float>(current) / static_cast<float>(total),
+                                 0.0f, 1.0f)
+                    : 0.0f;
+                const float progress_value = std::clamp(
+                    (static_cast<float>(stage) + stage_fraction) /
+                        static_cast<float>(Slic3r::IMPORT_STAGE_MAX),
+                    0.02f, 0.72f);
+                report_progress(callbacks, progress_value, "Reading 3MF project");
+            };
+
+        Slic3r::Model model = Slic3r::Model::read_from_archive(
+            request.path, &config, &substitutions, file_type, strategy,
+            &plate_data, &project_presets, &file_version, progress);
+        if (cancellation_requested(callbacks)) {
+            result.cancelled = true;
+            release_import_resources();
+            return result;
+        }
+
+        report_progress(callbacks, 0.75f, "Converting model geometry");
+        std::size_t maximum_filament_id = 0;
+        for (std::size_t object_index = 0; object_index < model.objects.size(); ++object_index) {
+            const Slic3r::ModelObject* object = model.objects[object_index];
+            if (object == nullptr) continue;
+            for (std::size_t volume_index = 0; volume_index < object->volumes.size(); ++volume_index) {
+                const Slic3r::ModelVolume* volume = object->volumes[volume_index];
+                if (volume == nullptr || !volume->is_model_part() || volume->mesh().empty()) {
+                    continue;
+                }
+
+                ProjectImportMesh mesh;
+                mesh.id = "object-" + std::to_string(object_index + 1) +
+                    "/mesh-" + std::to_string(volume_index + 1);
+                mesh.name = !volume->name.empty() ? volume->name
+                    : !object->name.empty() ? object->name : mesh.id;
+                const int extruder_id = volume->extruder_id();
+                if (extruder_id > 0) {
+                    mesh.filament_id = "filament-" + std::to_string(extruder_id);
+                    maximum_filament_id = std::max(
+                        maximum_filament_id, static_cast<std::size_t>(extruder_id));
+                }
+
+                const auto& indexed = volume->mesh().its;
+                mesh.vertices.reserve(indexed.vertices.size());
+                for (const auto& vertex : indexed.vertices) {
+                    mesh.vertices.push_back({vertex.x(), vertex.y(), vertex.z()});
+                }
+                mesh.triangles.reserve(indexed.indices.size());
+                for (const auto& triangle : indexed.indices) {
+                    mesh.triangles.push_back({
+                        static_cast<std::uint32_t>(triangle.x()),
+                        static_cast<std::uint32_t>(triangle.y()),
+                        static_cast<std::uint32_t>(triangle.z())});
+                }
+
+                const auto& facet_labels = volume->mmu_segmentation_facets.get_data();
+                mesh.facet_labels.roots.reserve(facet_labels.triangles_to_split.size());
+                for (const auto& root : facet_labels.triangles_to_split) {
+                    if (root.triangle_idx < 0 || root.bitstream_start_idx < 0) continue;
+                    mesh.facet_labels.roots.push_back({
+                        static_cast<std::uint32_t>(root.triangle_idx),
+                        static_cast<std::uint32_t>(root.bitstream_start_idx)});
+                }
+                mesh.facet_labels.bitstream.reserve(facet_labels.bitstream.size());
+                for (const bool bit : facet_labels.bitstream) {
+                    mesh.facet_labels.bitstream.push_back(bit ? 1u : 0u);
+                }
+
+                const auto append_instance = [&](const Slic3r::Transform3d& instance_matrix,
+                                                 bool printable,
+                                                 std::size_t instance_index) {
+                    ProjectImportInstance instance;
+                    instance.mesh_id = mesh.id;
+                    instance.name = !object->name.empty() ? object->name : mesh.name;
+                    if (object->instances.size() > 1) {
+                        instance.name += " " + std::to_string(instance_index + 1);
+                    }
+                    const Slic3r::Transform3d combined = instance_matrix * volume->get_matrix();
+                    for (int row = 0; row < 4; ++row) {
+                        for (int column = 0; column < 4; ++column) {
+                            instance.transform[static_cast<std::size_t>(row * 4 + column)] =
+                                combined(row, column);
+                        }
+                    }
+                    instance.printable = object->printable && printable;
+                    result.instances.push_back(std::move(instance));
+                };
+
+                if (object->instances.empty()) {
+                    append_instance(Slic3r::Transform3d::Identity(), true, 0);
+                } else {
+                    for (std::size_t instance_index = 0;
+                         instance_index < object->instances.size(); ++instance_index) {
+                        const Slic3r::ModelInstance* instance = object->instances[instance_index];
+                        if (instance != nullptr) {
+                            append_instance(instance->get_matrix(), instance->printable,
+                                            instance_index);
+                        }
+                    }
+                }
+                result.meshes.push_back(std::move(mesh));
+            }
+        }
+
+        if (result.meshes.empty() || result.instances.empty()) {
+            result.diagnostics.push_back(
+                {"model", "3MF project contains no printable model geometry", false});
+            release_import_resources();
+            return result;
+        }
+
+        report_progress(callbacks, 0.88f, "Converting project settings");
+        result.filaments = project_import_filaments(
+            config, project_presets, maximum_filament_id);
+        result.config = project_import_config(config);
+        for (const std::string& key : substitutions.unrecogized_keys) {
+            result.diagnostics.push_back(
+                {"config", "Unrecognized 3MF project setting: " + key, true});
+        }
+
+        result.success = true;
+        release_import_resources();
+        report_progress(callbacks, 1.0f, "3MF project ready");
+    } catch (const Slic3r::CanceledException&) {
+        result.cancelled = true;
+        release_import_resources();
+    } catch (const std::exception& error) {
+        if (cancellation_requested(callbacks)) {
+            result.cancelled = true;
+        } else {
+            result.diagnostics.push_back({"3mf", error.what(), false});
+        }
+        release_import_resources();
     }
     return result;
 }
