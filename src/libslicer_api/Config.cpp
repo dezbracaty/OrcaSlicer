@@ -74,13 +74,18 @@ public:
         // print preset. It is nevertheless an editable slicing input and is
         // presented alongside process settings by the public three-group API.
         const std::set<std::string> process_project_keys{"curr_bed_type"};
+        // Per-slot colors are also project state (they are intentionally not
+        // part of Preset::filament_options()), but must travel with a project
+        // so facet labels continue to address the correct material colors.
+        const std::set<std::string> filament_project_keys{"filament_colour"};
 
         items.reserve(process_keys.size() + filament_keys.size() + printer_keys.size());
         for (const auto& [key, option] : Slic3r::print_config_def.options) {
             const bool internal    = !has_presentation_metadata(option);
             const bool visible     = !internal && option.gui_type != Slic3r::ConfigOptionDef::GUIType::legend;
             const bool is_process  = process_keys.count(key) != 0 || process_project_keys.count(key) != 0;
-            const bool is_filament = filament_keys.count(key) != 0;
+            const bool is_filament = filament_keys.count(key) != 0 ||
+                                     filament_project_keys.count(key) != 0;
             const bool is_printer  = printer_keys.count(key) != 0;
             const int group_count  = static_cast<int>(is_process) + static_cast<int>(is_filament) + static_cast<int>(is_printer);
             if (option.printer_technology == Slic3r::ptSLA || !visible || option.readonly) {
@@ -319,9 +324,18 @@ SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std:
             candidate.set_deserialize_strict(key, serialized_value);
             const auto* option_definition = Slic3r::print_config_def.get(key);
             const auto* option            = candidate.option(key);
-            if (option_definition != nullptr && option != nullptr && definition->type != SettingType::List &&
-                is_scalar_numeric(definition->element_type) && !option_definition->is_value_valid(option->getFloat())) {
-                return failure(key, "Configuration value is outside the allowed range");
+            if (option_definition != nullptr && option != nullptr) {
+                std::optional<double> numeric_value;
+                if (definition->type == SettingType::Integer) {
+                    numeric_value = static_cast<double>(option->getInt());
+                } else if (definition->type == SettingType::Float ||
+                           definition->type == SettingType::Percent ||
+                           definition->type == SettingType::FloatOrPercent) {
+                    numeric_value = option->getFloat();
+                }
+                if (numeric_value && !option_definition->is_value_valid(*numeric_value)) {
+                    return failure(key, "Configuration value is outside the allowed range");
+                }
             }
         }
     } catch (const std::exception& error) {

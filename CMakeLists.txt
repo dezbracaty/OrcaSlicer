@@ -298,11 +298,13 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/libslicer"
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/OrcaFilamentLibrary.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Flashforge.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/BBL.json"
     DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/profiles"
 )
 install(DIRECTORY
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/OrcaFilamentLibrary"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Flashforge"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/BBL"
     DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/profiles"
 )
 install(FILES

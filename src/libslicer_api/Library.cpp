@@ -205,6 +205,8 @@ std::string renderable_texture_path(const fs::path& resource_root,
         std::error_code error;
         if (fs::is_regular_file(raster_path, error) && !error) {
             path = std::move(raster_path);
+        } else {
+            return {};
         }
     }
     return resource.empty() ? std::string{} : path.lexically_normal().string();
@@ -1562,7 +1564,7 @@ class Library::Impl
 {
 public:
     std::string resource_directory;
-    Slic3r::PresetBundle presets;
+    std::vector<std::unique_ptr<Slic3r::PresetBundle>> vendor_presets;
     std::vector<MachineModelOption> machines;
     std::vector<BuildPlateOption> build_plates;
 };
@@ -1601,53 +1603,57 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
 
         constexpr const char* filament_library = "OrcaFilamentLibrary";
         const bool has_filament_library = fs::is_regular_file(profiles_directory / "OrcaFilamentLibrary.json");
+        Slic3r::PresetBundle filament_presets;
         if (has_filament_library) {
             vendors.erase(std::remove(vendors.begin(), vendors.end(), filament_library), vendors.end());
-            library->impl_->presets.load_vendor_configs_from_json(
+            filament_presets.load_vendor_configs_from_json(
                 profiles_directory.string(), filament_library, Slic3r::PresetBundle::LoadSystem,
                 Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
         }
         for (const std::string& vendor : vendors) {
-            library->impl_->presets.load_vendor_configs_from_json(
+            auto presets = std::make_unique<Slic3r::PresetBundle>();
+            presets->load_vendor_configs_from_json(
                 profiles_directory.string(), vendor, Slic3r::PresetBundle::LoadSystem,
                 Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent,
-                has_filament_library ? &library->impl_->presets : nullptr);
-        }
+                has_filament_library ? &filament_presets : nullptr);
 
-        for (const auto& [vendor_id, vendor] : library->impl_->presets.vendors) {
-            for (const auto& model : vendor.models) {
-                if (model.technology != Slic3r::ptFFF) {
-                    continue;
-                }
-                MachineModelOption machine;
-                machine.id               = model.id;
-                machine.vendor_id        = vendor_id;
-                machine.name             = model.name.empty() ? model.id : model.name;
-                machine.family           = model.family;
-                machine.cover_image_path = resource_path(library->impl_->resource_directory,
-                                                         vendor_id, machine.name + "_cover.png");
-                machine.bed_model_path   = resource_path(library->impl_->resource_directory, vendor_id, model.bed_model);
-                machine.bed_texture_path = renderable_texture_path(library->impl_->resource_directory,
-                                                                   vendor_id, model.bed_texture);
-
-                for (const auto& variant : model.variants) {
-                    const auto* preset = library->impl_->presets.printers.find_system_preset_by_model_and_variant(
-                        model.id, variant.name);
-                    if (preset == nullptr) {
+            for (const auto& [vendor_id, vendor_profile] : presets->vendors) {
+                for (const auto& model : vendor_profile.models) {
+                    if (model.technology != Slic3r::ptFFF) {
                         continue;
                     }
-                    MachineVariantOption option;
-                    option.id                = variant.name;
-                    option.name              = variant.name + " mm";
-                    option.nozzle_diameter   = nozzle_diameter(variant.name);
-                    option.printer_preset_id = preset->name;
-                    populate_printable_volume(preset->config, option);
-                    machine.variants.push_back(std::move(option));
-                }
-                if (!machine.variants.empty()) {
-                    library->impl_->machines.push_back(std::move(machine));
+                    MachineModelOption machine;
+                    machine.id               = model.id;
+                    machine.vendor_id        = vendor_id;
+                    machine.name             = model.name.empty() ? model.id : model.name;
+                    machine.family           = model.family;
+                    machine.cover_image_path = resource_path(library->impl_->resource_directory,
+                                                             vendor_id, machine.name + "_cover.png");
+                    machine.bed_model_path   = resource_path(library->impl_->resource_directory,
+                                                             vendor_id, model.bed_model);
+                    machine.bed_texture_path = renderable_texture_path(library->impl_->resource_directory,
+                                                                       vendor_id, model.bed_texture);
+
+                    for (const auto& variant : model.variants) {
+                        const auto* preset = presets->printers.find_system_preset_by_model_and_variant(
+                            model.id, variant.name);
+                        if (preset == nullptr) {
+                            continue;
+                        }
+                        MachineVariantOption option;
+                        option.id                = variant.name;
+                        option.name              = variant.name + " mm";
+                        option.nozzle_diameter   = nozzle_diameter(variant.name);
+                        option.printer_preset_id = preset->name;
+                        populate_printable_volume(preset->config, option);
+                        machine.variants.push_back(std::move(option));
+                    }
+                    if (!machine.variants.empty()) {
+                        library->impl_->machines.push_back(std::move(machine));
+                    }
                 }
             }
+            library->impl_->vendor_presets.push_back(std::move(presets));
         }
         std::sort(library->impl_->machines.begin(), library->impl_->machines.end(),
                   [](const MachineModelOption& left, const MachineModelOption& right) {
@@ -1696,13 +1702,21 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
 {
     ConfigCreateResult result;
     try {
-        auto selected = impl_->presets;
-        const Slic3r::Preset* printer = selected.printers.find_system_preset_by_model_and_variant(
-            selection.machine_model_id, selection.machine_variant_id);
-        if (printer == nullptr) {
+        const Slic3r::PresetBundle* source_presets = nullptr;
+        for (const auto& presets : impl_->vendor_presets) {
+            if (presets->printers.find_system_preset_by_model_and_variant(
+                    selection.machine_model_id, selection.machine_variant_id) != nullptr) {
+                source_presets = presets.get();
+                break;
+            }
+        }
+        if (source_presets == nullptr) {
             result.diagnostics.push_back({"machine", "Unknown machine model or nozzle variant"});
             return result;
         }
+        auto selected = *source_presets;
+        const Slic3r::Preset* printer = selected.printers.find_system_preset_by_model_and_variant(
+            selection.machine_model_id, selection.machine_variant_id);
 
         const std::string printer_name = printer->name;
         selected.printers.select_preset_by_name(printer_name, true);
