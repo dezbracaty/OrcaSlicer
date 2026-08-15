@@ -1150,13 +1150,21 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
     }
 
     preview->filaments.reserve(filament_count);
+    const auto* configured_filament_colors = config == nullptr
+        ? nullptr
+        : config->option<Slic3r::ConfigOptionStrings>("filament_colour");
     for (std::size_t index = 0; index < filament_count; ++index) {
         ToolpathFilament filament;
         filament.id = static_cast<std::uint16_t>(index);
         filament.tool_id = static_cast<std::uint16_t>(tool_by_filament[index]);
-        filament.color = parse_color(index < source.extruder_colors.size()
-                                         ? source.extruder_colors[index]
-                                         : std::string{"#FF8000"});
+        const bool has_configured_color = configured_filament_colors != nullptr &&
+            index < configured_filament_colors->values.size() &&
+            !configured_filament_colors->values[index].empty();
+        filament.color = parse_color(has_configured_color
+            ? configured_filament_colors->values[index]
+            : index < source.extruder_colors.size()
+                ? source.extruder_colors[index]
+                : std::string{"#FF8000"});
         if (index < source.filament_diameters.size()) filament.diameter_mm = source.filament_diameters[index];
         if (index < source.filament_densities.size()) filament.density_g_cm3 = source.filament_densities[index];
         if (index < source.filament_costs.size()) filament.cost_per_kg = source.filament_costs[index];
@@ -1833,25 +1841,118 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         report_progress(callbacks, 0.02f, "Loading models");
         Slic3r::Model plate_model;
         for (const SliceObjectInput& input : request.objects) {
-            const std::string& path = input.model_path;
-            std::error_code error;
-            if (!fs::is_regular_file(path, error) || error) {
-                result.diagnostics.push_back({"model", "Model file does not exist: " + path, false});
-                return result;
-            }
-            Slic3r::Model source = Slic3r::Model::read_from_file(path);
-            if (!input.support_enforcer_paths.empty() && source.objects.size() != 1) {
+            const bool has_file_input = !input.model_path.empty();
+            const bool has_memory_input = !input.volumes.empty();
+            if (has_file_input == has_memory_input) {
                 result.diagnostics.push_back({
-                    "support",
-                    "A model with support enforcers must contain exactly one printable object: " + path,
+                    "model",
+                    "Each slice object must provide exactly one of model_path or in-memory volumes",
                     false});
                 return result;
             }
             Slic3r::ModelObject* support_target = nullptr;
-            for (const Slic3r::ModelObject* object : source.objects) {
-                Slic3r::ModelObject* added = plate_model.add_object(*object);
-                if (support_target == nullptr) {
-                    support_target = added;
+
+            if (has_memory_input) {
+                Slic3r::ModelObject* object = plate_model.add_object();
+                object->name = input.name;
+                for (const SliceVolumeInput& source_volume : input.volumes) {
+                    if (source_volume.vertices.empty() || source_volume.triangles.empty()) {
+                        result.diagnostics.push_back({"model", "In-memory slice volume has no geometry", false});
+                        return result;
+                    }
+                    std::vector<Slic3r::Vec3f> vertices;
+                    vertices.reserve(source_volume.vertices.size());
+                    for (const auto& vertex : source_volume.vertices) {
+                        vertices.emplace_back(vertex.x, vertex.y, vertex.z);
+                    }
+                    std::vector<Slic3r::Vec3i32> faces;
+                    faces.reserve(source_volume.triangles.size());
+                    for (const auto& triangle : source_volume.triangles) {
+                        if (triangle.vertex_a >= vertices.size() ||
+                            triangle.vertex_b >= vertices.size() ||
+                            triangle.vertex_c >= vertices.size()) {
+                            result.diagnostics.push_back({"model", "In-memory slice volume has an invalid triangle index", false});
+                            return result;
+                        }
+                        faces.emplace_back(
+                            static_cast<int>(triangle.vertex_a),
+                            static_cast<int>(triangle.vertex_b),
+                            static_cast<int>(triangle.vertex_c));
+                    }
+
+                    Slic3r::ModelVolumeType volume_type = Slic3r::ModelVolumeType::MODEL_PART;
+                    if (source_volume.role == SliceVolumeRole::SupportEnforcer) {
+                        volume_type = Slic3r::ModelVolumeType::SUPPORT_ENFORCER;
+                    } else if (source_volume.role == SliceVolumeRole::SupportBlocker) {
+                        volume_type = Slic3r::ModelVolumeType::SUPPORT_BLOCKER;
+                    }
+                    Slic3r::ModelVolume* volume = object->add_volume(
+                        Slic3r::TriangleMesh(std::move(vertices), std::move(faces)),
+                        volume_type, false);
+                    if (source_volume.role == SliceVolumeRole::ModelPart) {
+                        if (source_volume.default_filament_slot <= 0) {
+                            result.diagnostics.push_back({"filament", "Model volume has an invalid default filament slot", false});
+                            return result;
+                        }
+                        volume->config.set("extruder", source_volume.default_filament_slot);
+                    }
+                    if (!source_volume.facet_labels.valid()) {
+                        result.diagnostics.push_back({
+                            "facet_labels",
+                            "Facet painting roots and bitstream must either both be present or both be empty",
+                            false});
+                        return result;
+                    }
+                    if (!source_volume.facet_labels.empty()) {
+                        Slic3r::TriangleSelector::TriangleSplittingData painting;
+                        painting.triangles_to_split.reserve(source_volume.facet_labels.roots.size());
+                        for (const auto& root : source_volume.facet_labels.roots) {
+                            if (root.triangle_index >= source_volume.triangles.size() ||
+                                root.bitstream_start_index >= source_volume.facet_labels.bitstream.size()) {
+                                result.diagnostics.push_back({"facet_labels", "Facet painting references invalid triangle data", false});
+                                return result;
+                            }
+                            painting.triangles_to_split.emplace_back(
+                                static_cast<int>(root.triangle_index),
+                                static_cast<int>(root.bitstream_start_index));
+                        }
+                        painting.bitstream.reserve(source_volume.facet_labels.bitstream.size());
+                        for (const std::uint8_t bit : source_volume.facet_labels.bitstream) {
+                            painting.bitstream.push_back(bit != 0u);
+                        }
+                        painting.update_used_states(0);
+                        volume->mmu_segmentation_facets.set_data(std::move(painting));
+                    }
+                }
+                Slic3r::Transform3d transform = Slic3r::Transform3d::Identity();
+                for (int row = 0; row < 4; ++row) {
+                    for (int column = 0; column < 4; ++column) {
+                        transform(row, column) = input.transform[static_cast<std::size_t>(row * 4 + column)];
+                    }
+                }
+                object->add_instance()->set_transformation(
+                    Slic3r::Geometry::Transformation(transform));
+                support_target = object;
+            } else {
+                const std::string& path = input.model_path;
+                std::error_code error;
+                if (!fs::is_regular_file(path, error) || error) {
+                    result.diagnostics.push_back({"model", "Model file does not exist: " + path, false});
+                    return result;
+                }
+                Slic3r::Model source = Slic3r::Model::read_from_file(path);
+                if (!input.support_enforcer_paths.empty() && source.objects.size() != 1) {
+                    result.diagnostics.push_back({
+                        "support",
+                        "A model with support enforcers must contain exactly one printable object: " + path,
+                        false});
+                    return result;
+                }
+                for (const Slic3r::ModelObject* object : source.objects) {
+                    Slic3r::ModelObject* added = plate_model.add_object(*object);
+                    if (support_target == nullptr) {
+                        support_target = added;
+                    }
                 }
             }
 
@@ -1906,6 +2007,9 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
         report_progress(callbacks, 0.08f, "Validating print");
         Slic3r::Print print;
+        const auto* printer_model = config.option<Slic3r::ConfigOptionString>("printer_model");
+        print.is_BBL_printer() = printer_model != nullptr &&
+            printer_model->value.rfind("Bambu Lab", 0) == 0;
         print.set_status_callback([&](const Slic3r::PrintBase::SlicingStatus& status) {
             if (cancellation_requested(callbacks)) {
                 print.cancel();

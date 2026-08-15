@@ -97,11 +97,66 @@ struct ConfigCreateResult
     explicit operator bool() const noexcept { return success; }
 };
 
+struct SliceVertex
+{
+    float x{0.0f};
+    float y{0.0f};
+    float z{0.0f};
+};
+
+struct SliceTriangle
+{
+    std::uint32_t vertex_a{0};
+    std::uint32_t vertex_b{0};
+    std::uint32_t vertex_c{0};
+};
+
+struct SliceFacetLabelRoot
+{
+    std::uint32_t triangle_index{0};
+    std::uint32_t bitstream_start_index{0};
+};
+
+struct SliceFacetLabels
+{
+    std::vector<SliceFacetLabelRoot> roots;
+    std::vector<std::uint8_t> bitstream;
+
+    bool empty() const noexcept { return roots.empty() && bitstream.empty(); }
+    bool valid() const noexcept { return roots.empty() == bitstream.empty(); }
+};
+
+enum class SliceVolumeRole
+{
+    ModelPart,
+    SupportEnforcer,
+    SupportBlocker
+};
+
+struct SliceVolumeInput
+{
+    std::vector<SliceVertex> vertices;
+    std::vector<SliceTriangle> triangles;
+    int default_filament_slot{1};
+    SliceFacetLabels facet_labels;
+    SliceVolumeRole role{SliceVolumeRole::ModelPart};
+};
+
 struct SliceObjectInput
 {
-    // The model and its support enforcers must use the same coordinate space.
+    // File input remains available for compatibility. New document slicing
+    // uses immutable in-memory volumes so transforms and facet annotations are
+    // not discarded through an STL intermediate. Exactly one of model_path or
+    // volumes must be populated.
     std::string model_path;
     std::vector<std::string> support_enforcer_paths;
+    std::string name;
+    std::array<double, 16> transform{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0};
+    std::vector<SliceVolumeInput> volumes;
 };
 
 enum class OutputArtifactOwnership
