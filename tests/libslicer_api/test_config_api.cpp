@@ -170,6 +170,8 @@ TEST_CASE("library owns machine presets and builds a selected configuration", "[
     CHECK(nozzle->printable_area[2].x == 220.0);
     CHECK(nozzle->printable_area[2].y == 220.0);
     CHECK_FALSE(nozzle->printer_preset_id.empty());
+    CHECK(nozzle->variable_filament_slots);
+    CHECK(nozzle->max_filament_slots == 4);
 
     libslicer::ConfigSelection selection;
     selection.machine_model_id = machine->id;
@@ -198,6 +200,129 @@ TEST_CASE("library owns machine presets and builds a selected configuration", "[
     CHECK_FALSE(missing_filament.success);
     REQUIRE_FALSE(missing_filament.diagnostics.empty());
     CHECK(missing_filament.diagnostics.front().key == "filament");
+}
+
+TEST_CASE("library resizes variable filament slots atomically", "[libslicer_api][filaments]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "Flashforge AD5X";
+    selection.machine_variant_id = "0.4";
+    auto activated = library->activate_config(selection);
+    REQUIRE(activated.success);
+    REQUIRE(activated.view.filament_slots.size() == 1);
+    REQUIRE(library->set_active_filament_color(0, {0x24, 0x74, 0xd8, 0xff}));
+
+    const auto resized = library->resize_active_filament_slots(4);
+    REQUIRE(resized.success);
+    REQUIRE(resized.view.filament_slots.size() == 4);
+    CHECK(resized.view.selection.filament_preset_ids.size() == 4);
+    CHECK(resized.view.filament_slots[0].color.red == 0x24);
+    CHECK(resized.view.filament_slots[3].color.blue == 0xd8);
+    CHECK(library->validate_active_config().empty());
+
+    const auto rejected = library->resize_active_filament_slots(5);
+    CHECK_FALSE(rejected.success);
+    REQUIRE_FALSE(rejected.diagnostics.empty());
+    CHECK(library->active_config()->filament_slots.size() == 4);
+}
+
+TEST_CASE("library owns one normalized active filament configuration", "[libslicer_api][filaments]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    const auto machine = std::find_if(
+        library->machine_models().begin(), library->machine_models().end(),
+        [](const libslicer::MachineModelOption& item) {
+            return item.id == "Flashforge Creator 5";
+        });
+    REQUIRE(machine != library->machine_models().end());
+    const auto variant = std::find_if(
+        machine->variants.begin(), machine->variants.end(),
+        [](const libslicer::MachineVariantOption& item) { return item.id == "0.4"; });
+    REQUIRE(variant != machine->variants.end());
+    CHECK(variant->physical_tool_count == 4);
+    CHECK_FALSE(variant->variable_filament_slots);
+
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = machine->id;
+    selection.machine_variant_id = variant->id;
+    auto activated = library->activate_config(
+        selection, {{"filament_colour", "#11223344"}});
+    const std::string diagnostic = activated.diagnostics.empty()
+        ? std::string{}
+        : activated.diagnostics.front().key + ": " + activated.diagnostics.front().message;
+    INFO(diagnostic);
+    REQUIRE(activated.success);
+    REQUIRE(activated.view.filament_slots.size() == 4);
+    CHECK(activated.view.selection.filament_preset_ids.size() == 4);
+    CHECK(activated.view.filament_slots.front().color.red == 0x11);
+    CHECK(activated.view.filament_slots.front().color.green == 0x22);
+    CHECK(activated.view.filament_slots.front().color.blue == 0x33);
+    CHECK(activated.view.filament_slots.front().color.alpha == 0x44);
+    CHECK(library->validate_active_config().empty());
+    const auto snapshot = library->active_config_snapshot();
+    REQUIRE(snapshot.has_value());
+    const auto flush_multipliers = snapshot->value("flush_multiplier");
+    const auto flush_matrix = snapshot->value("flush_volumes_matrix");
+    REQUIRE(flush_multipliers.has_value());
+    REQUIRE(flush_matrix.has_value());
+    CHECK(std::count(flush_multipliers->begin(), flush_multipliers->end(), ',') + 1 == 4);
+    CHECK(std::count(flush_matrix->begin(), flush_matrix->end(), ',') + 1 == 64);
+
+    const auto initial_revision = activated.view.revision;
+    const auto changed_color = library->set_active_filament_color(
+        3, {0xaa, 0xbb, 0xcc, 0xdd});
+    REQUIRE(changed_color.success);
+    const auto view = library->active_config();
+    REQUIRE(view.has_value());
+    CHECK(view->revision > initial_revision);
+    REQUIRE(view->filament_slots.size() == 4);
+    CHECK(view->filament_slots[3].color.red == 0xaa);
+    CHECK(view->filament_slots[3].color.green == 0xbb);
+    CHECK(view->filament_slots[3].color.blue == 0xcc);
+    CHECK(view->filament_slots[3].color.alpha == 0xdd);
+
+    const auto invalid_slot = library->set_active_filament_color(
+        4, {0, 0, 0, 255});
+    CHECK_FALSE(invalid_slot.success);
+    REQUIRE_FALSE(invalid_slot.diagnostics.empty());
+    CHECK(invalid_slot.diagnostics.front().key == "filament");
+}
+
+TEST_CASE("library rejects mismatched filament cardinality before slicing", "[libslicer_api][slice][filaments]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "Flashforge Creator 5";
+    selection.machine_variant_id = "0.4";
+    auto created = library->create_config(selection);
+    REQUIRE(created.success);
+    REQUIRE(created.config != nullptr);
+    REQUIRE(created.config->set("filament_colour", "#11223344").success);
+
+    libslicer::SliceRequest request;
+    request.objects = {{std::string(LIBSLICER_TEST_DATA_DIR) + "/20mm_cube.obj", {}}};
+    request.config = created.config->snapshot();
+    const auto sliced = library->slice(request);
+    CHECK_FALSE(sliced.success);
+    REQUIRE_FALSE(sliced.diagnostics.empty());
+    CHECK(sliced.diagnostics.front().code == "filament");
+    CHECK(sliced.diagnostics.front().message.find("filament colours") != std::string::npos);
 }
 
 TEST_CASE("library slices a model with a preset-backed configuration", "[libslicer_api][slice]")

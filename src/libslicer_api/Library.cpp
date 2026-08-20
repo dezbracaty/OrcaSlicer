@@ -428,6 +428,155 @@ Slic3r::DynamicPrintConfig dynamic_config(const ConfigSnapshot& snapshot)
     return config;
 }
 
+std::vector<std::string> config_vector_values(const Config& config, const std::string& key)
+{
+    return serialized_option_values(dynamic_config(config.snapshot()), key);
+}
+
+std::string serialize_strings(const std::vector<std::string>& values)
+{
+    return Slic3r::ConfigOptionStrings(values).serialize();
+}
+
+SettingsResult settings_failure(std::string key, std::string message)
+{
+    SettingsResult result;
+    result.diagnostics.push_back({std::move(key), std::move(message)});
+    return result;
+}
+
+void append_changed_items(std::vector<SettingItem>& target, std::vector<SettingItem> source)
+{
+    for (auto& item : source) {
+        const auto existing = std::find_if(target.begin(), target.end(), [&item](const SettingItem& value) {
+            return value.key == item.key;
+        });
+        if (existing == target.end()) {
+            target.push_back(std::move(item));
+        } else {
+            *existing = std::move(item);
+        }
+    }
+}
+
+SettingsResult normalize_filament_colors(Config& config,
+                                          std::size_t slot_count,
+                                          const std::vector<std::string>& preferred_colors = {})
+{
+    if (slot_count == 0) {
+        return settings_failure("filament", "The active configuration has no filament slots");
+    }
+    std::vector<std::string> colors = preferred_colors.empty()
+        ? config_vector_values(config, "filament_colour")
+        : preferred_colors;
+    if (colors.empty()) {
+        colors.push_back("#00AE42");
+    }
+    colors.resize(slot_count, colors.back());
+    return config.set("filament_colour", serialize_strings(colors));
+}
+
+std::vector<ConfigDiagnostic> filament_cardinality_diagnostics(
+    const Config& config, std::size_t slot_count)
+{
+    std::vector<ConfigDiagnostic> diagnostics;
+    const auto check = [&config, slot_count, &diagnostics](const char* key, bool required) {
+        const std::size_t count = config_vector_values(config, key).size();
+        if ((required || count != 0) && count != slot_count) {
+            diagnostics.push_back({
+                key,
+                "Expected " + std::to_string(slot_count) + " values, received " +
+                    std::to_string(count)});
+        }
+    };
+    check("filament_colour", true);
+    check("filament_diameter", true);
+    check("filament_settings_id", false);
+    check("filament_type", false);
+    const std::size_t tool_count = config_vector_values(config, "nozzle_diameter").size();
+    const std::size_t flush_multiplier_count =
+        config_vector_values(config, "flush_multiplier").size();
+    const std::size_t flush_matrix_count =
+        config_vector_values(config, "flush_volumes_matrix").size();
+    if (slot_count > 1 && flush_multiplier_count != tool_count) {
+        diagnostics.push_back({
+            "flush_multiplier",
+            "Expected " + std::to_string(tool_count) + " tool-head multipliers, received " +
+                std::to_string(flush_multiplier_count)});
+    }
+    const std::size_t expected_flush_matrix_count =
+        slot_count * slot_count * flush_multiplier_count;
+    if (slot_count > 1 && flush_matrix_count != expected_flush_matrix_count) {
+        diagnostics.push_back({
+            "flush_volumes_matrix",
+            "Expected " + std::to_string(expected_flush_matrix_count) +
+                " purge-volume values, received " + std::to_string(flush_matrix_count)});
+    }
+    return diagnostics;
+}
+
+Rgba8 rgba8_color(const std::string& serialized)
+{
+    const ProjectImportColor parsed = project_import_color(serialized);
+    const auto byte = [](float value) {
+        return static_cast<std::uint8_t>(std::clamp(std::lround(value * 255.0f), 0l, 255l));
+    };
+    return {byte(parsed.red), byte(parsed.green), byte(parsed.blue), byte(parsed.alpha)};
+}
+
+std::string serialized_color(Rgba8 color)
+{
+    static constexpr char digits[] = "0123456789ABCDEF";
+    std::string output(9, '0');
+    output[0] = '#';
+    const auto write = [&output](std::size_t offset, std::uint8_t value) {
+        output[offset] = digits[value >> 4];
+        output[offset + 1] = digits[value & 0x0f];
+    };
+    write(1, color.red);
+    write(3, color.green);
+    write(5, color.blue);
+    write(7, color.alpha);
+    return output;
+}
+
+std::vector<ConfigDiagnostic> slice_filament_diagnostics(
+    const Slic3r::DynamicPrintConfig& config)
+{
+    std::vector<ConfigDiagnostic> diagnostics;
+    const std::size_t diameter_count = serialized_option_values(config, "filament_diameter").size();
+    const std::size_t color_count = serialized_option_values(config, "filament_colour").size();
+    const std::size_t tool_count = serialized_option_values(config, "nozzle_diameter").size();
+    const std::size_t flush_multiplier_count =
+        serialized_option_values(config, "flush_multiplier").size();
+    const std::size_t flush_matrix_count =
+        serialized_option_values(config, "flush_volumes_matrix").size();
+    if (diameter_count == 0) {
+        diagnostics.push_back({"filament_diameter", "The slicing configuration has no filament slots"});
+    }
+    if (color_count != diameter_count) {
+        diagnostics.push_back({
+            "filament_colour",
+            "Expected " + std::to_string(diameter_count) + " filament colours, received " +
+                std::to_string(color_count)});
+    }
+    if (color_count > 1 && flush_multiplier_count != tool_count) {
+        diagnostics.push_back({
+            "flush_multiplier",
+            "Expected " + std::to_string(tool_count) + " tool-head multipliers, received " +
+                std::to_string(flush_multiplier_count)});
+    }
+    const std::size_t expected_flush_matrix_count =
+        color_count * color_count * flush_multiplier_count;
+    if (color_count > 1 && flush_matrix_count != expected_flush_matrix_count) {
+        diagnostics.push_back({
+            "flush_volumes_matrix",
+            "Expected " + std::to_string(expected_flush_matrix_count) +
+                " purge-volume values, received " + std::to_string(flush_matrix_count)});
+    }
+    return diagnostics;
+}
+
 Slic3r::Vec2d build_plate_center(const Slic3r::DynamicPrintConfig& config)
 {
     const auto* area = config.option<Slic3r::ConfigOptionPoints>("printable_area");
@@ -1575,6 +1724,11 @@ public:
     std::vector<std::unique_ptr<Slic3r::PresetBundle>> vendor_presets;
     std::vector<MachineModelOption> machines;
     std::vector<BuildPlateOption> build_plates;
+    std::unique_ptr<Config> active_config;
+    ResolvedSelection active_selection;
+    std::vector<PresetOption> compatible_processes;
+    std::vector<PresetOption> compatible_filaments;
+    std::uint64_t active_revision{0};
 };
 
 const char* version() noexcept
@@ -1653,6 +1807,20 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
                         option.name              = variant.name + " mm";
                         option.nozzle_diameter   = nozzle_diameter(variant.name);
                         option.printer_preset_id = preset->name;
+                        if (const auto* diameters =
+                                preset->config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter")) {
+                            option.physical_tool_count = std::max<std::size_t>(1, diameters->values.size());
+                        }
+                        if (const auto* multi_material =
+                                preset->config.option<Slic3r::ConfigOptionBool>("single_extruder_multi_material")) {
+                            option.variable_filament_slots = multi_material->value;
+                        }
+                        // Current supported single-nozzle material systems expose
+                        // four feed slots. Fixed multi-tool machines use exactly
+                        // their physical tool count.
+                        option.max_filament_slots = option.variable_filament_slots
+                            ? 4
+                            : option.physical_tool_count;
                         populate_printable_volume(preset->config, option);
                         machine.variants.push_back(std::move(option));
                     }
@@ -1813,6 +1981,267 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
     return result;
 }
 
+ConfigActivationResult Library::activate_config(
+    const ConfigSelection& selection,
+    const std::vector<std::pair<std::string, std::string>>& patch)
+{
+    ConfigActivationResult result;
+    const std::vector<std::string> previous_colors = impl_->active_config
+        ? config_vector_values(*impl_->active_config, "filament_colour")
+        : std::vector<std::string>{};
+    auto created = create_config(selection);
+    if (!created) {
+        result.diagnostics = std::move(created.diagnostics);
+        return result;
+    }
+
+    const bool patch_supplies_colors = std::any_of(
+        patch.begin(), patch.end(), [](const auto& entry) {
+            return entry.first == "filament_colour";
+        });
+    if (!patch.empty()) {
+        const SettingsResult patched = created.config->apply_patch(patch);
+        if (!patched) {
+            result.diagnostics = patched.diagnostics;
+            return result;
+        }
+    }
+    const SettingsResult normalized = normalize_filament_colors(
+        *created.config, created.selection.filament_preset_ids.size(),
+        patch_supplies_colors ? std::vector<std::string>{} : previous_colors);
+    if (!normalized) {
+        result.diagnostics = normalized.diagnostics;
+        return result;
+    }
+    result.diagnostics = created.config->validate();
+    auto cardinality = filament_cardinality_diagnostics(
+        *created.config, created.selection.filament_preset_ids.size());
+    result.diagnostics.insert(result.diagnostics.end(),
+                              std::make_move_iterator(cardinality.begin()),
+                              std::make_move_iterator(cardinality.end()));
+    if (!result.diagnostics.empty()) {
+        return result;
+    }
+
+    impl_->active_config = std::move(created.config);
+    impl_->active_selection = std::move(created.selection);
+    impl_->compatible_processes = std::move(created.compatible_processes);
+    impl_->compatible_filaments = std::move(created.compatible_filaments);
+    ++impl_->active_revision;
+    result.success = true;
+    result.view = *active_config();
+    return result;
+}
+
+std::optional<ActiveConfigView> Library::active_config() const
+{
+    if (!impl_->active_config || impl_->active_revision == 0) {
+        return std::nullopt;
+    }
+    ActiveConfigView view;
+    view.revision = impl_->active_revision;
+    view.selection = impl_->active_selection;
+    view.compatible_processes = impl_->compatible_processes;
+    view.compatible_filaments = impl_->compatible_filaments;
+    view.settings = impl_->active_config->settings();
+
+    const Slic3r::DynamicPrintConfig config = dynamic_config(impl_->active_config->snapshot());
+    view.filament_slots.reserve(view.selection.filament_preset_ids.size());
+    for (std::size_t index = 0; index < view.selection.filament_preset_ids.size(); ++index) {
+        FilamentSlotInfo slot;
+        slot.index = index;
+        slot.preset_id = view.selection.filament_preset_ids[index];
+        const auto preset = std::find_if(
+            view.compatible_filaments.begin(), view.compatible_filaments.end(),
+            [&slot](const PresetOption& option) { return option.id == slot.preset_id; });
+        slot.preset_name = preset == view.compatible_filaments.end()
+            ? slot.preset_id
+            : preset->name;
+        slot.vendor = option_value_at(config, "filament_vendor", index);
+        slot.material_type = option_value_at(config, "filament_type", index);
+        slot.color = rgba8_color(option_value_at(config, "filament_colour", index));
+        if (const auto* diameters = config.option<Slic3r::ConfigOptionFloats>("filament_diameter");
+            diameters != nullptr && index < diameters->values.size()) {
+            slot.diameter_mm = diameters->values[index];
+        }
+        view.filament_slots.push_back(std::move(slot));
+    }
+    return view;
+}
+
+std::optional<ConfigSnapshot> Library::active_config_snapshot() const
+{
+    return impl_->active_config
+        ? std::optional<ConfigSnapshot>{impl_->active_config->snapshot()}
+        : std::nullopt;
+}
+
+SettingsResult Library::apply_active_config_patch(
+    const std::vector<std::pair<std::string, std::string>>& patch)
+{
+    if (!impl_->active_config) {
+        return settings_failure("configuration", "No slicing configuration is active");
+    }
+    Config candidate = *impl_->active_config;
+    SettingsResult result = candidate.apply_patch(patch);
+    if (!result) return result;
+    SettingsResult normalized = normalize_filament_colors(
+        candidate, impl_->active_selection.filament_preset_ids.size());
+    if (!normalized) return normalized;
+    append_changed_items(result.changed_items, std::move(normalized.changed_items));
+    auto diagnostics = candidate.validate();
+    auto cardinality = filament_cardinality_diagnostics(
+        candidate, impl_->active_selection.filament_preset_ids.size());
+    diagnostics.insert(diagnostics.end(),
+                       std::make_move_iterator(cardinality.begin()),
+                       std::make_move_iterator(cardinality.end()));
+    if (!diagnostics.empty()) {
+        result.success = false;
+        result.diagnostics = std::move(diagnostics);
+        result.changed_items.clear();
+        return result;
+    }
+    impl_->active_config = std::make_unique<Config>(std::move(candidate));
+    ++impl_->active_revision;
+    return result;
+}
+
+SettingsResult Library::set_active_config_value(std::string_view key, std::string_view value)
+{
+    return apply_active_config_patch({{std::string(key), std::string(value)}});
+}
+
+SettingsResult Library::reset_active_config_value(std::string_view key)
+{
+    if (!impl_->active_config) {
+        return settings_failure("configuration", "No slicing configuration is active");
+    }
+    Config candidate = *impl_->active_config;
+    SettingsResult result = candidate.reset(key);
+    if (!result) return result;
+    SettingsResult normalized = normalize_filament_colors(
+        candidate, impl_->active_selection.filament_preset_ids.size());
+    if (!normalized) return normalized;
+    append_changed_items(result.changed_items, std::move(normalized.changed_items));
+    auto diagnostics = candidate.validate();
+    auto cardinality = filament_cardinality_diagnostics(
+        candidate, impl_->active_selection.filament_preset_ids.size());
+    diagnostics.insert(diagnostics.end(),
+                       std::make_move_iterator(cardinality.begin()),
+                       std::make_move_iterator(cardinality.end()));
+    if (!diagnostics.empty()) {
+        result.success = false;
+        result.diagnostics = std::move(diagnostics);
+        result.changed_items.clear();
+        return result;
+    }
+    impl_->active_config = std::make_unique<Config>(std::move(candidate));
+    ++impl_->active_revision;
+    return result;
+}
+
+ConfigActivationResult Library::set_active_filament_preset(
+    std::size_t slot_index, std::string_view preset_id)
+{
+    if (!impl_->active_config) {
+        ConfigActivationResult result;
+        result.diagnostics.push_back({"configuration", "No slicing configuration is active"});
+        return result;
+    }
+    if (slot_index >= impl_->active_selection.filament_preset_ids.size()) {
+        ConfigActivationResult result;
+        result.diagnostics.push_back({"filament", "Filament slot index is out of range"});
+        return result;
+    }
+    ConfigSelection selection;
+    selection.machine_model_id = impl_->active_selection.machine_model_id;
+    selection.machine_variant_id = impl_->active_selection.machine_variant_id;
+    selection.process_preset_id = impl_->active_selection.process_preset_id;
+    selection.filament_preset_ids = impl_->active_selection.filament_preset_ids;
+    selection.filament_preset_ids[slot_index] = std::string(preset_id);
+    return activate_config(selection);
+}
+
+ConfigActivationResult Library::resize_active_filament_slots(std::size_t slot_count)
+{
+    ConfigActivationResult result;
+    if (!impl_->active_config) {
+        result.diagnostics.push_back({"configuration", "No slicing configuration is active"});
+        return result;
+    }
+    const auto model = std::find_if(
+        impl_->machines.begin(), impl_->machines.end(), [this](const MachineModelOption& option) {
+            return option.id == impl_->active_selection.machine_model_id;
+        });
+    const MachineVariantOption* variant = nullptr;
+    if (model != impl_->machines.end()) {
+        const auto found = std::find_if(
+            model->variants.begin(), model->variants.end(), [this](const MachineVariantOption& option) {
+                return option.id == impl_->active_selection.machine_variant_id;
+            });
+        if (found != model->variants.end()) variant = &*found;
+    }
+    if (variant == nullptr) {
+        result.diagnostics.push_back({"machine", "The active machine variant is unavailable"});
+        return result;
+    }
+    if (slot_count == 0 || slot_count > variant->max_filament_slots) {
+        result.diagnostics.push_back({
+            "filament",
+            "Filament slot count must be between 1 and " +
+                std::to_string(variant->max_filament_slots)});
+        return result;
+    }
+    if (!variant->variable_filament_slots &&
+        slot_count != variant->physical_tool_count) {
+        result.diagnostics.push_back({"filament", "This machine has a fixed filament slot count"});
+        return result;
+    }
+
+    ConfigSelection selection;
+    selection.machine_model_id = impl_->active_selection.machine_model_id;
+    selection.machine_variant_id = impl_->active_selection.machine_variant_id;
+    selection.process_preset_id = impl_->active_selection.process_preset_id;
+    selection.filament_preset_ids = impl_->active_selection.filament_preset_ids;
+    if (selection.filament_preset_ids.empty()) {
+        result.diagnostics.push_back({"filament", "The active configuration has no filament preset"});
+        return result;
+    }
+    selection.filament_preset_ids.resize(slot_count,
+                                         selection.filament_preset_ids.back());
+    return activate_config(selection);
+}
+
+SettingsResult Library::set_active_filament_color(std::size_t slot_index, Rgba8 color)
+{
+    if (!impl_->active_config) {
+        return settings_failure("configuration", "No slicing configuration is active");
+    }
+    const std::size_t slot_count = impl_->active_selection.filament_preset_ids.size();
+    if (slot_index >= slot_count) {
+        return settings_failure("filament", "Filament slot index is out of range");
+    }
+    std::vector<std::string> colors = config_vector_values(*impl_->active_config, "filament_colour");
+    if (colors.empty()) colors.push_back("#00AE42");
+    colors.resize(slot_count, colors.back());
+    colors[slot_index] = serialized_color(color);
+    return set_active_config_value("filament_colour", serialize_strings(colors));
+}
+
+std::vector<ConfigDiagnostic> Library::validate_active_config() const
+{
+    if (!impl_->active_config) {
+        return {{"configuration", "No slicing configuration is active"}};
+    }
+    auto diagnostics = impl_->active_config->validate();
+    auto cardinality = filament_cardinality_diagnostics(
+        *impl_->active_config, impl_->active_selection.filament_preset_ids.size());
+    diagnostics.insert(diagnostics.end(),
+                       std::make_move_iterator(cardinality.begin()),
+                       std::make_move_iterator(cardinality.end()));
+    return diagnostics;
+}
+
 SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& callbacks) const
 {
     SliceResult result;
@@ -1833,6 +2262,18 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             result.diagnostics.push_back({"config", "Slice request has no initialized configuration", false});
             return result;
         }
+        Slic3r::DynamicPrintConfig config = dynamic_config(request.config);
+        normalize_filament_identity(config);
+        const auto filament_diagnostics = slice_filament_diagnostics(config);
+        if (!filament_diagnostics.empty()) {
+            for (const auto& diagnostic : filament_diagnostics) {
+                result.diagnostics.push_back({
+                    "filament", diagnostic.key + ": " + diagnostic.message, false});
+            }
+            return result;
+        }
+        const std::size_t filament_slot_count =
+            serialized_option_values(config, "filament_diameter").size();
         if (cancellation_requested(callbacks)) {
             result.cancelled = true;
             return result;
@@ -1890,8 +2331,10 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                         Slic3r::TriangleMesh(std::move(vertices), std::move(faces)),
                         volume_type, false);
                     if (source_volume.role == SliceVolumeRole::ModelPart) {
-                        if (source_volume.default_filament_slot <= 0) {
-                            result.diagnostics.push_back({"filament", "Model volume has an invalid default filament slot", false});
+                        if (source_volume.default_filament_slot <= 0 ||
+                            static_cast<std::size_t>(source_volume.default_filament_slot) >
+                                filament_slot_count) {
+                            result.diagnostics.push_back({"filament", "Model volume default filament slot is outside the active configuration", false});
                             return result;
                         }
                         volume->config.set("extruder", source_volume.default_filament_slot);
@@ -1921,6 +2364,13 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                             painting.bitstream.push_back(bit != 0u);
                         }
                         painting.update_used_states(0);
+                        for (std::size_t label = filament_slot_count + 1;
+                             label < painting.used_states.size(); ++label) {
+                            if (painting.used_states[label]) {
+                                result.diagnostics.push_back({"filament", "Facet painting references a missing filament slot", false});
+                                return result;
+                            }
+                        }
                         volume->mmu_segmentation_facets.set_data(std::move(painting));
                     }
                 }
@@ -1999,8 +2449,6 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             return result;
         }
 
-        Slic3r::DynamicPrintConfig config = dynamic_config(request.config);
-        normalize_filament_identity(config);
         if (request.center_on_build_plate) {
             plate_model.center_instances_around_point(build_plate_center(config));
         }

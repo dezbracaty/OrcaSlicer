@@ -876,14 +876,19 @@ static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCance
     // Returns MM segmentation based on painting in MM segmentation gizmo
     std::vector<std::vector<ExPolygons>> segmentation = multi_material_segmentation_by_painting(print_object, throw_on_cancel);
     assert(segmentation.size() == print_object.layer_count());
+    const size_t num_extruders = print_object.print()->config().filament_diameter.size();
+    if (segmentation.size() != print_object.layer_count())
+        throw SlicingError("Multi-material segmentation layer count does not match the sliced object");
+    for (const auto &layer_segmentation : segmentation) {
+        if (layer_segmentation.size() < num_extruders)
+            throw SlicingError("Multi-material segmentation has fewer material regions than the active filament configuration");
+    }
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, segmentation.size(), std::max(segmentation.size() / 128, size_t(1))),
-        [&print_object, &segmentation, throw_on_cancel](const tbb::blocked_range<size_t> &range) {
+        [&print_object, &segmentation, num_extruders, throw_on_cancel](const tbb::blocked_range<size_t> &range) {
             const auto  &layer_ranges   = print_object.shared_regions()->layer_ranges;
             double       z              = print_object.get_layer(int(range.begin()))->slice_z;
             auto         it_layer_range = layer_range_first(layer_ranges, z);
-            // BBS
-            const size_t num_extruders = print_object.print()->config().filament_diameter.size();
 
             struct ByExtruder {
                 ExPolygons  expolygons;
@@ -908,7 +913,7 @@ static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCance
                 bool layer_split = false;
                 for (size_t extruder_id = 0; extruder_id < num_extruders; ++ extruder_id) {
                     ByExtruder &region = by_extruder[extruder_id];
-                    append(region.expolygons, std::move(segmentation[layer_id][extruder_id]));
+                    append(region.expolygons, std::move(segmentation[layer_id].at(extruder_id)));
                     if (! region.expolygons.empty()) {
                         region.bbox = get_extents(region.expolygons);
                         layer_split = true;

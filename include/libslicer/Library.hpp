@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -30,6 +31,9 @@ struct MachineVariantOption
     double printable_width{0.0};
     double printable_depth{0.0};
     double printable_height{0.0};
+    std::size_t physical_tool_count{1};
+    bool variable_filament_slots{false};
+    std::size_t max_filament_slots{1};
     std::vector<PrintableAreaPoint> printable_area;
     std::string printer_preset_id;
 };
@@ -93,6 +97,46 @@ struct ConfigCreateResult
     std::vector<PresetOption> compatible_filaments;
     std::vector<ConfigDiagnostic> diagnostics;
     std::unique_ptr<Config> config;
+
+    explicit operator bool() const noexcept { return success; }
+};
+
+struct Rgba8
+{
+    std::uint8_t red{0};
+    std::uint8_t green{0};
+    std::uint8_t blue{0};
+    std::uint8_t alpha{255};
+};
+
+struct FilamentSlotInfo
+{
+    std::size_t index{0};
+    std::string preset_id;
+    std::string preset_name;
+    std::string vendor;
+    std::string material_type;
+    Rgba8 color;
+    double diameter_mm{1.75};
+};
+
+struct ActiveConfigView
+{
+    std::uint64_t revision{0};
+    ResolvedSelection selection;
+    std::vector<PresetOption> compatible_processes;
+    std::vector<PresetOption> compatible_filaments;
+    std::vector<SettingItem> settings;
+    std::vector<FilamentSlotInfo> filament_slots;
+
+    bool valid() const noexcept { return revision != 0; }
+};
+
+struct ConfigActivationResult
+{
+    bool success{false};
+    ActiveConfigView view;
+    std::vector<ConfigDiagnostic> diagnostics;
 
     explicit operator bool() const noexcept { return success; }
 };
@@ -365,6 +409,20 @@ public:
     const std::vector<MachineModelOption>& machine_models() const noexcept;
     const std::vector<BuildPlateOption>& build_plate_options() const noexcept;
     ConfigCreateResult create_config(const ConfigSelection& selection) const;
+    ConfigActivationResult activate_config(
+        const ConfigSelection& selection,
+        const std::vector<std::pair<std::string, std::string>>& patch = {});
+    std::optional<ActiveConfigView> active_config() const;
+    std::optional<ConfigSnapshot> active_config_snapshot() const;
+    SettingsResult apply_active_config_patch(
+        const std::vector<std::pair<std::string, std::string>>& patch);
+    SettingsResult set_active_config_value(std::string_view key, std::string_view value);
+    SettingsResult reset_active_config_value(std::string_view key);
+    ConfigActivationResult set_active_filament_preset(
+        std::size_t slot_index, std::string_view preset_id);
+    ConfigActivationResult resize_active_filament_slots(std::size_t slot_count);
+    SettingsResult set_active_filament_color(std::size_t slot_index, Rgba8 color);
+    std::vector<ConfigDiagnostic> validate_active_config() const;
     SliceResult slice(const SliceRequest& request, const SliceCallbacks& callbacks = {}) const;
     GCodePreviewResult load_gcode_preview(const GCodePreviewRequest& request,
                                           const SliceCallbacks& callbacks = {}) const;

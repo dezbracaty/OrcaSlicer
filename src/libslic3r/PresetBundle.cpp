@@ -5196,7 +5196,12 @@ void PresetBundle::update_multi_material_filament_presets(size_t to_delete_filam
         f_multiplier.resize(nozzle_nums, 1.f);
     }
 
-    if ( (num_filaments * num_filaments) != size_t(old_matrix.size() / old_nozzle_nums) ) {
+    // A machine switch may change the number of physical tool heads without
+    // changing the number of filament slots (for example, 1 -> 4 and 4 slots
+    // in both configurations). The matrix still needs one complete block per
+    // tool head in that case.
+    if (old_nozzle_nums != nozzle_nums ||
+        (num_filaments * num_filaments) != size_t(old_matrix.size() / old_nozzle_nums)) {
         // First verify if purging volumes presets for each extruder matches number of extruders
         std::vector<double>& filaments = this->project_config.option<ConfigOptionFloats>("flush_volumes_vector")->values;
         while (filaments.size() < 2* num_filaments) {
