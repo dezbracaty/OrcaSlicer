@@ -359,6 +359,34 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     request.output_gcode_path = output.string();
     request.output_gcode_3mf_path = packaged_output.string();
 
+    const auto original_relative = created.config->snapshot().value(
+        "use_relative_e_distances");
+    const auto original_before_layer = created.config->snapshot().value(
+        "before_layer_change_gcode");
+    const auto original_layer = created.config->snapshot().value(
+        "layer_change_gcode");
+    REQUIRE(original_relative.has_value());
+    REQUIRE(original_before_layer.has_value());
+    REQUIRE(original_layer.has_value());
+    REQUIRE(created.config->set("use_relative_e_distances", "1").success);
+    REQUIRE(created.config->set("before_layer_change_gcode", "").success);
+    REQUIRE(created.config->set("layer_change_gcode", "").success);
+    request.config = created.config->snapshot();
+    const auto invalid = library->slice(request);
+    REQUIRE_FALSE(invalid.success);
+    const auto validation = std::find_if(
+        invalid.diagnostics.begin(), invalid.diagnostics.end(),
+        [](const libslicer::SliceDiagnostic& diagnostic) {
+            return diagnostic.code == "validation" && !diagnostic.warning;
+        });
+    REQUIRE(validation != invalid.diagnostics.end());
+    CHECK(validation->option_key == "before_layer_change_gcode");
+
+    REQUIRE(created.config->set("use_relative_e_distances", *original_relative).success);
+    REQUIRE(created.config->set("before_layer_change_gcode", *original_before_layer).success);
+    REQUIRE(created.config->set("layer_change_gcode", *original_layer).success);
+    request.config = created.config->snapshot();
+
     float last_progress = 0.0f;
     libslicer::SliceCallbacks callbacks;
     callbacks.progress = [&last_progress](float progress, std::string_view) {

@@ -248,6 +248,7 @@ struct SliceDiagnostic
     std::string code;
     std::string message;
     bool warning{false};
+    std::string option_key;
 };
 
 struct SliceCallbacks

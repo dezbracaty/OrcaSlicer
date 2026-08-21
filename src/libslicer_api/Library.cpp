@@ -2434,10 +2434,13 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         Slic3r::StringObjectException warning;
         const Slic3r::StringObjectException validation_error = print.validate(&warning);
         if (!warning.string.empty()) {
-            result.diagnostics.push_back({"validation", warning.string, true});
+            result.diagnostics.push_back(
+                {"validation", warning.string, true, warning.opt_key});
         }
         if (!validation_error.string.empty()) {
-            result.diagnostics.push_back({"validation", validation_error.string, false});
+            result.diagnostics.push_back(
+                {"validation", validation_error.string, false,
+                 validation_error.opt_key});
             return result;
         }
         if (cancellation_requested(callbacks)) {
