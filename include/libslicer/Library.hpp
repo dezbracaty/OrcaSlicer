@@ -337,25 +337,6 @@ struct ProjectImportInstance
     bool printable{true};
 };
 
-struct ProjectImportConfigEntry
-{
-    std::string key;
-    std::string value;
-};
-
-enum class ProjectImportConfigGroup
-{
-    Project,
-    Printer,
-    Process
-};
-
-struct ProjectImportGroupedConfigEntry
-{
-    ProjectImportConfigGroup group{ProjectImportConfigGroup::Project};
-    ProjectImportConfigEntry entry;
-};
-
 struct ProjectImportColor
 {
     float red{0.8f};
@@ -372,7 +353,6 @@ struct ProjectImportFilament
     std::string vendor;
     std::string material_type;
     ProjectImportColor color;
-    std::vector<ProjectImportConfigEntry> settings;
 };
 
 struct ProjectImportRequest
@@ -387,7 +367,6 @@ struct ProjectImportResult
     std::vector<ProjectImportMesh> meshes;
     std::vector<ProjectImportInstance> instances;
     std::vector<ProjectImportFilament> filaments;
-    std::vector<ProjectImportGroupedConfigEntry> config;
     std::vector<SliceDiagnostic> diagnostics;
 
     explicit operator bool() const noexcept { return success; }

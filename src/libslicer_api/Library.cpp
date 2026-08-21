@@ -307,7 +307,6 @@ ProjectImportColor project_import_color(const std::string& value)
 
 std::vector<ProjectImportFilament> project_import_filaments(
     const Slic3r::DynamicPrintConfig& config,
-    const std::vector<Slic3r::Preset*>& project_presets,
     std::size_t minimum_count)
 {
     std::size_t count = minimum_count;
@@ -317,9 +316,6 @@ std::vector<ProjectImportFilament> project_import_filaments(
     }
 
     std::vector<ProjectImportFilament> result(count);
-    const std::unordered_set<std::string> filament_keys(
-        Slic3r::Preset::filament_options().begin(),
-        Slic3r::Preset::filament_options().end());
     for (std::size_t index = 0; index < result.size(); ++index) {
         auto& filament = result[index];
         filament.id = "filament-" + std::to_string(index + 1);
@@ -329,72 +325,8 @@ std::vector<ProjectImportFilament> project_import_filaments(
         filament.material_type = option_value_at(config, "filament_type", index);
         filament.color = project_import_color(
             option_value_at(config, "filament_colour", index));
-
-        for (const std::string& key : filament_keys) {
-            const Slic3r::ConfigOption* option = config.option(key);
-            if (option == nullptr) continue;
-            if (const auto* vector = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(option)) {
-                const auto values = vector->vserialize();
-                if (!values.empty()) {
-                    filament.settings.push_back(
-                        {key, values[std::min(index, values.size() - 1)]});
-                }
-            } else {
-                filament.settings.push_back({key, option->serialize()});
-            }
-        }
     }
 
-    // Embedded filament presets carry the most faithful per-filament values.
-    // Match them to the active ordered list by preset name and overlay settings.
-    for (const Slic3r::Preset* preset : project_presets) {
-        if (preset == nullptr || preset->type != Slic3r::Preset::TYPE_FILAMENT) continue;
-        const auto found = std::find_if(result.begin(), result.end(), [preset](const auto& filament) {
-            return filament.preset_id == preset->name || filament.name == preset->name;
-        });
-        if (found == result.end()) continue;
-        found->name = preset->name;
-        if (!preset->setting_id.empty()) found->preset_id = preset->setting_id;
-        found->settings.clear();
-        for (const auto& [key, value] : serialized_values(preset->config)) {
-            if (filament_keys.count(key) != 0) {
-                found->settings.push_back({key, value});
-            }
-        }
-        const std::string vendor = option_value_at(preset->config, "filament_vendor", 0);
-        const std::string material = option_value_at(preset->config, "filament_type", 0);
-        const std::string color = option_value_at(preset->config, "filament_colour", 0);
-        if (!vendor.empty()) found->vendor = vendor;
-        if (!material.empty()) found->material_type = material;
-        if (!color.empty()) found->color = project_import_color(color);
-    }
-    return result;
-}
-
-std::vector<ProjectImportGroupedConfigEntry> project_import_config(
-    const Slic3r::DynamicPrintConfig& config)
-{
-    const std::unordered_set<std::string> printer_keys(
-        Slic3r::Preset::printer_options().begin(),
-        Slic3r::Preset::printer_options().end());
-    const std::unordered_set<std::string> process_keys(
-        Slic3r::Preset::print_options().begin(),
-        Slic3r::Preset::print_options().end());
-    const std::unordered_set<std::string> filament_keys(
-        Slic3r::Preset::filament_options().begin(),
-        Slic3r::Preset::filament_options().end());
-
-    std::vector<ProjectImportGroupedConfigEntry> result;
-    for (const auto& [key, value] : serialized_values(config)) {
-        if (filament_keys.count(key) != 0) continue;
-        ProjectImportConfigGroup group = ProjectImportConfigGroup::Project;
-        if (printer_keys.count(key) != 0) {
-            group = ProjectImportConfigGroup::Printer;
-        } else if (process_keys.count(key) != 0 || key == "curr_bed_type") {
-            group = ProjectImportConfigGroup::Process;
-        }
-        result.push_back({group, {key, value}});
-    }
     return result;
 }
 
@@ -1894,8 +1826,24 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
         const Slic3r::Preset* printer = selected.printers.find_system_preset_by_model_and_variant(
             selection.machine_model_id, selection.machine_variant_id);
 
-        const std::string printer_name = printer->name;
-        selected.printers.select_preset_by_name(printer_name, true);
+        std::string printer_name = printer->name;
+        const bool same_active_machine =
+            selection.machine_model_id == impl_->active_selection.machine_model_id &&
+            selection.machine_variant_id == impl_->active_selection.machine_variant_id &&
+            !impl_->active_selection.printer_preset_id.empty() &&
+            selected.printers.find_preset(
+                impl_->active_selection.printer_preset_id, false) != nullptr;
+        if (same_active_machine) {
+            // A project import may leave the selected preset edited with
+            // custom values. Keep it while changing process or filament
+            // choices for the same physical machine.
+            printer_name = impl_->active_selection.printer_preset_id;
+        }
+        const bool keep_edited_printer = same_active_machine &&
+            selected.printers.get_selected_preset_name() == printer_name;
+        if (!keep_edited_printer) {
+            selected.printers.select_preset_by_name(printer_name, true);
+        }
         selected.update_compatible(Slic3r::PresetSelectCompatibleType::Never);
 
         const Slic3r::Preset& active_printer = selected.printers.get_edited_preset();
@@ -1922,7 +1870,12 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
         if (process_name.empty()) {
             throw std::runtime_error("Selected machine has no compatible process preset");
         }
-        selected.prints.select_preset_by_name(process_name, true);
+        const bool keep_edited_process = keep_edited_printer &&
+            process_name == impl_->active_selection.process_preset_id &&
+            selected.prints.get_selected_preset_name() == process_name;
+        if (!keep_edited_process) {
+            selected.prints.select_preset_by_name(process_name, true);
+        }
         selected.update_compatible(Slic3r::PresetSelectCompatibleType::Always);
 
         std::vector<std::string> filament_names = selection.filament_preset_ids;
@@ -1958,7 +1911,12 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
         if (filament_names.empty()) {
                 throw std::runtime_error("Selected machine has no compatible filament preset");
         }
-        selected.filaments.select_preset_by_name(filament_names.front(), true);
+        const bool keep_edited_filament = keep_edited_process &&
+            filament_names == impl_->active_selection.filament_preset_ids &&
+            selected.filaments.get_selected_preset_name() == filament_names.front();
+        if (!keep_edited_filament) {
+            selected.filaments.select_preset_by_name(filament_names.front(), true);
+        }
         selected.filament_presets = filament_names;
         selected.update_compatible(Slic3r::PresetSelectCompatibleType::Always);
         selected.update_multi_material_filament_presets();
@@ -2151,6 +2109,12 @@ ConfigActivationResult Library::set_active_filament_preset(
     if (slot_index >= impl_->active_selection.filament_preset_ids.size()) {
         ConfigActivationResult result;
         result.diagnostics.push_back({"filament", "Filament slot index is out of range"});
+        return result;
+    }
+    if (impl_->active_selection.filament_preset_ids[slot_index] == preset_id) {
+        ConfigActivationResult result;
+        result.success = true;
+        result.view = *active_config();
         return result;
     }
     ConfigSelection selection;
@@ -2841,11 +2805,115 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
 
         report_progress(callbacks, 0.88f, "Converting project settings");
         result.filaments = project_import_filaments(
-            config, project_presets, maximum_filament_id);
-        result.config = project_import_config(config);
+            config, maximum_filament_id);
         for (const std::string& key : substitutions.unrecogized_keys) {
             result.diagnostics.push_back(
                 {"config", "Unrecognized 3MF project setting: " + key, true});
+        }
+
+        // Match OrcaSlicer's project loading semantics: the resolved config
+        // stored in the 3MF is authoritative. Installed preset names are used
+        // when their content matches; otherwise PresetBundle creates temporary
+        // project presets from the resolved config and selects them.
+        if (!config.empty()) {
+            report_progress(callbacks, 0.93f, "Activating 3MF project settings");
+            const std::string printer_model = option_value_at(config, "printer_model", 0);
+            const std::string printer_variant = option_value_at(config, "printer_variant", 0);
+            const std::string printer_preset = option_value_at(config, "printer_settings_id", 0);
+            const std::vector<std::string> inherited_presets =
+                serialized_option_values(config, "inherits_group");
+
+            const MachineModelOption* machine = nullptr;
+            const MachineVariantOption* variant = nullptr;
+            const auto select_machine = [&](const auto& candidate_machine,
+                                            const auto& candidate_variant) {
+                machine = &candidate_machine;
+                variant = &candidate_variant;
+            };
+            for (const auto& candidate_machine : impl_->machines) {
+                for (const auto& candidate_variant : candidate_machine.variants) {
+                    const bool identity_match =
+                        candidate_machine.id == printer_model &&
+                        candidate_variant.id == printer_variant;
+                    const bool preset_match =
+                        candidate_variant.printer_preset_id == printer_preset ||
+                        std::find(inherited_presets.begin(), inherited_presets.end(),
+                                  candidate_variant.printer_preset_id) != inherited_presets.end();
+                    if (identity_match || preset_match) {
+                        select_machine(candidate_machine, candidate_variant);
+                        break;
+                    }
+                }
+                if (machine != nullptr) break;
+            }
+
+            Slic3r::PresetBundle* preset_bundle = nullptr;
+            if (machine != nullptr && variant != nullptr) {
+                for (const auto& candidate : impl_->vendor_presets) {
+                    if (candidate->printers.find_system_preset_by_model_and_variant(
+                            machine->id, variant->id) != nullptr) {
+                        preset_bundle = candidate.get();
+                        break;
+                    }
+                }
+            }
+
+            if (preset_bundle == nullptr) {
+                result.diagnostics.push_back({
+                    "config",
+                    "3MF project settings reference an unavailable printer model; geometry was loaded without changing the active configuration",
+                    true});
+            } else {
+                try {
+                    Slic3r::DynamicPrintConfig resolved_config;
+                    resolved_config.apply(Slic3r::FullPrintConfig::defaults());
+                    resolved_config += config;
+                    Slic3r::Preset::normalize(resolved_config);
+                    result.filaments = project_import_filaments(
+                        resolved_config, maximum_filament_id);
+                    auto imported_values = serialized_values(resolved_config);
+
+                    if (!project_presets.empty()) {
+                        preset_bundle->load_project_embedded_presets(
+                            project_presets,
+                            Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
+                    }
+
+                    preset_bundle->load_config_model(
+                        request.path, std::move(resolved_config), file_version);
+
+                    auto active = std::unique_ptr<Config>(
+                        new Config(std::move(imported_values)));
+                    for (const auto& diagnostic : active->validate()) {
+                        result.diagnostics.push_back({
+                            diagnostic.key, diagnostic.message, true});
+                    }
+
+                    impl_->active_config = std::move(active);
+                    impl_->active_selection.machine_model_id = machine->id;
+                    impl_->active_selection.machine_variant_id = variant->id;
+                    impl_->active_selection.printer_preset_id =
+                        preset_bundle->printers.get_selected_preset_name();
+                    impl_->active_selection.process_preset_id =
+                        preset_bundle->prints.get_selected_preset_name();
+                    impl_->active_selection.filament_preset_ids =
+                        preset_bundle->filament_presets;
+                    impl_->compatible_processes = compatible_presets(
+                        preset_bundle->prints,
+                        impl_->active_selection.process_preset_id);
+                    impl_->compatible_filaments = compatible_presets(
+                        preset_bundle->filaments,
+                        impl_->active_selection.filament_preset_ids.empty()
+                            ? std::string{}
+                            : impl_->active_selection.filament_preset_ids.front());
+                    ++impl_->active_revision;
+                } catch (const std::exception& error) {
+                    result.diagnostics.push_back({
+                        "config",
+                        std::string("Unable to activate 3MF project settings: ") + error.what(),
+                        true});
+                }
+            }
         }
 
         result.success = true;
