@@ -2870,11 +2870,8 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                 try {
                     Slic3r::DynamicPrintConfig resolved_config;
                     resolved_config.apply(Slic3r::FullPrintConfig::defaults());
-                    resolved_config += config;
+                    resolved_config.apply(config);
                     Slic3r::Preset::normalize(resolved_config);
-                    result.filaments = project_import_filaments(
-                        resolved_config, maximum_filament_id);
-                    auto imported_values = serialized_values(resolved_config);
 
                     if (!project_presets.empty()) {
                         preset_bundle->load_project_embedded_presets(
@@ -2886,7 +2883,7 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                         request.path, std::move(resolved_config), file_version);
 
                     auto active = std::unique_ptr<Config>(
-                        new Config(std::move(imported_values)));
+                        new Config(serialized_values(preset_bundle->full_config())));
                     for (const auto& diagnostic : active->validate()) {
                         result.diagnostics.push_back({
                             diagnostic.key, diagnostic.message, true});
