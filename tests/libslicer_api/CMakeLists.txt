@@ -6,6 +6,8 @@ target_link_libraries(libslicer_api_tests
     PRIVATE
         libslicer::libslicer
         Catch2::Catch2WithMain
+        miniz
+        PNG::PNG
 )
 
 target_include_directories(libslicer_api_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)

@@ -722,16 +722,28 @@ struct ProjectedThumbnailTriangle
 {
     std::array<Slic3r::Vec3d, 3> world;
     std::array<Slic3r::Vec3d, 3> projected;
+    std::array<unsigned char, 3> color;
     double shade{1.0};
 };
 
-std::array<unsigned char, 3> thumbnail_model_color(const Slic3r::DynamicPrintConfig& config)
+struct ProjectedThumbnailScene
 {
-    std::string value;
-    if (const auto* colors = config.option<Slic3r::ConfigOptionStrings>("filament_colour");
-        colors != nullptr && !colors->values.empty()) {
-        value = colors->values.front();
+    std::vector<ProjectedThumbnailTriangle> triangles;
+    double min_x{std::numeric_limits<double>::max()};
+    double min_y{std::numeric_limits<double>::max()};
+    double max_x{std::numeric_limits<double>::lowest()};
+    double max_y{std::numeric_limits<double>::lowest()};
+
+    bool valid() const noexcept
+    {
+        return !triangles.empty() && max_x > min_x && max_y > min_y;
     }
+};
+
+constexpr std::array<unsigned char, 3> default_thumbnail_color{42, 132, 210};
+
+std::array<unsigned char, 3> parse_thumbnail_color(std::string value)
+{
     if (!value.empty() && value.front() == '#') {
         value.erase(value.begin());
     }
@@ -745,7 +757,24 @@ std::array<unsigned char, 3> thumbnail_model_color(const Slic3r::DynamicPrintCon
         } catch (...) {
         }
     }
-    return {42, 132, 210};
+    return default_thumbnail_color;
+}
+
+std::vector<std::array<unsigned char, 3>> thumbnail_filament_colors(
+    const Slic3r::DynamicPrintConfig& config)
+{
+    std::vector<std::array<unsigned char, 3>> result;
+    if (const auto* colors = config.option<Slic3r::ConfigOptionStrings>("filament_colour");
+        colors != nullptr) {
+        result.reserve(colors->values.size());
+        for (const std::string& color : colors->values) {
+            result.push_back(parse_thumbnail_color(color));
+        }
+    }
+    if (result.empty()) {
+        result.push_back(default_thumbnail_color);
+    }
+    return result;
 }
 
 double thumbnail_edge(double ax, double ay, double bx, double by, double px, double py)
@@ -753,29 +782,70 @@ double thumbnail_edge(double ax, double ay, double bx, double by, double px, dou
     return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
 }
 
-Slic3r::ThumbnailData render_model_thumbnail(const Slic3r::Model& model,
-                                             const Slic3r::DynamicPrintConfig& config,
-                                             unsigned int width,
-                                             unsigned int height,
-                                             bool transparent_background)
+ProjectedThumbnailScene prepare_model_thumbnail_scene(
+    const Slic3r::Model& model,
+    const Slic3r::DynamicPrintConfig& config)
 {
-    Slic3r::ThumbnailData output;
-    if (width == 0 || height == 0) {
-        return output;
-    }
+    ProjectedThumbnailScene output;
 
-    // Match OrcaSlicer's familiar isometric plate view, but rasterize on the CPU
-    // so the headless library does not acquire a GUI or OpenGL dependency.
+    // Keep the same camera and lighting as the existing headless thumbnail,
+    // while using Orca's own facet expansion and filament-to-color mapping.
     const Slic3r::Vec3d camera_ray = Slic3r::Vec3d(-1.0, -1.0, -0.8).normalized();
     const Slic3r::Vec3d screen_right = camera_ray.cross(Slic3r::Vec3d::UnitZ()).normalized();
     const Slic3r::Vec3d screen_up = screen_right.cross(camera_ray).normalized();
     const Slic3r::Vec3d light_direction = Slic3r::Vec3d(-0.35, -0.45, 1.0).normalized();
+    const auto filament_colors = thumbnail_filament_colors(config);
+    const auto color_for_slot = [&filament_colors](int one_based_slot) {
+        if (one_based_slot > 0 &&
+            static_cast<std::size_t>(one_based_slot) <= filament_colors.size()) {
+            return filament_colors[static_cast<std::size_t>(one_based_slot - 1)];
+        }
+        return filament_colors.front();
+    };
 
-    std::vector<ProjectedThumbnailTriangle> triangles;
-    double min_x = std::numeric_limits<double>::max();
-    double min_y = std::numeric_limits<double>::max();
-    double max_x = std::numeric_limits<double>::lowest();
-    double max_y = std::numeric_limits<double>::lowest();
+    const auto append_mesh = [&](const indexed_triangle_set& mesh,
+                                 const Slic3r::Transform3d& transform,
+                                 const std::array<unsigned char, 3>& color) {
+        for (const Slic3r::Vec3i32& indices : mesh.indices) {
+            ProjectedThumbnailTriangle triangle;
+            triangle.color = color;
+            bool valid = true;
+            for (int corner = 0; corner < 3; ++corner) {
+                const int vertex_index = indices[corner];
+                if (vertex_index < 0 ||
+                    static_cast<std::size_t>(vertex_index) >= mesh.vertices.size()) {
+                    valid = false;
+                    break;
+                }
+                const Slic3r::Vec3d world =
+                    transform * mesh.vertices[vertex_index].cast<double>();
+                const Slic3r::Vec3d projected(world.dot(screen_right),
+                                             world.dot(screen_up),
+                                             world.dot(camera_ray));
+                triangle.world[corner] = world;
+                triangle.projected[corner] = projected;
+                output.min_x = std::min(output.min_x, projected.x());
+                output.min_y = std::min(output.min_y, projected.y());
+                output.max_x = std::max(output.max_x, projected.x());
+                output.max_y = std::max(output.max_y, projected.y());
+            }
+            if (!valid) {
+                continue;
+            }
+            Slic3r::Vec3d normal = (triangle.world[1] - triangle.world[0])
+                                       .cross(triangle.world[2] - triangle.world[0]);
+            const double normal_length = normal.norm();
+            if (normal_length <= std::numeric_limits<double>::epsilon()) {
+                continue;
+            }
+            normal /= normal_length;
+            if (normal.dot(-camera_ray) < 0.0) {
+                normal = -normal;
+            }
+            triangle.shade = 0.38 + 0.62 * std::max(0.0, normal.dot(light_direction));
+            output.triangles.push_back(std::move(triangle));
+        }
+    };
 
     for (const Slic3r::ModelObject* object : model.objects) {
         if (object == nullptr || !object->printable) {
@@ -789,49 +859,41 @@ Slic3r::ThumbnailData render_model_thumbnail(const Slic3r::Model& model,
                 if (volume == nullptr || !volume->is_model_part()) {
                     continue;
                 }
-                const auto& mesh = volume->mesh().its;
-                const Slic3r::Transform3d transform = instance->get_matrix() * volume->get_matrix();
-                for (const Slic3r::Vec3i32& indices : mesh.indices) {
-                    ProjectedThumbnailTriangle triangle;
-                    bool valid = true;
-                    for (int corner = 0; corner < 3; ++corner) {
-                        const int vertex_index = indices[corner];
-                        if (vertex_index < 0 || static_cast<std::size_t>(vertex_index) >= mesh.vertices.size()) {
-                            valid = false;
-                            break;
-                        }
-                        const Slic3r::Vec3d world = transform * mesh.vertices[vertex_index].cast<double>();
-                        const Slic3r::Vec3d projected(world.dot(screen_right),
-                                                     world.dot(screen_up),
-                                                     world.dot(camera_ray));
-                        triangle.world[corner] = world;
-                        triangle.projected[corner] = projected;
-                        min_x = std::min(min_x, projected.x());
-                        min_y = std::min(min_y, projected.y());
-                        max_x = std::max(max_x, projected.x());
-                        max_y = std::max(max_y, projected.y());
-                    }
-                    if (!valid) {
-                        continue;
-                    }
-                    Slic3r::Vec3d normal = (triangle.world[1] - triangle.world[0])
-                                               .cross(triangle.world[2] - triangle.world[0]);
-                    const double normal_length = normal.norm();
-                    if (normal_length <= std::numeric_limits<double>::epsilon()) {
-                        continue;
-                    }
-                    normal /= normal_length;
-                    if (normal.dot(-camera_ray) < 0.0) {
-                        normal = -normal;
-                    }
-                    triangle.shade = 0.38 + 0.62 * std::max(0.0, normal.dot(light_direction));
-                    triangles.push_back(std::move(triangle));
+                const Slic3r::Transform3d transform =
+                    instance->get_matrix() * volume->get_matrix();
+                if (volume->mmu_segmentation_facets.empty()) {
+                    append_mesh(volume->mesh().its, transform,
+                                color_for_slot(volume->extruder_id()));
+                    continue;
+                }
+
+                std::vector<indexed_triangle_set> facets_per_color;
+                volume->mmu_segmentation_facets.get_facets(*volume, facets_per_color);
+                for (std::size_t color_index = 0;
+                     color_index < facets_per_color.size(); ++color_index) {
+                    const int filament_slot = color_index == 0
+                        ? volume->extruder_id()
+                        : static_cast<int>(color_index);
+                    append_mesh(facets_per_color[color_index], transform,
+                                color_for_slot(filament_slot));
                 }
             }
         }
     }
+    return output;
+}
 
-    if (triangles.empty() || !(max_x > min_x) || !(max_y > min_y)) {
+Slic3r::ThumbnailData render_model_thumbnail(const ProjectedThumbnailScene& scene,
+                                             unsigned int width,
+                                             unsigned int height,
+                                             bool transparent_background)
+{
+    Slic3r::ThumbnailData output;
+    if (width == 0 || height == 0) {
+        return output;
+    }
+
+    if (!scene.valid()) {
         return output;
     }
 
@@ -841,12 +903,13 @@ Slic3r::ThumbnailData render_model_thumbnail(const Slic3r::Model& model,
     const double margin = std::max(2.0, 0.08 * static_cast<double>(std::min(raster_width, raster_height)));
     const double available_width = std::max(1.0, static_cast<double>(raster_width) - 2.0 * margin);
     const double available_height = std::max(1.0, static_cast<double>(raster_height) - 2.0 * margin);
-    const double scale = std::min(available_width / (max_x - min_x),
-                                  available_height / (max_y - min_y));
-    const double offset_x = (static_cast<double>(raster_width) - (max_x - min_x) * scale) * 0.5;
-    const double offset_y = (static_cast<double>(raster_height) - (max_y - min_y) * scale) * 0.5;
+    const double scale = std::min(available_width / (scene.max_x - scene.min_x),
+                                  available_height / (scene.max_y - scene.min_y));
+    const double offset_x =
+        (static_cast<double>(raster_width) - (scene.max_x - scene.min_x) * scale) * 0.5;
+    const double offset_y =
+        (static_cast<double>(raster_height) - (scene.max_y - scene.min_y) * scale) * 0.5;
 
-    const auto base_color = thumbnail_model_color(config);
     const std::array<unsigned char, 4> background = transparent_background
         ? std::array<unsigned char, 4>{255, 255, 255, 0}
         : std::array<unsigned char, 4>{245, 247, 250, 255};
@@ -857,12 +920,12 @@ Slic3r::ThumbnailData render_model_thumbnail(const Slic3r::Model& model,
     std::vector<double> depth(static_cast<std::size_t>(raster_width) * raster_height,
                               std::numeric_limits<double>::infinity());
 
-    for (const ProjectedThumbnailTriangle& triangle : triangles) {
+    for (const ProjectedThumbnailTriangle& triangle : scene.triangles) {
         std::array<Slic3r::Vec3d, 3> screen;
         for (int corner = 0; corner < 3; ++corner) {
             screen[corner] = {
-                offset_x + (triangle.projected[corner].x() - min_x) * scale,
-                offset_y + (triangle.projected[corner].y() - min_y) * scale,
+                offset_x + (triangle.projected[corner].x() - scene.min_x) * scale,
+                offset_y + (triangle.projected[corner].y() - scene.min_y) * scale,
                 triangle.projected[corner].z(),
             };
         }
@@ -879,9 +942,9 @@ Slic3r::ThumbnailData render_model_thumbnail(const Slic3r::Model& model,
         const int y_end = std::min(static_cast<int>(raster_height) - 1,
                                    static_cast<int>(std::ceil(std::max({screen[0].y(), screen[1].y(), screen[2].y()}))));
         const std::array<unsigned char, 4> color = {
-            static_cast<unsigned char>(std::clamp(triangle.shade * base_color[0], 0.0, 255.0)),
-            static_cast<unsigned char>(std::clamp(triangle.shade * base_color[1], 0.0, 255.0)),
-            static_cast<unsigned char>(std::clamp(triangle.shade * base_color[2], 0.0, 255.0)),
+            static_cast<unsigned char>(std::clamp(triangle.shade * triangle.color[0], 0.0, 255.0)),
+            static_cast<unsigned char>(std::clamp(triangle.shade * triangle.color[1], 0.0, 255.0)),
+            static_cast<unsigned char>(std::clamp(triangle.shade * triangle.color[2], 0.0, 255.0)),
             255,
         };
         for (int y = y_begin; y <= y_end; ++y) {
@@ -928,15 +991,14 @@ Slic3r::ThumbnailData render_model_thumbnail(const Slic3r::Model& model,
     return output;
 }
 
-Slic3r::ThumbnailsList render_model_thumbnails(const Slic3r::Model& model,
-                                                const Slic3r::DynamicPrintConfig& config,
+Slic3r::ThumbnailsList render_model_thumbnails(const ProjectedThumbnailScene& scene,
                                                 const Slic3r::ThumbnailsParams& params)
 {
     Slic3r::ThumbnailsList thumbnails;
     thumbnails.reserve(params.sizes.size());
     for (const Slic3r::Vec2d& size : params.sizes) {
         thumbnails.push_back(render_model_thumbnail(
-            model, config,
+            scene,
             static_cast<unsigned int>(std::max(0.0, std::round(size.x()))),
             static_cast<unsigned int>(std::max(0.0, std::round(size.y()))),
             params.transparent_background));
@@ -2467,8 +2529,10 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
         report_progress(callbacks, 0.88f, "Exporting G-code");
         Slic3r::GCodeProcessorResult processor_result;
-        const auto thumbnail_callback = [&plate_model, &config](const Slic3r::ThumbnailsParams& params) {
-            return render_model_thumbnails(plate_model, config, params);
+        const ProjectedThumbnailScene thumbnail_scene =
+            prepare_model_thumbnail_scene(plate_model, config);
+        const auto thumbnail_callback = [&thumbnail_scene](const Slic3r::ThumbnailsParams& params) {
+            return render_model_thumbnails(thumbnail_scene, params);
         };
         result.output.path = print.export_gcode(output_path, &processor_result, thumbnail_callback);
         result.output.ownership = library_temporary
@@ -2499,7 +2563,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
             report_progress(callbacks, 0.94f, "Packaging sliced G-code 3MF");
             Slic3r::ThumbnailData plate_thumbnail =
-                render_model_thumbnail(plate_model, config, 256, 256, false);
+                render_model_thumbnail(thumbnail_scene, 256, 256, false);
             if (!plate_thumbnail.is_valid()) {
                 result.diagnostics.push_back({"gcode_3mf", "Slicer could not render the sliced G-code 3MF thumbnail", false});
                 discard_generated_temporary();

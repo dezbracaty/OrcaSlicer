@@ -3,10 +3,15 @@
 #include <libslicer/Config.hpp>
 #include <libslicer/Library.hpp>
 
+#include <miniz.h>
+#include <png.h>
+
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <set>
 #include <string_view>
 #include <vector>
@@ -19,6 +24,54 @@ const libslicer::SettingItem* find_item(const std::vector<libslicer::SettingItem
             return &item;
     }
     return nullptr;
+}
+
+std::vector<unsigned char> read_zip_entry(const std::filesystem::path& archive_path,
+                                          const char* entry_name)
+{
+    mz_zip_archive archive{};
+    if (!mz_zip_reader_init_file(&archive, archive_path.string().c_str(), 0)) {
+        return {};
+    }
+    std::size_t size = 0;
+    void* data = mz_zip_reader_extract_file_to_heap(
+        &archive, entry_name, &size, 0);
+    std::vector<unsigned char> result;
+    if (data != nullptr && size > 0) {
+        const auto* begin = static_cast<const unsigned char*>(data);
+        result.assign(begin, begin + size);
+    }
+    mz_free(data);
+    mz_zip_reader_end(&archive);
+    return result;
+}
+
+struct DecodedPng
+{
+    unsigned int width{0};
+    unsigned int height{0};
+    std::vector<unsigned char> rgba;
+};
+
+std::optional<DecodedPng> decode_png(const std::vector<unsigned char>& encoded)
+{
+    if (encoded.empty()) {
+        return std::nullopt;
+    }
+    png_image image{};
+    image.version = PNG_IMAGE_VERSION;
+    if (!png_image_begin_read_from_memory(&image, encoded.data(), encoded.size())) {
+        return std::nullopt;
+    }
+    image.format = PNG_FORMAT_RGBA;
+    DecodedPng result;
+    result.width = image.width;
+    result.height = image.height;
+    result.rgba.resize(PNG_IMAGE_SIZE(image));
+    const bool decoded = png_image_finish_read(
+        &image, nullptr, result.rgba.data(), 0, nullptr) != 0;
+    png_image_free(&image);
+    return decoded ? std::optional<DecodedPng>(std::move(result)) : std::nullopt;
 }
 } // namespace
 
@@ -543,6 +596,97 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
                                libslicer::ToolpathExtrusionRole::SparseInfill) > 0);
     CHECK(count_extrusion_role(*imported.preview,
                                libslicer::ToolpathExtrusionRole::InternalSolidInfill) > 0);
+    std::filesystem::remove(output, remove_error);
+    std::filesystem::remove(packaged_output, remove_error);
+}
+
+TEST_CASE("painted model thumbnails preserve filament colors", "[libslicer_api][slice][thumbnail]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "Flashforge Creator 5";
+    selection.machine_variant_id = "0.4";
+    const auto activated = library->activate_config(
+        selection, {{"filament_colour", "#FF0000FF"}});
+    REQUIRE(activated.success);
+    REQUIRE(library->set_active_filament_color(0, {255, 0, 0, 255}).success);
+    REQUIRE(library->set_active_filament_color(1, {0, 255, 0, 255}).success);
+    const auto config = library->active_config_snapshot();
+    REQUIRE(config.has_value());
+
+    libslicer::SliceVolumeInput volume;
+    volume.default_filament_slot = 1;
+    volume.vertices = {
+        {0.0f, 0.0f, 0.0f}, {20.0f, 0.0f, 0.0f},
+        {20.0f, 20.0f, 0.0f}, {0.0f, 20.0f, 0.0f},
+        {0.0f, 0.0f, 20.0f}, {20.0f, 0.0f, 20.0f},
+        {20.0f, 20.0f, 20.0f}, {0.0f, 20.0f, 20.0f},
+    };
+    volume.triangles = {
+        {0, 2, 1}, {0, 3, 2},
+        {4, 5, 6}, {4, 6, 7},
+        {0, 1, 5}, {0, 5, 4},
+        {1, 2, 6}, {1, 6, 5},
+        {2, 3, 7}, {2, 7, 6},
+        {3, 0, 4}, {3, 4, 7},
+    };
+    // A leaf with state 2 is encoded as the little-endian nibble 0b1000.
+    // Paint both top triangles with filament slot 2; all other faces retain slot 1.
+    volume.facet_labels.roots = {{2, 0}, {3, 4}};
+    volume.facet_labels.bitstream = {0, 0, 0, 1, 0, 0, 0, 1};
+
+    libslicer::SliceObjectInput object;
+    object.name = "painted-cube";
+    object.volumes.push_back(std::move(volume));
+
+    const std::filesystem::path output =
+        std::filesystem::temp_directory_path() / "libslicer_api_painted_cube.gcode";
+    const std::filesystem::path packaged_output =
+        std::filesystem::temp_directory_path() / "libslicer_api_painted_cube.gcode.3mf";
+    std::error_code remove_error;
+    std::filesystem::remove(output, remove_error);
+    std::filesystem::remove(packaged_output, remove_error);
+
+    libslicer::SliceRequest request;
+    request.config = *config;
+    request.objects.push_back(std::move(object));
+    request.output_gcode_path = output.string();
+    request.output_gcode_3mf_path = packaged_output.string();
+    const auto sliced = library->slice(request);
+    const std::string diagnostic = sliced.diagnostics.empty()
+        ? std::string{}
+        : sliced.diagnostics.front().message;
+    INFO(diagnostic);
+    REQUIRE(sliced.success);
+
+    const auto thumbnail_bytes = read_zip_entry(
+        packaged_output, "Metadata/plate_1.png");
+    const auto thumbnail = decode_png(thumbnail_bytes);
+    REQUIRE(thumbnail.has_value());
+    REQUIRE(thumbnail->rgba.size() ==
+            static_cast<std::size_t>(thumbnail->width) * thumbnail->height * 4);
+
+    std::size_t red_pixels = 0;
+    std::size_t green_pixels = 0;
+    for (std::size_t pixel = 0; pixel < thumbnail->rgba.size(); pixel += 4) {
+        const unsigned int red = thumbnail->rgba[pixel];
+        const unsigned int green = thumbnail->rgba[pixel + 1];
+        const unsigned int blue = thumbnail->rgba[pixel + 2];
+        if (red > 48 && red > green + 32 && red > blue + 32) {
+            ++red_pixels;
+        }
+        if (green > 48 && green > red + 32 && green > blue + 32) {
+            ++green_pixels;
+        }
+    }
+    CHECK(red_pixels > 100);
+    CHECK(green_pixels > 100);
+
     std::filesystem::remove(output, remove_error);
     std::filesystem::remove(packaged_output, remove_error);
 }
