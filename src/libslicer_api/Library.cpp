@@ -11,6 +11,7 @@
 #include <libslic3r/GCode/ThumbnailData.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
 #include <libslic3r/PNGReadWrite.hpp>
+#include <libslic3r/TriangleMeshSlicer.hpp>
 #include <libslic3r/Utils.hpp>
 #include <libslic3r/libslic3r.h>
 #include <libslic3r/miniz_extension.hpp>
@@ -1710,6 +1711,105 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
 }
 
 } // namespace
+
+PlaneCutResult cut_mesh_with_plane(const PlaneCutRequest& request)
+{
+    PlaneCutResult result;
+    if (request.mesh.vertices.empty() || request.mesh.triangles.empty()) {
+        result.error = "Plane cut input mesh has no geometry";
+        return result;
+    }
+
+    Eigen::Matrix4d mesh_to_plane;
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            const double value = request.mesh_to_plane[
+                static_cast<std::size_t>(row * 4 + column)];
+            if (!std::isfinite(value)) {
+                result.error = "Plane cut transform contains a non-finite value";
+                return result;
+            }
+            mesh_to_plane(row, column) = value;
+        }
+    }
+    if (std::abs(mesh_to_plane.determinant()) <= 1.0e-12) {
+        result.error = "Plane cut transform is not invertible";
+        return result;
+    }
+    const Eigen::Matrix4d plane_to_mesh = mesh_to_plane.inverse();
+
+    indexed_triangle_set source;
+    source.vertices.reserve(request.mesh.vertices.size());
+    for (const SliceVertex& vertex : request.mesh.vertices) {
+        const Eigen::Vector4d transformed = mesh_to_plane * Eigen::Vector4d(
+            static_cast<double>(vertex.x), static_cast<double>(vertex.y),
+            static_cast<double>(vertex.z), 1.0);
+        source.vertices.emplace_back(
+            static_cast<float>(transformed.x()),
+            static_cast<float>(transformed.y()),
+            static_cast<float>(transformed.z()));
+    }
+    source.indices.reserve(request.mesh.triangles.size());
+    for (const SliceTriangle& triangle : request.mesh.triangles) {
+        if (triangle.vertex_a >= source.vertices.size() ||
+            triangle.vertex_b >= source.vertices.size() ||
+            triangle.vertex_c >= source.vertices.size()) {
+            result.error = "Plane cut input contains an invalid triangle index";
+            return result;
+        }
+        source.indices.emplace_back(
+            static_cast<int>(triangle.vertex_a),
+            static_cast<int>(triangle.vertex_b),
+            static_cast<int>(triangle.vertex_c));
+    }
+    // GPlatform may provide triangle soup for legacy meshes. Welding exact
+    // duplicates restores the shared-edge topology required for reliable cap
+    // construction without changing the model's geometry.
+    Slic3r::its_merge_vertices(source);
+
+    indexed_triangle_set upper;
+    indexed_triangle_set lower;
+    try {
+        Slic3r::cut_mesh(source, 0.0f, &upper, &lower, true);
+    } catch (const std::exception& error) {
+        result.error = error.what();
+        return result;
+    } catch (...) {
+        result.error = "Plane cutting failed with an unknown error";
+        return result;
+    }
+
+    const auto publish_mesh = [&plane_to_mesh](
+                                  const indexed_triangle_set& source_mesh,
+                                  PlaneCutMesh& destination) {
+        destination.vertices.reserve(source_mesh.vertices.size());
+        for (const Slic3r::Vec3f& vertex : source_mesh.vertices) {
+            const Eigen::Vector4d transformed = plane_to_mesh * Eigen::Vector4d(
+                static_cast<double>(vertex.x()),
+                static_cast<double>(vertex.y()),
+                static_cast<double>(vertex.z()), 1.0);
+            destination.vertices.push_back(SliceVertex{
+                static_cast<float>(transformed.x()),
+                static_cast<float>(transformed.y()),
+                static_cast<float>(transformed.z())});
+        }
+        destination.triangles.reserve(source_mesh.indices.size());
+        for (const Slic3r::Vec3i32& triangle : source_mesh.indices) {
+            destination.triangles.push_back(SliceTriangle{
+                static_cast<std::uint32_t>(triangle.x()),
+                static_cast<std::uint32_t>(triangle.y()),
+                static_cast<std::uint32_t>(triangle.z())});
+        }
+    };
+    publish_mesh(upper, result.upper);
+    publish_mesh(lower, result.lower);
+    if (result.upper.empty() || result.lower.empty()) {
+        result.error = "The cutting plane does not split the mesh into two parts";
+        return result;
+    }
+    result.success = true;
+    return result;
+}
 
 class Library::Impl
 {

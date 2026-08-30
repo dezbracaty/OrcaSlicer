@@ -186,6 +186,41 @@ struct SliceVolumeInput
     SliceVolumeRole role{SliceVolumeRole::ModelPart};
 };
 
+// Geometry-only plane cutting contract. The mesh is expressed in model-local
+// coordinates and mesh_to_plane maps those coordinates into a space where the
+// cutting plane is z == 0. Results are returned in the original model-local
+// coordinates and include triangulated cut caps when the input is closed.
+struct PlaneCutMesh
+{
+    std::vector<SliceVertex> vertices;
+    std::vector<SliceTriangle> triangles;
+
+    bool empty() const noexcept { return vertices.empty() || triangles.empty(); }
+};
+
+struct PlaneCutRequest
+{
+    PlaneCutMesh mesh;
+    std::array<double, 16> mesh_to_plane{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0};
+};
+
+struct PlaneCutResult
+{
+    bool success{false};
+    PlaneCutMesh upper;
+    PlaneCutMesh lower;
+    std::string error;
+
+    explicit operator bool() const noexcept { return success; }
+};
+
+LIBSLICER_API PlaneCutResult cut_mesh_with_plane(
+    const PlaneCutRequest& request);
+
 struct SliceObjectInput
 {
     // File input remains available for compatibility. New document slicing
