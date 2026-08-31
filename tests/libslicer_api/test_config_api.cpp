@@ -600,6 +600,61 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     std::filesystem::remove(packaged_output, remove_error);
 }
 
+TEST_CASE("library imports generic G-code without embedded Orca configuration",
+          "[libslicer_api][gcode][preview]")
+{
+    const auto gcode_path =
+        std::filesystem::temp_directory_path() /
+        "libslicer_api_generic_external.gcode";
+    std::error_code remove_error;
+    std::filesystem::remove(gcode_path, remove_error);
+
+    {
+        std::ofstream gcode(gcode_path, std::ios::binary);
+        REQUIRE(gcode.good());
+        gcode << R"(;Generated with Cura_SteamEngine 4.7.0
+G21
+G90
+M82
+G92 E0
+;LAYER_COUNT:2
+;LAYER:0
+G1 Z0.2 F1200
+;TYPE:WALL-OUTER
+G1 X0 Y0 F3000
+G1 X20 Y0 E1 F1200
+G1 X20 Y20 E2
+G1 X0 Y20 E3
+G1 X0 Y0 E4
+;LAYER:1
+G1 Z0.4 F1200
+;TYPE:WALL-OUTER
+G1 X20 Y0 E5 F1200
+G1 X20 Y20 E6
+G1 X0 Y20 E7
+G1 X0 Y0 E8
+)";
+        REQUIRE(gcode.good());
+    }
+
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    const auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    libslicer::GCodePreviewRequest request;
+    request.gcode_path = gcode_path.string();
+    const auto imported = library->load_gcode_preview(request);
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview != nullptr);
+    CHECK(imported.preview->statistics.total_layers > 0);
+    CHECK(imported.preview->statistics.render_segment_count > 0);
+    CHECK_FALSE(imported.preview->segments.empty());
+
+    std::filesystem::remove(gcode_path, remove_error);
+}
+
 TEST_CASE("painted model thumbnails preserve filament colors", "[libslicer_api][slice][thumbnail]")
 {
     libslicer::LibraryOptions options;

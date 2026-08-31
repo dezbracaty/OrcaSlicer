@@ -2767,6 +2767,7 @@ GCodePreviewResult Library::load_gcode_preview(const GCodePreviewRequest& reques
 
         report_progress(callbacks, 0.05f, "Loading G-code");
         Slic3r::GCodeProcessor processor;
+        processor.init_filament_maps_and_nozzle_type_when_import_only_gcode();
         processor.process_file(request.gcode_path, [&callbacks]() {
             if (cancellation_requested(callbacks)) {
                 throw Slic3r::CanceledException();
