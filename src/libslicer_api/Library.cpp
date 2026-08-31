@@ -2883,87 +2883,134 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
         for (std::size_t object_index = 0; object_index < model.objects.size(); ++object_index) {
             const Slic3r::ModelObject* object = model.objects[object_index];
             if (object == nullptr) continue;
+
+            ProjectImportObject imported_object;
+            imported_object.id = "object-" + std::to_string(object_index + 1);
+            imported_object.name = !object->name.empty()
+                ? object->name : imported_object.id;
             for (std::size_t volume_index = 0; volume_index < object->volumes.size(); ++volume_index) {
                 const Slic3r::ModelVolume* volume = object->volumes[volume_index];
-                if (volume == nullptr || !volume->is_model_part() || volume->mesh().empty()) {
+                if (volume == nullptr) continue;
+                if (volume->mesh().empty()) {
+                    result.diagnostics.push_back({
+                        "model",
+                        "Skipping empty 3MF volume " +
+                            std::to_string(volume_index + 1) + " in " +
+                            imported_object.id,
+                        true});
                     continue;
                 }
 
-                ProjectImportMesh mesh;
-                mesh.id = "object-" + std::to_string(object_index + 1) +
-                    "/mesh-" + std::to_string(volume_index + 1);
-                mesh.name = !volume->name.empty() ? volume->name
-                    : !object->name.empty() ? object->name : mesh.id;
+                ProjectImportPart part;
+                part.id = imported_object.id +
+                    "/part-" + std::to_string(volume_index + 1);
+                part.name = !volume->name.empty() ? volume->name
+                    : imported_object.name;
+                if (volume->is_model_part()) {
+                    part.role = ProjectImportPartRole::Model;
+                } else if (volume->is_support_enforcer()) {
+                    part.role = ProjectImportPartRole::SupportEnforcer;
+                } else if (volume->is_support_blocker()) {
+                    part.role = ProjectImportPartRole::SupportBlocker;
+                } else {
+                    result.diagnostics.push_back({
+                        "model",
+                        "Unsupported 3MF volume role in " + part.id,
+                        false});
+                    release_import_resources();
+                    return result;
+                }
+                const Slic3r::Transform3d volume_matrix = volume->get_matrix();
+                for (int row = 0; row < 4; ++row) {
+                    for (int column = 0; column < 4; ++column) {
+                        part.local_transform[
+                            static_cast<std::size_t>(row * 4 + column)] =
+                            volume_matrix(row, column);
+                    }
+                }
                 const int extruder_id = volume->extruder_id();
                 if (extruder_id > 0) {
-                    mesh.filament_id = "filament-" + std::to_string(extruder_id);
+                    part.filament_id = "filament-" + std::to_string(extruder_id);
                     maximum_filament_id = std::max(
                         maximum_filament_id, static_cast<std::size_t>(extruder_id));
                 }
 
                 const auto& indexed = volume->mesh().its;
-                mesh.vertices.reserve(indexed.vertices.size());
+                part.vertices.reserve(indexed.vertices.size());
                 for (const auto& vertex : indexed.vertices) {
-                    mesh.vertices.push_back({vertex.x(), vertex.y(), vertex.z()});
+                    part.vertices.push_back({vertex.x(), vertex.y(), vertex.z()});
                 }
-                mesh.triangles.reserve(indexed.indices.size());
+                part.triangles.reserve(indexed.indices.size());
                 for (const auto& triangle : indexed.indices) {
-                    mesh.triangles.push_back({
+                    part.triangles.push_back({
                         static_cast<std::uint32_t>(triangle.x()),
                         static_cast<std::uint32_t>(triangle.y()),
                         static_cast<std::uint32_t>(triangle.z())});
                 }
 
                 const auto& facet_labels = volume->mmu_segmentation_facets.get_data();
-                mesh.facet_labels.roots.reserve(facet_labels.triangles_to_split.size());
+                part.facet_labels.roots.reserve(facet_labels.triangles_to_split.size());
                 for (const auto& root : facet_labels.triangles_to_split) {
                     if (root.triangle_idx < 0 || root.bitstream_start_idx < 0) continue;
-                    mesh.facet_labels.roots.push_back({
+                    part.facet_labels.roots.push_back({
                         static_cast<std::uint32_t>(root.triangle_idx),
                         static_cast<std::uint32_t>(root.bitstream_start_idx)});
                 }
-                mesh.facet_labels.bitstream.reserve(facet_labels.bitstream.size());
+                part.facet_labels.bitstream.reserve(facet_labels.bitstream.size());
                 for (const bool bit : facet_labels.bitstream) {
-                    mesh.facet_labels.bitstream.push_back(bit ? 1u : 0u);
+                    part.facet_labels.bitstream.push_back(bit ? 1u : 0u);
                 }
-
-                const auto append_instance = [&](const Slic3r::Transform3d& instance_matrix,
-                                                 bool printable,
-                                                 std::size_t instance_index) {
-                    ProjectImportInstance instance;
-                    instance.mesh_id = mesh.id;
-                    instance.name = !object->name.empty() ? object->name : mesh.name;
-                    if (object->instances.size() > 1) {
-                        instance.name += " " + std::to_string(instance_index + 1);
-                    }
-                    const Slic3r::Transform3d combined = instance_matrix * volume->get_matrix();
-                    for (int row = 0; row < 4; ++row) {
-                        for (int column = 0; column < 4; ++column) {
-                            instance.transform[static_cast<std::size_t>(row * 4 + column)] =
-                                combined(row, column);
-                        }
-                    }
-                    instance.printable = object->printable && printable;
-                    result.instances.push_back(std::move(instance));
-                };
-
-                if (object->instances.empty()) {
-                    append_instance(Slic3r::Transform3d::Identity(), true, 0);
-                } else {
-                    for (std::size_t instance_index = 0;
-                         instance_index < object->instances.size(); ++instance_index) {
-                        const Slic3r::ModelInstance* instance = object->instances[instance_index];
-                        if (instance != nullptr) {
-                            append_instance(instance->get_matrix(), instance->printable,
-                                            instance_index);
-                        }
-                    }
-                }
-                result.meshes.push_back(std::move(mesh));
+                imported_object.parts.push_back(std::move(part));
             }
+
+            if (imported_object.parts.empty()) {
+                result.diagnostics.push_back({
+                    "model",
+                    "Skipping 3MF object without non-empty supported volumes: " +
+                        imported_object.id,
+                    true});
+                continue;
+            }
+
+            const auto append_instance = [&](const Slic3r::Transform3d& matrix,
+                                             bool printable,
+                                             std::size_t instance_index) {
+                ProjectImportInstance instance;
+                instance.name = imported_object.name;
+                if (object->instances.size() > 1) {
+                    instance.name += " " + std::to_string(instance_index + 1);
+                }
+                for (int row = 0; row < 4; ++row) {
+                    for (int column = 0; column < 4; ++column) {
+                        instance.transform[
+                            static_cast<std::size_t>(row * 4 + column)] =
+                            matrix(row, column);
+                    }
+                }
+                instance.printable = object->printable && printable;
+                imported_object.instances.push_back(std::move(instance));
+            };
+            if (object->instances.empty()) {
+                append_instance(Slic3r::Transform3d::Identity(), true, 0);
+            } else {
+                for (std::size_t instance_index = 0;
+                     instance_index < object->instances.size(); ++instance_index) {
+                    const Slic3r::ModelInstance* instance =
+                        object->instances[instance_index];
+                    if (instance != nullptr) {
+                        append_instance(
+                            instance->get_matrix(), instance->printable,
+                            instance_index);
+                    }
+                }
+            }
+            if (imported_object.instances.empty()) {
+                append_instance(Slic3r::Transform3d::Identity(), true, 0);
+            }
+            result.objects.push_back(std::move(imported_object));
         }
 
-        if (result.meshes.empty() || result.instances.empty()) {
+        if (result.objects.empty()) {
             result.diagnostics.push_back(
                 {"model", "3MF project contains no printable model geometry", false});
             release_import_resources();

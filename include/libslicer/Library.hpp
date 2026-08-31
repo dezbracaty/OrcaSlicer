@@ -350,10 +350,24 @@ struct ProjectImportFacetLabels
     bool empty() const noexcept { return roots.empty() || bitstream.empty(); }
 };
 
-struct ProjectImportMesh
+enum class ProjectImportPartRole
+{
+    Model,
+    SupportEnforcer,
+    SupportBlocker
+};
+
+struct ProjectImportPart
 {
     std::string id;
     std::string name;
+    ProjectImportPartRole role{ProjectImportPartRole::Model};
+    // Row-major affine matrix. Coordinates and translations use millimetres.
+    std::array<double, 16> local_transform{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0};
     std::string filament_id;
     std::vector<ProjectImportVertex> vertices;
     std::vector<ProjectImportTriangle> triangles;
@@ -362,7 +376,6 @@ struct ProjectImportMesh
 
 struct ProjectImportInstance
 {
-    std::string mesh_id;
     std::string name;
     // Row-major affine matrix. Coordinates and translations use millimetres.
     std::array<double, 16> transform{
@@ -371,6 +384,14 @@ struct ProjectImportInstance
         0.0, 0.0, 1.0, 0.0,
         0.0, 0.0, 0.0, 1.0};
     bool printable{true};
+};
+
+struct ProjectImportObject
+{
+    std::string id;
+    std::string name;
+    std::vector<ProjectImportPart> parts;
+    std::vector<ProjectImportInstance> instances;
 };
 
 struct ProjectImportColor
@@ -400,8 +421,7 @@ struct ProjectImportResult
 {
     bool success{false};
     bool cancelled{false};
-    std::vector<ProjectImportMesh> meshes;
-    std::vector<ProjectImportInstance> instances;
+    std::vector<ProjectImportObject> objects;
     std::vector<ProjectImportFilament> filaments;
     std::vector<SliceDiagnostic> diagnostics;
 
