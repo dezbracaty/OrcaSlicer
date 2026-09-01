@@ -359,7 +359,8 @@ enum PrinterStructure {
     psCoreXY,
     psI3,
     psHbot,
-    psDelta
+    psDelta,
+    psBelt
 };
 
 enum class InputShaperType : unsigned char {
@@ -1412,6 +1413,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                auxiliary_fan))
     ((ConfigOptionBool,                support_air_filtration))
     ((ConfigOptionEnum<PrinterStructure>,printer_structure))
+    ((ConfigOptionFloat,               belt_gantry_angle))
     ((ConfigOptionBool,                support_chamber_temp_control))
     ((ConfigOptionEnumsGeneric,        extruder_type))
     ((ConfigOptionEnumsGeneric,        nozzle_volume_type))

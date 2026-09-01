@@ -12,6 +12,7 @@
 #include <deque>
 #include <queue>
 #include <mutex>
+#include <stdexcept>
 #include <utility>
 
 #include <boost/log/trivial.hpp>
@@ -41,6 +42,18 @@
 #endif
 
 namespace Slic3r {
+
+bool OrientedSliceFrame::valid(double epsilon) const noexcept
+{
+    return origin_world.allFinite() && axis_u.allFinite() && axis_v.allFinite() &&
+           normal.allFinite() && std::abs(axis_u.norm() - 1.0) <= epsilon &&
+           std::abs(axis_v.norm() - 1.0) <= epsilon &&
+           std::abs(normal.norm() - 1.0) <= epsilon &&
+           std::abs(axis_u.dot(axis_v)) <= epsilon &&
+           std::abs(axis_u.dot(normal)) <= epsilon &&
+           std::abs(axis_v.dot(normal)) <= epsilon &&
+           (axis_u.cross(axis_v) - normal).norm() <= epsilon;
+}
 const float epson = 1e-3;
 bool is_equal(float lh, float rh)
 {
@@ -2047,6 +2060,45 @@ std::vector<ExPolygons> slice_mesh_ex(
 //    BOOST_LOG_TRIVIAL(debug) << "slice_mesh make_expolygons in parallel - end";
 
     return layers;
+}
+
+std::vector<ExPolygons> slice_mesh_ex_oriented(
+    const indexed_triangle_set       &mesh,
+    const std::vector<float>         &slice_positions,
+    const Transform3d                &local_to_world,
+    const OrientedSliceFrame         &frame,
+    const Vec2d                      &output_offset,
+    const MeshSlicingParamsEx        &params,
+    std::function<void()>             throw_on_cancel)
+{
+    if (!frame.valid())
+        throw std::invalid_argument("Oriented slicing frame must be finite, orthonormal and right handed");
+    if (!local_to_world.matrix().allFinite() || !output_offset.allFinite())
+        throw std::invalid_argument("Oriented slicing transform and output offset must be finite");
+    if (!is_identity(params.trafo))
+        throw std::invalid_argument("Oriented slicing does not accept MeshSlicingParams::trafo");
+
+    indexed_triangle_set projected(mesh);
+    for (Vec3f &vertex : projected.vertices) {
+        const Vec3d world = local_to_world * vertex.cast<double>();
+        const Vec3d relative = world - frame.origin_world;
+        const double u = frame.axis_u.dot(relative) - output_offset.x();
+        const double v = frame.axis_v.dot(relative) - output_offset.y();
+        const double s = frame.normal.dot(relative);
+        // Keep the temporary mesh in the same units as every indexed_triangle_set.
+        // slice_mesh_ex() performs the one required XY scaling before constructing
+        // integer polygons; pre-scaling here would scale twice and overflow the
+        // downstream perimeter grid.
+        vertex = Vec3f(static_cast<float>(u), static_cast<float>(v),
+                       static_cast<float>(s));
+    }
+
+    if (local_to_world.linear().determinant() < 0.0)
+        its_flip_triangles(projected);
+
+    MeshSlicingParamsEx projected_params(params);
+    projected_params.trafo = Transform3d::Identity();
+    return slice_mesh_ex(projected, slice_positions, projected_params, std::move(throw_on_cancel));
 }
 
 // Slice a triangle set with a set of Z slabs (thick layers).

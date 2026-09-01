@@ -6,6 +6,7 @@
 #include "Fill/FillLightning.hpp"
 
 #include "BoundingBox.hpp"
+#include "Belt/BeltCoordinateSystem.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include "Flow.hpp"
 #include "Point.hpp"
@@ -946,6 +947,12 @@ public:
     void                auto_assign_extruders(ModelObject* model_object) const;
 
     const PrintConfig&          config() const { return m_config; }
+    bool                        is_belt_printer() const noexcept
+        { return m_config.printer_structure.value == PrinterStructure::psBelt; }
+    void                        set_belt_coordinate_system(BeltCoordinateSystem coordinates)
+        { m_belt_coordinate_system = std::move(coordinates); }
+    const BeltCoordinateSystem* belt_coordinate_system() const noexcept
+        { return m_belt_coordinate_system ? &*m_belt_coordinate_system : nullptr; }
     const PrintObjectConfig&    default_object_config() const { return m_default_object_config; }
     const PrintRegionConfig& default_region_config() const { return m_default_region_config; }
     ConstPrintObjectPtrsAdaptor objects() const { return ConstPrintObjectPtrsAdaptor(&m_objects); }
@@ -1148,6 +1155,7 @@ private:
     Polygons            first_layer_islands() const;
 
     PrintConfig                             m_config;
+    std::optional<BeltCoordinateSystem>     m_belt_coordinate_system;
     PrintObjectConfig                       m_default_object_config;
     PrintRegionConfig                       m_default_region_config;
     PrintObjectPtrs                         m_objects;

@@ -655,6 +655,65 @@ G1 X0 Y0 E8
     std::filesystem::remove(gcode_path, remove_error);
 }
 
+TEST_CASE("belt G-code preview reconstructs world coordinates across G92 Z reset",
+          "[libslicer_api][gcode][preview][belt]")
+{
+    const auto gcode_path =
+        std::filesystem::temp_directory_path() /
+        "libslicer_api_belt_world_preview.gcode";
+    std::error_code remove_error;
+    std::filesystem::remove(gcode_path, remove_error);
+
+    {
+        std::ofstream gcode(gcode_path, std::ios::binary);
+        REQUIRE(gcode.good());
+        gcode << R"(;SLICING_KINEMATICS:BELT
+;BELT_COORDINATE_VERSION:1
+;BELT_GANTRY_ANGLE:45
+;BELT_PLATE_MAX_WORLD_Y:100
+G21
+G90
+M83
+G1 Z20 F1200
+G92 Z0
+;LAYER_CHANGE
+; Z_HEIGHT: 10
+;TYPE:Outer wall
+G1 X0 Y2 Z14.142136 F1200
+G1 X1 Y2 E1
+)";
+        REQUIRE(gcode.good());
+    }
+
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    const auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    libslicer::GCodePreviewRequest request;
+    request.gcode_path = gcode_path.string();
+    const auto imported = library->load_gcode_preview(request);
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview != nullptr);
+
+    const auto segment = std::find_if(
+        imported.preview->segments.begin(), imported.preview->segments.end(),
+        [](const libslicer::ToolpathSegment& candidate) {
+            return candidate.motion == libslicer::ToolpathMotionKind::Extrusion;
+        });
+    REQUIRE(segment != imported.preview->segments.end());
+    CHECK(std::abs(segment->start_mm.x - 0.0f) < 0.001f);
+    CHECK(std::abs(segment->end_mm.x - 1.0f) < 0.001f);
+    CHECK(std::abs(segment->start_mm.y - 87.27208f) < 0.001f);
+    CHECK(std::abs(segment->end_mm.y - 87.27208f) < 0.001f);
+    CHECK(std::abs(segment->start_mm.z - 1.414214f) < 0.001f);
+    CHECK(std::abs(segment->end_mm.z - 1.414214f) < 0.001f);
+    CHECK(std::abs(segment->print_z_mm - 10.0f) < 0.001f);
+
+    std::filesystem::remove(gcode_path, remove_error);
+}
+
 TEST_CASE("painted model thumbnails preserve filament colors", "[libslicer_api][slice][thumbnail]")
 {
     libslicer::LibraryOptions options;

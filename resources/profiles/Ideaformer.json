@@ -1,0 +1,29 @@
+{
+    "name": "Ideaformer",
+    "url": "",
+    "version": "02.03.00.03",
+    "force_update": "0",
+    "description": "Ideaformer belt printer configurations",
+    "machine_model_list": [{
+        "name": "Ideaformer IR3V2",
+        "sub_path": "machine/Ideaformer IR3V2.json"
+    }],
+    "process_list": [{
+        "name": "0.20mm Standard @Ideaformer IR3V2",
+        "sub_path": "process/0.20mm Standard @Ideaformer IR3V2.json"
+    }],
+    "filament_list": [{
+        "name": "Ideaformer Generic PLA",
+        "sub_path": "filament/Ideaformer Generic PLA.json"
+    }],
+    "machine_list": [
+        {
+            "name": "fdm_ideaformer_common",
+            "sub_path": "machine/fdm_ideaformer_common.json"
+        },
+        {
+            "name": "Ideaformer IR3V2 0.4 nozzle",
+            "sub_path": "machine/Ideaformer IR3V2 0.4 nozzle.json"
+        }
+    ]
+}

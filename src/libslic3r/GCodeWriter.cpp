@@ -25,6 +25,15 @@ bool GCodeWriter::supports_separate_travel_acceleration(GCodeFlavor flavor)
     return (flavor == gcfRepetier || flavor == gcfMarlinFirmware ||  flavor == gcfRepRapFirmware);
 }
 
+Vec3d GCodeWriter::machine_position(const Vec3d &oriented_position) const
+{
+    const Vec3d point_on_plate(oriented_position.x() - m_x_offset,
+                               oriented_position.y() - m_y_offset,
+                               oriented_position.z());
+    return m_belt_coordinates ? m_belt_coordinates->oriented_to_machine(point_on_plate)
+                              : point_on_plate;
+}
+
 void GCodeWriter::apply_print_config(const PrintConfig &print_config)
 {
     this->config.apply(print_config, true);
@@ -605,10 +614,10 @@ std::string GCodeWriter::travel_to_xy(const Vec2d &point, const std::string &com
 
     this->set_current_position_clear(true);
     //BBS: take plate offset into consider
-    Vec2d point_on_plate = { point(0) - m_x_offset, point(1) - m_y_offset };
+    const Vec3d machine = machine_position(m_pos);
 
     GCodeG1Formatter w;
-    w.emit_xy(point_on_plate);
+    w.emit_xy(machine.head<2>());
     auto speed = m_is_first_layer
         ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value;
     w.emit_f(speed * 60.0);
@@ -697,6 +706,22 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
     Vec3d dest_point = point;
     auto travel_speed =
         m_is_first_layer ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value;
+
+    // Belt profiles disable Z hop. In belt mode the internal position remains in
+    // the oriented slicing frame; only the coordinates emitted to G-code are
+    // converted to coupled machine Y/Z motion.
+    if (m_belt_coordinates) {
+        const Vec3d machine = machine_position(dest_point);
+        GCodeG1Formatter w;
+        w.emit_xyz(machine);
+        w.emit_f(travel_speed * 60.0);
+        w.emit_comment(GCodeWriter::full_gcode_comment, comment);
+        m_pos = dest_point;
+        m_lifted = 0.0;
+        m_to_lift = 0.0;
+        this->set_current_position_clear(true);
+        return w.string();
+    }
     //BBS: a z_hop need to be handle when travel
     if (std::abs(m_to_lift) > EPSILON) {
         assert(std::abs(m_lifted) < EPSILON);
@@ -839,7 +864,13 @@ std::string GCodeWriter::_travel_to_z(double z, const std::string &comment)
     }
 
     GCodeG1Formatter w;
-    w.emit_z(z);
+    if (m_belt_coordinates) {
+        const Vec3d machine = machine_position(m_pos);
+        w.emit_y(machine.y());
+        w.emit_z(machine.z());
+    } else {
+        w.emit_z(z);
+    }
     w.emit_f(speed * 60.0);
     //BBS
     w.emit_comment(GCodeWriter::full_gcode_comment, comment);
@@ -941,10 +972,10 @@ std::string GCodeWriter::extrude_to_xy(const Vec2d &point, double dE, const std:
         filament()->extrude(dE);
 
     //BBS: take plate offset into consider
-    Vec2d point_on_plate = { point(0) - m_x_offset, point(1) - m_y_offset };
+    const Vec3d machine = machine_position(m_pos);
 
     GCodeG1Formatter w;
-    w.emit_xy(point_on_plate);
+    w.emit_xy(machine.head<2>());
     if (!force_no_extrusion)
         w.emit_e(filament()->E());
     //BBS
@@ -962,10 +993,10 @@ std::string GCodeWriter::extrude_arc_to_xy(const Vec2d& point, const Vec2d& cent
     if (!force_no_extrusion)
         filament()->extrude(dE);
 
-    Vec2d point_on_plate = { point(0) - m_x_offset, point(1) - m_y_offset };
+    const Vec3d machine = machine_position(m_pos);
 
     GCodeG2G3Formatter w(is_ccw);
-    w.emit_xy(point_on_plate);
+    w.emit_xy(machine.head<2>());
     w.emit_ij(center_offset);
     if (!force_no_extrusion)
         w.emit_e(filament()->E());
@@ -987,13 +1018,13 @@ std::string GCodeWriter::extrude_to_xyz(const Vec3d &point, double dE, const std
         filament()->extrude(dE);
 
     //BBS: take plate offset into consider
-    Vec3d point_on_plate = { point(0) - m_x_offset, point(1) - m_y_offset, point(2) };
+    const Vec3d machine = machine_position(point);
 
     GCodeG1Formatter w;
-    if (z_changed)
-        w.emit_xyz(point_on_plate);
+    if (z_changed || m_belt_coordinates)
+        w.emit_xyz(machine);
     else
-        w.emit_xy(Vec2d(point_on_plate.x(), point_on_plate.y()));
+        w.emit_xy(machine.head<2>());
     if (!force_no_extrusion)
         w.emit_e(filament()->E());
     //BBS

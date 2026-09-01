@@ -1,0 +1,14 @@
+{
+    "type": "machine",
+    "setting_id": "GM001",
+    "name": "Ideaformer IR3V2 0.4 nozzle",
+    "from": "system",
+    "instantiation": "true",
+    "inherits": "fdm_ideaformer_common",
+    "printer_model": "Ideaformer IR3V2",
+    "default_print_profile": "0.20mm Standard @Ideaformer IR3V2",
+    "nozzle_diameter": ["0.4"],
+    "printer_variant": "0.4",
+    "printable_area": ["0x0", "250x0", "250x999", "0x999"],
+    "printable_height": "250"
+}

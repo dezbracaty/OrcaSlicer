@@ -1270,6 +1270,43 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
     if (extruders.empty())
         return { L("No extrusions under current settings.") };
 
+    if (this->is_belt_printer()) {
+        const auto belt_error = [](const char* message, const char* option) {
+            StringObjectException error{L(message)};
+            error.opt_key = option;
+            return error;
+        };
+        if (this->belt_coordinate_system() == nullptr)
+            return belt_error("Belt slicing requires a valid shared coordinate system.",
+                              "belt_gantry_angle");
+        if (extruders.size() != 1)
+            return belt_error("Belt slicing currently supports exactly one filament.",
+                              "filament_map");
+        if (m_config.print_sequence != PrintSequence::ByLayer)
+            return belt_error("Belt slicing does not support printing by object.",
+                              "print_sequence");
+        if (m_config.spiral_mode)
+            return belt_error("Belt slicing does not support spiral vase mode.",
+                              "spiral_mode");
+        if (m_config.enable_prime_tower)
+            return belt_error("Belt slicing does not support a prime tower.",
+                              "enable_prime_tower");
+        if (std::any_of(m_config.z_hop.values.begin(), m_config.z_hop.values.end(),
+                        [](double value) { return std::abs(value) > EPSILON; }))
+            return belt_error("Belt slicing does not support Z hop.", "z_hop");
+        if (this->has_skirt())
+            return belt_error("Belt slicing does not support a skirt.", "skirt_loops");
+        for (const PrintObject* object : m_objects) {
+            if (object->config().enable_support)
+                return belt_error("Belt slicing support generation is not implemented yet.",
+                                  "enable_support");
+            if (object->config().raft_layers.value > 0)
+                return belt_error("Belt slicing does not support a raft.", "raft_layers");
+            if (object->config().brim_type != btNoBrim)
+                return belt_error("Belt slicing does not support a brim.", "brim_type");
+        }
+    }
+
     if (nozzles < 2 && extruders.size() > 1) {
         auto ret = check_multi_filament_valid(*this);
         if (!ret.string.empty())

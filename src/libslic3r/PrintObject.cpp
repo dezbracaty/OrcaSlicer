@@ -28,7 +28,9 @@
 #include <cstddef>
 #include <float.h>
 #include <iterator>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/concurrent_vector.h>
@@ -86,6 +88,42 @@ PrintObject::PrintObject(Print* print, ModelObject* model_object, const Transfor
     // BBS
     m_tree_support_preview_cache(nullptr)
 {
+    if (print->is_belt_printer()) {
+        const BeltCoordinateSystem* coordinates = print->belt_coordinate_system();
+        if (coordinates == nullptr)
+            throw std::runtime_error("Belt PrintObject requires a coordinate system");
+
+        Vec3d minimum = Vec3d::Constant(std::numeric_limits<double>::max());
+        Vec3d maximum = Vec3d::Constant(std::numeric_limits<double>::lowest());
+        bool has_model_vertex = false;
+        for (const ModelVolume* volume : model_object->volumes) {
+            if (!volume->is_model_part())
+                continue;
+            const Transform3d local_to_world = m_trafo * volume->get_matrix();
+            for (const Vec3f& vertex : volume->mesh().its.vertices) {
+                const Vec3d oriented = coordinates->world_to_oriented(
+                    local_to_world * vertex.cast<double>());
+                minimum = minimum.cwiseMin(oriented);
+                maximum = maximum.cwiseMax(oriented);
+                has_model_vertex = true;
+            }
+        }
+        if (!has_model_vertex)
+            throw std::runtime_error("Belt PrintObject contains no printable model vertices");
+        if (minimum.z() < -1e-5)
+            throw std::runtime_error("Belt model lies before the shared slicing origin");
+
+        const Vec2d center = 0.5 * (minimum.head<2>() + maximum.head<2>());
+        m_center_offset = Point::new_scale(center.x(), center.y());
+        m_size = Vec3crd(
+            scaled<coord_t>(maximum.x() - minimum.x()),
+            scaled<coord_t>(maximum.y() - minimum.y()),
+            scaled<coord_t>(std::max(0.0, maximum.z())));
+        m_max_z = scaled(std::max(0.0, maximum.z()));
+        this->set_instances(std::move(instances));
+        return;
+    }
+
     // Compute centering offet to be applied to our meshes so that we work with smaller coordinates
     // requiring less bits to represent Clipper coordinates.
 
@@ -3731,7 +3769,10 @@ void PrintObject::update_slicing_parameters()
 {
     // Orca: updated function call for XYZ shrinkage compensation
     if (!m_slicing_params.valid) {
-          m_slicing_params = SlicingParameters::create_from_config(this->print()->config(), m_config, this->model_object()->max_z(),
+          const double object_height = this->print()->is_belt_printer()
+              ? unscale<double>(m_max_z)
+              : this->model_object()->max_z();
+          m_slicing_params = SlicingParameters::create_from_config(this->print()->config(), m_config, object_height,
                                                                    this->object_extruders(), this->print()->shrinkage_compensation());
       }
 }

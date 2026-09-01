@@ -8,6 +8,9 @@
 #include "Point.hpp"
 #include "PrintConfig.hpp"
 #include "GCode/CoolingBuffer.hpp"
+#include "Belt/BeltCoordinateSystem.hpp"
+
+#include <optional>
 
 namespace Slic3r {
 
@@ -34,6 +37,11 @@ public:
     const Extruder* filament() const { if(m_curr_extruder_id==-1) return nullptr; return m_curr_filament_extruder[m_curr_extruder_id]; }
 
     void                 apply_print_config(const PrintConfig &print_config);
+    void                 set_belt_coordinate_system(const BeltCoordinateSystem *coordinates)
+    {
+        m_belt_coordinates = coordinates == nullptr ? std::nullopt
+                                                    : std::optional<BeltCoordinateSystem>(*coordinates);
+    }
     // Extruders are expected to be sorted in an increasing order.
     void                 set_extruders(std::vector<unsigned int> extruder_ids);
     const std::vector<Extruder>& extruders() const { return m_filament_extruders; }
@@ -170,6 +178,7 @@ public:
     //BBS: x, y offset for gcode generated
     double          m_x_offset{ 0 };
     double          m_y_offset{ 0 };
+    std::optional<BeltCoordinateSystem> m_belt_coordinates;
 
     // Orca: slicing resolution in mm
     double          m_resolution = 0.01;
@@ -191,6 +200,7 @@ public:
     std::string _spiral_travel_to_z(double z, const Vec2d &ij_offset, const std::string &comment);
     std::string _retract(double length, double restart_extra, const std::string &comment);
     std::string set_acceleration_internal(Acceleration type, unsigned int acceleration);
+    Vec3d       machine_position(const Vec3d &oriented_position) const;
 
 };
 
@@ -243,6 +253,10 @@ public:
 
     void emit_z(const double z) {
         this->emit_axis('Z', z, XYZF_EXPORT_DIGITS);
+    }
+
+    void emit_y(const double y) {
+        this->emit_axis('Y', y, XYZF_EXPORT_DIGITS);
     }
 
     void emit_e(double v) {

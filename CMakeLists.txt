@@ -299,12 +299,14 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/OrcaFilamentLibrary.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Flashforge.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/BBL.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Ideaformer.json"
     DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/profiles"
 )
 install(DIRECTORY
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/OrcaFilamentLibrary"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Flashforge"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/BBL"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Ideaformer"
     DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/profiles"
 )
 install(FILES

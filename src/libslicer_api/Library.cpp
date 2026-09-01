@@ -529,6 +529,59 @@ Slic3r::Vec2d build_plate_center(const Slic3r::DynamicPrintConfig& config)
     return {(min_x + max_x) * 0.5, (min_y + max_y) * 0.5};
 }
 
+struct ModelWorldBounds {
+    Slic3r::Vec3d minimum{Slic3r::Vec3d::Constant(std::numeric_limits<double>::max())};
+    Slic3r::Vec3d maximum{Slic3r::Vec3d::Constant(std::numeric_limits<double>::lowest())};
+    bool valid{false};
+};
+
+bool is_belt_config(const Slic3r::DynamicPrintConfig& config)
+{
+    const auto* structure = config.option<Slic3r::ConfigOptionEnum<Slic3r::PrinterStructure>>(
+        "printer_structure");
+    return structure != nullptr && structure->value == Slic3r::PrinterStructure::psBelt;
+}
+
+ModelWorldBounds model_world_bounds(const Slic3r::Model& model)
+{
+    ModelWorldBounds bounds;
+    for (const Slic3r::ModelObject* object : model.objects) {
+        const std::size_t instance_count = std::max<std::size_t>(1, object->instances.size());
+        for (std::size_t instance_index = 0; instance_index < instance_count; ++instance_index) {
+            const Slic3r::Transform3d instance = object->instances.empty()
+                ? Slic3r::Transform3d::Identity()
+                : object->instances[instance_index]->get_matrix();
+            for (const Slic3r::ModelVolume* volume : object->volumes) {
+                if (!volume->is_model_part())
+                    continue;
+                const Slic3r::Transform3d local_to_world = instance * volume->get_matrix();
+                for (const Slic3r::Vec3f& vertex : volume->mesh().its.vertices) {
+                    const Slic3r::Vec3d world = local_to_world * vertex.cast<double>();
+                    bounds.minimum = bounds.minimum.cwiseMin(world);
+                    bounds.maximum = bounds.maximum.cwiseMax(world);
+                    bounds.valid = true;
+                }
+            }
+        }
+    }
+    return bounds;
+}
+
+void center_belt_model_on_x(Slic3r::Model& model, double target_x)
+{
+    const ModelWorldBounds bounds = model_world_bounds(model);
+    if (!bounds.valid)
+        return;
+    const double delta_x = target_x - 0.5 * (bounds.minimum.x() + bounds.maximum.x());
+    for (Slic3r::ModelObject* object : model.objects) {
+        if (object->instances.empty())
+            object->add_instance();
+        for (Slic3r::ModelInstance* instance : object->instances)
+            instance->set_offset(Slic3r::X, instance->get_offset().x() + delta_x);
+        object->invalidate_bounding_box();
+    }
+}
+
 std::string temporary_output_path(std::string_view suffix)
 {
     static std::atomic<unsigned long long> sequence{0};
@@ -1228,10 +1281,49 @@ std::vector<int> filament_tool_map(const Slic3r::DynamicPrintConfig* config,
     return result;
 }
 
+std::optional<Slic3r::BeltCoordinateSystem> belt_coordinates_from_gcode(const std::string& source_path)
+{
+    std::ifstream input(source_path);
+    if (!input)
+        return std::nullopt;
+
+    constexpr const char* kinematics = ";SLICING_KINEMATICS:BELT";
+    constexpr const char* version_prefix = ";BELT_COORDINATE_VERSION:";
+    constexpr const char* angle_prefix = ";BELT_GANTRY_ANGLE:";
+    constexpr const char* max_y_prefix = ";BELT_PLATE_MAX_WORLD_Y:";
+    bool is_belt = false;
+    bool supported_version = false;
+    std::optional<double> angle;
+    std::optional<double> max_world_y;
+    std::string line;
+    for (std::size_t line_count = 0; line_count < 200 && std::getline(input, line); ++line_count) {
+        try {
+            if (line == kinematics) {
+                is_belt = true;
+            } else if (line.rfind(version_prefix, 0) == 0) {
+                supported_version = std::stoi(line.substr(
+                    std::char_traits<char>::length(version_prefix))) == 1;
+            } else if (line.rfind(angle_prefix, 0) == 0) {
+                angle = std::stod(line.substr(
+                    std::char_traits<char>::length(angle_prefix)));
+            } else if (line.rfind(max_y_prefix, 0) == 0) {
+                max_world_y = std::stod(line.substr(
+                    std::char_traits<char>::length(max_y_prefix)));
+            }
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    }
+    if (!is_belt || !supported_version || !angle || !max_world_y)
+        return std::nullopt;
+    return Slic3r::BeltCoordinateSystem::create(*angle, *max_world_y);
+}
+
 std::shared_ptr<ToolpathPreview> make_toolpath_preview(
     const Slic3r::GCodeProcessorResult& source,
     const Slic3r::DynamicPrintConfig* config,
-    const std::string& source_path)
+    const std::string& source_path,
+    const Slic3r::BeltCoordinateSystem* belt_coordinates = nullptr)
 {
     auto preview = std::make_shared<ToolpathPreview>();
     preview->source_path = source_path;
@@ -1383,7 +1475,22 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
             : invalid_toolpath_id;
         const auto motion = to_motion_kind(input.type);
         const bool has_end = finite_point(input.position);
-        const ToolpathPoint end = has_end ? to_toolpath_point(input.position) : ToolpathPoint{};
+        Slic3r::Vec3f preview_position = input.position;
+        if (has_end && belt_coordinates != nullptr) {
+            Slic3r::Vec3d logical_machine_position = input.position.cast<double>();
+            // GCodeProcessor resolves G92 into its physical axis position. Belt
+            // start G-code commonly resets Z after loading the belt, so that
+            // physical value is not the logical machine Z emitted for a slice
+            // plane. Phase-one Belt printing has no Z hop; print_z is therefore
+            // the authoritative physical distance along the slicing normal.
+            if (input.print_z > 0.0f) {
+                logical_machine_position.z() =
+                    belt_coordinates->physical_s_to_machine_z(input.print_z);
+            }
+            preview_position = belt_coordinates->machine_to_world(
+                logical_machine_position).cast<float>();
+        }
+        const ToolpathPoint end = has_end ? to_toolpath_point(preview_position) : ToolpathPoint{};
 
         if (motion && previous_position && has_end &&
             point_distance(*previous_position, end) > 0.000001) {
@@ -2575,12 +2682,26 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             return result;
         }
 
+        const bool belt_printer = is_belt_config(config);
         if (request.center_on_build_plate) {
-            plate_model.center_instances_around_point(build_plate_center(config));
+            if (belt_printer)
+                center_belt_model_on_x(plate_model, build_plate_center(config).x());
+            else
+                plate_model.center_instances_around_point(build_plate_center(config));
         }
 
         report_progress(callbacks, 0.08f, "Validating print");
         Slic3r::Print print;
+        if (belt_printer) {
+            const ModelWorldBounds belt_bounds = model_world_bounds(plate_model);
+            if (!belt_bounds.valid) {
+                result.diagnostics.push_back({"model", "Belt slicing found no printable model vertices", false});
+                return result;
+            }
+            const auto* angle = config.option<Slic3r::ConfigOptionFloat>("belt_gantry_angle");
+            print.set_belt_coordinate_system(Slic3r::BeltCoordinateSystem::create(
+                angle == nullptr ? 45.0 : angle->value, belt_bounds.maximum.y()));
+        }
         const auto* printer_model = config.option<Slic3r::ConfigOptionString>("printer_model");
         print.is_BBL_printer() = printer_model != nullptr &&
             printer_model->value.rfind("Bambu Lab", 0) == 0;
@@ -2717,7 +2838,8 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
         if (request.generate_preview) {
             report_progress(callbacks, 0.96f, "Preparing toolpath preview");
-            result.preview = make_toolpath_preview(processor_result, &config, result.output.path);
+            result.preview = make_toolpath_preview(processor_result, &config, result.output.path,
+                                                   print.belt_coordinate_system());
             if (!result.preview || result.preview->layers.empty() ||
                 result.preview->segments.empty()) {
                 result.diagnostics.push_back({"preview", "Slicer generated no drawable toolpath preview", false});
@@ -2779,7 +2901,9 @@ GCodePreviewResult Library::load_gcode_preview(const GCodePreviewRequest& reques
         }
 
         report_progress(callbacks, 0.9f, "Preparing toolpath preview");
-        result.preview = make_toolpath_preview(processor.get_result(), nullptr, request.gcode_path);
+        const auto belt_coordinates = belt_coordinates_from_gcode(request.gcode_path);
+        result.preview = make_toolpath_preview(processor.get_result(), nullptr, request.gcode_path,
+                                               belt_coordinates ? &*belt_coordinates : nullptr);
         if (!result.preview || result.preview->layers.empty() ||
             result.preview->segments.empty()) {
             result.diagnostics.push_back({"preview", "G-code contains no drawable toolpath", false});

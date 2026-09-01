@@ -78,17 +78,29 @@ static std::vector<ExPolygons> slice_volume(
     const ModelVolume             &volume,
     const std::vector<float>      &zs,
     const MeshSlicingParamsEx     &params,
+    const BeltCoordinateSystem    *belt_coordinates,
+    const Transform3d             &object_trafo,
+    const Vec2d                   &oriented_output_offset,
     const std::function<void()>   &throw_on_cancel_callback)
 {
     std::vector<ExPolygons> layers;
     if (! zs.empty()) {
         indexed_triangle_set its = volume.mesh().its;
         if (its.indices.size() > 0) {
-            MeshSlicingParamsEx params2 { params };
-            params2.trafo = params2.trafo * volume.get_matrix();
-            if (params2.trafo.rotation().determinant() < 0.)
-                its_flip_triangles(its);
-            layers = slice_mesh_ex(its, zs, params2, throw_on_cancel_callback);
+            if (belt_coordinates != nullptr) {
+                MeshSlicingParamsEx oriented_params { params };
+                oriented_params.trafo = Transform3d::Identity();
+                layers = slice_mesh_ex_oriented(
+                    its, zs, object_trafo * volume.get_matrix(),
+                    belt_coordinates->oriented_slice_frame(), oriented_output_offset,
+                    oriented_params, throw_on_cancel_callback);
+            } else {
+                MeshSlicingParamsEx params2 { params };
+                params2.trafo = params2.trafo * volume.get_matrix();
+                if (params2.trafo.rotation().determinant() < 0.)
+                    its_flip_triangles(its);
+                layers = slice_mesh_ex(its, zs, params2, throw_on_cancel_callback);
+            }
             throw_on_cancel_callback();
         }
     }
@@ -102,13 +114,17 @@ static std::vector<ExPolygons> slice_volume(
     const std::vector<float>                    &z,
     const std::vector<t_layer_height_range>     &ranges,
     const MeshSlicingParamsEx                   &params,
+    const BeltCoordinateSystem                  *belt_coordinates,
+    const Transform3d                           &object_trafo,
+    const Vec2d                                 &oriented_output_offset,
     const std::function<void()>                 &throw_on_cancel_callback)
 {
     std::vector<ExPolygons> out;
     if (! z.empty() && ! ranges.empty()) {
         if (ranges.size() == 1 && z.front() >= ranges.front().first && z.back() < ranges.front().second) {
             // All layers fit into a single range.
-            out = slice_volume(volume, z, params, throw_on_cancel_callback);
+            out = slice_volume(volume, z, params, belt_coordinates, object_trafo,
+                               oriented_output_offset, throw_on_cancel_callback);
         } else {
             std::vector<float>                     z_filtered;
             std::vector<std::pair<size_t, size_t>> n_filtered;
@@ -124,7 +140,9 @@ static std::vector<ExPolygons> slice_volume(
                     n_filtered.emplace_back(std::make_pair(first, i));
             }
             if (! n_filtered.empty()) {
-                std::vector<ExPolygons> layers = slice_volume(volume, z_filtered, params, throw_on_cancel_callback);
+                std::vector<ExPolygons> layers = slice_volume(
+                    volume, z_filtered, params, belt_coordinates, object_trafo,
+                    oriented_output_offset, throw_on_cancel_callback);
                 out.assign(z.size(), ExPolygons());
                 i = 0;
                 for (const std::pair<size_t, size_t> &span : n_filtered)
@@ -149,6 +167,8 @@ static std::vector<VolumeSlices> slice_volumes_inner(
     const PrintConfig                                        &print_config,
     const PrintObjectConfig                                  &print_object_config,
     const Transform3d                                        &object_trafo,
+    const BeltCoordinateSystem                               *belt_coordinates,
+    const Vec2d                                              &oriented_output_offset,
     ModelVolumePtrs                                           model_volumes,
     const std::vector<PrintObjectRegions::LayerRangeRegions> &layer_ranges,
     const std::vector<float>                                 &zs,
@@ -166,7 +186,9 @@ static std::vector<VolumeSlices> slice_volumes_inner(
     MeshSlicingParamsEx params_base;
     params_base.closing_radius = print_object_config.slice_closing_radius.value;
     params_base.extra_offset   = 0;
-    params_base.trafo          = object_trafo;
+    params_base.trafo          = belt_coordinates == nullptr
+        ? object_trafo
+        : Transform3d::Identity();
     //BBS: 0.0025mm is safe enough to simplify the data to speed slicing up for high-resolution model.
     //Also has on influence on arc fitting which has default resolution 0.0125mm.
     params_base.resolution = print_config.resolution <= 0.001 ? 0.0f : 0.0025;
@@ -206,7 +228,9 @@ static std::vector<VolumeSlices> slice_volumes_inner(
                     }
                     out.push_back({
                         model_volume->id(),
-                        slice_volume(*model_volume, zs, params, throw_on_cancel_callback)
+                        slice_volume(*model_volume, zs, params, belt_coordinates,
+                                     object_trafo, oriented_output_offset,
+                                     throw_on_cancel_callback)
                     });
                 }
             } else {
@@ -218,7 +242,9 @@ static std::vector<VolumeSlices> slice_volumes_inner(
                 if (! slicing_ranges.empty())
                     out.push_back({
                         model_volume->id(),
-                        slice_volume(*model_volume, zs, slicing_ranges, params, throw_on_cancel_callback)
+                        slice_volume(*model_volume, zs, slicing_ranges, params,
+                                     belt_coordinates, object_trafo,
+                                     oriented_output_offset, throw_on_cancel_callback)
                     });
             }
             if (! out.empty() && out.back().slices.empty())
@@ -1173,8 +1199,17 @@ void PrintObject::slice_volumes()
     std::vector<float>                   slice_zs      = zs_from_layers(m_layers);
     std::vector<VolumeSlices> objSliceByVolume;
     if (!slice_zs.empty()) {
+        const BeltCoordinateSystem* belt_coordinates = print->belt_coordinate_system();
+        const Transform3d object_trafo = belt_coordinates == nullptr
+            ? this->trafo_centered()
+            : this->trafo();
+        const Vec2d oriented_output_offset = belt_coordinates == nullptr
+            ? Vec2d::Zero()
+            : Vec2d(unscale<double>(this->center_offset().x()),
+                    unscale<double>(this->center_offset().y()));
         objSliceByVolume = slice_volumes_inner(
-            print->config(), this->config(), this->trafo_centered(),
+            print->config(), this->config(), object_trafo,
+            belt_coordinates, oriented_output_offset,
             this->model_object()->volumes, m_shared_regions->layer_ranges, slice_zs, throw_on_cancel_callback);
     }
 
@@ -1564,7 +1599,9 @@ std::vector<Polygons> PrintObject::slice_support_volumes(const ModelVolumeType m
         params.trafo = this->trafo_centered();
         for (; it_volume != it_volume_end; ++ it_volume)
             if ((*it_volume)->type() == model_volume_type) {
-                std::vector<ExPolygons> slices2 = slice_volume(*(*it_volume), zs, params, throw_on_cancel_callback);
+                std::vector<ExPolygons> slices2 = slice_volume(
+                    *(*it_volume), zs, params, nullptr, Transform3d::Identity(), Vec2d::Zero(),
+                    throw_on_cancel_callback);
                 if (slices.empty()) {
                     slices.reserve(slices2.size());
                     for (ExPolygons &src : slices2)

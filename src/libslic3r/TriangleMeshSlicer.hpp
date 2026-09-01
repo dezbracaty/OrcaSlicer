@@ -5,8 +5,19 @@
 #include <vector>
 #include "Polygon.hpp"
 #include "ExPolygon.hpp"
+#include "TriangleMesh.hpp"
 
 namespace Slic3r {
+
+struct OrientedSliceFrame
+{
+    Vec3d origin_world { Vec3d::Zero() };
+    Vec3d axis_u       { Vec3d::UnitX() };
+    Vec3d axis_v       { Vec3d::UnitY() };
+    Vec3d normal       { Vec3d::UnitZ() };
+
+    bool valid(double epsilon = 1e-8) const noexcept;
+};
 
 struct MeshSlicingParams
 {
@@ -72,6 +83,18 @@ Polygons                        slice_mesh(
 std::vector<ExPolygons>         slice_mesh_ex(
     const indexed_triangle_set       &mesh,
     const std::vector<float>         &zs,
+    const MeshSlicingParamsEx        &params,
+    std::function<void()>             throw_on_cancel = []{});
+
+// Slice the original mesh with planes expressed in a world-space orthonormal
+// frame. local_to_world is the real model transform. output_offset is a fixed
+// per-object U/V centering offset and must not vary between layers.
+std::vector<ExPolygons>         slice_mesh_ex_oriented(
+    const indexed_triangle_set       &mesh,
+    const std::vector<float>         &slice_positions,
+    const Transform3d                &local_to_world,
+    const OrientedSliceFrame         &frame,
+    const Vec2d                      &output_offset,
     const MeshSlicingParamsEx        &params,
     std::function<void()>             throw_on_cancel = []{});
 

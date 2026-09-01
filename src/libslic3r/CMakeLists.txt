@@ -77,6 +77,8 @@ set(lisbslic3r_sources
     BlacklistedLibraryCheck.hpp
     BoundingBox.cpp
     BoundingBox.hpp
+    Belt/BeltCoordinateSystem.cpp
+    Belt/BeltCoordinateSystem.hpp
     BridgeDetector.cpp
     BridgeDetector.hpp
     Brim.cpp

@@ -498,7 +498,8 @@ static t_config_enum_values s_keys_map_PrinterStructure {
     {"corexy",          int(PrinterStructure::psCoreXY)},
     {"i3",              int(PrinterStructure::psI3)},
     {"hbot",            int(PrinterStructure::psHbot)},
-    {"delta",           int(PrinterStructure::psDelta)}
+    {"delta",           int(PrinterStructure::psDelta)},
+    {"belt",            int(PrinterStructure::psBelt)}
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(PrinterStructure)
 
@@ -3807,13 +3808,24 @@ void PrintConfigDef::init_fff_params()
     def->enum_values.push_back("i3");
     def->enum_values.push_back("hbot");
     def->enum_values.push_back("delta");
+    def->enum_values.push_back("belt");
     def->enum_labels.push_back(L("Undefine"));
     def->enum_labels.push_back(L("CoreXY"));
     def->enum_labels.push_back(L("I3"));
     def->enum_labels.push_back(L("Hbot"));
     def->enum_labels.push_back(L("Delta"));
+    def->enum_labels.push_back(L("Belt"));
     def->mode = comDevelop;
     def->set_default_value(new ConfigOptionEnum<PrinterStructure>(psUndefine));
+
+    def = this->add("belt_gantry_angle", coFloat);
+    def->label = L("Belt gantry angle");
+    def->tooltip = L("Angle between the belt plane and the print gantry.");
+    def->sidetext = L("deg");
+    def->min = 0.001;
+    def->max = 89.999;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(45.0));
 
     def = this->add("best_object_pos", coPoint);
     def->label = L("Best object position");
