@@ -16,6 +16,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <vector>
 
 using namespace Slic3r;
 
@@ -195,6 +196,51 @@ TEST_CASE("Belt tapered support starts with one open build plate contact path",
     }
     CHECK(static_cast<double>(audited_root_trunk_count) ==
           tree_stage.metrics.at("root_trunk_count"));
+    const auto& primitive_stage = support_debug.stage(
+        BeltSupportDebugStageId::TaperedPrimitives);
+    REQUIRE(primitive_stage.metrics.count("root_wedge_count") == 1);
+    CHECK(primitive_stage.metrics.at("root_wedge_count") ==
+          tree_stage.metrics.at("root_trunk_count"));
+    std::vector<const BeltSupportDebugLine*> root_bottom_edges;
+    for (const BeltSupportDebugLine& line : primitive_stage.lines) {
+        if (line.category == "root_wedge_bottom")
+            root_bottom_edges.push_back(&line);
+    }
+    REQUIRE(root_bottom_edges.size() ==
+            static_cast<size_t>(primitive_stage.metrics.at(
+                "root_wedge_count")) * 4);
+    for (size_t edge_index = 0; edge_index < root_bottom_edges.size();
+         edge_index += 4) {
+        double maximum_y = std::numeric_limits<double>::lowest();
+        for (size_t local_edge = 0; local_edge < 4; ++local_edge) {
+            const BeltSupportDebugLine& edge =
+                *root_bottom_edges[edge_index + local_edge];
+            maximum_y = std::max(
+                {maximum_y, edge.start_world.y(), edge.end_world.y()});
+            CHECK(edge.start_world.z() == Catch::Approx(0.0).margin(1e-6));
+            CHECK(edge.end_world.z() == Catch::Approx(0.0).margin(1e-6));
+        }
+        const BeltSupportDebugLine& leading_edge =
+            *root_bottom_edges[edge_index];
+        CHECK(leading_edge.start_world.y() ==
+              Catch::Approx(maximum_y).margin(1e-6));
+        CHECK(leading_edge.end_world.y() ==
+              Catch::Approx(maximum_y).margin(1e-6));
+        CHECK(leading_edge.start_world.x() !=
+              Catch::Approx(leading_edge.end_world.x()).margin(1e-6));
+    }
+    const auto& section_stage = support_debug.stage(
+        BeltSupportDebugStageId::LayerSections);
+    REQUIRE(section_stage.metrics.count(
+        "root_wedge_missing_leading_edge_count") == 1);
+    CHECK(section_stage.metrics.at(
+        "root_wedge_missing_leading_edge_count") == 0.0);
+    REQUIRE(section_stage.metrics.count("root_wedge_section_count") == 1);
+    CHECK(section_stage.metrics.at("root_wedge_section_count") > 0.0);
+    REQUIRE(section_stage.metrics.count(
+        "root_wedge_bed_contact_segment_count") == 1);
+    CHECK(section_stage.metrics.at(
+        "root_wedge_bed_contact_segment_count") > 0.0);
     const BeltCoordinateSystem* final_belt = print.belt_coordinate_system();
     REQUIRE(final_belt != nullptr);
     CHECK(final_belt->print_origin_s() == Catch::Approx(0.0).margin(1e-9));
@@ -229,8 +275,8 @@ TEST_CASE("Belt tapered support starts with one open build plate contact path",
         const double u = unscaled<double>(point.x()) + center_u;
         const double v = unscaled<double>(point.y()) + center_v;
 
-        // Root width is sampled at slice_s, while the actual extrusion is
-        // emitted at print_s. That emitted path must be the platform line.
+        // The finite foundation width and its build-plate boundary are both
+        // evaluated on the actual extrusion plane.
         const Vec3d root_extrusion(u, v, print_s);
         CHECK(final_belt->oriented_to_world(root_extrusion).z() ==
               Catch::Approx(0.0).margin(1e-5));

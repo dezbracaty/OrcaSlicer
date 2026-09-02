@@ -17,6 +17,7 @@
 #include <boost/log/trivial.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <deque>
@@ -112,6 +113,27 @@ struct BeltSupportRoute
 struct BeltRootFoundation
 {
     Polygon footprint_us;
+};
+
+// The independently rooted tail is not an ordinary frustum section. Its
+// lower face lies in the real world build plate (Z=0), while its upper face is
+// the N-orthogonal section consumed by the rest of the branch pipeline.  In
+// particular, birth_s is the minimum s of the finite lower face -- not the s
+// coordinate of the root centreline.
+struct BeltRootWedge
+{
+    std::array<Vec3d, 4> bottom_world;
+    std::array<Vec3d, 4> top_world;
+    double birth_s{0.0};
+    double top_s{0.0};
+    size_t source_route_index{std::numeric_limits<size_t>::max()};
+    size_t source_contact_index{0};
+};
+
+struct BeltRootWedgeSlice
+{
+    ExPolygons regions;
+    Polylines bed_contact_paths;
 };
 
 Polygon rectangle_at(const Point& center, double half_width_u, double half_width_v)
@@ -481,6 +503,122 @@ Vec3d local_point_to_world(const Point& point, double slice_s, double center_u, 
         slice_s));
 }
 
+template <size_t VertexCount>
+std::vector<Vec3d> intersect_convex_vertices_with_belt_plane(
+    const std::array<Vec3d, VertexCount>& vertices,
+    double slice_s,
+    const BeltCoordinateSystem& coordinates)
+{
+    constexpr double plane_tolerance = 1e-7;
+    constexpr double point_tolerance = 1e-6;
+    std::vector<Vec3d> intersections;
+    auto append_unique = [&intersections](const Vec3d& point) {
+        const bool duplicate = std::any_of(
+            intersections.begin(), intersections.end(),
+            [&point](const Vec3d& existing) {
+                return (existing - point).norm() <= point_tolerance;
+            });
+        if (!duplicate)
+            intersections.emplace_back(point);
+    };
+
+    std::array<double, VertexCount> signed_distances{};
+    for (size_t index = 0; index < VertexCount; ++index) {
+        signed_distances[index] =
+            coordinates.world_to_oriented(vertices[index]).z() - slice_s;
+        if (std::abs(signed_distances[index]) <= plane_tolerance)
+            append_unique(vertices[index]);
+    }
+
+    // The root wedge is the convex hull of its lower and upper rectangles.
+    // Intersecting every vertex pair is intentional: it avoids assuming that
+    // a tilted upper rectangle and a horizontal lower rectangle have the same
+    // polyhedron edge topology. Non-hull chords only add interior points and
+    // therefore do not change the final 2D convex hull.
+    for (size_t first = 0; first < VertexCount; ++first) {
+        for (size_t second = first + 1; second < VertexCount; ++second) {
+            const double first_distance = signed_distances[first];
+            const double second_distance = signed_distances[second];
+            if ((first_distance < -plane_tolerance &&
+                 second_distance < -plane_tolerance) ||
+                (first_distance > plane_tolerance &&
+                 second_distance > plane_tolerance) ||
+                std::abs(first_distance - second_distance) <=
+                    plane_tolerance) {
+                continue;
+            }
+            const double ratio = std::clamp(
+                first_distance / (first_distance - second_distance),
+                0.0, 1.0);
+            append_unique(vertices[first] +
+                          ratio * (vertices[second] - vertices[first]));
+        }
+    }
+    return intersections;
+}
+
+BeltRootWedgeSlice slice_root_wedge(
+    const BeltRootWedge& wedge,
+    double manufacturing_s,
+    double center_u,
+    double center_v,
+    const BeltCoordinateSystem& coordinates)
+{
+    BeltRootWedgeSlice result;
+    if (manufacturing_s + EPSILON < wedge.birth_s ||
+        manufacturing_s - EPSILON > wedge.top_s) {
+        return result;
+    }
+
+    std::array<Vec3d, 8> vertices{};
+    std::copy(wedge.bottom_world.begin(), wedge.bottom_world.end(),
+              vertices.begin());
+    std::copy(wedge.top_world.begin(), wedge.top_world.end(),
+              vertices.begin() + 4);
+    const std::vector<Vec3d> section_world =
+        intersect_convex_vertices_with_belt_plane(
+            vertices, manufacturing_s, coordinates);
+    if (section_world.size() >= 3) {
+        Points points;
+        points.reserve(section_world.size());
+        for (const Vec3d& world : section_world) {
+            const Vec3d oriented = coordinates.world_to_oriented(world);
+            points.emplace_back(Point::new_scale(
+                oriented.x() - center_u,
+                oriented.y() - center_v));
+        }
+        Polygon section = Geometry::convex_hull(std::move(points));
+        if (section.points.size() >= 3)
+            result.regions.emplace_back(std::move(section));
+    }
+
+    // The lower rectangle is entirely on world Z=0. Its intersection with a
+    // manufacturing plane is the root's own X/U leading/contact line. Keep it
+    // separate from the area section so a zero-area birth edge is never lost
+    // by Clipper or by a branch-centre containment test.
+    const std::vector<Vec3d> bed_world =
+        intersect_convex_vertices_with_belt_plane(
+            wedge.bottom_world, manufacturing_s, coordinates);
+    if (bed_world.size() >= 2) {
+        coord_t minimum_u = std::numeric_limits<coord_t>::max();
+        coord_t maximum_u = std::numeric_limits<coord_t>::lowest();
+        for (const Vec3d& world : bed_world) {
+            const Vec3d oriented = coordinates.world_to_oriented(world);
+            const coord_t local_u = scaled<coord_t>(
+                oriented.x() - center_u);
+            minimum_u = std::min(minimum_u, local_u);
+            maximum_u = std::max(maximum_u, local_u);
+        }
+        if (maximum_u > minimum_u) {
+            const coord_t boundary_v = scaled<coord_t>(
+                coordinates.belt_boundary_v(manufacturing_s) - center_v);
+            result.bed_contact_paths.emplace_back(
+                Point(minimum_u, boundary_v), Point(maximum_u, boundary_v));
+        }
+    }
+    return result;
+}
+
 void debug_polygon(BeltSupportDebugRecorder* recorder, BeltSupportDebugStageId stage,
                    const Polygon& polygon, double slice_s, double center_u, double center_v,
                    const BeltCoordinateSystem& coordinates, const std::string& category)
@@ -562,8 +700,7 @@ void append_contact_samples(const ExPolygon& overhang, coord_t spacing, std::vec
     }
 }
 
-Polylines make_root_paths(double slice_s,
-                          double print_s,
+Polylines make_root_paths(double manufacturing_s,
                           const BeltRootFoundation& foundation,
                           double center_v,
                           const BeltCoordinateSystem& coordinates)
@@ -572,7 +709,7 @@ Polylines make_root_paths(double slice_s,
         return {};
 
     const BoundingBox bounds = get_extents(foundation.footprint_us);
-    const coord_t scaled_s = scaled<coord_t>(slice_s);
+    const coord_t scaled_s = scaled<coord_t>(manufacturing_s);
     if (!bounds.defined || scaled_s < bounds.min.y() || scaled_s > bounds.max.y())
         return {};
 
@@ -595,9 +732,11 @@ Polylines make_root_paths(double slice_s,
     if (maximum_u <= minimum_u)
         return {};
 
-    // Width is sampled at the layer centre, but G-code emits this path on
-    // print_s. Put the actual extrusion plane on the physical build plate.
-    const double boundary_v_local = coordinates.belt_boundary_v(print_s) - center_v;
+    // This path is emitted on manufacturing_s. Use that same plane for both
+    // the finite foundation intersection and the physical build-plate
+    // boundary; mixing slice_s and print_s creates a half-layer root offset.
+    const double boundary_v_local =
+        coordinates.belt_boundary_v(manufacturing_s) - center_v;
     Polyline root(Point(minimum_u, scaled<coord_t>(boundary_v_local)),
                   Point(maximum_u, scaled<coord_t>(boundary_v_local)));
     return root.is_valid() ? Polylines{std::move(root)} : Polylines{};
@@ -4997,6 +5136,7 @@ void BeltTaperedSupport::generate()
     // make later coverage validation read default witness coordinates.
     const std::vector<BeltSupportContact> effective_contacts = contacts;
     std::vector<BeltSupportContact> route_branches;
+    std::vector<BeltRootWedge> root_wedges;
     for (size_t route_index = 0; route_index < routes.size(); ++route_index) {
         const BeltSupportRoute& route = routes[route_index];
         if (!route.failure_reason.empty() || route.points.size() < 2)
@@ -5025,6 +5165,54 @@ void BeltTaperedSupport::generate()
             branch.root_edge =
                 route.parent_route_index == BeltSupportRoute::no_parent &&
                 point_index + 1 == route.points.size();
+            if (branch.root_edge) {
+                const Vec3d root_center_world =
+                    coordinates->oriented_to_world({
+                        lower.u + center_u,
+                        lower.v + center_v,
+                        lower.s});
+                const double bottom_half_width = branch.root_half_width;
+                const double top_half_width = branch.tip_half_width;
+                BeltRootWedge wedge;
+                // Clockwise when seen from world +Z, beginning at the Y-max
+                // leading edge. Both lower leading corners therefore share
+                // the mathematically earliest manufacturing coordinate.
+                wedge.bottom_world = {
+                    Vec3d(root_center_world.x() - bottom_half_width,
+                          root_center_world.y() + bottom_half_width, 0.0),
+                    Vec3d(root_center_world.x() + bottom_half_width,
+                          root_center_world.y() + bottom_half_width, 0.0),
+                    Vec3d(root_center_world.x() + bottom_half_width,
+                          root_center_world.y() - bottom_half_width, 0.0),
+                    Vec3d(root_center_world.x() - bottom_half_width,
+                          root_center_world.y() - bottom_half_width, 0.0),
+                };
+                wedge.top_world = {
+                    coordinates->oriented_to_world({
+                        upper.u - top_half_width + center_u,
+                        upper.v + top_half_width + center_v, upper.s}),
+                    coordinates->oriented_to_world({
+                        upper.u + top_half_width + center_u,
+                        upper.v + top_half_width + center_v, upper.s}),
+                    coordinates->oriented_to_world({
+                        upper.u + top_half_width + center_u,
+                        upper.v - top_half_width + center_v, upper.s}),
+                    coordinates->oriented_to_world({
+                        upper.u - top_half_width + center_u,
+                        upper.v - top_half_width + center_v, upper.s}),
+                };
+                wedge.birth_s = std::numeric_limits<double>::max();
+                for (const Vec3d& corner : wedge.bottom_world) {
+                    wedge.birth_s = std::min(
+                        wedge.birth_s,
+                        coordinates->world_to_oriented(corner).z());
+                }
+                wedge.top_s = upper.s;
+                wedge.source_route_index = route_index;
+                wedge.source_contact_index = route.contact_index;
+                root_wedges.emplace_back(std::move(wedge));
+                continue;
+            }
             route_branches.emplace_back(std::move(branch));
         }
     }
@@ -5379,32 +5567,96 @@ void BeltTaperedSupport::generate()
                               })));
     }
 
-    if (contacts.empty() && debug != nullptr)
+    if (root_wedges.empty() && debug != nullptr)
         return;
-    if (contacts.empty())
+    if (root_wedges.empty())
         throw SlicingError("Belt tapered support could not connect any overhang contact to the build plate.");
 
     double minimum_root_s = std::numeric_limits<double>::max();
     double maximum_root_s = std::numeric_limits<double>::lowest();
     coord_t minimum_root_u = std::numeric_limits<coord_t>::max();
     coord_t maximum_root_u = std::numeric_limits<coord_t>::lowest();
-    std::vector<const BeltSupportContact*> root_edges;
+    size_t root_wedge_contract_failure_count = 0;
     {
         BeltSupportDebugStageTimer selected_timer(debug, BeltSupportDebugStageId::TreeTopology);
         BeltSupportDebugStageTimer primitive_timer(debug, BeltSupportDebugStageId::TaperedPrimitives);
-        for (const BeltSupportContact& contact : contacts) {
-            if (contact.root_edge) {
-                root_edges.push_back(&contact);
-                minimum_root_s = std::min(minimum_root_s, contact.root_s);
-                maximum_root_s = std::max(maximum_root_s, contact.root_s);
-                minimum_root_u = std::min(
-                    minimum_root_u,
-                    contact.root_u_local - scaled<coord_t>(contact.root_half_width));
-                maximum_root_u = std::max(
-                    maximum_root_u,
-                    contact.root_u_local + scaled<coord_t>(contact.root_half_width));
+        for (const BeltRootWedge& wedge : root_wedges) {
+            Vec3d bottom_center = Vec3d::Zero();
+            Vec3d top_center = Vec3d::Zero();
+            for (size_t corner_index = 0; corner_index < 4; ++corner_index) {
+                bottom_center += wedge.bottom_world[corner_index];
+                top_center += wedge.top_world[corner_index];
+                const Vec3d bottom_oriented =
+                    coordinates->world_to_oriented(
+                        wedge.bottom_world[corner_index]);
+                minimum_root_s = std::min(
+                    minimum_root_s, bottom_oriented.z());
+                maximum_root_s = std::max(
+                    maximum_root_s, bottom_oriented.z());
+                const coord_t local_u = scaled<coord_t>(
+                    bottom_oriented.x() - center_u);
+                minimum_root_u = std::min(minimum_root_u, local_u);
+                maximum_root_u = std::max(maximum_root_u, local_u);
             }
-
+            bottom_center *= 0.25;
+            top_center *= 0.25;
+            const double leading_y = std::max({
+                wedge.bottom_world[0].y(), wedge.bottom_world[1].y(),
+                wedge.bottom_world[2].y(), wedge.bottom_world[3].y()});
+            const BeltRootWedgeSlice birth_slice = slice_root_wedge(
+                wedge, wedge.birth_s, center_u, center_v, *coordinates);
+            const bool valid_birth_edge =
+                birth_slice.bed_contact_paths.size() == 1 &&
+                birth_slice.bed_contact_paths.front().points.size() >= 2 &&
+                std::abs(wedge.bottom_world[0].y() - leading_y) <= 1e-6 &&
+                std::abs(wedge.bottom_world[1].y() - leading_y) <= 1e-6;
+            const bool bottom_on_bed = std::all_of(
+                wedge.bottom_world.begin(), wedge.bottom_world.end(),
+                [](const Vec3d& corner) {
+                    return std::abs(corner.z()) <= 1e-6;
+                });
+            if (!valid_birth_edge || !bottom_on_bed)
+                ++root_wedge_contract_failure_count;
+            if (debug != nullptr) {
+                debug->add_line(BeltSupportDebugStageId::TreeTopology,
+                                bottom_center, top_center, "tree_branch");
+                debug->add_line(BeltSupportDebugStageId::TaperedPrimitives,
+                                bottom_center, top_center, "root_wedge_axis");
+                for (size_t corner_index = 0; corner_index < 4;
+                     ++corner_index) {
+                    const size_t next = (corner_index + 1) % 4;
+                    debug->add_line(
+                        BeltSupportDebugStageId::TaperedPrimitives,
+                        wedge.bottom_world[corner_index],
+                        wedge.bottom_world[next], "root_wedge_bottom");
+                    debug->add_line(
+                        BeltSupportDebugStageId::TaperedPrimitives,
+                        wedge.top_world[corner_index],
+                        wedge.top_world[next], "root_wedge_top");
+                    debug->add_line(
+                        BeltSupportDebugStageId::TaperedPrimitives,
+                        wedge.bottom_world[corner_index],
+                        wedge.top_world[corner_index], "root_wedge_side");
+                }
+                debug->add_record(
+                    BeltSupportDebugStageId::TaperedPrimitives,
+                    "root_wedge", "world_bed_face_to_oriented_top_section",
+                    {{"source_route_index",
+                      static_cast<double>(wedge.source_route_index)},
+                     {"source_contact_index",
+                      static_cast<double>(wedge.source_contact_index)},
+                     {"birth_s_mm", wedge.birth_s},
+                     {"top_s_mm", wedge.top_s},
+                     {"leading_edge_world_y_mm",
+                      wedge.bottom_world[0].y()},
+                     {"maximum_bottom_abs_world_z_mm",
+                      std::max({std::abs(wedge.bottom_world[0].z()),
+                                std::abs(wedge.bottom_world[1].z()),
+                                std::abs(wedge.bottom_world[2].z()),
+                                std::abs(wedge.bottom_world[3].z())})}});
+            }
+        }
+        for (const BeltSupportContact& contact : contacts) {
             if (debug != nullptr) {
                 const Point root_local(contact.root_u_local, contact.root_v_local);
                 const Vec3d root_world = local_point_to_world(
@@ -5436,6 +5688,10 @@ void BeltTaperedSupport::generate()
             }
         }
     }
+    if (root_wedge_contract_failure_count != 0) {
+        throw SlicingError(
+            "Belt root wedge does not start on its world Y-max build-plate edge.");
+    }
     if (minimum_root_s == std::numeric_limits<double>::max()) {
         if (debug != nullptr) {
             debug->add_record(BeltSupportDebugStageId::TreeTopology,
@@ -5456,30 +5712,18 @@ void BeltTaperedSupport::generate()
                 })));
         debug->set_metric(BeltSupportDebugStageId::TaperedPrimitives, "frustum_count",
                           static_cast<double>(contacts.size()));
+        debug->set_metric(BeltSupportDebugStageId::TaperedPrimitives,
+                          "root_wedge_count",
+                          static_cast<double>(root_wedges.size()));
     }
-    const double maximum_plan_height = std::accumulate(
-        plans.begin(), plans.end(), 0.0,
-        [](double value, const BeltSupportLayerPlan& plan) {
-            return std::max(value, plan.height);
-        });
-    const double foundation_depth_s = std::max(
-        maximum_plan_height,
-        static_cast<double>(support_parameters.first_layer_flow.width()));
     Points foundation_points;
-    foundation_points.reserve(root_edges.size() * 4);
-    for (const BeltSupportContact* root : root_edges) {
-        const coord_t left_u =
-            root->root_u_local - scaled<coord_t>(root->root_half_width);
-        const coord_t right_u =
-            root->root_u_local + scaled<coord_t>(root->root_half_width);
-        const coord_t front_s = scaled<coord_t>(
-            std::max(0.0, root->root_s - foundation_depth_s));
-        const coord_t back_s = scaled<coord_t>(
-            root->root_s + foundation_depth_s);
-        foundation_points.emplace_back(left_u, front_s);
-        foundation_points.emplace_back(right_u, front_s);
-        foundation_points.emplace_back(right_u, back_s);
-        foundation_points.emplace_back(left_u, back_s);
+    foundation_points.reserve(root_wedges.size() * 4);
+    for (const BeltRootWedge& wedge : root_wedges) {
+        for (const Vec3d& world : wedge.bottom_world) {
+            const Vec3d oriented = coordinates->world_to_oriented(world);
+            foundation_points.emplace_back(Point::new_scale(
+                oriented.x() - center_u, oriented.z()));
+        }
     }
     BeltRootFoundation root_foundation{
         Geometry::convex_hull(std::move(foundation_points))};
@@ -5494,6 +5738,10 @@ void BeltTaperedSupport::generate()
 
     size_t first_nonempty_plan = plans.size();
     size_t section_count = 0;
+    size_t root_wedge_section_count = 0;
+    size_t root_wedge_bed_contact_segment_count = 0;
+    size_t root_wedge_missing_leading_edge_count =
+        root_wedge_contract_failure_count;
     size_t build_plate_clipped_section_count = 0;
     size_t section_trimmed_by_model_count = 0;
     size_t section_trimmed_by_clearance_count = 0;
@@ -5534,7 +5782,6 @@ void BeltTaperedSupport::generate()
             detector.throw_on_cancel();
 
             plan.root_paths = make_root_paths(
-                plan.slice_s,
                 plan.print_s,
                 root_foundation, center_v, *coordinates);
 
@@ -5545,6 +5792,91 @@ void BeltTaperedSupport::generate()
 
             ExPolygons base_sections;
             ExPolygons interface_sections;
+            for (const BeltRootWedge& wedge : root_wedges) {
+                if (plan.slice_s + EPSILON < wedge.birth_s ||
+                    plan.slice_s - EPSILON > wedge.top_s) {
+                    continue;
+                }
+                BeltRootWedgeSlice wedge_slice = slice_root_wedge(
+                    wedge, plan.slice_s, center_u, center_v, *coordinates);
+                root_wedge_bed_contact_segment_count += std::accumulate(
+                    wedge_slice.bed_contact_paths.begin(),
+                    wedge_slice.bed_contact_paths.end(), size_t{0},
+                    [](size_t count, const Polyline& path) {
+                        return count + (path.points.size() > 1
+                            ? path.points.size() - 1 : 0);
+                    });
+
+                if (!model_solid.empty())
+                    wedge_slice.regions = diff_ex(
+                        wedge_slice.regions, model_solid);
+                if (!forbidden.empty())
+                    wedge_slice.regions = diff_ex(
+                        wedge_slice.regions, forbidden);
+
+                // A root wedge is accepted by its real Z=0 lower face and by
+                // continuity of the analytic solid. Do not apply the generic
+                // branch-centre test here: before the slicing plane reaches
+                // the centreline, the valid Y-max leading wedge deliberately
+                // does not contain that centreline.
+                for (ExPolygon& section : wedge_slice.regions) {
+                    for (const Point& point : section.contour.points) {
+                        const double world_z = local_point_to_world(
+                            point, plan.slice_s, center_u, center_v,
+                            *coordinates).z();
+                        minimum_section_world_z = std::min(
+                            minimum_section_world_z, world_z);
+                        if (world_z < -1e-5) {
+                            throw SlicingError(
+                                "Belt root wedge crosses below the world build plate.");
+                        }
+                    }
+                    if (debug != nullptr) {
+                        debug_polygon(
+                            debug, BeltSupportDebugStageId::LayerSections,
+                            section.contour, plan.slice_s,
+                            center_u, center_v, *coordinates,
+                            "root_wedge_section");
+                        debug->add_record(
+                            BeltSupportDebugStageId::LayerSections,
+                            "root_wedge_section",
+                            "finite_world_bed_root_intersection",
+                            {{"source_route_index",
+                              static_cast<double>(wedge.source_route_index)},
+                             {"source_contact_index",
+                              static_cast<double>(wedge.source_contact_index)},
+                             {"plan_index", static_cast<double>(plan_index)},
+                             {"slice_s_mm", plan.slice_s},
+                             {"birth_s_mm", wedge.birth_s},
+                             {"top_s_mm", wedge.top_s},
+                             {"area_mm2", expolygons_area_mm2(
+                                  ExPolygons{section})}});
+                    }
+                    ++root_wedge_section_count;
+                    ++section_count;
+                    base_sections.emplace_back(std::move(section));
+                }
+                if (debug != nullptr) {
+                    for (const Polyline& contact :
+                         wedge_slice.bed_contact_paths) {
+                        for (size_t point_index = 1;
+                             point_index < contact.points.size();
+                             ++point_index) {
+                            debug->add_line(
+                                BeltSupportDebugStageId::LayerSections,
+                                local_point_to_world(
+                                    contact.points[point_index - 1],
+                                    plan.slice_s, center_u, center_v,
+                                    *coordinates),
+                                local_point_to_world(
+                                    contact.points[point_index],
+                                    plan.slice_s, center_u, center_v,
+                                    *coordinates),
+                                "root_wedge_bed_contact");
+                        }
+                    }
+                }
+            }
             for (const BeltSupportContact& contact : contacts) {
                 if (plan.slice_s + EPSILON < contact.root_s ||
                     plan.slice_s - EPSILON > contact.tip_s)
@@ -6439,6 +6771,17 @@ void BeltTaperedSupport::generate()
                           static_cast<double>(plans.size()));
         debug->set_metric(BeltSupportDebugStageId::LayerSections, "section_count",
                           static_cast<double>(section_count));
+        debug->set_metric(BeltSupportDebugStageId::LayerSections,
+                          "root_wedge_section_count",
+                          static_cast<double>(root_wedge_section_count));
+        debug->set_metric(BeltSupportDebugStageId::LayerSections,
+                          "root_wedge_bed_contact_segment_count",
+                          static_cast<double>(
+                              root_wedge_bed_contact_segment_count));
+        debug->set_metric(BeltSupportDebugStageId::LayerSections,
+                          "root_wedge_missing_leading_edge_count",
+                          static_cast<double>(
+                              root_wedge_missing_leading_edge_count));
         debug->set_metric(BeltSupportDebugStageId::LayerSections,
                           "interface_roof_source_witness_count",
                           static_cast<double>(
