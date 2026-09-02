@@ -935,17 +935,23 @@ void BeltTaperedSupport::generate()
                 std::vector<Point> samples;
                 append_contact_samples(overhang, sample_spacing, samples);
                 contact_candidate_count += samples.size();
-                ExPolygons contact_safe_regions = offset_ex(overhang, -scale_(contact_inset));
-                if (contact_safe_regions.empty()) {
-                    ++narrow_overhang_count;
-                } else {
-                    // The eroded core is diagnostic only. Belt overhang strips
-                    // are often thinner than the configured inset, but they
-                    // still require contacts sampled from the original region.
-                    contact_safe_region_count += contact_safe_regions.size();
-                    debug_expolygons(debug, BeltSupportDebugStageId::RawContacts,
-                                     contact_safe_regions, layer->slice_z,
-                                     center_u, center_v, *coordinates, "contact_safe_region");
+                if (debug != nullptr) {
+                    ExPolygons contact_safe_regions =
+                        offset_ex(overhang, -scale_(contact_inset));
+                    if (contact_safe_regions.empty()) {
+                        ++narrow_overhang_count;
+                    } else {
+                        // The eroded core is audit data only. Belt overhang
+                        // strips are often thinner than the configured inset,
+                        // but they still require contacts sampled from the
+                        // original region.
+                        contact_safe_region_count += contact_safe_regions.size();
+                        debug_expolygons(
+                            debug, BeltSupportDebugStageId::RawContacts,
+                            contact_safe_regions, layer->slice_z,
+                            center_u, center_v, *coordinates,
+                            "contact_safe_region");
+                    }
                 }
                 size_t accepted_sample_count = 0;
                 for (const Point& sample : samples) {
@@ -968,13 +974,15 @@ void BeltTaperedSupport::generate()
                     if (!clear_center.has_value())
                         ++unplaceable_contact_center_count;
 
-                    const double global_u = unscaled<double>(center.x()) + center_u;
-                    const double global_v = unscaled<double>(center.y()) + center_v;
-                    const double root_s = -global_v / coordinates->cot_angle();
                     const Vec3d witness_world = local_point_to_world(
                         sample, tip_s, center_u, center_v, *coordinates);
                     const Vec3d center_world = local_point_to_world(
                         center, tip_s, center_u, center_v, *coordinates);
+                    const Vec3d root_world(
+                        center_world.x(), center_world.y(), 0.0);
+                    const Vec3d root_oriented =
+                        coordinates->world_to_oriented(root_world);
+                    const double root_s = root_oriented.z();
                     if (root_s < -EPSILON) {
                         ++rejected_before_task_origin_count;
                         if (debug != nullptr) {
@@ -1019,8 +1027,10 @@ void BeltTaperedSupport::generate()
                     BeltSupportContact contact;
                     contact.center_local = center;
                     contact.witness_local = sample;
-                    contact.root_u_local = center.x();
-                    contact.root_v_local = center.y();
+                    contact.root_u_local = scaled<coord_t>(
+                        root_oriented.x() - center_u);
+                    contact.root_v_local = scaled<coord_t>(
+                        root_oriented.y() - center_v);
                     contact.tip_s = tip_s;
                     contact.root_s = std::max(0.0, root_s);
                     contact.source_overhang_region_index = overhang_region_index;
@@ -1192,7 +1202,166 @@ void BeltTaperedSupport::generate()
         m_object.config().tree_support_branch_angle_organic.value *
             M_PI / 180.0,
         0.0, 0.5 * M_PI - EPSILON);
-    const double maximum_lateral_slope = std::tan(maximum_lateral_angle);
+    // Orca's branch angle is measured from world vertical. A world-vertical
+    // Belt trunk advances by ds / cos(alpha) in world Z for each oriented ds,
+    // so its available world-X movement per ds is tan(beta) / cos(alpha).
+    // Do not reinterpret beta as a cone around the Belt slicing normal N.
+    const double maximum_world_branch_slope = std::tan(maximum_lateral_angle);
+    constexpr double world_branch_numeric_tolerance = 5e-5;
+    const double maximum_vertical_route_u_slope =
+        maximum_world_branch_slope / coordinates->cos_angle();
+    const double world_vertical_route_v_slope =
+        -coordinates->sin_angle() / coordinates->cos_angle();
+    // The remaining fallback planners still use an oriented-layer reachability
+    // radius. Keep that implementation budget separate from the authoritative
+    // world-angle audit below.
+    const double maximum_lateral_slope = std::max(
+        maximum_world_branch_slope,
+        coordinates->sin_angle() / coordinates->cos_angle());
+    const auto world_segment_horizontal_slope =
+        [&](const BeltRoutePoint& upper, const BeltRoutePoint& lower) {
+            const Vec3d upper_world = coordinates->oriented_to_world({
+                upper.u + center_u, upper.v + center_v, upper.s});
+            const Vec3d lower_world = coordinates->oriented_to_world({
+                lower.u + center_u, lower.v + center_v, lower.s});
+            const Vec3d growth = upper_world - lower_world;
+            if (growth.z() <= EPSILON)
+                return std::numeric_limits<double>::infinity();
+            return std::hypot(growth.x(), growth.y()) / growth.z();
+        };
+    const auto world_branch_segment_is_valid =
+        [&](const BeltRoutePoint& upper, const BeltRoutePoint& lower,
+            double tolerance = 5e-5) {
+            return upper.s > lower.s + EPSILON &&
+                world_segment_horizontal_slope(upper, lower) <=
+                    maximum_world_branch_slope + tolerance;
+        };
+    // At a fixed oriented-layer step ds, the world-vertical branch cone maps
+    // to a translated, axis-aligned ellipse in the oriented U/V plane:
+    //
+    //   A (dv / ds - b0)^2 + (du / ds)^2 <= R^2
+    //
+    // This is the exact replacement for the old circle around N. It lets the
+    // area solver keep using robust 2D offsets without deforming the model.
+    const double cone_a =
+        coordinates->cos_angle() * coordinates->cos_angle() -
+        maximum_world_branch_slope * maximum_world_branch_slope *
+            coordinates->sin_angle() * coordinates->sin_angle();
+    const double cone_b =
+        2.0 * coordinates->sin_angle() * coordinates->cos_angle() *
+        (1.0 + maximum_world_branch_slope * maximum_world_branch_slope);
+    const double cone_c =
+        coordinates->sin_angle() * coordinates->sin_angle() -
+        maximum_world_branch_slope * maximum_world_branch_slope *
+            coordinates->cos_angle() * coordinates->cos_angle();
+    const bool bounded_world_cone = cone_a > EPSILON;
+    const double cone_center_v_slope = bounded_world_cone
+        ? -cone_b / (2.0 * cone_a)
+        : -coordinates->sin_angle() / coordinates->cos_angle();
+    const double cone_radius_squared = bounded_world_cone
+        ? std::max(0.0,
+              cone_b * cone_b / (4.0 * cone_a) - cone_c)
+        : maximum_vertical_route_u_slope * maximum_vertical_route_u_slope;
+    const double cone_u_radius_per_s =
+        std::max(1e-6, std::sqrt(cone_radius_squared));
+    const double cone_v_radius_per_s = bounded_world_cone
+        ? std::max(1e-6, std::sqrt(cone_radius_squared / cone_a))
+        : cone_u_radius_per_s;
+    auto transform_cone_space = [&](ExPolygons polygons, bool inverse,
+                                    double translate_v = 0.0) {
+        auto transform_point = [&](Point& point) {
+            const double u = unscaled<double>(point.x());
+            const double v = unscaled<double>(point.y());
+            if (inverse) {
+                point = Point::new_scale(
+                    u * cone_u_radius_per_s,
+                    v * cone_v_radius_per_s + translate_v);
+            } else {
+                point = Point::new_scale(
+                    u / cone_u_radius_per_s,
+                    v / cone_v_radius_per_s);
+            }
+        };
+        for (ExPolygon& polygon : polygons) {
+            for (Point& point : polygon.contour.points)
+                transform_point(point);
+            for (Polygon& hole : polygon.holes)
+                for (Point& point : hole.points)
+                    transform_point(point);
+        }
+        return polygons;
+    };
+    auto expand_by_world_branch_cone =
+        [&](const ExPolygons& regions, double delta_s, double guard) {
+            if (regions.empty() || delta_s <= EPSILON)
+                return regions;
+            ExPolygons normalized = transform_cone_space(regions, false);
+            normalized = offset_ex(
+                normalized,
+                scale_(std::max(0.0, delta_s - guard)), jtRound);
+            return union_ex(transform_cone_space(
+                std::move(normalized), true,
+                cone_center_v_slope * delta_s));
+        };
+    auto expand_to_world_branch_successors =
+        [&](const ExPolygons& regions, double delta_s,
+            double radial_growth) {
+            if (regions.empty() || delta_s <= EPSILON)
+                return regions;
+            ExPolygons normalized = transform_cone_space(regions, false);
+            normalized = offset_ex(
+                normalized, scale_(delta_s), jtRound);
+            ExPolygons expanded = transform_cone_space(
+                std::move(normalized), true,
+                -cone_center_v_slope * delta_s);
+            if (radial_growth > EPSILON) {
+                expanded = offset_ex(
+                    expanded, scale_(radial_growth), jtRound);
+            }
+            return union_ex(expanded);
+        };
+    auto world_branch_cone_section =
+        [&](const Point& upper, double delta_s, double guard) {
+            constexpr size_t segment_count = 48;
+            const double radial_s = std::max(0.0, delta_s - guard);
+            const double center_u = unscaled<double>(upper.x());
+            const double center_v = unscaled<double>(upper.y()) +
+                cone_center_v_slope * delta_s;
+            Points points;
+            points.reserve(segment_count);
+            for (size_t segment = 0; segment < segment_count; ++segment) {
+                const double angle = 2.0 * M_PI *
+                    static_cast<double>(segment) /
+                    static_cast<double>(segment_count);
+                points.emplace_back(Point::new_scale(
+                    center_u + cone_u_radius_per_s * radial_s *
+                        std::cos(angle),
+                    center_v + cone_v_radius_per_s * radial_s *
+                        std::sin(angle)));
+            }
+            return ExPolygons{ExPolygon(Polygon(std::move(points)))};
+        };
+    auto world_branch_predecessor_section =
+        [&](const Point& lower, double delta_s, double guard) {
+            constexpr size_t segment_count = 48;
+            const double radial_s = std::max(0.0, delta_s - guard);
+            const double center_u = unscaled<double>(lower.x());
+            const double center_v = unscaled<double>(lower.y()) -
+                cone_center_v_slope * delta_s;
+            Points points;
+            points.reserve(segment_count);
+            for (size_t segment = 0; segment < segment_count; ++segment) {
+                const double angle = 2.0 * M_PI *
+                    static_cast<double>(segment) /
+                    static_cast<double>(segment_count);
+                points.emplace_back(Point::new_scale(
+                    center_u + cone_u_radius_per_s * radial_s *
+                        std::cos(angle),
+                    center_v + cone_v_radius_per_s * radial_s *
+                        std::sin(angle)));
+            }
+            return ExPolygons{ExPolygon(Polygon(std::move(points)))};
+        };
     const double interface_depth =
         std::max(0, m_object.config().support_interface_top_layers.value) *
         m_slicing_parameters.layer_height;
@@ -1316,6 +1485,10 @@ void BeltTaperedSupport::generate()
         }
     }
     std::set<size_t> effective_contact_source_regions;
+    const auto preferred_vertical_v_at = [](const BeltSupportContact& contact,
+                                            double slice_s) {
+        return unscaled<double>(branch_center_at(contact, slice_s).y());
+    };
     {
         BeltSupportDebugStageTimer timer(debug, BeltSupportDebugStageId::ConsolidatedContacts);
         for (size_t contact_index = 0; contact_index < contacts.size(); ++contact_index) {
@@ -1473,15 +1646,22 @@ void BeltTaperedSupport::generate()
         return;
     }
 
+    double maximum_root_projection_xy_shift = 0.0;
+    double maximum_root_projection_abs_world_z = 0.0;
     {
         BeltSupportDebugStageTimer timer(debug, BeltSupportDebugStageId::RootProjection);
         for (size_t contact_index = 0; contact_index < contacts.size(); ++contact_index) {
             const BeltSupportContact& contact = contacts[contact_index];
             const Vec3d tip = local_point_to_world(
                 contact.center_local, contact.tip_s, center_u, center_v, *coordinates);
-            const Point root_local(contact.center_local.x(), contact.center_local.y());
+            const Point root_local(contact.root_u_local, contact.root_v_local);
             const Vec3d root = local_point_to_world(
                 root_local, contact.root_s, center_u, center_v, *coordinates);
+            maximum_root_projection_xy_shift = std::max(
+                maximum_root_projection_xy_shift,
+                std::hypot(root.x() - tip.x(), root.y() - tip.y()));
+            maximum_root_projection_abs_world_z = std::max(
+                maximum_root_projection_abs_world_z, std::abs(root.z()));
             if (debug != nullptr) {
                 debug->add_line(BeltSupportDebugStageId::RootProjection, tip, root,
                                 "root_projection");
@@ -1489,7 +1669,7 @@ void BeltTaperedSupport::generate()
                                  "projected_root");
                 debug->add_record(
                     BeltSupportDebugStageId::RootProjection, "root_projection",
-                    "parallel_to_negative_belt_normal",
+                    "parallel_to_negative_world_z",
                     {{"contact_index", static_cast<double>(contact_index)},
                      {"tip_world_x_mm", tip.x()},
                      {"tip_world_y_mm", tip.y()},
@@ -1503,6 +1683,14 @@ void BeltTaperedSupport::generate()
     if (debug != nullptr)
         debug->set_metric(BeltSupportDebugStageId::RootProjection, "projection_count",
                           static_cast<double>(contacts.size()));
+    if (debug != nullptr) {
+        debug->set_metric(BeltSupportDebugStageId::RootProjection,
+                          "maximum_projection_xy_shift_mm",
+                          maximum_root_projection_xy_shift);
+        debug->set_metric(BeltSupportDebugStageId::RootProjection,
+                          "maximum_projection_abs_world_z_mm",
+                          maximum_root_projection_abs_world_z);
+    }
 
     // Rebuild the complete print schedule from the same authoritative layer
     // height profile used by PrintObject::slice(). PrintObject::layers() may
@@ -1621,7 +1809,8 @@ void BeltTaperedSupport::generate()
                     break;
 
                 const double step_shift =
-                    maximum_lateral_slope * (previous_s - plan.slice_s);
+                    maximum_vertical_route_u_slope *
+                    (previous_s - plan.slice_s);
                 std::vector<BeltReachableInterval> expanded;
                 expanded.reserve(reachable.size());
                 for (const BeltReachableInterval& interval : reachable)
@@ -1630,7 +1819,8 @@ void BeltTaperedSupport::generate()
                 expanded = merge_intervals(std::move(expanded));
 
                 const double total_shift =
-                    maximum_lateral_slope * (contact.tip_s - plan.slice_s);
+                    maximum_vertical_route_u_slope *
+                    (contact.tip_s - plan.slice_s);
                 for (BeltReachableInterval& interval : expanded) {
                     interval.minimum_u = std::max(interval.minimum_u, tip_u - total_shift);
                     interval.maximum_u = std::min(interval.maximum_u, tip_u + total_shift);
@@ -1644,7 +1834,8 @@ void BeltTaperedSupport::generate()
                 if (distance_to_tip > contact_cap_depth) {
                     const BeltForbiddenLayer& forbidden =
                         forbidden_by_plan[static_cast<size_t>(plan_index)];
-                    const double v = unscaled<double>(contact.center_local.y());
+                    const double v = preferred_vertical_v_at(
+                        contact, plan.slice_s);
                     blocked = blocked_u_intervals(
                         forbidden, v, tip_half_width);
                 }
@@ -1654,10 +1845,10 @@ void BeltTaperedSupport::generate()
                     for (const BeltReachableInterval& interval : blocked) {
                         const Point first = Point::new_scale(
                             interval.minimum_u,
-                            unscaled<double>(contact.center_local.y()));
+                            preferred_vertical_v_at(contact, plan.slice_s));
                         const Point second = Point::new_scale(
                             interval.maximum_u,
-                            unscaled<double>(contact.center_local.y()));
+                            preferred_vertical_v_at(contact, plan.slice_s));
                         debug->add_line(
                             BeltSupportDebugStageId::RouteClassification,
                             local_point_to_world(first, plan.slice_s, center_u, center_v,
@@ -1689,10 +1880,10 @@ void BeltTaperedSupport::generate()
                     for (const BeltReachableInterval& interval : reachable) {
                         const Point first = Point::new_scale(
                             interval.minimum_u,
-                            unscaled<double>(contact.center_local.y()));
+                            preferred_vertical_v_at(contact, plan.slice_s));
                         const Point second = Point::new_scale(
                             interval.maximum_u,
-                            unscaled<double>(contact.center_local.y()));
+                            preferred_vertical_v_at(contact, plan.slice_s));
                         debug->add_line(
                             BeltSupportDebugStageId::ReachableCorridors,
                             local_point_to_world(first, plan.slice_s, center_u, center_v,
@@ -1716,7 +1907,8 @@ void BeltTaperedSupport::generate()
 
             if (route.failure_reason.empty()) {
                 const double final_shift =
-                    maximum_lateral_slope * std::max(0.0, previous_s - contact.root_s);
+                    maximum_vertical_route_u_slope *
+                    std::max(0.0, previous_s - contact.root_s);
                 std::vector<BeltReachableInterval> root_intervals;
                 root_intervals.reserve(reachable.size());
                 for (const BeltReachableInterval& interval : reachable)
@@ -1729,13 +1921,15 @@ void BeltTaperedSupport::generate()
                 double chosen_u = closest_value_in_intervals(
                     route.reachable_layers.back().intervals, tip_u);
                 std::vector<BeltRoutePoint> reverse_points;
-                const double route_v = unscaled<double>(route.v_local);
-                reverse_points.push_back({chosen_u, route_v, contact.root_s});
+                reverse_points.push_back({
+                    chosen_u,
+                    preferred_vertical_v_at(contact, contact.root_s),
+                    contact.root_s});
                 for (size_t layer_index = route.reachable_layers.size() - 1;
                      layer_index > 0; --layer_index) {
                     const BeltReachableLayer& lower = route.reachable_layers[layer_index];
                     const BeltReachableLayer& upper = route.reachable_layers[layer_index - 1];
-                    const double permitted = maximum_lateral_slope *
+                    const double permitted = maximum_vertical_route_u_slope *
                         std::max(0.0, upper.slice_s - lower.slice_s);
                     std::vector<BeltReachableInterval> feasible;
                     for (const BeltReachableInterval& interval : upper.intervals) {
@@ -1751,7 +1945,10 @@ void BeltTaperedSupport::generate()
                         break;
                     }
                     chosen_u = closest_value_in_intervals(feasible, tip_u);
-                    reverse_points.push_back({chosen_u, route_v, upper.slice_s});
+                    reverse_points.push_back({
+                        chosen_u,
+                        preferred_vertical_v_at(contact, upper.slice_s),
+                        upper.slice_s});
                 }
                 if (route.failure_reason.empty()) {
                     route.points.assign(reverse_points.rbegin(), reverse_points.rend());
@@ -1786,7 +1983,9 @@ void BeltTaperedSupport::generate()
     constexpr size_t merge_stability_layers = 3;
     const size_t direct_reachable_contact_count = reachable_contact_count;
     size_t rescued_contact_count = 0;
-    auto backtrack_to_reachable_layer = [maximum_lateral_slope](
+    auto backtrack_to_reachable_layer = [
+        &contacts, maximum_vertical_route_u_slope,
+        &preferred_vertical_v_at](
         BeltSupportRoute& route, size_t target_layer_index, double target_u) {
         if (target_layer_index == 0 ||
             target_layer_index >= route.reachable_layers.size()) {
@@ -1794,14 +1993,15 @@ void BeltTaperedSupport::generate()
         }
         double chosen_u = target_u;
         std::vector<BeltRoutePoint> reverse_points;
-        const double route_v = unscaled<double>(route.v_local);
+        const BeltSupportContact& contact = contacts[route.contact_index];
+        const double target_s =
+            route.reachable_layers[target_layer_index].slice_s;
         reverse_points.push_back(
-            {chosen_u, route_v,
-             route.reachable_layers[target_layer_index].slice_s});
+            {chosen_u, preferred_vertical_v_at(contact, target_s), target_s});
         for (size_t layer_index = target_layer_index; layer_index > 0; --layer_index) {
             const BeltReachableLayer& lower = route.reachable_layers[layer_index];
             const BeltReachableLayer& upper = route.reachable_layers[layer_index - 1];
-            const double permitted = maximum_lateral_slope *
+            const double permitted = maximum_vertical_route_u_slope *
                 std::max(0.0, upper.slice_s - lower.slice_s);
             std::vector<BeltReachableInterval> feasible;
             for (const BeltReachableInterval& interval : upper.intervals) {
@@ -1816,7 +2016,10 @@ void BeltTaperedSupport::generate()
                 return false;
             const double contact_u = route.reachable_layers.front().intervals.front().minimum_u;
             chosen_u = closest_value_in_intervals(feasible, contact_u);
-            reverse_points.push_back({chosen_u, route_v, upper.slice_s});
+            reverse_points.push_back({
+                chosen_u,
+                preferred_vertical_v_at(contact, upper.slice_s),
+                upper.slice_s});
         }
 
         BeltSupportRoute partial = route;
@@ -1929,9 +2132,9 @@ void BeltTaperedSupport::generate()
             }
     }
 
-    // Fixed-V is only one radial direction inside the configured branch cone.
-    // If that slice is blocked, try a bounded family of straight V slopes and
-    // spend the remaining lateral slope budget on the existing U corridor
+    // World vertical is only one direction inside the configured branch cone.
+    // If that route is blocked, try a bounded family of world-space tilts and
+    // spend the remaining horizontal slope budget on the existing U corridor
     // search. Every attempt is recorded; no failed contact is silently dropped.
     size_t sloped_v_attempt_count = 0;
     size_t sloped_v_invalid_root_count = 0;
@@ -1962,10 +2165,28 @@ void BeltTaperedSupport::generate()
             return false;
         }
 
-        const double maximum_u_slope = std::sqrt(std::max(
-            0.0,
-            maximum_lateral_slope * maximum_lateral_slope -
-                v_slope * v_slope));
+        // v_slope describes lower.v - upper.v per oriented ds. Convert that
+        // direction to the real world before assigning the remaining X
+        // budget. The former oriented circle was a cone around N and admitted
+        // branches which were almost horizontal in the real machine.
+        const double world_growth_v_slope = -v_slope;
+        const double world_dz_per_s =
+            world_growth_v_slope * coordinates->sin_angle() +
+            coordinates->cos_angle();
+        const double world_dy_per_s =
+            world_growth_v_slope * coordinates->cos_angle() -
+            coordinates->sin_angle();
+        const double maximum_u_slope_squared =
+            maximum_world_branch_slope * maximum_world_branch_slope *
+                world_dz_per_s * world_dz_per_s -
+            world_dy_per_s * world_dy_per_s;
+        if (world_dz_per_s <= EPSILON ||
+            maximum_u_slope_squared < -EPSILON) {
+            rejection_reason = "outside_world_vertical_branch_cone";
+            return false;
+        }
+        const double maximum_u_slope =
+            std::sqrt(std::max(0.0, maximum_u_slope_squared));
         auto v_at = [&](double slice_s) {
             return tip_v_local + v_slope * (contact.tip_s - slice_s);
         };
@@ -2083,18 +2304,19 @@ void BeltTaperedSupport::generate()
 
     size_t solid_only_rescued_contact_count = 0;
     size_t solid_only_rejected_contact_count = 0;
-    for (size_t route_index = 0; route_index < routes.size(); ++route_index) {
-        BeltSupportRoute& route = routes[route_index];
-        if (route.failure_reason.empty())
-            continue;
-        BeltSupportRoute candidate;
-        std::string rejection_reason;
-        double failure_slice_s = 0.0;
-        const bool accepted = try_sloped_v_route(
-            contacts[route.contact_index], route.contact_index, 0.0,
-            model_solid_by_plan, false,
-            candidate, rejection_reason, failure_slice_s);
-        if (debug != nullptr) {
+    if (debug != nullptr) {
+        for (size_t route_index = 0; route_index < routes.size(); ++route_index) {
+            BeltSupportRoute& route = routes[route_index];
+            if (route.failure_reason.empty())
+                continue;
+            BeltSupportRoute candidate;
+            std::string rejection_reason;
+            double failure_slice_s = 0.0;
+            const bool accepted = try_sloped_v_route(
+                contacts[route.contact_index], route.contact_index,
+                world_vertical_route_v_slope,
+                model_solid_by_plan, false,
+                candidate, rejection_reason, failure_slice_s);
             debug->add_record(
                 BeltSupportDebugStageId::RouteClassification,
                 "route_solid_only_attempt",
@@ -2104,15 +2326,15 @@ void BeltTaperedSupport::generate()
                  {"accepted", accepted ? 1.0 : 0.0},
                  {"configured_xy_gap_mm", model_clearance},
                  {"failure_slice_s_mm", failure_slice_s}});
+            if (!accepted) {
+                ++solid_only_rejected_contact_count;
+                continue;
+            }
+            // Preserve this as audit data only. A path which intersects the
+            // configured XY clearance is not printable merely because it
+            // avoids the model's solid volume.
+            ++solid_only_rescued_contact_count;
         }
-        if (!accepted) {
-            ++solid_only_rejected_contact_count;
-            continue;
-        }
-        // Preserve this as a diagnostic only. A path which intersects the
-        // configured XY clearance is not printable merely because it avoids
-        // the model's solid volume.
-        ++solid_only_rescued_contact_count;
     }
 
     constexpr size_t sloped_v_step_count = 8;
@@ -2122,12 +2344,27 @@ void BeltTaperedSupport::generate()
             continue;
 
         bool rescued = false;
-        for (size_t step = 1; step <= sloped_v_step_count && !rescued; ++step) {
-            const double magnitude = maximum_lateral_slope * 0.95 *
-                static_cast<double>(step) /
+        // Search outward from world vertical. Sample directions in the world
+        // Y/Z plane, then convert them to the oriented V/S slope consumed by
+        // the corridor solver. This preserves Orca's branch-angle semantics.
+        for (size_t attempt = 0;
+             attempt < sloped_v_step_count && !rescued; ++attempt) {
+            const double world_tilt = maximum_lateral_angle * 0.95 *
+                static_cast<double>(attempt + 1) /
                 static_cast<double>(sloped_v_step_count);
-            for (const double sign : {-1.0, 1.0}) {
-                const double v_slope = sign * magnitude;
+            for (const double world_y_sign : {-1.0, 1.0}) {
+                const double world_dy =
+                    world_y_sign * std::sin(world_tilt);
+                const double world_dz = std::cos(world_tilt);
+                const double oriented_ds =
+                    -world_dy * coordinates->sin_angle() +
+                    world_dz * coordinates->cos_angle();
+                const double oriented_dv =
+                    world_dy * coordinates->cos_angle() +
+                    world_dz * coordinates->sin_angle();
+                if (oriented_ds <= EPSILON)
+                    continue;
+                const double v_slope = -oriented_dv / oriented_ds;
                 ++sloped_v_attempt_count;
                 BeltSupportRoute candidate;
                 std::string rejection_reason;
@@ -2191,7 +2428,7 @@ void BeltTaperedSupport::generate()
         }
     }
 
-    // A failed fixed-V route may still be a valid tree branch: it can move in
+    // A failed world-vertical route may still be a valid tree branch: it can move in
     // both U and V and terminate on an already grounded route. First rank a
     // bounded set of geometric candidates, then spend exact Clipper collision
     // checks only on those candidates. This avoids the rejected
@@ -2253,8 +2490,9 @@ void BeltTaperedSupport::generate()
                     const double branch_span = child.tip_s - merge_s;
                     const double lateral_distance = std::hypot(
                         target_u - tip_u, target_v - tip_v);
-                    if (lateral_distance >
-                        maximum_lateral_slope * branch_span + EPSILON) {
+                    if (!world_branch_segment_is_valid(
+                            {tip_u, tip_v, child.tip_s},
+                            {target_u, target_v, merge_s})) {
                         continue;
                     }
                     candidates.push_back({
@@ -2475,9 +2713,7 @@ void BeltTaperedSupport::generate()
         const double span = upper.s - lower.s;
         if (span <= EPSILON)
             return false;
-        const double lateral_distance = std::hypot(
-            lower.u - upper.u, lower.v - upper.v);
-        if (lateral_distance > maximum_lateral_slope * span + EPSILON)
+        if (!world_branch_segment_is_valid(upper, lower))
             return false;
         const auto first_it = std::lower_bound(
             plans.begin(), plans.end(), lower.s - EPSILON,
@@ -2574,22 +2810,42 @@ void BeltTaperedSupport::generate()
                 const double delta_s = source.point.s - target_s;
                 if (delta_s <= EPSILON)
                     continue;
-                const double maximum_step = maximum_lateral_slope * delta_s * 0.98;
                 std::vector<std::pair<double, double>> offsets;
                 offsets.reserve(1 + search_direction_count * 2);
-                offsets.emplace_back(0.0, 0.0);
+                // Generate the search fan in world coordinates. Its center is
+                // the world-vertical continuation, not the Belt normal N.
+                const auto append_world_direction =
+                    [&](double tilt, double azimuth) {
+                        const double world_dx =
+                            std::sin(tilt) * std::cos(azimuth);
+                        const double world_dy =
+                            std::sin(tilt) * std::sin(azimuth);
+                        const double world_dz = std::cos(tilt);
+                        const double oriented_du = world_dx;
+                        const double oriented_dv =
+                            world_dy * coordinates->cos_angle() +
+                            world_dz * coordinates->sin_angle();
+                        const double oriented_ds =
+                            -world_dy * coordinates->sin_angle() +
+                            world_dz * coordinates->cos_angle();
+                        if (oriented_ds <= EPSILON)
+                            return;
+                        const double scale = delta_s / oriented_ds;
+                        offsets.emplace_back(
+                            -oriented_du * scale,
+                            -oriented_dv * scale);
+                    };
+                append_world_direction(0.0, 0.0);
                 for (size_t direction = 0;
                      direction < search_direction_count; ++direction) {
                     const double angle = 2.0 * M_PI *
                         static_cast<double>(direction) /
                         static_cast<double>(search_direction_count);
-                    offsets.emplace_back(
-                        maximum_step * std::cos(angle),
-                        maximum_step * std::sin(angle));
+                    append_world_direction(
+                        maximum_lateral_angle * 0.98, angle);
                     if (direction % 2 == 0) {
-                        offsets.emplace_back(
-                            0.5 * maximum_step * std::cos(angle),
-                            0.5 * maximum_step * std::sin(angle));
+                        append_world_direction(
+                            maximum_lateral_angle * 0.5, angle);
                     }
                 }
 
@@ -2672,15 +2928,22 @@ void BeltTaperedSupport::generate()
                         break;
                     }
 
-                    const double root_s =
-                        -(candidate.v + center_v) / coordinates->cot_angle();
+                    const Vec3d candidate_world =
+                        coordinates->oriented_to_world({
+                            candidate.u + center_u,
+                            candidate.v + center_v,
+                            candidate.s});
+                    const Vec3d root_oriented =
+                        coordinates->world_to_oriented({
+                            candidate_world.x(), candidate_world.y(), 0.0});
+                    const double root_s = root_oriented.z();
                     if (root_s >= -EPSILON && root_s < target_s - EPSILON &&
                         target_s - root_s <=
                             1.5 * search_plan_stride *
                                 m_slicing_parameters.layer_height) {
                         const BeltRoutePoint root_point{
-                            candidate.u,
-                            coordinates->belt_boundary_v(std::max(0.0, root_s)) - center_v,
+                            root_oriented.x() - center_u,
+                            root_oriented.y() - center_v,
                             std::max(0.0, root_s)};
                         if (segment_stays_outside_model(
                                 candidate, root_point, contact.tip_s)) {
@@ -2924,31 +3187,26 @@ void BeltTaperedSupport::generate()
             const double delta_s = previous_s - plan.slice_s;
             if (delta_s <= EPSILON)
                 continue;
-            const double nominal_move_budget =
-                maximum_lateral_slope * delta_s;
+            const double nominal_move_budget = delta_s;
             const double move_budget = std::max(
-                0.0, nominal_move_budget - exact_route_coordinate_guard);
-            reachable = offset_ex(
-                reachable, scale_(move_budget), jtRound);
+                0.0, delta_s - exact_route_coordinate_guard);
+            reachable = expand_by_world_branch_cone(
+                reachable, delta_s, exact_route_coordinate_guard);
 
             // The finite Clipper seed must not enlarge the mathematical cone.
             // Bound every propagated set by the cumulative Euclidean lateral
             // budget measured from the exact contact center.
             const double nominal_total_lateral_budget =
-                maximum_lateral_slope *
                 std::max(0.0, contact.tip_s - plan.slice_s);
             const double total_lateral_budget = std::max(
                 0.0,
                 nominal_total_lateral_budget - exact_route_coordinate_guard);
             if (total_lateral_budget > EPSILON && !reachable.empty()) {
-                Polygon total_budget_circle = make_circle(
-                    scale_(total_lateral_budget),
-                    scale_(std::min(
-                        0.005, 0.1 * total_lateral_budget)));
-                total_budget_circle.translate(tip_point);
                 reachable = intersection_ex(
                     reachable,
-                    ExPolygons{ExPolygon(std::move(total_budget_circle))});
+                    world_branch_cone_section(
+                        tip_point, nominal_total_lateral_budget,
+                        exact_route_coordinate_guard));
             }
 
             const double distance_to_tip = contact.tip_s - plan.slice_s;
@@ -3130,34 +3388,47 @@ void BeltTaperedSupport::generate()
                  layer_index >= 0; --layer_index) {
                 const BeltReachableAreaLayer& upper =
                     area_layers[static_cast<size_t>(layer_index)];
-                const double permitted = maximum_lateral_slope *
-                    (upper.slice_s - current_s);
-                Point chosen = current_point;
-                const bool current_inside = std::any_of(
-                    upper.regions.begin(), upper.regions.end(),
-                    [&current_point](const ExPolygon& region) {
-                        return region.contains(current_point);
-                    });
-                if (!current_inside)
-                    chosen = projection_onto(upper.regions, current_point);
-                const double actual_step =
-                    unscaled<double>((chosen - current_point).norm());
+                const double delta_s = upper.slice_s - current_s;
                 constexpr double backtrack_coordinate_tolerance = 0.00001;
-                if (actual_step > permitted + backtrack_coordinate_tolerance) {
+                const ExPolygons feasible = intersection_ex(
+                    upper.regions,
+                    world_branch_predecessor_section(
+                        current_point, delta_s, 0.0));
+                if (feasible.empty()) {
                     backtrack_failed = true;
                     if (debug != nullptr) {
                         debug->add_record(
                             BeltSupportDebugStageId::RouteClassification,
                             "exact_reachable_area_backtrack_step",
-                            "nearest_predecessor_exceeds_branch_angle_budget",
+                            "no_world_cone_predecessor",
                             {{"contact_index",
                               static_cast<double>(route.contact_index)},
                              {"slice_s_mm", upper.slice_s},
-                             {"permitted_lateral_step_mm", permitted},
-                             {"actual_lateral_step_mm", actual_step},
                              {"coordinate_tolerance_mm",
                               backtrack_coordinate_tolerance}});
                     }
+                    break;
+                }
+                const Point preferred = Point::new_scale(
+                    unscaled<double>(current_point.x()),
+                    unscaled<double>(current_point.y()) +
+                        coordinates->sin_angle() /
+                            coordinates->cos_angle() * delta_s);
+                Point chosen = preferred;
+                const bool preferred_inside = std::any_of(
+                    feasible.begin(), feasible.end(),
+                    [&preferred](const ExPolygon& region) {
+                        return region.contains(preferred);
+                    });
+                if (!preferred_inside)
+                    chosen = projection_onto(feasible, preferred);
+                if (!world_branch_segment_is_valid(
+                        {unscaled<double>(chosen.x()),
+                         unscaled<double>(chosen.y()), upper.slice_s},
+                        {unscaled<double>(current_point.x()),
+                         unscaled<double>(current_point.y()), current_s},
+                        backtrack_coordinate_tolerance)) {
+                    backtrack_failed = true;
                     break;
                 }
                 current_point = chosen;
@@ -3208,8 +3479,8 @@ void BeltTaperedSupport::generate()
                 std::sqrt(delta_u * delta_u + delta_v * delta_v) / delta_s;
             dense_route_maximum_lateral_slope = std::max(
                 dense_route_maximum_lateral_slope, lateral_slope);
-            if (lateral_slope >
-                maximum_lateral_slope + route_slope_tolerance) {
+            if (!world_branch_segment_is_valid(
+                    upper, lower, route_slope_tolerance)) {
                 dense_route_angle_valid = false;
                 break;
             }
@@ -3367,8 +3638,9 @@ void BeltTaperedSupport::generate()
                     const double branch_span = candidate.tip_s - merge_s;
                     const double lateral_distance = std::hypot(
                         target_u - tip_u, target_v - tip_v);
-                    if (lateral_distance >
-                        maximum_lateral_slope * branch_span + EPSILON) {
+                    if (!world_branch_segment_is_valid(
+                            {tip_u, tip_v, candidate.tip_s},
+                            {target_u, target_v, merge_s})) {
                         continue;
                     }
                     ++route_aware_uv_angle_candidate_count;
@@ -3561,29 +3833,26 @@ void BeltTaperedSupport::generate()
             const double delta_s = previous_s - plan.slice_s;
             if (delta_s <= EPSILON)
                 continue;
-            const double nominal_move_budget =
-                lateral_slope_limit * delta_s;
+            const double nominal_move_budget = delta_s;
             const double move_budget = std::max(
                 0.0,
-                nominal_move_budget - exact_route_coordinate_guard);
-            reachable = offset_ex(
-                reachable, scale_(move_budget), jtRound);
+                delta_s - exact_route_coordinate_guard);
+            reachable = expand_by_world_branch_cone(
+                reachable, delta_s, exact_route_coordinate_guard);
 
             const double distance_to_tip =
                 candidate.tip_s - plan.slice_s;
             const double nominal_total_budget =
-                lateral_slope_limit * std::max(0.0, distance_to_tip);
+                std::max(0.0, distance_to_tip);
             const double total_budget = std::max(
                 0.0,
                 nominal_total_budget - exact_route_coordinate_guard);
             if (total_budget > EPSILON && !reachable.empty()) {
-                Polygon total_budget_circle = make_circle(
-                    scale_(total_budget),
-                    scale_(std::min(0.005, 0.1 * total_budget)));
-                total_budget_circle.translate(tip_point);
                 reachable = intersection_ex(
                     reachable,
-                    ExPolygons{ExPolygon(std::move(total_budget_circle))});
+                    world_branch_cone_section(
+                        tip_point, nominal_total_budget,
+                        exact_route_coordinate_guard));
             }
             if (!reachable.empty())
                 reachable = union_ex(reachable);
@@ -3804,20 +4073,32 @@ void BeltTaperedSupport::generate()
              layer_cursor >= 0; --layer_cursor) {
             const BeltReachableAreaLayer& upper =
                 area_layers[static_cast<size_t>(layer_cursor)];
-            const double permitted =
-                lateral_slope_limit * (upper.slice_s - current_s);
-            Point chosen = current_point;
-            const bool inside = std::any_of(
-                upper.regions.begin(), upper.regions.end(),
-                [&current_point](const ExPolygon& region) {
-                    return region.contains(current_point);
-                });
-            if (!inside)
-                chosen = projection_onto(upper.regions, current_point);
-            if (unscaled<double>((chosen - current_point).norm()) >
-                permitted + 0.00001) {
+            const double delta_s = upper.slice_s - current_s;
+            const ExPolygons feasible = intersection_ex(
+                upper.regions,
+                world_branch_predecessor_section(
+                    current_point, delta_s, 0.0));
+            if (feasible.empty())
                 return result;
-            }
+            const Point preferred = Point::new_scale(
+                unscaled<double>(current_point.x()),
+                unscaled<double>(current_point.y()) +
+                    coordinates->sin_angle() /
+                        coordinates->cos_angle() * delta_s);
+            Point chosen = preferred;
+            const bool preferred_inside = std::any_of(
+                feasible.begin(), feasible.end(),
+                [&preferred](const ExPolygon& region) {
+                    return region.contains(preferred);
+                });
+            if (!preferred_inside)
+                chosen = projection_onto(feasible, preferred);
+            if (!world_branch_segment_is_valid(
+                    {unscaled<double>(chosen.x()),
+                     unscaled<double>(chosen.y()), upper.slice_s},
+                    {unscaled<double>(current_point.x()),
+                     unscaled<double>(current_point.y()), current_s}))
+                return result;
             current_point = chosen;
             current_s = upper.slice_s;
             reverse_points.push_back({
@@ -3830,6 +4111,7 @@ void BeltTaperedSupport::generate()
         result.points.insert(
             result.points.end(),
             reverse_points.rbegin(), reverse_points.rend());
+        bool world_direction_valid = true;
         for (size_t point_index = 1;
              point_index < result.points.size(); ++point_index) {
             const BeltRoutePoint& upper = result.points[point_index - 1];
@@ -3843,10 +4125,14 @@ void BeltTaperedSupport::generate()
                 result.maximum_lateral_slope,
                 std::hypot(upper.u - lower.u, upper.v - lower.v) /
                     delta_s);
+            if (!world_branch_segment_is_valid(upper, lower)) {
+                world_direction_valid = false;
+                break;
+            }
         }
         result.accepted =
-            result.maximum_lateral_slope <=
-                lateral_slope_limit + 1e-5;
+            world_direction_valid &&
+            result.maximum_lateral_slope <= lateral_slope_limit + 1e-5;
         if (!result.accepted)
             result.points.clear();
         return result;
@@ -3985,190 +4271,15 @@ void BeltTaperedSupport::generate()
         (void)rescued;
     }
 
-    // Diagnostic only: preserve the configured result, but measure whether a
-    // failed contact becomes geometrically reachable at larger branch-cone
-    // angles supported by the existing option. This separates a configuration
-    // limit from a topologically sealed free-space corridor.
-    size_t route_aware_angle_sweep_contact_count = 0;
-    size_t route_aware_angle_sweep_candidate_count = 0;
-    size_t route_aware_angle_sweep_attempt_count = 0;
-    size_t route_aware_angle_sweep_feasible_candidate_count = 0;
-    size_t route_aware_angle_sweep_feasible_contact_count = 0;
-    size_t route_aware_angle_sweep_unreachable_at_60_count = 0;
-    double route_aware_angle_sweep_minimum_required_angle_deg =
-        std::numeric_limits<double>::max();
-    double route_aware_angle_sweep_maximum_required_angle_deg = 0.0;
-    const double configured_lateral_angle_deg =
-        maximum_lateral_angle * 180.0 / M_PI;
-    for (size_t route_index = 0; route_index < routes.size(); ++route_index) {
-        const BeltSupportRoute& route = routes[route_index];
-        if (route.failure_reason.empty())
-            continue;
-        ++route_aware_angle_sweep_contact_count;
-        const BeltSupportContact& original_contact =
-            contacts[route.contact_index];
-        const auto component_it = raw_contacts_by_surface_component.find(
-            original_contact.source_surface_component_index);
-        if (component_it == raw_contacts_by_surface_component.end())
-            continue;
-
-        double best_angle_deg = std::numeric_limits<double>::max();
-        size_t best_raw_index = std::numeric_limits<size_t>::max();
-        double best_mapping_distance = 0.0;
-        ExactAlternativeRouteResult best_alternative;
-        for (const size_t raw_index : component_it->second) {
-            const BeltSupportContact& candidate = raw_contacts[raw_index];
-            const Vec3d candidate_world = local_point_to_world(
-                candidate.center_local, candidate.tip_s,
-                center_u, center_v, *coordinates);
-            bool preserves_assignment = true;
-            double maximum_mapping_distance = 0.0;
-            for (const size_t witness_index :
-                 original_contact.source_witness_indices) {
-                if (witness_index >= raw_witness_world.size()) {
-                    preserves_assignment = false;
-                    break;
-                }
-                maximum_mapping_distance = std::max(
-                    maximum_mapping_distance,
-                    (raw_witness_world[witness_index] - candidate_world).norm());
-                if (!contact_covers_witness(
-                        candidate, raw_contacts[witness_index])) {
-                    preserves_assignment = false;
-                    break;
-                }
-            }
-            if (!preserves_assignment)
-                continue;
-            ++route_aware_angle_sweep_candidate_count;
-
-            bool candidate_feasible = false;
-            for (double angle_deg = 45.0;
-                 angle_deg <= 60.0 + EPSILON;
-                 angle_deg += 5.0) {
-                if (angle_deg <= configured_lateral_angle_deg + EPSILON ||
-                    angle_deg >= best_angle_deg - EPSILON) {
-                    continue;
-                }
-                ++route_aware_angle_sweep_attempt_count;
-                const double slope_limit =
-                    std::tan(angle_deg * M_PI / 180.0);
-                ExactAlternativeRouteResult alternative =
-                    try_exact_alternative_route(
-                        candidate, route_index, raw_index,
-                        slope_limit,
-                        "route_aware_angle_sweep_layer", false);
-                if (debug != nullptr) {
-                    debug->add_record(
-                        BeltSupportDebugStageId::RouteClassification,
-                        "route_aware_angle_sweep",
-                        alternative.accepted
-                            ? "candidate_reachable_at_diagnostic_angle"
-                            : "candidate_unreachable_at_diagnostic_angle",
-                        {{"contact_index",
-                          static_cast<double>(route.contact_index)},
-                         {"raw_contact_index",
-                          static_cast<double>(raw_index)},
-                         {"diagnostic_angle_deg", angle_deg},
-                         {"diagnostic_slope_limit", slope_limit},
-                         {"accepted", alternative.accepted ? 1.0 : 0.0},
-                         {"processed_layer_count", static_cast<double>(
-                              alternative.processed_layer_count)},
-                         {"failure_slice_s_mm", alternative.failure_s},
-                         {"maximum_lateral_slope",
-                          alternative.maximum_lateral_slope},
-                         {"maximum_mapping_distance_mm",
-                          maximum_mapping_distance},
-                         {"rooted", alternative.rooted ? 1.0 : 0.0},
-                         {"parent_contact_index",
-                          alternative.accepted && !alternative.rooted
-                              ? static_cast<double>(routes[
-                                    alternative.parent_index].contact_index)
-                              : -1.0}});
-                }
-                if (!alternative.accepted)
-                    continue;
-                candidate_feasible = true;
-                best_angle_deg = angle_deg;
-                best_raw_index = raw_index;
-                best_mapping_distance = maximum_mapping_distance;
-                best_alternative = std::move(alternative);
-                break;
-            }
-            if (candidate_feasible)
-                ++route_aware_angle_sweep_feasible_candidate_count;
-        }
-
-        if (best_raw_index == std::numeric_limits<size_t>::max()) {
-            ++route_aware_angle_sweep_unreachable_at_60_count;
-            if (debug != nullptr) {
-                debug->add_record(
-                    BeltSupportDebugStageId::RouteClassification,
-                    "route_aware_angle_sweep_contact",
-                    "no_coverage_preserving_candidate_reachable_up_to_60_deg",
-                    {{"contact_index",
-                      static_cast<double>(route.contact_index)},
-                     {"surface_component_index", static_cast<double>(
-                          original_contact.source_surface_component_index)},
-                     {"configured_angle_deg",
-                      configured_lateral_angle_deg}});
-            }
-            continue;
-        }
-
-        ++route_aware_angle_sweep_feasible_contact_count;
-        route_aware_angle_sweep_minimum_required_angle_deg = std::min(
-            route_aware_angle_sweep_minimum_required_angle_deg,
-            best_angle_deg);
-        route_aware_angle_sweep_maximum_required_angle_deg = std::max(
-            route_aware_angle_sweep_maximum_required_angle_deg,
-            best_angle_deg);
-        if (debug != nullptr) {
-            for (size_t point_index = 1;
-                 point_index < best_alternative.points.size(); ++point_index) {
-                debug->add_line(
-                    BeltSupportDebugStageId::RouteClassification,
-                    local_point_to_world(
-                        Point::new_scale(
-                            best_alternative.points[point_index - 1].u,
-                            best_alternative.points[point_index - 1].v),
-                        best_alternative.points[point_index - 1].s,
-                        center_u, center_v, *coordinates),
-                    local_point_to_world(
-                        Point::new_scale(
-                            best_alternative.points[point_index].u,
-                            best_alternative.points[point_index].v),
-                        best_alternative.points[point_index].s,
-                        center_u, center_v, *coordinates),
-                    "route_aware_angle_sweep_feasible");
-            }
-            debug->add_record(
-                BeltSupportDebugStageId::RouteClassification,
-                "route_aware_angle_sweep_contact",
-                "reachable_only_above_configured_angle",
-                {{"contact_index",
-                  static_cast<double>(route.contact_index)},
-                 {"raw_contact_index",
-                  static_cast<double>(best_raw_index)},
-                 {"surface_component_index", static_cast<double>(
-                      original_contact.source_surface_component_index)},
-                 {"configured_angle_deg", configured_lateral_angle_deg},
-                 {"minimum_tested_reachable_angle_deg", best_angle_deg},
-                 {"maximum_mapping_distance_mm", best_mapping_distance},
-                 {"rooted", best_alternative.rooted ? 1.0 : 0.0}});
-        }
-    }
-
     // A consolidated contact is useful only if its full assigned witness set
-    // can be represented by a contact which also has a printable fixed-V
-    // route. Audit every contact that required the experimental 2D fallback
-    // against all raw candidates in the same surface component. This does not
-    // mutate the result: it tells the next consolidation revision whether the
-    // failure belongs to contact selection or to the fixed-V route search.
+    // can be represented by a contact which also has a printable world-vertical
+    // route. This audit does not mutate the result and therefore must not run
+    // during a normal slice.
     size_t alternative_audited_contact_count = 0;
-    size_t contact_with_coverage_preserving_fixed_v_alternative_count = 0;
-    size_t coverage_preserving_fixed_v_alternative_count = 0;
-    for (const size_t route_index : exact_area_attempted_route_indices) {
+    size_t contact_with_coverage_preserving_world_vertical_alternative_count = 0;
+    size_t coverage_preserving_world_vertical_alternative_count = 0;
+    if (debug != nullptr) {
+      for (const size_t route_index : exact_area_attempted_route_indices) {
         const BeltSupportRoute& route = routes[route_index];
         const BeltSupportContact& effective = contacts[route.contact_index];
         const auto component_it = raw_contacts_by_surface_component.find(
@@ -4210,54 +4321,52 @@ void BeltTaperedSupport::generate()
             BeltSupportRoute candidate_route;
             std::string rejection_reason;
             double failure_slice_s = 0.0;
-            const bool fixed_v_reachable = try_sloped_v_route(
-                candidate_contact, route.contact_index, 0.0,
+            const bool world_vertical_reachable = try_sloped_v_route(
+                candidate_contact, route.contact_index,
+                world_vertical_route_v_slope,
                 forbidden_by_plan, true,
                 candidate_route, rejection_reason, failure_slice_s);
-            if (!fixed_v_reachable)
+            if (!world_vertical_reachable)
                 continue;
             ++viable_candidate_count;
-            ++coverage_preserving_fixed_v_alternative_count;
+            ++coverage_preserving_world_vertical_alternative_count;
             if (maximum_mapping_distance < best_maximum_mapping_distance) {
                 best_maximum_mapping_distance = maximum_mapping_distance;
                 best_raw_contact_index = raw_index;
             }
-            if (debug != nullptr) {
-                debug->add_record(
-                    BeltSupportDebugStageId::RouteClassification,
-                    "coverage_preserving_fixed_v_alternative",
-                    "candidate_reaches_ground_without_v_drift",
-                    {{"contact_index", static_cast<double>(route.contact_index)},
-                     {"raw_contact_index", static_cast<double>(raw_index)},
-                     {"maximum_mapping_distance_mm", maximum_mapping_distance},
-                     {"mapping_radius_mm", witness_mapping_radius},
-                     {"route_point_count",
-                      static_cast<double>(candidate_route.points.size())}});
-            }
-        }
-        if (viable_candidate_count > 0)
-            ++contact_with_coverage_preserving_fixed_v_alternative_count;
-        if (debug != nullptr) {
             debug->add_record(
                 BeltSupportDebugStageId::RouteClassification,
-                "fixed_v_alternative_summary",
-                viable_candidate_count > 0
-                    ? "coverage_preserving_alternative_exists"
-                    : "no_coverage_preserving_alternative",
+                "coverage_preserving_world_vertical_alternative",
+                "candidate_reaches_ground_world_vertically",
                 {{"contact_index", static_cast<double>(route.contact_index)},
-                 {"assigned_witness_count",
-                  static_cast<double>(effective.source_witness_indices.size())},
-                 {"preserving_candidate_count",
-                  static_cast<double>(preserving_candidate_count)},
-                 {"fixed_v_reachable_candidate_count",
-                  static_cast<double>(viable_candidate_count)},
-                 {"best_raw_contact_index",
-                  best_raw_contact_index == BeltSupportRoute::no_parent
-                      ? -1.0 : static_cast<double>(best_raw_contact_index)},
-                 {"best_maximum_mapping_distance_mm",
-                  best_raw_contact_index == BeltSupportRoute::no_parent
-                      ? -1.0 : best_maximum_mapping_distance}});
+                 {"raw_contact_index", static_cast<double>(raw_index)},
+                 {"maximum_mapping_distance_mm", maximum_mapping_distance},
+                 {"mapping_radius_mm", witness_mapping_radius},
+                 {"route_point_count",
+                  static_cast<double>(candidate_route.points.size())}});
         }
+        if (viable_candidate_count > 0)
+            ++contact_with_coverage_preserving_world_vertical_alternative_count;
+        debug->add_record(
+            BeltSupportDebugStageId::RouteClassification,
+            "world_vertical_alternative_summary",
+            viable_candidate_count > 0
+                ? "coverage_preserving_alternative_exists"
+                : "no_coverage_preserving_alternative",
+            {{"contact_index", static_cast<double>(route.contact_index)},
+             {"assigned_witness_count",
+              static_cast<double>(effective.source_witness_indices.size())},
+             {"preserving_candidate_count",
+              static_cast<double>(preserving_candidate_count)},
+             {"world_vertical_reachable_candidate_count",
+              static_cast<double>(viable_candidate_count)},
+             {"best_raw_contact_index",
+              best_raw_contact_index == BeltSupportRoute::no_parent
+                  ? -1.0 : static_cast<double>(best_raw_contact_index)},
+             {"best_maximum_mapping_distance_mm",
+              best_raw_contact_index == BeltSupportRoute::no_parent
+                  ? -1.0 : best_maximum_mapping_distance}});
+      }
     }
 
     struct RouteAwareCandidateAudit
@@ -4267,14 +4376,15 @@ void BeltTaperedSupport::generate()
         BeltSupportRoute route;
     };
     size_t route_aware_raw_candidate_count = 0;
-    size_t route_aware_fixed_v_reachable_candidate_count = 0;
+    size_t route_aware_world_vertical_reachable_candidate_count = 0;
     size_t route_aware_selected_contact_count = 0;
     size_t route_aware_covered_witness_count = 0;
     size_t route_aware_uncovered_witness_count = 0;
     size_t route_aware_fully_coverable_surface_component_count = 0;
     size_t route_aware_uncoverable_surface_component_count = 0;
-    for (const auto& [surface_component, raw_indices] :
-         raw_contacts_by_surface_component) {
+    if (debug != nullptr) {
+      for (const auto& [surface_component, raw_indices] :
+           raw_contacts_by_surface_component) {
         std::vector<RouteAwareCandidateAudit> candidates;
         candidates.reserve(raw_indices.size());
         for (const size_t raw_index : raw_indices) {
@@ -4284,12 +4394,13 @@ void BeltTaperedSupport::generate()
             std::string rejection_reason;
             double failure_slice_s = 0.0;
             if (!try_sloped_v_route(
-                    candidate_contact, raw_index, 0.0,
+                    candidate_contact, raw_index,
+                    world_vertical_route_v_slope,
                     forbidden_by_plan, true,
                     candidate_route, rejection_reason, failure_slice_s)) {
                 continue;
             }
-            ++route_aware_fixed_v_reachable_candidate_count;
+            ++route_aware_world_vertical_reachable_candidate_count;
             RouteAwareCandidateAudit candidate;
             candidate.raw_contact_index = raw_index;
             candidate.route = std::move(candidate_route);
@@ -4340,8 +4451,7 @@ void BeltTaperedSupport::generate()
         else
             ++route_aware_uncoverable_surface_component_count;
 
-        if (debug != nullptr) {
-            for (const size_t selected_index : selected_candidate_indices) {
+        for (const size_t selected_index : selected_candidate_indices) {
                 const RouteAwareCandidateAudit& selected = candidates[selected_index];
                 const BeltSupportContact& selected_contact =
                     raw_contacts[selected.raw_contact_index];
@@ -4351,7 +4461,7 @@ void BeltTaperedSupport::generate()
                 debug->add_point(
                     BeltSupportDebugStageId::RouteClassification,
                     selected_world, 0.32,
-                    "route_aware_fixed_v_contact");
+                    "route_aware_world_vertical_contact");
                 for (const size_t witness_index :
                      selected.covered_witness_indices) {
                     debug->add_line(
@@ -4362,7 +4472,7 @@ void BeltTaperedSupport::generate()
                 debug->add_record(
                     BeltSupportDebugStageId::RouteClassification,
                     "route_aware_selected_contact",
-                    "fixed_v_reachable_set_cover_candidate",
+                    "world_vertical_reachable_set_cover_candidate",
                     {{"surface_component_index",
                       static_cast<double>(surface_component)},
                      {"raw_contact_index",
@@ -4372,17 +4482,17 @@ void BeltTaperedSupport::generate()
                           selected.covered_witness_indices.size())},
                      {"route_point_count",
                       static_cast<double>(selected.route.points.size())}});
-            }
-            debug->add_record(
+        }
+        debug->add_record(
                 BeltSupportDebugStageId::RouteClassification,
                 "route_aware_surface_component_coverage",
                 uncovered.empty()
-                    ? "all_witnesses_have_fixed_v_route_coverage"
-                    : "some_witnesses_have_no_fixed_v_route_coverage",
+                    ? "all_witnesses_have_world_vertical_route_coverage"
+                    : "some_witnesses_have_no_world_vertical_route_coverage",
                 {{"surface_component_index",
                   static_cast<double>(surface_component)},
                  {"raw_witness_count", static_cast<double>(raw_indices.size())},
-                 {"fixed_v_reachable_candidate_count",
+                 {"world_vertical_reachable_candidate_count",
                   static_cast<double>(candidates.size())},
                  {"selected_contact_count",
                   static_cast<double>(selected_candidate_indices.size())},
@@ -4390,6 +4500,120 @@ void BeltTaperedSupport::generate()
                   static_cast<double>(raw_indices.size() - uncovered.size())},
                  {"uncovered_witness_count",
                   static_cast<double>(uncovered.size())}});
+      }
+    }
+
+    // Every independently rooted route must leave the real build plate along
+    // world +Z. A collision-avoidance fallback may bend above this trunk, but
+    // it must never spend its branch-angle budget directly at Z=0. Find the
+    // lowest collision-free point on the already validated route whose world
+    // vertical projection reaches the plate, then replace only the tail below
+    // that point. Parent junctions are normalized afterwards against the new
+    // route, so no stale child connection is retained.
+    size_t already_world_vertical_root_count = 0;
+    size_t world_verticalized_root_count = 0;
+    size_t world_vertical_root_failure_count = 0;
+    double minimum_world_vertical_trunk_height =
+        std::numeric_limits<double>::infinity();
+    for (size_t route_index = 0; route_index < routes.size(); ++route_index) {
+        BeltSupportRoute& route = routes[route_index];
+        if (!route.failure_reason.empty() || route.points.size() < 2 ||
+            route.parent_route_index != BeltSupportRoute::no_parent) {
+            continue;
+        }
+        const BeltRoutePoint& current_upper =
+            route.points[route.points.size() - 2];
+        const BeltRoutePoint& current_root = route.points.back();
+        if (world_segment_horizontal_slope(current_upper, current_root) <=
+            world_branch_numeric_tolerance) {
+            ++already_world_vertical_root_count;
+            const Vec3d upper_world = coordinates->oriented_to_world({
+                current_upper.u + center_u,
+                current_upper.v + center_v,
+                current_upper.s});
+            minimum_world_vertical_trunk_height = std::min(
+                minimum_world_vertical_trunk_height, upper_world.z());
+            continue;
+        }
+
+        const Vec3d tip_world = coordinates->oriented_to_world({
+            route.points.front().u + center_u,
+            route.points.front().v + center_v,
+            route.points.front().s});
+        const double desired_trunk_height = std::min(
+            5.0, std::max(1.0, 0.25 * std::max(0.0, tip_world.z())));
+        bool verticalized = false;
+        for (const double minimum_height : {desired_trunk_height, 1.0}) {
+            for (const BeltSupportLayerPlan& plan : plans) {
+                if (plan.slice_s <= route.points.back().s + EPSILON ||
+                    plan.slice_s >= route.points.front().s - EPSILON) {
+                    continue;
+                }
+                const BeltRoutePoint trunk_top{
+                    route_u_at(route, plan.slice_s),
+                    route_v_at(route, plan.slice_s),
+                    plan.slice_s};
+                const Vec3d trunk_top_world =
+                    coordinates->oriented_to_world({
+                        trunk_top.u + center_u,
+                        trunk_top.v + center_v,
+                        trunk_top.s});
+                if (trunk_top_world.z() + EPSILON < minimum_height)
+                    continue;
+                const Vec3d root_oriented =
+                    coordinates->world_to_oriented({
+                        trunk_top_world.x(), trunk_top_world.y(), 0.0});
+                const BeltRoutePoint vertical_root{
+                    root_oriented.x() - center_u,
+                    root_oriented.y() - center_v,
+                    std::max(0.0, root_oriented.z())};
+                if (vertical_root.s >= trunk_top.s - EPSILON ||
+                    !segment_stays_outside_model(
+                        trunk_top, vertical_root, route.tip_s)) {
+                    continue;
+                }
+
+                std::vector<BeltRoutePoint> verticalized_points;
+                verticalized_points.reserve(route.points.size() + 1);
+                for (const BeltRoutePoint& point : route.points) {
+                    if (point.s > trunk_top.s + EPSILON)
+                        verticalized_points.push_back(point);
+                }
+                if (verticalized_points.empty() ||
+                    verticalized_points.back().s > trunk_top.s + EPSILON) {
+                    verticalized_points.push_back(trunk_top);
+                }
+                verticalized_points.push_back(vertical_root);
+                route.points = std::move(verticalized_points);
+                route.root_s = vertical_root.s;
+                route.merge_s = 0.0;
+                minimum_world_vertical_trunk_height = std::min(
+                    minimum_world_vertical_trunk_height,
+                    trunk_top_world.z());
+                ++world_verticalized_root_count;
+                verticalized = true;
+                if (debug != nullptr) {
+                    debug->add_record(
+                        BeltSupportDebugStageId::TreeTopology,
+                        "world_vertical_root_trunk",
+                        "oblique_root_tail_replaced_by_world_vertical_trunk",
+                        {{"route_index", static_cast<double>(route_index)},
+                         {"contact_index",
+                          static_cast<double>(route.contact_index)},
+                         {"trunk_height_mm", trunk_top_world.z()},
+                         {"root_world_z_mm", 0.0}});
+                }
+                break;
+            }
+            if (verticalized)
+                break;
+        }
+        if (!verticalized) {
+            route.failure_reason =
+                "no_collision_free_world_vertical_root_trunk";
+            ++world_vertical_root_failure_count;
+            --reachable_contact_count;
+            ++unreachable_contact_count;
         }
     }
 
@@ -4513,29 +4737,37 @@ void BeltTaperedSupport::generate()
         }
     }
 
-    // Every accepted branch must remain inside the configured lateral cone
-    // around the Belt manufacturing normal. U and V are both physical lateral
-    // axes in the oriented layer; their combined Euclidean slope is therefore
-    // the quantity which must be bounded before structural frustums are built.
-    constexpr double route_direction_tolerance = 1e-5;
+    // Orca defines the tree branch angle from world vertical, not from the Belt
+    // manufacturing normal. Audit the real world segment here. A vertical
+    // trunk is always zero degrees even though its oriented V changes by
+    // tan(alpha) for every unit of oriented S.
+    // Route points are stored on Clipper's micron integer grid. Two
+    // independently rounded U/V coordinates can move a boundary segment by a
+    // few 1e-5 in slope; keep this strictly as a numerical acceptance margin.
+    constexpr double route_direction_tolerance =
+        world_branch_numeric_tolerance;
     size_t direction_audited_route_count = 0;
     size_t branch_angle_contract_violation_route_count = 0;
     size_t route_with_v_drift_count = 0;
     double maximum_route_v_drift = 0.0;
     double maximum_route_v_slope = 0.0;
     double maximum_route_lateral_slope = 0.0;
+    double maximum_route_world_horizontal_slope = 0.0;
     for (size_t route_index = 0; route_index < routes.size(); ++route_index) {
         const BeltSupportRoute& route = routes[route_index];
         if (!route.failure_reason.empty() || route.points.size() < 2)
             continue;
         ++direction_audited_route_count;
-        const double expected_v = unscaled<double>(
-            contacts[route.contact_index].center_local.y());
+        const BeltSupportContact& contact = contacts[route.contact_index];
         double route_v_drift = 0.0;
         double route_v_slope = 0.0;
         double route_lateral_slope = 0.0;
+        double route_world_horizontal_slope = 0.0;
+        bool route_world_direction_valid = true;
         for (size_t point_index = 0;
              point_index < route.points.size(); ++point_index) {
+            const double expected_v = preferred_vertical_v_at(
+                contact, route.points[point_index].s);
             route_v_drift = std::max(
                 route_v_drift,
                 std::abs(route.points[point_index].v - expected_v));
@@ -4556,6 +4788,23 @@ void BeltTaperedSupport::generate()
                     route_lateral_slope,
                     std::sqrt(delta_u * delta_u + delta_v * delta_v) /
                         delta_s);
+                const Vec3d upper_world = coordinates->oriented_to_world({
+                    route.points[point_index - 1].u + center_u,
+                    route.points[point_index - 1].v + center_v,
+                    route.points[point_index - 1].s});
+                const Vec3d lower_world = coordinates->oriented_to_world({
+                    route.points[point_index].u + center_u,
+                    route.points[point_index].v + center_v,
+                    route.points[point_index].s});
+                const Vec3d world_growth = upper_world - lower_world;
+                if (world_growth.z() <= route_direction_tolerance) {
+                    route_world_direction_valid = false;
+                } else {
+                    route_world_horizontal_slope = std::max(
+                        route_world_horizontal_slope,
+                        std::hypot(world_growth.x(), world_growth.y()) /
+                            world_growth.z());
+                }
             }
         }
         if (route_v_drift > route_direction_tolerance)
@@ -4566,9 +4815,13 @@ void BeltTaperedSupport::generate()
             maximum_route_v_slope, route_v_slope);
         maximum_route_lateral_slope = std::max(
             maximum_route_lateral_slope, route_lateral_slope);
+        maximum_route_world_horizontal_slope = std::max(
+            maximum_route_world_horizontal_slope,
+            route_world_horizontal_slope);
         const bool violates_contract =
-            route_lateral_slope >
-                maximum_lateral_slope + route_direction_tolerance;
+            !route_world_direction_valid ||
+            route_world_horizontal_slope >
+                maximum_world_branch_slope + route_direction_tolerance;
         if (violates_contract)
             ++branch_angle_contract_violation_route_count;
         if (debug != nullptr) {
@@ -4576,12 +4829,16 @@ void BeltTaperedSupport::generate()
                 BeltSupportDebugStageId::RouteClassification,
                 "route_direction_contract",
                 violates_contract
-                    ? "exceeds_configured_lateral_branch_cone"
-                    : "inside_configured_lateral_branch_cone",
+                    ? "exceeds_configured_world_vertical_branch_cone"
+                    : "inside_configured_world_vertical_branch_cone",
                 {{"contact_index", static_cast<double>(route.contact_index)},
                  {"maximum_abs_v_drift_mm", route_v_drift},
                  {"maximum_abs_v_slope", route_v_slope},
                  {"maximum_lateral_slope", route_lateral_slope},
+                 {"maximum_world_horizontal_slope",
+                  route_world_horizontal_slope},
+                 {"configured_maximum_world_horizontal_slope",
+                  maximum_world_branch_slope},
                  {"configured_maximum_lateral_slope",
                   maximum_lateral_slope},
                  {"slope_tolerance", route_direction_tolerance}});
@@ -4957,64 +5214,27 @@ void BeltTaperedSupport::generate()
             "route_aware_exact_alternative_exhausted_count",
             static_cast<double>(
                 route_aware_exact_alternative_exhausted_count));
-        debug->set_metric(
-            BeltSupportDebugStageId::RouteClassification,
-            "route_aware_angle_sweep_contact_count",
-            static_cast<double>(route_aware_angle_sweep_contact_count));
-        debug->set_metric(
-            BeltSupportDebugStageId::RouteClassification,
-            "route_aware_angle_sweep_candidate_count",
-            static_cast<double>(route_aware_angle_sweep_candidate_count));
-        debug->set_metric(
-            BeltSupportDebugStageId::RouteClassification,
-            "route_aware_angle_sweep_attempt_count",
-            static_cast<double>(route_aware_angle_sweep_attempt_count));
-        debug->set_metric(
-            BeltSupportDebugStageId::RouteClassification,
-            "route_aware_angle_sweep_feasible_candidate_count",
-            static_cast<double>(
-                route_aware_angle_sweep_feasible_candidate_count));
-        debug->set_metric(
-            BeltSupportDebugStageId::RouteClassification,
-            "route_aware_angle_sweep_feasible_contact_count",
-            static_cast<double>(
-                route_aware_angle_sweep_feasible_contact_count));
-        debug->set_metric(
-            BeltSupportDebugStageId::RouteClassification,
-            "route_aware_angle_sweep_unreachable_at_60_count",
-            static_cast<double>(
-                route_aware_angle_sweep_unreachable_at_60_count));
-        debug->set_metric(
-            BeltSupportDebugStageId::RouteClassification,
-            "route_aware_angle_sweep_minimum_required_angle_deg",
-            route_aware_angle_sweep_minimum_required_angle_deg <
-                    std::numeric_limits<double>::max()
-                ? route_aware_angle_sweep_minimum_required_angle_deg
-                : -1.0);
-        debug->set_metric(
-            BeltSupportDebugStageId::RouteClassification,
-            "route_aware_angle_sweep_maximum_required_angle_deg",
-            route_aware_angle_sweep_maximum_required_angle_deg);
         debug->set_metric(BeltSupportDebugStageId::RouteClassification,
                           "alternative_audited_contact_count",
                           static_cast<double>(alternative_audited_contact_count));
         debug->set_metric(
             BeltSupportDebugStageId::RouteClassification,
-            "contact_with_coverage_preserving_fixed_v_alternative_count",
+            "contact_with_coverage_preserving_world_vertical_alternative_count",
             static_cast<double>(
-                contact_with_coverage_preserving_fixed_v_alternative_count));
+                contact_with_coverage_preserving_world_vertical_alternative_count));
         debug->set_metric(
             BeltSupportDebugStageId::RouteClassification,
-            "coverage_preserving_fixed_v_alternative_count",
-            static_cast<double>(coverage_preserving_fixed_v_alternative_count));
+            "coverage_preserving_world_vertical_alternative_count",
+            static_cast<double>(
+                coverage_preserving_world_vertical_alternative_count));
         debug->set_metric(BeltSupportDebugStageId::RouteClassification,
                           "route_aware_raw_candidate_count",
                           static_cast<double>(route_aware_raw_candidate_count));
         debug->set_metric(
             BeltSupportDebugStageId::RouteClassification,
-            "route_aware_fixed_v_reachable_candidate_count",
+            "route_aware_world_vertical_reachable_candidate_count",
             static_cast<double>(
-                route_aware_fixed_v_reachable_candidate_count));
+                route_aware_world_vertical_reachable_candidate_count));
         debug->set_metric(BeltSupportDebugStageId::RouteClassification,
                           "route_aware_selected_contact_count",
                           static_cast<double>(route_aware_selected_contact_count));
@@ -5053,6 +5273,12 @@ void BeltTaperedSupport::generate()
         debug->set_metric(BeltSupportDebugStageId::RouteClassification,
                           "maximum_route_lateral_slope",
                           maximum_route_lateral_slope);
+        debug->set_metric(BeltSupportDebugStageId::RouteClassification,
+                          "maximum_route_world_horizontal_slope",
+                          maximum_route_world_horizontal_slope);
+        debug->set_metric(BeltSupportDebugStageId::RouteClassification,
+                          "configured_maximum_world_horizontal_slope",
+                          maximum_world_branch_slope);
         debug->set_metric(BeltSupportDebugStageId::RouteClassification,
                           "configured_maximum_lateral_slope",
                           maximum_lateral_slope);
@@ -5124,6 +5350,23 @@ void BeltTaperedSupport::generate()
             "post_trim_parent_connection_rejected_count",
             static_cast<double>(
                 post_trim_parent_connection_rejected_count));
+        debug->set_metric(
+            BeltSupportDebugStageId::TreeTopology,
+            "already_world_vertical_root_count",
+            static_cast<double>(already_world_vertical_root_count));
+        debug->set_metric(
+            BeltSupportDebugStageId::TreeTopology,
+            "world_verticalized_root_count",
+            static_cast<double>(world_verticalized_root_count));
+        debug->set_metric(
+            BeltSupportDebugStageId::TreeTopology,
+            "world_vertical_root_failure_count",
+            static_cast<double>(world_vertical_root_failure_count));
+        debug->set_metric(
+            BeltSupportDebugStageId::TreeTopology,
+            "minimum_world_vertical_trunk_height_mm",
+            std::isfinite(minimum_world_vertical_trunk_height)
+                ? minimum_world_vertical_trunk_height : 0.0);
         debug->set_metric(BeltSupportDebugStageId::TreeTopology,
                           "root_trunk_count",
                           static_cast<double>(std::count_if(
@@ -5560,10 +5803,14 @@ void BeltTaperedSupport::generate()
                             plans[previous_causal_plan_index].slice_s);
                     const double permitted_growth_mm = std::max(
                         0.001,
-                        (maximum_lateral_slope + taper) * delta_s);
-                    append(support_seeds, union_ex(offset(
-                        previous_causal_structural_region,
-                        scaled<coord_t>(permitted_growth_mm))));
+                        (std::max(
+                             cone_u_radius_per_s,
+                             std::abs(cone_center_v_slope) +
+                                 cone_v_radius_per_s) + taper) * delta_s);
+                    append(support_seeds,
+                           expand_to_world_branch_successors(
+                               previous_causal_structural_region,
+                               delta_s, taper * delta_s));
                 }
                 support_seeds = union_ex(support_seeds);
 
@@ -5702,13 +5949,17 @@ void BeltTaperedSupport::generate()
                     : plan.height;
                 const double permitted_growth_mm = std::max(
                     0.001,
-                    (maximum_lateral_slope + taper) * delta_s);
+                    (std::max(
+                         cone_u_radius_per_s,
+                         std::abs(cone_center_v_slope) +
+                             cone_v_radius_per_s) + taper) * delta_s);
                 ExPolygons causal_envelope = root_footprint;
                 if (has_preceding_plane &&
                     !previous_causal_structural_region.empty()) {
-                    append(causal_envelope, union_ex(offset(
-                        previous_causal_structural_region,
-                        scaled<coord_t>(permitted_growth_mm))));
+                    append(causal_envelope,
+                           expand_to_world_branch_successors(
+                               previous_causal_structural_region,
+                               delta_s, taper * delta_s));
                 }
                 causal_envelope = union_ex(causal_envelope);
 
@@ -6437,14 +6688,19 @@ void BeltTaperedSupport::generate()
                 plans[previous_structural_plan_index].slice_s)
             : plan.height;
         const double permitted_growth_mm = std::max(
-            0.001, (maximum_lateral_slope + taper) * delta_s);
+            0.001,
+            (std::max(
+                 cone_u_radius_per_s,
+                 std::abs(cone_center_v_slope) + cone_v_radius_per_s) +
+             taper) * delta_s);
 
         ExPolygons causal_support = root_footprint;
         if (has_preceding_plane &&
             !previous_rooted_structural_region.empty()) {
-            append(causal_support, union_ex(offset(
-                previous_rooted_structural_region,
-                scaled<coord_t>(permitted_growth_mm))));
+            append(causal_support,
+                   expand_to_world_branch_successors(
+                       previous_rooted_structural_region,
+                       delta_s, taper * delta_s));
         }
         causal_support = union_ex(causal_support);
 
@@ -7213,6 +7469,8 @@ void BeltTaperedSupport::generate()
         final_empty_layer_count == 0 &&
         final_unrooted_structural_component_count == 0 &&
         final_nonconsecutive_layer_count == 0 &&
+        branch_angle_contract_violation_route_count == 0 &&
+        world_vertical_root_failure_count == 0 &&
         significant_path_model_overlap_layer_count == 0 &&
         final_minimum_world_z >= -1e-5 &&
         required_uncovered_raw_witness_count == 0 &&

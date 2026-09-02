@@ -570,45 +570,6 @@ ModelWorldBounds model_world_bounds(const Slic3r::Model& model)
     return bounds;
 }
 
-bool belt_support_enabled(const Slic3r::Model& model,
-                          const Slic3r::DynamicPrintConfig& config)
-{
-    const Slic3r::ConfigOption* global = config.option("enable_support");
-    const bool global_enabled = global != nullptr && global->getBool();
-    for (const Slic3r::ModelObject* object : model.objects) {
-        const Slic3r::ConfigOption* local = object->config.option("enable_support");
-        if ((local != nullptr && local->getBool()) || (local == nullptr && global_enabled))
-            return true;
-    }
-    return false;
-}
-
-double belt_support_reference_world_y(const Slic3r::Model& model, double angle_degrees)
-{
-    constexpr double pi = 3.14159265358979323846;
-    const double tangent = std::tan(angle_degrees * pi / 180.0);
-    double reference_y = std::numeric_limits<double>::lowest();
-    for (const Slic3r::ModelObject* object : model.objects) {
-        const std::size_t instance_count = std::max<std::size_t>(1, object->instances.size());
-        for (std::size_t instance_index = 0; instance_index < instance_count; ++instance_index) {
-            const Slic3r::Transform3d instance = object->instances.empty()
-                ? Slic3r::Transform3d::Identity()
-                : object->instances[instance_index]->get_matrix();
-            for (const Slic3r::ModelVolume* volume : object->volumes) {
-                if (!volume->is_model_part())
-                    continue;
-                const Slic3r::Transform3d local_to_world = instance * volume->get_matrix();
-                for (const Slic3r::Vec3f& vertex : volume->mesh().its.vertices) {
-                    const Slic3r::Vec3d world = local_to_world * vertex.cast<double>();
-                    reference_y = std::max(reference_y,
-                                           world.y() + std::max(0.0, world.z()) * tangent);
-                }
-            }
-        }
-    }
-    return reference_y;
-}
-
 void center_belt_model_on_x(Slic3r::Model& model, double target_x)
 {
     const ModelWorldBounds bounds = model_world_bounds(model);
@@ -2927,9 +2888,10 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             }
             const auto* angle = config.option<Slic3r::ConfigOptionFloat>("belt_gantry_angle");
             const double angle_degrees = angle == nullptr ? 45.0 : angle->value;
-            const double reference_world_y = belt_support_enabled(plate_model, config)
-                ? belt_support_reference_world_y(plate_model, angle_degrees)
-                : belt_bounds.maximum.y();
+            // Support trunks are rooted by a world-vertical projection. Their
+            // build-plate Y is therefore the contact Y, not Y + Z*tan(alpha).
+            // The real maximum model Y remains the authoritative task front.
+            const double reference_world_y = belt_bounds.maximum.y();
             print.set_belt_coordinate_system(Slic3r::BeltCoordinateSystem::create(
                 angle_degrees, reference_world_y));
         }
