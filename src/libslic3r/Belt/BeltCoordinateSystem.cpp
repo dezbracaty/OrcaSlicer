@@ -5,6 +5,13 @@
 
 namespace Slic3r {
 
+void BeltCoordinateSystem::set_print_origin_s(double value)
+{
+    if (!std::isfinite(value) || value < 0.0)
+        throw std::invalid_argument("Belt print origin must be finite and non-negative");
+    m_print_origin_s = value;
+}
+
 BeltCoordinateSystem BeltCoordinateSystem::create(double angle_degrees, double plate_max_world_y)
 {
     if (!std::isfinite(angle_degrees) || angle_degrees <= 0.0 || angle_degrees >= 90.0)
@@ -28,36 +35,40 @@ BeltCoordinateSystem BeltCoordinateSystem::create(double angle_degrees, double p
 
 OrientedSliceFrame BeltCoordinateSystem::oriented_slice_frame() const noexcept
 {
-    return {world_origin(), m_axis_u, m_axis_v, m_normal};
+    return {world_origin() + m_normal * m_print_origin_s,
+            m_axis_u, m_axis_v, m_normal};
 }
 
 Vec3d BeltCoordinateSystem::world_to_oriented(const Vec3d& world) const noexcept
 {
-    const Vec3d relative = world - world_origin();
+    const Vec3d relative = world - world_origin() - m_normal * m_print_origin_s;
     return Vec3d(m_axis_u.dot(relative), m_axis_v.dot(relative), m_normal.dot(relative));
 }
 
 Vec3d BeltCoordinateSystem::oriented_to_world(const Vec3d& oriented) const noexcept
 {
-    return world_origin() + m_axis_u * oriented.x() + m_axis_v * oriented.y() + m_normal * oriented.z();
+    return world_origin() + m_axis_u * oriented.x() + m_axis_v * oriented.y() +
+           m_normal * (oriented.z() + m_print_origin_s);
 }
 
 Vec3d BeltCoordinateSystem::oriented_to_machine(const Vec3d& oriented) const noexcept
 {
-    return Vec3d(oriented.x(), oriented.y() + oriented.z() * cot_angle(),
+    const double absolute_s = oriented.z() + m_print_origin_s;
+    return Vec3d(oriented.x(), oriented.y() + absolute_s * cot_angle(),
                  physical_s_to_machine_z(oriented.z()));
 }
 
 Vec3d BeltCoordinateSystem::machine_to_world(const Vec3d& machine) const noexcept
 {
-    return Vec3d(machine.x(),
-                 m_plate_max_world_y + machine.y() * m_cos_angle - machine.z(),
-                 machine.y() * m_sin_angle);
+    const double task_s = machine_z_to_physical_s(machine.z());
+    const double absolute_s = task_s + m_print_origin_s;
+    const double v = machine.y() - absolute_s * cot_angle();
+    return oriented_to_world(Vec3d(machine.x(), v, task_s));
 }
 
 double BeltCoordinateSystem::belt_boundary_v(double physical_s) const noexcept
 {
-    return -physical_s * cot_angle();
+    return -(physical_s + m_print_origin_s) * cot_angle();
 }
 
 double BeltCoordinateSystem::physical_s_to_machine_z(double physical_s) const noexcept

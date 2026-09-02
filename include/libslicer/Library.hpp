@@ -266,6 +266,12 @@ struct SliceRequest
     std::string output_gcode_3mf_path;
     bool center_on_build_plate{true};
     bool generate_preview{true};
+    // Development audit mode for the Belt support algorithm. It records and
+    // renders every algorithm stage while still exporting the real G-code.
+    // When an explicit audit path is supplied, the G-code is retained beside
+    // it so the intermediate and final artifacts remain one audit unit.
+    bool belt_support_debug_only{false};
+    std::string belt_support_debug_output_path;
 };
 
 struct SliceSummary
@@ -298,6 +304,7 @@ struct SliceResult
     bool cancelled{false};
     OutputArtifact output;
     OutputArtifact gcode_3mf;
+    OutputArtifact belt_support_debug;
     SliceSummary summary;
     ToolpathPreviewPtr preview;
     std::vector<SliceDiagnostic> diagnostics;

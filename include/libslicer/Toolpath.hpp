@@ -275,6 +275,9 @@ struct ToolpathPreview
 {
     std::uint32_t schema_version{toolpath_schema_version};
     std::string source_path;
+    // Optional structured metadata for non-G-code previews such as an
+    // algorithm audit. Renderers ignore it; UI bridges may expose it.
+    std::string metadata_json;
     std::vector<ToolpathLayer> layers;
     std::vector<ToolpathSegment> segments;
     std::vector<ToolpathEvent> events;

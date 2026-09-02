@@ -13,6 +13,7 @@ add_executable(${_TEST_NAME}_tests
     test_preset_setting_id.cpp
     test_slicing.cpp
     test_belt_world_slicing.cpp
+    test_belt_tapered_support.cpp
     test_elephant_foot_compensation.cpp
     test_geometry.cpp
     test_placeholder_parser.cpp

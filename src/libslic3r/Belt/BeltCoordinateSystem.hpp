@@ -12,6 +12,8 @@ public:
 
     double angle_degrees() const noexcept { return m_angle_degrees; }
     double plate_max_world_y() const noexcept { return m_plate_max_world_y; }
+    double print_origin_s() const noexcept { return m_print_origin_s; }
+    void set_print_origin_s(double value);
     double sin_angle() const noexcept { return m_sin_angle; }
     double cos_angle() const noexcept { return m_cos_angle; }
     double cot_angle() const noexcept { return m_cos_angle / m_sin_angle; }
@@ -34,6 +36,7 @@ public:
 private:
     double m_angle_degrees{45.0};
     double m_plate_max_world_y{0.0};
+    double m_print_origin_s{0.0};
     double m_sin_angle{0.0};
     double m_cos_angle{0.0};
     Vec3d m_axis_u{Vec3d::UnitX()};

@@ -1150,6 +1150,7 @@ private:
     void                _make_skirt();
     void                _make_wipe_tower();
     void                finalize_first_layer_convex_hull();
+    void                normalize_belt_print_origin();
 
     // Islands of objects and their supports extruded at the 1st layer.
     Polygons            first_layer_islands() const;

@@ -11,6 +11,7 @@
 #include <libslic3r/GCode/ThumbnailData.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
 #include <libslic3r/PNGReadWrite.hpp>
+#include <libslic3r/Support/BeltSupportDebug.hpp>
 #include <libslic3r/TriangleMeshSlicer.hpp>
 #include <libslic3r/Utils.hpp>
 #include <libslic3r/libslic3r.h>
@@ -28,6 +29,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -35,6 +37,7 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_set>
+#include <unordered_map>
 #include <utility>
 
 #if defined(__APPLE__)
@@ -567,6 +570,45 @@ ModelWorldBounds model_world_bounds(const Slic3r::Model& model)
     return bounds;
 }
 
+bool belt_support_enabled(const Slic3r::Model& model,
+                          const Slic3r::DynamicPrintConfig& config)
+{
+    const Slic3r::ConfigOption* global = config.option("enable_support");
+    const bool global_enabled = global != nullptr && global->getBool();
+    for (const Slic3r::ModelObject* object : model.objects) {
+        const Slic3r::ConfigOption* local = object->config.option("enable_support");
+        if ((local != nullptr && local->getBool()) || (local == nullptr && global_enabled))
+            return true;
+    }
+    return false;
+}
+
+double belt_support_reference_world_y(const Slic3r::Model& model, double angle_degrees)
+{
+    constexpr double pi = 3.14159265358979323846;
+    const double tangent = std::tan(angle_degrees * pi / 180.0);
+    double reference_y = std::numeric_limits<double>::lowest();
+    for (const Slic3r::ModelObject* object : model.objects) {
+        const std::size_t instance_count = std::max<std::size_t>(1, object->instances.size());
+        for (std::size_t instance_index = 0; instance_index < instance_count; ++instance_index) {
+            const Slic3r::Transform3d instance = object->instances.empty()
+                ? Slic3r::Transform3d::Identity()
+                : object->instances[instance_index]->get_matrix();
+            for (const Slic3r::ModelVolume* volume : object->volumes) {
+                if (!volume->is_model_part())
+                    continue;
+                const Slic3r::Transform3d local_to_world = instance * volume->get_matrix();
+                for (const Slic3r::Vec3f& vertex : volume->mesh().its.vertices) {
+                    const Slic3r::Vec3d world = local_to_world * vertex.cast<double>();
+                    reference_y = std::max(reference_y,
+                                           world.y() + std::max(0.0, world.z()) * tangent);
+                }
+            }
+        }
+    }
+    return reference_y;
+}
+
 void center_belt_model_on_x(Slic3r::Model& model, double target_x)
 {
     const ModelWorldBounds bounds = model_world_bounds(model);
@@ -589,6 +631,181 @@ std::string temporary_output_path(std::string_view suffix)
     return (fs::temp_directory_path() /
             ("libslicer_" + std::to_string(timestamp) + "_" +
              std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + std::string(suffix))).string();
+}
+
+nlohmann::json belt_support_debug_json(
+    const Slic3r::BeltSupportDebugRecorder& recorder,
+    bool include_lines,
+    bool include_records,
+    const std::string& output_path)
+{
+    nlohmann::json root;
+    root["schema"] = "gplatform.belt_support_algorithm_audit.v1";
+    const Slic3r::BeltSupportDebugStage& final_stage =
+        recorder.stage(Slic3r::BeltSupportDebugStageId::FinalSupport);
+    const auto generated_it = final_stage.metrics.find(
+        "final_support_generated");
+    const auto contract_it = final_stage.metrics.find(
+        "final_support_contract_valid");
+    root["final_support_generated"] = generated_it != final_stage.metrics.end() &&
+        generated_it->second > 0.5;
+    root["final_support_contract_valid"] =
+        contract_it != final_stage.metrics.end() &&
+        contract_it->second > 0.5;
+    root["output_path"] = output_path;
+    root["stages"] = nlohmann::json::array();
+    for (const Slic3r::BeltSupportDebugStage& stage : recorder.stages()) {
+        nlohmann::json item;
+        item["id"] = stage.id;
+        item["name"] = stage.name;
+        item["purpose"] = stage.purpose;
+        item["expected"] = stage.expected;
+        item["elapsed_ms"] = stage.elapsed_ms;
+        item["line_count"] = stage.lines.size();
+        item["record_count"] = stage.records.size();
+        item["metrics"] = stage.metrics;
+        if (include_records) {
+            item["records"] = nlohmann::json::array();
+            for (const Slic3r::BeltSupportDebugRecord& record : stage.records) {
+                item["records"].push_back({
+                    {"kind", record.kind},
+                    {"reason", record.reason},
+                    {"values", record.values},
+                });
+            }
+        }
+        if (include_lines) {
+            item["lines"] = nlohmann::json::array();
+            for (const Slic3r::BeltSupportDebugLine& line : stage.lines) {
+                item["lines"].push_back({
+                    {"category", line.category},
+                    {"start", {line.start_world.x(), line.start_world.y(), line.start_world.z()}},
+                    {"end", {line.end_world.x(), line.end_world.y(), line.end_world.z()}},
+                });
+            }
+        }
+        root["stages"].push_back(std::move(item));
+    }
+    return root;
+}
+
+ToolpathColorValue belt_support_debug_color(std::string_view category)
+{
+    if (category == "model_slice") return {0.45f, 0.48f, 0.52f, 0.42f};
+    if (category == "overhang") return {1.0f, 0.45f, 0.05f, 1.0f};
+    if (category == "raw_contact") return {1.0f, 0.15f, 0.15f, 1.0f};
+    if (category == "contact_safe_region") return {1.0f, 0.4f, 0.15f, 0.8f};
+    if (category == "effective_contact") return {1.0f, 0.85f, 0.05f, 1.0f};
+    if (category == "root_projection") return {0.0f, 0.85f, 1.0f, 1.0f};
+    if (category == "projected_root") return {0.1f, 0.65f, 1.0f, 1.0f};
+    if (category == "reachable_corridor") return {0.95f, 0.75f, 0.1f, 0.8f};
+    if (category == "collision_accepted") return {0.1f, 0.95f, 0.25f, 1.0f};
+    if (category == "collision_rejected" || category == "candidate_section_rejected")
+        return {1.0f, 0.05f, 0.1f, 1.0f};
+    if (category == "collision_blocker") return {0.65f, 0.1f, 0.8f, 1.0f};
+    if (category == "tree_branch") return {0.1f, 1.0f, 0.45f, 1.0f};
+    if (category == "frustum_axis") return {0.95f, 0.1f, 0.95f, 1.0f};
+    if (category == "frustum_root_section") return {0.45f, 0.2f, 1.0f, 1.0f};
+    if (category == "frustum_tip_section") return {1.0f, 0.25f, 0.75f, 1.0f};
+    if (category == "base_section" || category == "base_region_input")
+        return {0.1f, 0.55f, 1.0f, 1.0f};
+    if (category == "interface_section" || category == "interface_region_input")
+        return {1.0f, 0.25f, 0.55f, 1.0f};
+    if (category == "final_root_open_path")
+        return {0.05f, 1.0f, 0.2f, 1.0f};
+    if (category == "final_support_extrusion_path")
+        return {0.05f, 0.75f, 1.0f, 1.0f};
+    if (category == "final_path_footprint_gap_component")
+        return {1.0f, 0.65f, 0.05f, 0.9f};
+    if (category == "final_path_footprint_gap")
+        return {1.0f, 0.85f, 0.15f, 1.0f};
+    if (category == "final_disconnected_support_island")
+        return {1.0f, 0.0f, 0.0f, 1.0f};
+    if (category == "final_disconnected_support_island_gap")
+        return {1.0f, 0.1f, 0.8f, 1.0f};
+    if (category == "raw_witness_excluded_by_build_plate_policy")
+        return {0.7f, 0.25f, 1.0f, 1.0f};
+    if (category == "root_open_path_input") return {1.0f, 1.0f, 1.0f, 1.0f};
+    return {0.8f, 0.8f, 0.8f, 1.0f};
+}
+
+std::shared_ptr<ToolpathPreview> make_belt_support_debug_preview(
+    const Slic3r::BeltSupportDebugRecorder& recorder,
+    const std::string& output_path)
+{
+    auto preview = std::make_shared<ToolpathPreview>();
+    preview->supported_view_types = {ToolpathViewType::Summary};
+    // The complete records remain in the audit artifact. The interactive
+    // preview only needs the twelve stage summaries and must stay cheap to
+    // query while the layer slider is moving.
+    preview->metadata_json =
+        belt_support_debug_json(recorder, false, false, output_path).dump();
+    std::unordered_map<std::string, std::uint16_t> color_ids;
+    std::uint64_t segment_id = 0;
+
+    const auto color_id_for = [&](const std::string& category) {
+        const auto found = color_ids.find(category);
+        if (found != color_ids.end())
+            return found->second;
+        const auto id = static_cast<std::uint16_t>(preview->colors.size());
+        preview->colors.push_back({id, invalid_toolpath_small_id,
+                                   ToolpathColorSource::Custom,
+                                   belt_support_debug_color(category), category});
+        color_ids.emplace(category, id);
+        return id;
+    };
+
+    const auto update_bounds = [&preview](const ToolpathPoint& point) {
+        if (!preview->bounds.valid) {
+            preview->bounds.minimum = point;
+            preview->bounds.maximum = point;
+            preview->bounds.valid = true;
+            return;
+        }
+        preview->bounds.minimum.x = std::min(preview->bounds.minimum.x, point.x);
+        preview->bounds.minimum.y = std::min(preview->bounds.minimum.y, point.y);
+        preview->bounds.minimum.z = std::min(preview->bounds.minimum.z, point.z);
+        preview->bounds.maximum.x = std::max(preview->bounds.maximum.x, point.x);
+        preview->bounds.maximum.y = std::max(preview->bounds.maximum.y, point.y);
+        preview->bounds.maximum.z = std::max(preview->bounds.maximum.z, point.z);
+    };
+
+    for (std::size_t stage_index = 0; stage_index < recorder.stages().size(); ++stage_index) {
+        const auto& stage = recorder.stages()[stage_index];
+        ToolpathLayer layer;
+        layer.index = static_cast<std::uint32_t>(stage_index);
+        layer.segment_begin = preview->segments.size();
+        layer.segment_count = stage.lines.size();
+        layer.print_z_mm = static_cast<float>(stage_index);
+        layer.height_mm = 1.0f;
+        layer.duration_seconds = static_cast<float>(stage.elapsed_ms / 1000.0);
+        preview->layers.push_back(layer);
+        for (const Slic3r::BeltSupportDebugLine& line : stage.lines) {
+            ToolpathSegment segment;
+            segment.id = segment_id;
+            segment.run_id = segment_id++;
+            segment.layer_index = static_cast<std::uint32_t>(stage_index);
+            segment.color_id = color_id_for(line.category);
+            segment.motion = ToolpathMotionKind::Extrusion;
+            segment.extrusion_role = ToolpathExtrusionRole::Custom;
+            segment.start_mm = {static_cast<float>(line.start_world.x()),
+                                static_cast<float>(line.start_world.y()),
+                                static_cast<float>(line.start_world.z())};
+            segment.end_mm = {static_cast<float>(line.end_world.x()),
+                              static_cast<float>(line.end_world.y()),
+                              static_cast<float>(line.end_world.z())};
+            segment.width_mm = 0.35f;
+            segment.height_mm = 0.35f;
+            segment.print_z_mm = static_cast<float>(stage_index);
+            update_bounds(segment.start_mm);
+            update_bounds(segment.end_mm);
+            preview->segments.push_back(segment);
+        }
+    }
+    preview->statistics.total_layers = preview->layers.size();
+    preview->statistics.logical_motion_count = preview->segments.size();
+    preview->statistics.render_segment_count = preview->segments.size();
+    return preview;
 }
 
 bool extract_zip_entry(mz_zip_archive& archive, const char* name, std::vector<unsigned char>& data)
@@ -1291,32 +1508,42 @@ std::optional<Slic3r::BeltCoordinateSystem> belt_coordinates_from_gcode(const st
     constexpr const char* version_prefix = ";BELT_COORDINATE_VERSION:";
     constexpr const char* angle_prefix = ";BELT_GANTRY_ANGLE:";
     constexpr const char* max_y_prefix = ";BELT_PLATE_MAX_WORLD_Y:";
+    constexpr const char* print_origin_prefix = ";BELT_PRINT_ORIGIN_S:";
     bool is_belt = false;
-    bool supported_version = false;
+    int coordinate_version = 0;
     std::optional<double> angle;
     std::optional<double> max_world_y;
+    std::optional<double> print_origin_s;
     std::string line;
     for (std::size_t line_count = 0; line_count < 200 && std::getline(input, line); ++line_count) {
         try {
             if (line == kinematics) {
                 is_belt = true;
             } else if (line.rfind(version_prefix, 0) == 0) {
-                supported_version = std::stoi(line.substr(
-                    std::char_traits<char>::length(version_prefix))) == 1;
+                coordinate_version = std::stoi(line.substr(
+                    std::char_traits<char>::length(version_prefix)));
             } else if (line.rfind(angle_prefix, 0) == 0) {
                 angle = std::stod(line.substr(
                     std::char_traits<char>::length(angle_prefix)));
             } else if (line.rfind(max_y_prefix, 0) == 0) {
                 max_world_y = std::stod(line.substr(
                     std::char_traits<char>::length(max_y_prefix)));
+            } else if (line.rfind(print_origin_prefix, 0) == 0) {
+                print_origin_s = std::stod(line.substr(
+                    std::char_traits<char>::length(print_origin_prefix)));
             }
         } catch (const std::exception&) {
             return std::nullopt;
         }
     }
-    if (!is_belt || !supported_version || !angle || !max_world_y)
+    if (!is_belt || (coordinate_version != 1 && coordinate_version != 2) ||
+        !angle || !max_world_y ||
+        (coordinate_version == 2 && !print_origin_s))
         return std::nullopt;
-    return Slic3r::BeltCoordinateSystem::create(*angle, *max_world_y);
+    Slic3r::BeltCoordinateSystem coordinates =
+        Slic3r::BeltCoordinateSystem::create(*angle, *max_world_y);
+    coordinates.set_print_origin_s(print_origin_s.value_or(0.0));
+    return coordinates;
 }
 
 std::shared_ptr<ToolpathPreview> make_toolpath_preview(
@@ -2699,8 +2926,12 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                 return result;
             }
             const auto* angle = config.option<Slic3r::ConfigOptionFloat>("belt_gantry_angle");
+            const double angle_degrees = angle == nullptr ? 45.0 : angle->value;
+            const double reference_world_y = belt_support_enabled(plate_model, config)
+                ? belt_support_reference_world_y(plate_model, angle_degrees)
+                : belt_bounds.maximum.y();
             print.set_belt_coordinate_system(Slic3r::BeltCoordinateSystem::create(
-                angle == nullptr ? 45.0 : angle->value, belt_bounds.maximum.y()));
+                angle_degrees, reference_world_y));
         }
         const auto* printer_model = config.option<Slic3r::ConfigOptionString>("printer_model");
         print.is_BBL_printer() = printer_model != nullptr &&
@@ -2732,14 +2963,86 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         }
 
         report_progress(callbacks, 0.1f, "Slicing model");
-        print.process();
+        std::unique_ptr<Slic3r::BeltSupportDebugRecorder> belt_support_debug;
+        ToolpathPreviewPtr belt_support_debug_preview;
+        std::string belt_support_debug_gcode_path;
+        if (request.belt_support_debug_only) {
+            if (!belt_printer) {
+                result.diagnostics.push_back({
+                    "belt_support_debug",
+                    "Belt support audit requires an active Belt printer configuration",
+                    false});
+                return result;
+            }
+            belt_support_debug = std::make_unique<Slic3r::BeltSupportDebugRecorder>();
+        }
+        {
+            Slic3r::ScopedBeltSupportDebugRecorder debug_scope(belt_support_debug.get());
+            print.process();
+        }
         if (cancellation_requested(callbacks)) {
             result.cancelled = true;
             return result;
         }
 
-        const bool library_temporary = request.output_gcode_path.empty();
-        std::string output_path = library_temporary ? temporary_output_path(".gcode") : request.output_gcode_path;
+        if (belt_support_debug) {
+            report_progress(callbacks, 0.9f, "Saving Belt support audit stages");
+            const bool temporary_debug = request.belt_support_debug_output_path.empty();
+            const std::string debug_path = temporary_debug
+                ? temporary_output_path(".belt-support-audit.json")
+                : request.belt_support_debug_output_path;
+            const fs::path debug_parent = fs::path(debug_path).parent_path();
+            if (!debug_parent.empty())
+                fs::create_directories(debug_parent);
+            std::ofstream stream(debug_path, std::ios::binary | std::ios::trunc);
+            if (!stream) {
+                result.diagnostics.push_back({
+                    "belt_support_debug",
+                    "Unable to create Belt support audit file: " + debug_path,
+                    false});
+                return result;
+            }
+            stream << belt_support_debug_json(
+                *belt_support_debug, true, true, debug_path).dump(2);
+            stream.close();
+            if (!stream) {
+                result.diagnostics.push_back({
+                    "belt_support_debug",
+                    "Unable to write Belt support audit file: " + debug_path,
+                    false});
+                return result;
+            }
+            result.belt_support_debug.path = debug_path;
+            result.belt_support_debug.ownership = temporary_debug
+                ? OutputArtifactOwnership::LibraryTemporary
+                : OutputArtifactOwnership::CallerOwned;
+            result.preview = make_belt_support_debug_preview(*belt_support_debug, debug_path);
+            if (!result.preview || result.preview->segments.empty()) {
+                result.diagnostics.push_back({
+                    "belt_support_debug",
+                    "Belt support audit produced no drawable intermediate geometry",
+                    false});
+                result.preview.reset();
+                return result;
+            }
+            result.summary.layer_count = result.preview->layers.size();
+            result.summary.logical_motion_count = result.preview->segments.size();
+            result.summary.render_segment_count = result.preview->segments.size();
+            belt_support_debug_preview = result.preview;
+            if (!temporary_debug) {
+                belt_support_debug_gcode_path =
+                    (fs::path(debug_path).parent_path() /
+                     "belt-support.gcode").string();
+            }
+        }
+
+        const bool library_temporary = request.output_gcode_path.empty() &&
+            belt_support_debug_gcode_path.empty();
+        std::string output_path = !request.output_gcode_path.empty()
+            ? request.output_gcode_path
+            : (!belt_support_debug_gcode_path.empty()
+                ? belt_support_debug_gcode_path
+                : temporary_output_path(".gcode"));
         if (library_temporary) {
             generated_temporary_paths.push_back(output_path);
         }
@@ -2853,6 +3156,12 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                 result.preview->statistics.logical_motion_count;
             result.summary.render_segment_count = result.preview->segments.size();
         }
+
+        // The audit UI must keep exposing the twelve process stages. The
+        // production preview above is still built and validated from the
+        // exported G-code before it is replaced here.
+        if (belt_support_debug_preview)
+            result.preview = std::move(belt_support_debug_preview);
 
         result.success = true;
         generated_temporary_paths.clear();

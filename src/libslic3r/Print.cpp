@@ -1296,15 +1296,42 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
             return belt_error("Belt slicing does not support Z hop.", "z_hop");
         if (this->has_skirt())
             return belt_error("Belt slicing does not support a skirt.", "skirt_loops");
+        size_t belt_support_object_count = 0;
         for (const PrintObject* object : m_objects) {
-            if (object->config().enable_support)
-                return belt_error("Belt slicing support generation is not implemented yet.",
-                                  "enable_support");
+            if (object->config().enable_support) {
+                ++belt_support_object_count;
+                if (object->instances().size() != 1)
+                    return belt_error("Belt support V1 requires exactly one instance of the supported object.",
+                                      "enable_support");
+                if (!is_tree(object->config().support_type.value))
+                    return belt_error("Belt slicing currently supports only tree support.",
+                                      "support_type");
+                if (object->config().support_style.value != smsDefault &&
+                    object->config().support_style.value != smsTreeOrganic)
+                    return belt_error("Belt slicing currently supports only Organic tree support style.",
+                                      "support_style");
+                if (!object->config().support_on_build_plate_only.value)
+                    return belt_error("Belt support must rest on the build plate only.",
+                                      "support_on_build_plate_only");
+                if (object->model_object()->has_custom_layering())
+                    return belt_error("Belt support does not support variable layer height.",
+                                      "layer_height");
+                if (std::any_of(object->model_object()->volumes.begin(),
+                                object->model_object()->volumes.end(),
+                                [](const ModelVolume* volume) {
+                                    return volume != nullptr && volume->is_support_modifier();
+                                }))
+                    return belt_error("Belt support does not support support enforcer or blocker volumes.",
+                                      "enable_support");
+            }
             if (object->config().raft_layers.value > 0)
                 return belt_error("Belt slicing does not support a raft.", "raft_layers");
             if (object->config().brim_type != btNoBrim)
                 return belt_error("Belt slicing does not support a brim.", "brim_type");
         }
+        if (belt_support_object_count > 1)
+            return belt_error("Belt support V1 supports exactly one support-enabled object.",
+                              "enable_support");
     }
 
     if (nozzles < 2 && extruders.size() > 1) {
@@ -2208,6 +2235,44 @@ std::map<ObjectID, unsigned int> getObjectExtruderMap(const Print& print) {
     return objectExtruderMap;
 }
 
+void Print::normalize_belt_print_origin()
+{
+    if (!is_belt_printer() || !m_belt_coordinate_system ||
+        m_belt_coordinate_system->print_origin_s() > EPSILON)
+        return;
+
+    double first_print_s = std::numeric_limits<double>::max();
+    for (const PrintObject* object : m_objects) {
+        for (const Layer* layer : object->layers()) {
+            if (layer->has_extrusions())
+                first_print_s = std::min(first_print_s, layer->print_z);
+        }
+        for (const SupportLayer* layer : object->support_layers()) {
+            if (layer->has_extrusions())
+                first_print_s = std::min(first_print_s, layer->print_z);
+        }
+    }
+    if (!std::isfinite(first_print_s))
+        throw SlicingError("Belt print contains no extrusion path to establish its task origin.");
+
+    const double first_layer_height = m_config.initial_layer_print_height.value;
+    const double print_origin_s = std::max(0.0, first_print_s - first_layer_height);
+    if (print_origin_s <= EPSILON)
+        return;
+
+    for (PrintObject* object : m_objects) {
+        for (Layer* layer : object->layers()) {
+            layer->slice_z -= print_origin_s;
+            layer->print_z -= print_origin_s;
+        }
+        for (SupportLayer* layer : object->support_layers()) {
+            layer->slice_z -= print_origin_s;
+            layer->print_z -= print_origin_s;
+        }
+    }
+    m_belt_coordinate_system->set_print_origin_s(print_origin_s);
+}
+
 // Slicing process, running at a background thread.
 void Print::process(long long *time_cost_with_cache, bool use_cache)
 {
@@ -2439,6 +2504,8 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
             obj->copy_layers_overhang_from_shared_object();
         }
     }
+
+    normalize_belt_print_origin();
 
 
 

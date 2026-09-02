@@ -420,6 +420,9 @@ set(lisbslic3r_sources
     Slicing.hpp
     Support/SupportCommon.cpp
     Support/SupportCommon.hpp
+    Support/BeltTaperedSupport.cpp
+    Support/BeltTaperedSupport.hpp
+    Support/BeltSupportDebug.hpp
     Support/SupportLayer.hpp
     Support/SupportMaterial.cpp
     Support/SupportMaterial.hpp

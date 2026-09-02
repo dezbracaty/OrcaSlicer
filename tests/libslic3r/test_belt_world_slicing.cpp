@@ -18,6 +18,28 @@ TEST_CASE("Belt coordinate conversion is reversible", "[belt]")
     CHECK((belt.machine_to_world(machine) - world).norm() < 1e-9);
 }
 
+TEST_CASE("Belt task origin preserves world geometry while restarting machine Z", "[belt]")
+{
+    BeltCoordinateSystem belt = BeltCoordinateSystem::create(45.0, 250.0);
+    const Vec3d world(31.25, 207.5, 18.75);
+    const Vec3d absolute_oriented = belt.world_to_oriented(world);
+    const Vec3d absolute_machine = belt.oriented_to_machine(absolute_oriented);
+
+    belt.set_print_origin_s(12.5);
+    const Vec3d task_oriented = belt.world_to_oriented(world);
+    const Vec3d task_machine = belt.oriented_to_machine(task_oriented);
+
+    CHECK(task_oriented.x() == Catch::Approx(absolute_oriented.x()));
+    CHECK(task_oriented.y() == Catch::Approx(absolute_oriented.y()));
+    CHECK(task_oriented.z() == Catch::Approx(absolute_oriented.z() - 12.5));
+    CHECK(task_machine.x() == Catch::Approx(absolute_machine.x()));
+    CHECK(task_machine.y() == Catch::Approx(absolute_machine.y()));
+    CHECK(task_machine.z() == Catch::Approx(
+        belt.physical_s_to_machine_z(task_oriented.z())));
+    CHECK((belt.oriented_to_world(task_oriented) - world).norm() < 1e-9);
+    CHECK((belt.machine_to_world(task_machine) - world).norm() < 1e-9);
+}
+
 TEST_CASE("Belt layer change emits coupled machine Y and Z", "[belt]")
 {
     GCodeWriter writer;
