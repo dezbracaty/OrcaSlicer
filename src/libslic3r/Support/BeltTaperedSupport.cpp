@@ -1,4 +1,5 @@
 #include "BeltTaperedSupport.hpp"
+#include "BeltModelVolume.hpp"
 #include "BeltSupportDebug.hpp"
 
 #include "SupportCommon.hpp"
@@ -6,6 +7,7 @@
 #include "TreeSupport.hpp"
 
 #include "libslic3r/Belt/BeltCoordinateSystem.hpp"
+#include "libslic3r/Belt/BeltSupportKinematics.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/Fill/FillBase.hpp"
@@ -272,29 +274,6 @@ Point branch_center_at(const BeltSupportContact& contact, double slice_s)
     const coord_t v = contact.root_v_local + static_cast<coord_t>(std::llround(
         static_cast<double>(contact.center_local.y() - contact.root_v_local) * ratio));
     return {u, v};
-}
-
-const Layer* closest_model_layer(const PrintObject& object, double slice_s, double tolerance)
-{
-    const Layer* closest = nullptr;
-    double best_distance = std::numeric_limits<double>::max();
-    for (const Layer* layer : object.layers()) {
-        const double distance = std::abs(layer->slice_z - slice_s);
-        if (distance < best_distance) {
-            closest = layer;
-            best_distance = distance;
-        }
-    }
-    return best_distance <= tolerance ? closest : nullptr;
-}
-
-ExPolygons model_clearance_at(const PrintObject& object, double slice_s, double tolerance,
-                              double clearance)
-{
-    const Layer* layer = closest_model_layer(object, slice_s, tolerance);
-    if (layer == nullptr || layer->lslices.empty())
-        return {};
-    return clearance > EPSILON ? offset_ex(layer->lslices, scale_(clearance)) : layer->lslices;
 }
 
 std::vector<BeltReachableInterval> merge_intervals(
@@ -973,16 +952,25 @@ void BeltTaperedSupport::generate()
     const double top_gap = std::max(0.0, m_object.config().support_top_z_distance.value);
     const double configured_tree_tip_half_width =
         0.5 * m_object.config().tree_support_tip_diameter.value;
-    const double tip_half_width =
-        0.5 * support_parameters.support_material_flow.width();
+    const double configured_branch_half_width =
+        0.5 * m_object.config().tree_support_branch_diameter_organic.value;
+    // Match Orca Organic semantics: the requested tip is bounded by the
+    // configured branch diameter, while the emitted tip remains at least one
+    // printable support line wide.
+    const double tip_half_width = std::max(
+        0.5 * support_parameters.support_material_flow.width(),
+        std::min(configured_tree_tip_half_width,
+                 configured_branch_half_width));
     const double taper = std::tan(std::clamp(
         m_object.config().tree_support_branch_diameter_angle.value * M_PI / 180.0,
         0.0, 0.45 * M_PI));
-    const double maximum_half_width = 6.0;
+    const double maximum_half_width = std::max(
+        tip_half_width, configured_branch_half_width);
     const coord_t sample_spacing = scale_(std::max(
         1.5 * support_parameters.support_material_flow.width(),
-        m_object.config().tree_support_branch_distance.value));
+        m_object.config().tree_support_branch_distance_organic.value));
     const double contact_inset = tip_half_width;
+    const BeltModelVolume model_volume(m_object);
     std::vector<ExPolygons> overhangs_by_layer;
     overhangs_by_layer.reserve(m_object.layers().size());
     size_t raw_overhang_region_count = 0;
@@ -1064,9 +1052,12 @@ void BeltTaperedSupport::generate()
             if (layer_overhangs.empty())
                 continue;
             const double layer_tip_s = layer->slice_z - top_gap;
-            const ExPolygons model_at_tip = model_clearance_at(
-                m_object, layer_tip_s,
-                std::max(m_slicing_parameters.layer_height, 0.2), 0.0);
+            const BeltModelSlab model_tip_slab = model_volume.slice_slab(
+                layer_tip_s,
+                std::max(layer->height,
+                         m_slicing_parameters.layer_height),
+                0.0);
+            const ExPolygons& model_at_tip = model_tip_slab.regions;
 
             for (const ExPolygon& overhang : layer_overhangs) {
                 const size_t overhang_region_index = overhang_region_count++;
@@ -1117,6 +1108,33 @@ void BeltTaperedSupport::generate()
                         sample, tip_s, center_u, center_v, *coordinates);
                     const Vec3d center_world = local_point_to_world(
                         center, tip_s, center_u, center_v, *coordinates);
+                    if (!clear_center.has_value()) {
+                        // A colliding cap is not a support contact. Keeping it
+                        // in raw_contacts made later routing look complete even
+                        // though the generated tip intersected the model.
+                        if (debug != nullptr) {
+                            debug->add_point(
+                                BeltSupportDebugStageId::RawContacts,
+                                witness_world, 0.25,
+                                "rejected_unplaceable_contact");
+                            debug->add_record(
+                                BeltSupportDebugStageId::RawContacts,
+                                "contact_sample",
+                                "rejected_without_clear_tip_center",
+                                {{"overhang_region_index",
+                                  static_cast<double>(overhang_region_index)},
+                                 {"layer_index",
+                                  static_cast<double>(layer_index)},
+                                 {"layer_s_mm", layer->slice_z},
+                                 {"tip_s_mm", tip_s},
+                                 {"original_tip_cap_model_overlap_area_mm2",
+                                  original_model_overlap},
+                                 {"witness_world_x_mm", witness_world.x()},
+                                 {"witness_world_y_mm", witness_world.y()},
+                                 {"witness_world_z_mm", witness_world.z()}});
+                        }
+                        continue;
+                    }
                     const Vec3d root_world(
                         center_world.x(), center_world.y(), 0.0);
                     const Vec3d root_oriented =
@@ -1200,9 +1218,7 @@ void BeltTaperedSupport::generate()
                         debug->add_point(
                             BeltSupportDebugStageId::RawContacts,
                             center_world, 0.22,
-                            clear_center.has_value()
-                                ? "clear_contact_center"
-                                : "unplaceable_contact_center");
+                            "clear_contact_center");
                         if (center_adjusted) {
                             debug->add_line(
                                 BeltSupportDebugStageId::RawContacts,
@@ -1211,11 +1227,9 @@ void BeltTaperedSupport::generate()
                         }
                         debug->add_record(
                             BeltSupportDebugStageId::RawContacts, "contact_sample",
-                            clear_center.has_value()
-                                ? (center_adjusted
-                                    ? "accepted_with_adjusted_clear_center"
-                                    : "accepted_with_original_clear_center")
-                                : "accepted_without_clear_tip_center",
+                            center_adjusted
+                                ? "accepted_with_adjusted_clear_center"
+                                : "accepted_with_original_clear_center",
                             {{"raw_contact_index", static_cast<double>(raw_contact_index)},
                              {"overhang_region_index", static_cast<double>(overhang_region_index)},
                              {"layer_index", static_cast<double>(layer_index)},
@@ -1341,16 +1355,36 @@ void BeltTaperedSupport::generate()
         m_object.config().tree_support_branch_angle_organic.value *
             M_PI / 180.0,
         0.0, 0.5 * M_PI - EPSILON);
+    const double configured_world_branch_angle_degrees =
+        maximum_lateral_angle * 180.0 / M_PI;
+    const BeltSupportKinematics contract_kinematics(
+        *coordinates, configured_world_branch_angle_degrees);
+    // When beta reaches 90-alpha, the exact conic section between two fixed
+    // slicing planes becomes unbounded in V. Such motion is legal by angle
+    // alone but mechanically useless. Use a conservative bounded routing
+    // angle while retaining the user's configured angle as the final contract.
+    const double critical_world_branch_angle_degrees =
+        90.0 - coordinates->angle_degrees();
+    const double routing_world_branch_angle_degrees = std::min(
+        configured_world_branch_angle_degrees,
+        std::max(0.0, critical_world_branch_angle_degrees - 0.25));
+    const BeltSupportKinematics routing_kinematics(
+        *coordinates, routing_world_branch_angle_degrees);
+    const BeltWorldMoveKernel unit_predecessor_kernel =
+        routing_kinematics.predecessor_kernel(1.0);
+    if (!unit_predecessor_kernel.bounded)
+        throw SlicingError("Belt support could not construct a bounded world-space movement kernel.");
     // Orca's branch angle is measured from world vertical. A world-vertical
     // Belt trunk advances by ds / cos(alpha) in world Z for each oriented ds,
     // so its available world-X movement per ds is tan(beta) / cos(alpha).
     // Do not reinterpret beta as a cone around the Belt slicing normal N.
-    const double maximum_world_branch_slope = std::tan(maximum_lateral_angle);
+    const double maximum_world_branch_slope =
+        contract_kinematics.maximum_world_horizontal_slope();
     constexpr double world_branch_numeric_tolerance = 5e-5;
     const double maximum_vertical_route_u_slope =
-        maximum_world_branch_slope / coordinates->cos_angle();
+        contract_kinematics.world_vertical_u_radius_per_s();
     const double world_vertical_route_v_slope =
-        -coordinates->sin_angle() / coordinates->cos_angle();
+        contract_kinematics.world_vertical_predecessor_v_per_s();
     // The remaining fallback planners still use an oriented-layer reachability
     // radius. Keep that implementation budget separate from the authoritative
     // world-angle audit below.
@@ -1359,14 +1393,9 @@ void BeltTaperedSupport::generate()
         coordinates->sin_angle() / coordinates->cos_angle());
     const auto world_segment_horizontal_slope =
         [&](const BeltRoutePoint& upper, const BeltRoutePoint& lower) {
-            const Vec3d upper_world = coordinates->oriented_to_world({
-                upper.u + center_u, upper.v + center_v, upper.s});
-            const Vec3d lower_world = coordinates->oriented_to_world({
-                lower.u + center_u, lower.v + center_v, lower.s});
-            const Vec3d growth = upper_world - lower_world;
-            if (growth.z() <= EPSILON)
-                return std::numeric_limits<double>::infinity();
-            return std::hypot(growth.x(), growth.y()) / growth.z();
+            return contract_kinematics.predecessor_world_horizontal_slope(
+                lower.u - upper.u, lower.v - upper.v,
+                upper.s - lower.s);
         };
     const auto world_branch_segment_is_valid =
         [&](const BeltRoutePoint& upper, const BeltRoutePoint& lower,
@@ -1382,30 +1411,11 @@ void BeltTaperedSupport::generate()
     //
     // This is the exact replacement for the old circle around N. It lets the
     // area solver keep using robust 2D offsets without deforming the model.
-    const double cone_a =
-        coordinates->cos_angle() * coordinates->cos_angle() -
-        maximum_world_branch_slope * maximum_world_branch_slope *
-            coordinates->sin_angle() * coordinates->sin_angle();
-    const double cone_b =
-        2.0 * coordinates->sin_angle() * coordinates->cos_angle() *
-        (1.0 + maximum_world_branch_slope * maximum_world_branch_slope);
-    const double cone_c =
-        coordinates->sin_angle() * coordinates->sin_angle() -
-        maximum_world_branch_slope * maximum_world_branch_slope *
-            coordinates->cos_angle() * coordinates->cos_angle();
-    const bool bounded_world_cone = cone_a > EPSILON;
-    const double cone_center_v_slope = bounded_world_cone
-        ? -cone_b / (2.0 * cone_a)
-        : -coordinates->sin_angle() / coordinates->cos_angle();
-    const double cone_radius_squared = bounded_world_cone
-        ? std::max(0.0,
-              cone_b * cone_b / (4.0 * cone_a) - cone_c)
-        : maximum_vertical_route_u_slope * maximum_vertical_route_u_slope;
+    const double cone_center_v_slope = unit_predecessor_kernel.center_v;
     const double cone_u_radius_per_s =
-        std::max(1e-6, std::sqrt(cone_radius_squared));
-    const double cone_v_radius_per_s = bounded_world_cone
-        ? std::max(1e-6, std::sqrt(cone_radius_squared / cone_a))
-        : cone_u_radius_per_s;
+        std::max(1e-6, unit_predecessor_kernel.radius_u);
+    const double cone_v_radius_per_s =
+        std::max(1e-6, unit_predecessor_kernel.radius_v);
     auto transform_cone_space = [&](ExPolygons polygons, bool inverse,
                                     double translate_v = 0.0) {
         auto transform_point = [&](Point& point) {
@@ -1706,6 +1716,9 @@ void BeltTaperedSupport::generate()
                           static_cast<double>(rejected_without_support_height_count));
         debug->set_metric(BeltSupportDebugStageId::RawContacts, "sample_spacing_mm",
                           unscaled<double>(sample_spacing));
+        debug->set_metric(BeltSupportDebugStageId::RawContacts,
+                          "organic_branch_distance_mm",
+                          m_object.config().tree_support_branch_distance_organic.value);
         debug->set_metric(BeltSupportDebugStageId::RawContacts, "contact_inset_mm",
                           contact_inset);
         debug->set_metric(BeltSupportDebugStageId::RawContacts,
@@ -1714,6 +1727,12 @@ void BeltTaperedSupport::generate()
         debug->set_metric(BeltSupportDebugStageId::RawContacts,
                           "effective_rectangular_tip_half_width_mm",
                           tip_half_width);
+        debug->set_metric(BeltSupportDebugStageId::RawContacts,
+                          "configured_organic_branch_half_width_mm",
+                          configured_branch_half_width);
+        debug->set_metric(BeltSupportDebugStageId::RawContacts,
+                          "maximum_structural_half_width_mm",
+                          maximum_half_width);
         debug->set_metric(BeltSupportDebugStageId::RawContacts, "overhang_region_count",
                           static_cast<double>(overhang_region_count));
         debug->set_metric(BeltSupportDebugStageId::RawContacts, "contact_safe_region_count",
@@ -1894,10 +1913,16 @@ void BeltTaperedSupport::generate()
     std::vector<BeltForbiddenLayer> forbidden_by_plan;
     model_solid_by_plan.reserve(plans.size());
     forbidden_by_plan.reserve(plans.size());
+    size_t maximum_model_slab_source_layer_count = 0;
     for (const BeltSupportLayerPlan& plan : plans) {
         BeltForbiddenLayer solid;
-        solid.regions = model_clearance_at(
-            m_object, plan.slice_s, collision_tolerance, 0.0);
+        const BeltModelSlab model_slab = model_volume.slice_slab(
+            plan.slice_s,
+            std::max(plan.height, collision_tolerance), 0.0);
+        solid.regions = model_slab.regions;
+        maximum_model_slab_source_layer_count = std::max(
+            maximum_model_slab_source_layer_count,
+            model_slab.source_layer_count);
         solid.bounds.reserve(solid.regions.size());
         for (const ExPolygon& region : solid.regions)
             solid.bounds.emplace_back(get_extents(region));
@@ -1911,6 +1936,12 @@ void BeltTaperedSupport::generate()
             clearance.bounds.emplace_back(get_extents(region));
         model_solid_by_plan.emplace_back(std::move(solid));
         forbidden_by_plan.emplace_back(std::move(clearance));
+    }
+    if (debug != nullptr) {
+        debug->set_metric(
+            BeltSupportDebugStageId::RouteClassification,
+            "maximum_model_slab_source_layer_count",
+            static_cast<double>(maximum_model_slab_source_layer_count));
     }
     const double contact_cap_depth = std::max(
         2.0 * tip_half_width,
@@ -5286,6 +5317,21 @@ void BeltTaperedSupport::generate()
         debug->set_metric(BeltSupportDebugStageId::ReachableCorridors,
                           "maximum_lateral_angle_deg",
                           maximum_lateral_angle * 180.0 / M_PI);
+        debug->set_metric(BeltSupportDebugStageId::ReachableCorridors,
+                          "routing_world_angle_deg",
+                          routing_world_branch_angle_degrees);
+        debug->set_metric(BeltSupportDebugStageId::ReachableCorridors,
+                          "critical_world_angle_deg",
+                          critical_world_branch_angle_degrees);
+        debug->set_metric(BeltSupportDebugStageId::ReachableCorridors,
+                          "world_kernel_center_v_per_s",
+                          cone_center_v_slope);
+        debug->set_metric(BeltSupportDebugStageId::ReachableCorridors,
+                          "world_kernel_u_radius_per_s",
+                          cone_u_radius_per_s);
+        debug->set_metric(BeltSupportDebugStageId::ReachableCorridors,
+                          "world_kernel_v_radius_per_s",
+                          cone_v_radius_per_s);
         debug->set_metric(BeltSupportDebugStageId::RouteClassification,
                           "reachable_contact_count",
                           static_cast<double>(reachable_contact_count));
@@ -5806,6 +5852,22 @@ void BeltTaperedSupport::generate()
                         return count + (path.points.size() > 1
                             ? path.points.size() - 1 : 0);
                     });
+
+                // A finite top rectangle may straddle Z=0 when the first
+                // routed edge is shorter than its printable half-width. The
+                // physical root primitive is the analytic wedge intersected
+                // with the world build halfspace, not the untrimmed convex
+                // hull. Perform that intersection before model clearance and
+                // retain the invariant check below as a hard postcondition.
+                const double root_area_before_build_plate_clip =
+                    expolygons_area_mm2(wedge_slice.regions);
+                wedge_slice.regions = clip_regions_to_world_build_halfspace(
+                    wedge_slice.regions, plan.slice_s,
+                    center_v, *coordinates);
+                if (root_area_before_build_plate_clip >
+                        expolygons_area_mm2(wedge_slice.regions) + 1e-8) {
+                    ++build_plate_clipped_section_count;
+                }
 
                 if (!model_solid.empty())
                     wedge_slice.regions = diff_ex(
@@ -7148,6 +7210,8 @@ void BeltTaperedSupport::generate()
     size_t rejected_unanchored_interface_spine_count = 0;
     size_t rejected_unanchored_base_entity_count = 0;
     size_t rejected_unanchored_interface_entity_count = 0;
+    size_t path_center_model_clearance_trimmed_plan_count = 0;
+    double path_center_model_clearance_removed_area_mm2 = 0.0;
     ExPolygons previous_path_footprint;
     ExPolygons previous_support_envelope;
     size_t previous_plan_index = plans.size();
@@ -7312,6 +7376,43 @@ void BeltTaperedSupport::generate()
         const Flow interface_flow = support_parameters.support_material_interface_flow
                                         .with_height(float(plan.height));
 
+        // Section polygons describe the intended deposited material. Path
+        // generators, however, operate on extrusion centre lines and their
+        // physical footprint extends by half a line width on either side.
+        // Keep those centres away from the model by that radius; otherwise a
+        // contour or narrow-region fallback lying exactly on a clipped section
+        // boundary can re-enter the model by a few square microns.
+        const auto model_safe_path_center_regions =
+            [&](const ExPolygons& regions, const Flow& flow) {
+                if (regions.empty() ||
+                    model_solid_by_plan[plan_index].regions.empty()) {
+                    return regions;
+                }
+                const double center_clearance_mm =
+                    0.5 * flow.width() + SUPPORT_RESOLUTION;
+                const ExPolygons center_forbidden = offset_ex(
+                    model_solid_by_plan[plan_index].regions,
+                    scale_(center_clearance_mm), jtRound);
+                return diff_ex(regions, center_forbidden);
+            };
+        const ExPolygons base_path_regions =
+            model_safe_path_center_regions(plan.base_regions, base_flow);
+        const ExPolygons interface_path_regions =
+            model_safe_path_center_regions(
+                plan.interface_regions, interface_flow);
+        const double original_path_region_area_mm2 =
+            expolygons_area_mm2(plan.base_regions) +
+            expolygons_area_mm2(plan.interface_regions);
+        const double safe_path_region_area_mm2 =
+            expolygons_area_mm2(base_path_regions) +
+            expolygons_area_mm2(interface_path_regions);
+        if (original_path_region_area_mm2 >
+                safe_path_region_area_mm2 + 1e-8) {
+            ++path_center_model_clearance_trimmed_plan_count;
+            path_center_model_clearance_removed_area_mm2 +=
+                original_path_region_area_mm2 - safe_path_region_area_mm2;
+        }
+
         // The untrimmed root path is the physical intersection of this
         // oriented manufacturing plane with world Z=0. A structural path may
         // start from it even when the duplicate root extrusion is later
@@ -7323,10 +7424,10 @@ void BeltTaperedSupport::generate()
 
         const size_t base_entity_begin =
             support_layer->support_fills.entities.size();
-        if (!plan.base_regions.empty()) {
+        if (!base_path_regions.empty()) {
             Polylines structural_spines =
                 route_spines_for_regions(
-                    plan.base_regions, plan_index, base_flow.width());
+                    base_path_regions, plan_index, base_flow.width());
             ExtrusionEntityCollection structural_spine_candidates;
             extrusion_entities_append_paths(
                 structural_spine_candidates.entities,
@@ -7351,7 +7452,7 @@ void BeltTaperedSupport::generate()
             // narrow/mature threshold made a full perimeter appear suddenly
             // millimetres away from the existing centerline.
             tree_supports_generate_paths(
-                base_candidates.entities, to_polygons(plan.base_regions),
+                base_candidates.entities, to_polygons(base_path_regions),
                 base_flow, support_parameters);
             const auto [accepted_count, rejected_count] =
                 append_causally_anchored_entities(
@@ -7366,10 +7467,10 @@ void BeltTaperedSupport::generate()
             support_layer->support_fills.entities.size();
 
         const size_t interface_entity_begin = base_entity_end;
-        if (!plan.interface_regions.empty()) {
+        if (!interface_path_regions.empty()) {
             Polylines interface_spines =
                 route_spines_for_regions(
-                    plan.interface_regions, plan_index,
+                    interface_path_regions, plan_index,
                     interface_flow.width());
             ExtrusionEntityCollection interface_spine_candidates;
             extrusion_entities_append_paths(
@@ -7393,7 +7494,7 @@ void BeltTaperedSupport::generate()
             ExtrusionEntityCollection interface_candidates;
             append_interface_fill(
                 interface_candidates.entities,
-                plan.interface_regions, interface_flow,
+                interface_path_regions, interface_flow,
                 support_parameters, installed_layer_count);
             const auto [accepted_count, rejected_count] =
                 append_causally_anchored_entities(
@@ -7447,6 +7548,13 @@ void BeltTaperedSupport::generate()
         const ExPolygons path_footprint = union_ex(path_coverage_polygons);
         support_layer->support_islands = path_footprint;
         const ExPolygons& support_envelope = path_footprint;
+        const double base_path_model_overlap_mm2 = overlap_area_mm2(
+            base_path_footprint, model_solid_by_plan[plan_index].regions);
+        const double interface_path_model_overlap_mm2 = overlap_area_mm2(
+            interface_path_footprint,
+            model_solid_by_plan[plan_index].regions);
+        const double root_path_model_overlap_mm2 = overlap_area_mm2(
+            root_path_footprint, model_solid_by_plan[plan_index].regions);
         const double layer_model_overlap_mm2 = overlap_area_mm2(
             path_footprint, model_solid_by_plan[plan_index].regions);
         final_path_model_overlap_mm2 += layer_model_overlap_mm2;
@@ -7788,6 +7896,12 @@ void BeltTaperedSupport::generate()
                  {"disconnected_support_island_count",
                   static_cast<double>(
                       disconnected_support_island_count)},
+                 {"base_path_model_overlap_mm2",
+                  base_path_model_overlap_mm2},
+                 {"interface_path_model_overlap_mm2",
+                  interface_path_model_overlap_mm2},
+                 {"root_path_model_overlap_mm2",
+                  root_path_model_overlap_mm2},
                  {"model_overlap_mm2", layer_model_overlap_mm2}});
         }
         previous_path_footprint = path_footprint;
@@ -7847,6 +7961,15 @@ void BeltTaperedSupport::generate()
             BeltSupportDebugStageId::PathInputs,
             "rejected_unanchored_interface_entity_count",
             static_cast<double>(rejected_unanchored_interface_entity_count));
+        debug->set_metric(
+            BeltSupportDebugStageId::PathInputs,
+            "path_center_model_clearance_trimmed_plan_count",
+            static_cast<double>(
+                path_center_model_clearance_trimmed_plan_count));
+        debug->set_metric(
+            BeltSupportDebugStageId::PathInputs,
+            "path_center_model_clearance_removed_area_mm2",
+            path_center_model_clearance_removed_area_mm2);
         debug->set_metric(BeltSupportDebugStageId::FinalSupport,
                           "final_support_generated", 1.0);
         debug->set_metric(BeltSupportDebugStageId::FinalSupport,

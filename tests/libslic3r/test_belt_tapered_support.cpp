@@ -1,4 +1,5 @@
 #include "libslic3r/Belt/BeltCoordinateSystem.hpp"
+#include "libslic3r/Belt/BeltSupportKinematics.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/Format/OBJ.hpp"
 #include "libslic3r/Layer.hpp"
@@ -118,6 +119,55 @@ TEST_CASE("Belt build plate slice line maps to zero world Z and machine Y",
         CHECK(belt.oriented_to_world(oriented).z() == Catch::Approx(0.0).margin(1e-9));
         CHECK(belt.oriented_to_machine(oriented).y() == Catch::Approx(0.0).margin(1e-9));
     }
+}
+
+TEST_CASE("Belt branch movement kernel enforces the real-world angle",
+          "[belt][support][kinematics]")
+{
+    const BeltCoordinateSystem belt =
+        BeltCoordinateSystem::create(45.0, 250.0);
+    const BeltSupportKinematics movement(belt, 40.0);
+    const BeltWorldMoveKernel kernel = movement.predecessor_kernel(0.2);
+
+    REQUIRE(kernel.bounded);
+    CHECK(kernel.center_v < 0.0);
+    CHECK(kernel.radius_u > 0.0);
+    CHECK(kernel.radius_v > kernel.radius_u);
+
+    // Moving only along the slicing normal would look vertical to a normal
+    // slicer, but is 45 degrees from world vertical and violates beta=40.
+    CHECK_FALSE(movement.predecessor_is_valid(0.0, 0.0, 0.2, 1e-9));
+
+    // The translated centre of the conic is valid, as are its analytical U
+    // extrema. A point just outside is rejected by the world-space predicate.
+    CHECK(movement.predecessor_is_valid(
+        0.0, kernel.center_v, kernel.delta_s, 1e-9));
+    CHECK(movement.predecessor_is_valid(
+        kernel.radius_u, kernel.center_v, kernel.delta_s, 1e-9));
+    CHECK_FALSE(movement.predecessor_is_valid(
+        kernel.radius_u + 0.001, kernel.center_v,
+        kernel.delta_s, 1e-9));
+
+    const double vertical_dv =
+        movement.world_vertical_predecessor_v_per_s() * kernel.delta_s;
+    CHECK(movement.predecessor_world_horizontal_slope(
+              0.0, vertical_dv, kernel.delta_s) ==
+          Catch::Approx(0.0).margin(1e-12));
+}
+
+TEST_CASE("Belt branch kernel exposes the critical-angle topology change",
+          "[belt][support][kinematics]")
+{
+    const BeltCoordinateSystem belt =
+        BeltCoordinateSystem::create(45.0, 250.0);
+    const BeltSupportKinematics movement(belt, 45.0);
+    const BeltWorldMoveKernel kernel = movement.predecessor_kernel(0.2);
+
+    CHECK_FALSE(kernel.bounded);
+    CHECK(std::isinf(kernel.radius_v));
+    CHECK(movement.predecessor_is_valid(0.0, -20.0, 0.2, 1e-9));
+    CHECK(movement.predecessor_is_valid(0.0, 0.0, 0.2, 1e-9));
+    CHECK_FALSE(movement.predecessor_is_valid(0.0, 0.01, 0.2, 1e-9));
 }
 
 TEST_CASE("Belt tapered support starts with one open build plate contact path",

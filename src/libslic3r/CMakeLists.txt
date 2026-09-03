@@ -79,6 +79,8 @@ set(lisbslic3r_sources
     BoundingBox.hpp
     Belt/BeltCoordinateSystem.cpp
     Belt/BeltCoordinateSystem.hpp
+    Belt/BeltSupportKinematics.cpp
+    Belt/BeltSupportKinematics.hpp
     BridgeDetector.cpp
     BridgeDetector.hpp
     Brim.cpp
@@ -420,6 +422,8 @@ set(lisbslic3r_sources
     Slicing.hpp
     Support/SupportCommon.cpp
     Support/SupportCommon.hpp
+    Support/BeltModelVolume.cpp
+    Support/BeltModelVolume.hpp
     Support/BeltTaperedSupport.cpp
     Support/BeltTaperedSupport.hpp
     Support/BeltSupportDebug.hpp
