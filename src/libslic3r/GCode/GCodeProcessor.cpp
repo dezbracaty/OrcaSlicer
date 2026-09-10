@@ -2477,6 +2477,7 @@ void GCodeProcessor::reset()
     m_processing_start_custom_gcode = false;
     m_g1_line_id = 0;
     m_layer_id = 0;
+    m_last_numbered_layer.reset();
     m_cp_color.reset();
 
     m_producer = EProducer::Unknown;
@@ -3045,6 +3046,44 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
     if (producers_enabled && process_producers_tags(comment))
         return;
 
+    // External slicers need not have a recognized producer header. Accept
+    // numbered layer comments (including FibreSeek's optional [height]) without
+    // mistaking LAYER_COUNT, arbitrary trailing text, or Z hops for boundaries.
+    const auto trim = [](std::string_view value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        return first == value.npos ? std::string_view{} :
+            value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+    };
+    const auto layer_comment = trim(comment);
+    if (boost::starts_with(layer_comment, "LAYER:")) {
+        const auto value = trim(layer_comment.substr(6));
+        unsigned int number = 0;
+        if (value.empty()) return;
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
+        if (parsed.ec != std::errc{}) return;
+        const auto suffix = trim(value.substr(parsed.ptr - value.data()));
+        if (!suffix.empty()) {
+            if (suffix.size() < 3 || suffix.front() != '[' || suffix.back() != ']') return;
+            const auto height_text = trim(suffix.substr(1, suffix.size() - 2));
+            if (height_text.empty()) return;
+            float height = 0.0f;
+            const auto parsed_height = fast_float::from_chars(
+                height_text.data(), height_text.data() + height_text.size(), height);
+            if (parsed_height.ec != std::errc{} ||
+                parsed_height.ptr != height_text.data() + height_text.size() ||
+                !std::isfinite(height)) return;
+        }
+        // The first recognized layer dialect owns the file. Mixing numbered
+        // and anonymous change tags must not count the same boundary twice.
+        if (m_last_numbered_layer || m_layer_id == 0) {
+            if (!m_last_numbered_layer || *m_last_numbered_layer != number) {
+                ++m_layer_id;
+                m_last_numbered_layer = number;
+            }
+        }
+        return;
+    }
+
     // A generated G-code file is the source of truth for its tag dialect.
     // Printer metadata may classify a non-Bambu profile as "compatible"
     // while the exporter has emitted Orca/Bambu-style FEATURE, CHANGE_LAYER,
@@ -3271,7 +3310,8 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
                comment == Reserved_Tags_compatible[index];
     };
     if (is_exact_tag(ETags::Layer_Change)) {
-        ++m_layer_id;
+        if (!m_last_numbered_layer)
+            ++m_layer_id;
         return;
     }
 }

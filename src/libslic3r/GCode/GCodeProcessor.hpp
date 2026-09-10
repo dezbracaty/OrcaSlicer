@@ -820,6 +820,8 @@ class Print;
         bool m_processing_start_custom_gcode;
         unsigned int m_g1_line_id;
         unsigned int m_layer_id;
+        // External numbered tags are normalized to contiguous internal layers.
+        std::optional<unsigned int> m_last_numbered_layer;
         CpColor m_cp_color;
         SeamsDetector m_seams_detector;
         OptionsZCorrector m_options_z_corrector;
@@ -1138,5 +1140,4 @@ class Print;
 } /* namespace Slic3r */
 
 #endif /* slic3r_GCodeProcessor_hpp_ */
-
 

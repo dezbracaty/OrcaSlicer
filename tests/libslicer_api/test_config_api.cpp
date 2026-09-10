@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string_view>
 #include <vector>
 
@@ -648,11 +650,130 @@ G1 X0 Y0 E8
     const auto imported = library->load_gcode_preview(request);
     REQUIRE(imported.success);
     REQUIRE(imported.preview != nullptr);
-    CHECK(imported.preview->statistics.total_layers > 0);
+    CHECK(imported.preview->statistics.total_layers == 2);
     CHECK(imported.preview->statistics.render_segment_count > 0);
     CHECK_FALSE(imported.preview->segments.empty());
+    for (const auto& segment : imported.preview->segments) {
+        if (segment.motion == libslicer::ToolpathMotionKind::Extrusion) {
+            CHECK(segment.layer_index == (segment.end_mm.z < 0.3f ? 0 : 1));
+        }
+    }
 
     std::filesystem::remove(gcode_path, remove_error);
+}
+
+TEST_CASE("external layer tags assign motions without double counting",
+          "[libslicer_api][gcode][preview][layer_tags]")
+{
+    std::string first = "; LAYER:1 [0.2]\r\n";
+    std::string second = "; LAYER:2 [0.4]\r\n";
+    std::string duplicate = first;
+    SECTION("FibreSeek numbered layers") {}
+    SECTION("whitespace and zero-based layers") {
+        first = ";\t LAYER: 0 [ 0.2 ] \t\r\n";
+        second = "; LAYER: 1 [0.4]\r\n";
+        duplicate = first;
+    }
+    SECTION("sparse external numbers are contiguous internally") {
+        first = ";LAYER:10\n";
+        second = ";LAYER:20\n";
+        duplicate = first;
+    }
+    SECTION("numbered tags take precedence when encountered first") {
+        first += ";LAYER_CHANGE\n";
+        second += "; CHANGE_LAYER\n";
+    }
+    SECTION("Orca change tags take precedence when encountered first") {
+        first = "; CHANGE_LAYER\n;LAYER:1\n";
+        second = "; CHANGE_LAYER\n;LAYER:2\n";
+        duplicate = ";LAYER:1\n";
+    }
+    SECTION("compatible change tags remain supported") {
+        first = ";LAYER_CHANGE\n";
+        second = ";LAYER_CHANGE\n";
+        duplicate.clear();
+    }
+
+    const auto path = std::filesystem::temp_directory_path() / "libslicer_layer_tags.gcode";
+    {
+        std::ofstream gcode(path, std::ios::binary);
+        REQUIRE(gcode.good());
+        gcode << "; Generated with FibreSeek Rocket Slicer\r\n"
+                 "G21\nG90\nM83\nG92 E0\n; LAYER_COUNT:363\n"
+                 "; LAYER:invalid\n; LAYER:9999999999999999999999\n"
+                 "; LAYER:12garbage\n; LAYER:12 [bad]\n"
+              << first
+              << "G0 X0 Y0 Z0.2 F1200\nG1 X10 E1\n"
+              << duplicate
+              << "G0 Z2\nG0 Z0.2\nG1 X20 E1\n"
+              << second
+              << "G0 Z0.4\nG1 X30 E1\n";
+        REQUIRE(gcode.good());
+    }
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    const auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+    libslicer::GCodePreviewRequest request;
+    request.gcode_path = path.string();
+    const auto imported = library->load_gcode_preview(request);
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview != nullptr);
+    CHECK(imported.preview->statistics.total_layers == 2);
+    std::set<std::uint32_t> extrusion_layers;
+    for (const auto& segment : imported.preview->segments) {
+        if (segment.motion == libslicer::ToolpathMotionKind::Extrusion) {
+            CHECK(segment.layer_index == (segment.end_mm.x <= 20.0f ? 0 : 1));
+            extrusion_layers.insert(segment.layer_index);
+        }
+    }
+    CHECK(extrusion_layers == std::set<std::uint32_t>{0, 1});
+    std::error_code remove_error;
+    std::filesystem::remove(path, remove_error);
+}
+
+TEST_CASE("FibreSeek file preserves every segment's source layer",
+          "[.][libslicer_api][gcode_external]")
+{
+    const char* path = std::getenv("LIBSLICER_TEST_GCODE_PATH");
+    REQUIRE(path != nullptr);
+    std::ifstream input(path);
+    REQUIRE(input.good());
+    std::vector<std::uint32_t> source_layers{0}; // Source command IDs are 1-based lines.
+    unsigned int layer_count = 0;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.rfind("; LAYER:", 0) == 0) {
+            unsigned int source_number = 0;
+            std::istringstream number(line.substr(8));
+            REQUIRE(bool(number >> source_number));
+            REQUIRE(source_number == layer_count + 1);
+            ++layer_count;
+        }
+        source_layers.push_back(layer_count == 0 ? 0 : layer_count - 1);
+    }
+    REQUIRE(layer_count == 363);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    const auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+    libslicer::GCodePreviewRequest request;
+    request.gcode_path = path;
+    const auto imported = library->load_gcode_preview(request);
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview != nullptr);
+    REQUIRE(imported.preview->layers.size() == layer_count);
+    REQUIRE(imported.preview->statistics.total_layers == layer_count);
+    REQUIRE_FALSE(imported.preview->segments.empty());
+    std::set<std::uint32_t> populated_layers;
+    for (const auto& segment : imported.preview->segments) {
+        REQUIRE(segment.source_command_id < source_layers.size());
+        CHECK(segment.layer_index == source_layers[segment.source_command_id]);
+        populated_layers.insert(segment.layer_index);
+    }
+    CHECK(populated_layers.size() == layer_count);
 }
 
 TEST_CASE("belt G-code preview reconstructs world coordinates across G92 Z reset",
