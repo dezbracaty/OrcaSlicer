@@ -687,86 +687,6 @@ std::string temporary_output_path(std::string_view suffix)
              std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + std::string(suffix))).string();
 }
 
-void publish_staged_outputs(const std::vector<std::pair<std::string, std::string>>& paths)
-{
-    struct Item {
-        fs::path staged;
-        fs::path target;
-        fs::path backup;
-        bool had_target = false;
-        bool published = false;
-    };
-    std::vector<Item> items;
-    items.reserve(paths.size());
-    for (const auto& [staged, target] : paths) {
-        if (staged.empty() || target.empty() || staged == target)
-            continue;
-        Item item;
-        item.staged = staged;
-        item.target = target;
-        item.backup = item.target.parent_path() /
-            (item.target.filename().string() + "." +
-             fs::path(temporary_output_path(".backup")).filename().string());
-        items.push_back(std::move(item));
-    }
-
-    const auto restore_backups = [&items]() {
-        for (auto it = items.rbegin(); it != items.rend(); ++it) {
-            std::error_code error;
-            if (it->published)
-                fs::remove(it->target, error);
-            if (it->had_target && fs::exists(it->backup, error)) {
-                error.clear();
-                fs::rename(it->backup, it->target, error);
-            }
-        }
-    };
-
-    for (Item& item : items) {
-        std::error_code error;
-        if (!fs::is_regular_file(item.staged, error) || error) {
-            restore_backups();
-            throw std::runtime_error("Staged slice output is missing: " + item.staged.string());
-        }
-        error.clear();
-        item.had_target = fs::exists(item.target, error);
-        if (error) {
-            restore_backups();
-            throw std::runtime_error("Unable to inspect slice output target: " + item.target.string() +
-                                     ": " + error.message());
-        }
-        if (!item.had_target)
-            continue;
-        if (!fs::is_regular_file(item.target, error) || error) {
-            restore_backups();
-            throw std::runtime_error("Slice output target is not a regular file: " + item.target.string());
-        }
-        fs::rename(item.target, item.backup, error);
-        if (error) {
-            restore_backups();
-            throw std::runtime_error("Unable to stage existing slice output for replacement: " +
-                                     item.target.string() + ": " + error.message());
-        }
-    }
-
-    for (Item& item : items) {
-        std::error_code error;
-        fs::rename(item.staged, item.target, error);
-        if (error) {
-            restore_backups();
-            throw std::runtime_error("Unable to publish slice output: " + item.target.string() +
-                                     ": " + error.message());
-        }
-        item.published = true;
-    }
-    for (const Item& item : items) {
-        if (!item.had_target)
-            continue;
-        std::error_code error;
-        fs::remove(item.backup, error);
-    }
-}
-
 nlohmann::json belt_support_debug_json(
     const Slic3r::BeltSupportDebugRecorder& recorder,
     bool include_lines,
@@ -3470,24 +3390,13 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             }
         }
 
-        const bool library_temporary = request.output_gcode_path.empty() &&
-            belt_support_debug_gcode_path.empty();
-        std::string output_path = !request.output_gcode_path.empty()
+        const std::string output_export_path = !request.output_gcode_path.empty()
             ? request.output_gcode_path
-            : (!belt_support_debug_gcode_path.empty()
-                ? belt_support_debug_gcode_path
-                : temporary_output_path(".gcode"));
-        if (library_temporary) {
-            generated_temporary_paths.push_back(output_path);
-        }
-        const std::string output_publish_path = !library_temporary ? output_path : std::string{};
-        std::string package_publish_path;
-        if (!output_publish_path.empty()) {
-            output_path = (fs::path(output_path).parent_path() /
-                           fs::path(temporary_output_path(".pending.gcode")).filename()).string();
-            generated_temporary_paths.push_back(output_path);
-        }
-        const fs::path output_parent = fs::path(output_path).parent_path();
+            : belt_support_debug_gcode_path;
+        const bool library_temporary = output_export_path.empty();
+        const std::string output_path = temporary_output_path(".gcode");
+        generated_temporary_paths.push_back(output_path);
+        const fs::path output_parent = fs::path(output_export_path).parent_path();
         if (!output_parent.empty()) {
             fs::create_directories(output_parent);
         }
@@ -3521,20 +3430,13 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         }
 
         const bool generate_gcode_3mf = request.generate_gcode_3mf || !request.output_gcode_3mf_path.empty();
+        std::string package_export_path;
         if (generate_gcode_3mf) {
             const bool package_temporary = request.output_gcode_3mf_path.empty();
-            std::string package_path = package_temporary
-                ? temporary_output_path(".gcode.3mf")
-                : request.output_gcode_3mf_path;
-            if (package_temporary) {
-                generated_temporary_paths.push_back(package_path);
-            }
-            if (!package_temporary) {
-                package_publish_path=package_path;
-                package_path=(fs::path(package_path).parent_path()/fs::path(temporary_output_path(".pending.gcode.3mf")).filename()).string();
-                generated_temporary_paths.push_back(package_path);
-            }
-            const fs::path package_parent = fs::path(package_path).parent_path();
+            package_export_path = request.output_gcode_3mf_path;
+            const std::string package_path = temporary_output_path(".gcode.3mf");
+            generated_temporary_paths.push_back(package_path);
+            const fs::path package_parent = fs::path(package_export_path).parent_path();
             if (!package_parent.empty()) {
                 fs::create_directories(package_parent);
             }
@@ -3595,7 +3497,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
         if (request.generate_preview) {
             report_progress(callbacks, 0.96f, "Preparing toolpath preview");
-            result.preview = make_toolpath_preview(processor_result, &config, output_publish_path.empty()?result.output.path:output_publish_path,
+            result.preview = make_toolpath_preview(processor_result, &config, result.output.path,
                                                    print.belt_coordinate_system());
             if (!result.preview || result.preview->layers.empty() ||
                 result.preview->segments.empty()) {
@@ -3618,12 +3520,32 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             result.preview = std::move(belt_support_debug_preview);
 
         if (cancellation_requested(callbacks)) throw Slic3r::CanceledException();
-        publish_staged_outputs({
-            {result.output.path, output_publish_path},
-            {result.gcode_3mf.path, package_publish_path}
-        });
-        if (!output_publish_path.empty()) result.output.path=output_publish_path;
-        if (!package_publish_path.empty()) result.gcode_3mf.path=package_publish_path;
+        const auto publish_output = [](const std::string& source,
+                                       const std::string& target,
+                                       const char* description) {
+            if (target.empty())
+                return;
+            std::string error;
+            const Slic3r::CopyFileResult copied =
+                Slic3r::copy_file(source, target, error, false);
+            if (copied != Slic3r::CopyFileResult::SUCCESS) {
+                throw Slic3r::ExportError(
+                    std::string("Unable to export ") + description + " to " +
+                    target + (error.empty() ? std::string{} : ": " + error));
+            }
+        };
+        if (!output_export_path.empty()) {
+            publish_output(result.output.path, output_export_path, "G-code");
+            std::error_code remove_error;
+            fs::remove(result.output.path, remove_error);
+            result.output.path = output_export_path;
+        }
+        if (!package_export_path.empty()) {
+            publish_output(result.gcode_3mf.path, package_export_path, "G-code 3MF");
+            std::error_code remove_error;
+            fs::remove(result.gcode_3mf.path, remove_error);
+            result.gcode_3mf.path = package_export_path;
+        }
         result.success = true;
         generated_temporary_paths.clear();
         report_progress(callbacks, 1.0f, "Slicing completed");
