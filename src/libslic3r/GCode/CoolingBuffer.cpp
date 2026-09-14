@@ -369,6 +369,9 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
             ++ line_end;
         // sline will not contain the trailing '\n'.
         std::string sline(line_start, line_end);
+        if (sline.find(";FIBER_BEGIN") == 0 || sline.find(";FIBER_END") == 0)
+            active_speed_modifier = size_t(-1); // Parse positions/time, but never inherit plastic slowdown across a fiber boundary.
+
         // CoolingLine will contain the trailing '\n'.
         if (*line_end == '\n')
             ++ line_end;

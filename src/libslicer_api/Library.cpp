@@ -1,3 +1,4 @@
+#include "libslic3r/FiberPlanning.hpp"
 #define NANOSVG_IMPLEMENTATION
 #include <nanosvg/nanosvg.h>
 
@@ -5,6 +6,7 @@
 
 #include <libslic3r/PresetBundle.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/ClipperUtils.hpp>
 #include <libslic3r/Print.hpp>
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/GCode/GCodeProcessor.hpp>
@@ -430,6 +432,21 @@ std::vector<ConfigDiagnostic> filament_cardinality_diagnostics(
     check("filament_settings_id", false);
     check("filament_type", false);
     const std::size_t tool_count = config_vector_values(config, "nozzle_diameter").size();
+    const auto mapping = config_vector_values(config, "filament_map");
+    if (mapping.size() != slot_count) {
+        diagnostics.push_back({"filament_map", "Material mapping must contain one tool for each slot"});
+    } else {
+        for (const auto& value : mapping) {
+            try {
+                const int tool = std::stoi(value);
+                if (tool < 1 || size_t(tool) > tool_count)
+                    diagnostics.push_back({"filament_map", "Mapped tool is outside the physical nozzle range"});
+            } catch (const std::exception&) {
+                diagnostics.push_back({"filament_map", "Invalid physical tool index"});
+            }
+        }
+    }
+
     const std::size_t flush_multiplier_count =
         config_vector_values(config, "flush_multiplier").size();
     const std::size_t flush_matrix_count =
@@ -1705,6 +1722,11 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
             segment.color_id = input.cp_color_id;
             segment.motion = *motion;
             segment.extrusion_role = role;
+            segment.deposition_process=input.fiber_deposition?ToolpathDepositionProcess::Fiber:ToolpathDepositionProcess::Plastic;
+            segment.phase=static_cast<ToolpathPhase>(input.fiber_phase);
+            segment.fiber_tail=input.fiber_tail;segment.fiber_path_id=input.fiber_path_id;
+            if(input.fiber_deposition){segment.object_id=input.fiber_object;segment.instance_id=input.fiber_instance;}
+
             segment.start_mm = *previous_position;
             segment.end_mm = end;
             segment.nominal_speed_mm_s = input.feedrate;
@@ -1762,6 +1784,17 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
                 }
             } else {
                 preview->statistics.total_travel_distance_mm += distance;
+            }
+
+
+            if (input.fiber_deposition) {
+                segment.width_mm=input.fiber_width_mm;
+                segment.height_mm=input.height>0?input.height:layer.height_mm;
+                segment.mm3_per_mm=0;
+                segment.extrusion_delta_mm=input.fiber_tail?0:input.delta_extruder;
+                segment.nominal_deposition_length_mm=static_cast<float>(distance);
+                preview->statistics.total_fiber_deposition_length_mm+=distance;
+                if(*motion==ToolpathMotionKind::Travel){preview->statistics.total_travel_distance_mm-=distance;preview->statistics.total_print_distance_mm+=distance;}
             }
 
             const float speed = segment.nominal_speed_mm_s;
@@ -1828,6 +1861,11 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
         if (const auto event_kind = to_event_kind(input.type); event_kind && has_end) {
             ToolpathEvent event;
             event.kind = *event_kind;
+            if(input.fiber_event==1)event.kind=ToolpathEventKind::FiberStart;
+            else if(input.fiber_event==2)event.kind=ToolpathEventKind::FiberCut;
+            if(input.fiber_event)event.message=input.fiber_path_id;
+            if(input.fiber_event){event.fiber_path_id=input.fiber_path_id;event.object_id=input.fiber_object;event.instance_id=input.fiber_instance;}
+
             event.after_segment = layer.segments.size();
             event.source_command_id = input.gcode_id;
             event.tool_id = tool_id;
@@ -2106,6 +2144,152 @@ PlaneCutResult cut_mesh_with_plane(const PlaneCutRequest& request)
     return result;
 }
 
+// Runtime editing state. Per-slot copies keep edits independent even when two
+// slots start with the same preset. Full configs remain derived snapshots.
+class Library::PresetState
+{
+public:
+    Slic3r::PresetBundle bundle;
+    std::vector<Slic3r::Preset> materials;
+    bool project_layout_initialized{false};
+
+    void initialize_project_layout(Slic3r::DynamicPrintConfig& full)
+    {
+        using namespace Slic3r;
+        if (project_layout_initialized) return;
+        project_layout_initialized = true;
+        DynamicPrintConfig fixed = full;
+        if (!resolve_fixed_filament_map(fixed, materials.size())) return;
+        const auto* area = full.option<ConfigOptionPoints>("printable_area");
+        const auto* excluded = full.option<ConfigOptionPoints>("bed_exclude_area");
+        if (!area || area->size() < 3 || !excluded || excluded->size() < 3) return;
+        auto polygon = [](const Pointfs& points) {
+            Polygon result;
+            for (const auto& point : points) result.points.emplace_back(scale_(point.x()), scale_(point.y()));
+            return result;
+        };
+        const auto available = diff_ex(Polygons{polygon(area->values)}, Polygons{polygon(excluded->values)});
+        const double width = full.option<ConfigOptionFloat>("prime_tower_width")->value;
+        const double margin = 5. + std::max(0., full.option<ConfigOptionFloat>("prime_tower_brim_width")->value);
+        const auto* structure = full.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
+        // Old PartPlateList::set_default_wipe_tower_pos_for_plate starts at
+        // (165,250), or (0,250) for I3, before applying the usable-bed margin.
+        const Vec2d initial(structure && structure->value == psI3 ? 0. : 165., 250.);
+        auto apply_position = [&](const Vec2d& point) {
+            full.option<ConfigOptionFloats>("wipe_tower_x")->values[0] = point.x();
+            full.option<ConfigOptionFloats>("wipe_tower_y")->values[0] = point.y();
+            for (const char* key : {"wipe_tower_x", "wipe_tower_y"}) bundle.project_config.set_key_value(key, full.option(key)->clone());
+        };
+        // Reserve the initial tower footprint inside the usable bed, as the
+        // original plate setup does. Final slicing still validates actual size.
+        auto fits = [&](const Vec2d& point) {
+            const Polygon footprint = polygon(Pointfs{{point.x()-margin, point.y()-margin},
+                {point.x()+width+margin, point.y()-margin}, {point.x()+width+margin, point.y()+width+margin},
+                {point.x()-margin, point.y()+width+margin}});
+            return diff_ex(ExPolygons{ExPolygon(footprint)}, available).empty();
+        };
+        if (fits(initial)) { apply_position(initial); return; }
+        std::vector<Vec2d> candidates;
+        for (const auto& island : available) {
+            const auto box = island.contour.bounding_box();
+            const double min_x = unscale<double>(box.min.x()) + margin;
+            const double max_x = unscale<double>(box.max.x()) - width - margin;
+            const double min_y = unscale<double>(box.min.y()) + margin;
+            const double max_y = unscale<double>(box.max.y()) - width - margin;
+            if (min_x > max_x || min_y > max_y) continue;
+            std::vector<double> xs{std::clamp(initial.x(), min_x, max_x), min_x, max_x};
+            std::vector<double> ys{std::clamp(initial.y(), min_y, max_y), min_y, max_y};
+            for (const auto& vertex : island.contour.points) {
+                xs.push_back(unscale<double>(vertex.x()) + margin);
+                xs.push_back(unscale<double>(vertex.x()) - width - margin);
+                ys.push_back(unscale<double>(vertex.y()) + margin);
+                ys.push_back(unscale<double>(vertex.y()) - width - margin);
+            }
+            for (double x : xs) for (double y : ys) candidates.emplace_back(x, y);
+        }
+        std::sort(candidates.begin(), candidates.end(), [&](const Vec2d& a, const Vec2d& b) { return (a-initial).squaredNorm() < (b-initial).squaredNorm(); });
+        for (const auto& point : candidates) if (fits(point)) {
+            apply_position(point);
+            break;
+        }
+    }
+
+    Slic3r::DynamicPrintConfig full_config()
+    {
+        using namespace Slic3r;
+        auto& printer = bundle.printers.get_edited_preset();
+        auto& process = bundle.prints.get_edited_preset();
+        DynamicPrintConfig mapping = printer.config;
+        mapping.apply(bundle.project_config);
+        if (resolve_fixed_filament_map(mapping, materials.size()))
+            bundle.project_config.set_key_value("filament_map", mapping.option("filament_map")->clone());
+        auto full = PresetBundle::construct_full_config(printer, process, bundle.project_config, materials, true, std::nullopt);
+        initialize_project_layout(full);
+        std::vector<std::string> differences;
+        auto add_diff = [&](const Preset& edited, const Preset* saved) {
+            differences.push_back(escape_strings_cstyle(saved ? edited.config.diff(saved->config) : edited.config.keys()));
+        };
+        add_diff(process, bundle.prints.find_preset(process.name, false));
+        for (const auto& material : materials) add_diff(material, bundle.filaments.find_preset(material.name, false));
+        add_diff(printer, bundle.printers.find_preset(printer.name, false));
+        full.set_key_value("different_settings_to_system", new ConfigOptionStrings(differences));
+        return full;
+    }
+
+    // Apply only edited keys, scattering material values back through the
+    // existing extruder/variant identity, not through a guessed array stride.
+    void apply_edits(const Slic3r::DynamicPrintConfig& before, const Slic3r::DynamicPrintConfig& after)
+    {
+        using namespace Slic3r;
+        const auto process_keys = Preset::print_options();
+        const auto printer_keys = Preset::printer_options();
+        const auto filament_keys = Preset::filament_options();
+        auto contains = [](const auto& keys, const auto& key) { return std::find(keys.begin(), keys.end(), key) != keys.end(); };
+        const auto* map = after.option<ConfigOptionInts>("filament_map");
+        const auto* types = after.option<ConfigOptionEnumsGeneric>("extruder_type");
+        const auto* volumes = after.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+        auto merge = [&](DynamicPrintConfig& dest, const std::string& key, const ConfigOption* src,
+                         const std::string& id_key, const std::string& variant_key,
+                         size_t source_index, size_t tool, bool variant, size_t stride) {
+            if (!variant || !types || !volumes || src->is_scalar()) {
+                if (variant_key == "filament_extruder_variant" && !src->is_scalar())
+                    static_cast<ConfigOptionVectorBase*>(dest.option(key, true))->set_at(src, 0, source_index);
+                else dest.set_key_value(key, src->clone());
+                return;
+            }
+            int index = dest.get_index_for_extruder(int(tool + 1), id_key,
+                ExtruderType(types->get_at(tool)), NozzleVolumeType(volumes->get_at(tool)), variant_key);
+            if (index < 0) throw std::runtime_error("No preset variant for edited setting: " + key);
+            auto* vector = static_cast<ConfigOptionVectorBase*>(dest.option(key, true));
+            for (size_t j = 0; j < stride; ++j) vector->set_at(src, size_t(index) * stride + j, source_index * stride + j);
+        };
+        for (const auto& key : after.keys()) {
+            const auto* value = after.option(key);
+            if (const auto* old = before.option(key); old && *old == *value) continue;
+            if (bundle.project_config.has(key)) {
+                bundle.project_config.set_key_value(key, value->clone());
+            } else if (contains(filament_keys, key)) {
+                for (size_t i = 0; i < materials.size(); ++i) {
+                    size_t tool = map && i < map->size() ? size_t(std::max(1, map->values[i]) - 1) : 0;
+                    merge(materials[i].config, key, value, "", "filament_extruder_variant", i, tool,
+                          filament_options_with_variant.count(key) != 0, 1);
+                }
+            } else {
+                const bool process = contains(process_keys, key);
+                if (!process && !contains(printer_keys, key)) continue;
+                auto& dest = process ? bundle.prints.get_edited_preset().config : bundle.printers.get_edited_preset().config;
+                const bool variant = process ? print_options_with_variant.count(key) != 0 :
+                    printer_options_with_variant_1.count(key) != 0 || printer_options_with_variant_2.count(key) != 0;
+                const size_t stride = !process && printer_options_with_variant_2.count(key) ? 2 : 1;
+                const size_t tools = variant && types ? types->size() : 1;
+                for (size_t i = 0; i < tools; ++i)
+                    merge(dest, key, value, process ? "print_extruder_id" : "printer_extruder_id",
+                          process ? "print_extruder_variant" : "printer_extruder_variant", i, i, variant, stride);
+            }
+        }
+    }
+};
+
 class Library::Impl
 {
 public:
@@ -2114,6 +2298,7 @@ public:
     std::vector<MachineModelOption> machines;
     std::vector<BuildPlateOption> build_plates;
     std::unique_ptr<Config> active_config;
+    std::unique_ptr<PresetState> active_presets;
     ResolvedSelection active_selection;
     std::vector<PresetOption> compatible_processes;
     std::vector<PresetOption> compatible_filaments;
@@ -2265,6 +2450,11 @@ const std::vector<BuildPlateOption>& Library::build_plate_options() const noexce
 
 ConfigCreateResult Library::create_config(const ConfigSelection& selection) const
 {
+    return create_config_impl(selection, nullptr);
+}
+
+ConfigCreateResult Library::create_config_impl(const ConfigSelection& selection, std::unique_ptr<PresetState>* prepared) const
+{
     ConfigCreateResult result;
     try {
         const Slic3r::PresetBundle* source_presets = nullptr;
@@ -2279,7 +2469,12 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
             result.diagnostics.push_back({"machine", "Unknown machine model or nozzle variant"});
             return result;
         }
-        auto selected = *source_presets;
+        const bool reuse_active = impl_->active_presets &&
+            selection.machine_model_id == impl_->active_selection.machine_model_id &&
+            selection.machine_variant_id == impl_->active_selection.machine_variant_id;
+        auto state = reuse_active ? std::make_unique<PresetState>(*impl_->active_presets) : std::make_unique<PresetState>();
+        if (!reuse_active) state->bundle = *source_presets;
+        auto& selected = state->bundle;
         const Slic3r::Preset* printer = selected.printers.find_system_preset_by_model_and_variant(
             selection.machine_model_id, selection.machine_variant_id);
 
@@ -2388,7 +2583,16 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
                                                          result.selection.filament_preset_ids.empty() ? std::string{} :
                                                                                                         result.selection.filament_preset_ids.front());
 
-        result.config = std::unique_ptr<Config>(new Config(serialized_values(selected.full_config())));
+        std::vector<Slic3r::Preset> materials;
+        for (size_t i = 0; i < selected.filament_presets.size(); ++i) {
+            const auto& name = selected.filament_presets[i];
+            if (reuse_active && i < state->materials.size() && state->materials[i].name == name)
+                materials.push_back(state->materials[i]);
+            else materials.push_back(*selected.filaments.find_preset(name, true));
+        }
+        state->materials = std::move(materials);
+        result.config = std::unique_ptr<Config>(new Config(serialized_values(state->full_config())));
+        if (prepared) *prepared = std::move(state);
         result.success = true;
     } catch (const std::exception& error) {
         result.diagnostics.push_back({"selection", error.what()});
@@ -2404,7 +2608,11 @@ ConfigActivationResult Library::activate_config(
     const std::vector<std::string> previous_colors = impl_->active_config
         ? config_vector_values(*impl_->active_config, "filament_colour")
         : std::vector<std::string>{};
-    auto created = create_config(selection);
+    const std::vector<std::string> previous_filament_presets =
+        impl_->active_selection.filament_preset_ids;
+    std::unique_ptr<PresetState> state;
+    auto created = create_config_impl(selection, &state);
+    const auto before = created ? created.config->snapshot() : ConfigSnapshot{};
     if (!created) {
         result.diagnostics = std::move(created.diagnostics);
         return result;
@@ -2421,9 +2629,34 @@ ConfigActivationResult Library::activate_config(
             return result;
         }
     }
+    std::vector<std::string> merged_colors;
+    if (!patch_supplies_colors) {
+        // A slot color is project state. Keep it while the material preset at that
+        // slot is unchanged; initialize new or changed slots from the preset default.
+        const std::size_t slot_count = created.selection.filament_preset_ids.size();
+        merged_colors = config_vector_values(*created.config, "filament_colour");
+        if (merged_colors.empty()) merged_colors.push_back("#00AE42");
+        merged_colors.resize(slot_count, merged_colors.back());
+
+        const std::vector<std::string> preset_default_colors =
+            config_vector_values(*created.config, "default_filament_colour");
+        for (std::size_t index = 0; index < slot_count; ++index) {
+            if (index < preset_default_colors.size() &&
+                !preset_default_colors[index].empty()) {
+                merged_colors[index] = preset_default_colors[index];
+            }
+
+            const bool preset_unchanged = index < previous_filament_presets.size() &&
+                index < previous_colors.size() &&
+                previous_filament_presets[index] ==
+                    created.selection.filament_preset_ids[index];
+            if (preset_unchanged && !previous_colors[index].empty()) {
+                merged_colors[index] = previous_colors[index];
+            }
+        }
+    }
     const SettingsResult normalized = normalize_filament_colors(
-        *created.config, created.selection.filament_preset_ids.size(),
-        patch_supplies_colors ? std::vector<std::string>{} : previous_colors);
+        *created.config, created.selection.filament_preset_ids.size(), merged_colors);
     if (!normalized) {
         result.diagnostics = normalized.diagnostics;
         return result;
@@ -2438,6 +2671,18 @@ ConfigActivationResult Library::activate_config(
         return result;
     }
 
+    try {
+        state->apply_edits(dynamic_config(before), dynamic_config(created.config->snapshot()));
+        created.config.reset(new Config(serialized_values(state->full_config())));
+        result.diagnostics = created.config->validate();
+        auto shape = filament_cardinality_diagnostics(*created.config, created.selection.filament_preset_ids.size());
+        result.diagnostics.insert(result.diagnostics.end(), shape.begin(), shape.end());
+        if (!result.diagnostics.empty()) return result;
+    } catch (const std::exception& error) {
+        result.diagnostics.push_back({"configuration", error.what()});
+        return result;
+    }
+    impl_->active_presets = std::move(state);
     impl_->active_config = std::move(created.config);
     impl_->active_selection = std::move(created.selection);
     impl_->compatible_processes = std::move(created.compatible_processes);
@@ -2479,6 +2724,13 @@ std::optional<ActiveConfigView> Library::active_config() const
             diameters != nullptr && index < diameters->values.size()) {
             slot.diameter_mm = diameters->values[index];
         }
+        const auto map = filament_tool_map(&config, view.selection.filament_preset_ids.size());
+        slot.physical_tool_index = static_cast<size_t>(map[index]);
+        const auto* nozzles = config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter");
+        const size_t tool_count = nozzles ? nozzles->size() : 1;
+        slot.physical_tool_name = tool_count == 2 ? (slot.physical_tool_index == 0 ? "Left nozzle" : "Right nozzle") :
+            "Nozzle " + std::to_string(slot.physical_tool_index + 1);
+        if (nozzles && slot.physical_tool_index < nozzles->size()) slot.nozzle_diameter_mm = nozzles->get_at(slot.physical_tool_index);
         view.filament_slots.push_back(std::move(slot));
     }
     return view;
@@ -2516,6 +2768,20 @@ SettingsResult Library::apply_active_config_patch(
         result.changed_items.clear();
         return result;
     }
+    if (impl_->active_presets) {
+        auto state = std::make_unique<PresetState>(*impl_->active_presets);
+        try {
+            state->apply_edits(dynamic_config(impl_->active_config->snapshot()), dynamic_config(candidate.snapshot()));
+            candidate = Config(serialized_values(state->full_config()));
+            auto errors = candidate.validate();
+            auto shape = filament_cardinality_diagnostics(candidate, impl_->active_selection.filament_preset_ids.size());
+            errors.insert(errors.end(), shape.begin(), shape.end());
+            if (!errors.empty()) { result.success = false; result.changed_items.clear(); result.diagnostics = std::move(errors); return result; }
+        } catch (const std::exception& error) {
+            return settings_failure("configuration", error.what());
+        }
+        impl_->active_presets = std::move(state);
+    }
     impl_->active_config = std::make_unique<Config>(std::move(candidate));
     ++impl_->active_revision;
     return result;
@@ -2549,6 +2815,20 @@ SettingsResult Library::reset_active_config_value(std::string_view key)
         result.diagnostics = std::move(diagnostics);
         result.changed_items.clear();
         return result;
+    }
+    if (impl_->active_presets) {
+        auto state = std::make_unique<PresetState>(*impl_->active_presets);
+        try {
+            state->apply_edits(dynamic_config(impl_->active_config->snapshot()), dynamic_config(candidate.snapshot()));
+            candidate = Config(serialized_values(state->full_config()));
+            auto errors = candidate.validate();
+            auto shape = filament_cardinality_diagnostics(candidate, impl_->active_selection.filament_preset_ids.size());
+            errors.insert(errors.end(), shape.begin(), shape.end());
+            if (!errors.empty()) { result.success = false; result.changed_items.clear(); result.diagnostics = std::move(errors); return result; }
+        } catch (const std::exception& error) {
+            return settings_failure("configuration", error.what());
+        }
+        impl_->active_presets = std::move(state);
     }
     impl_->active_config = std::make_unique<Config>(std::move(candidate));
     ++impl_->active_revision;
@@ -2689,7 +2969,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         if (!filament_diagnostics.empty()) {
             for (const auto& diagnostic : filament_diagnostics) {
                 result.diagnostics.push_back({
-                    "filament", diagnostic.key + ": " + diagnostic.message, false});
+                    "filament", diagnostic.key + ": " + diagnostic.message, false, diagnostic.key});
             }
             return result;
         }
@@ -2811,7 +3091,8 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                     result.diagnostics.push_back({"model", "Model file does not exist: " + path, false});
                     return result;
                 }
-                Slic3r::Model source = Slic3r::Model::read_from_file(path);
+                Slic3r::Model source = Slic3r::Model::read_from_file(path, nullptr, nullptr,
+                    Slic3r::LoadStrategy::AddDefaultInstances | Slic3r::LoadStrategy::LoadModel);
                 if (!input.support_enforcer_paths.empty() && source.objects.size() != 1) {
                     result.diagnostics.push_back({
                         "support",
@@ -2821,6 +3102,14 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                 }
                 for (const Slic3r::ModelObject* object : source.objects) {
                     Slic3r::ModelObject* added = plate_model.add_object(*object);
+                    Slic3r::Transform3d placement = Slic3r::Transform3d::Identity();
+                    for (int row = 0; row < 4; ++row) for (int column = 0; column < 4; ++column)
+                        placement(row, column) = input.transform[size_t(row * 4 + column)];
+                    for (auto* instance : added->instances) {
+                        instance->set_transformation(Slic3r::Geometry::Transformation(
+                            placement * instance->get_matrix()));
+                    }
+                    added->invalidate_bounding_box();
                     if (support_target == nullptr) {
                         support_target = added;
                     }
@@ -2840,7 +3129,8 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                             "support", "Support enforcer file does not exist: " + support_path, false});
                         return result;
                     }
-                    Slic3r::Model support_source = Slic3r::Model::read_from_file(support_path);
+                    Slic3r::Model support_source = Slic3r::Model::read_from_file(support_path, nullptr, nullptr,
+                        Slic3r::LoadStrategy::AddDefaultInstances | Slic3r::LoadStrategy::LoadModel);
                     for (const Slic3r::ModelObject* object : support_source.objects) {
                         const std::size_t instance_count = std::max<std::size_t>(1, object->instances.size());
                         for (std::size_t instance_index = 0; instance_index < instance_count; ++instance_index) {
@@ -2906,6 +3196,8 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             report_progress(callbacks, 0.08f + engine_progress * 0.78f, status.text);
         });
         print.apply(plate_model, config);
+
+        Slic3r::validate_fiber_configuration(print);
 
         Slic3r::StringObjectException warning;
         const Slic3r::StringObjectException validation_error = print.validate(&warning);
@@ -3008,6 +3300,12 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         if (library_temporary) {
             generated_temporary_paths.push_back(output_path);
         }
+        const std::string fiber_publish_path = Slic3r::fiber_active(print) && !library_temporary ? output_path : std::string{};
+        std::string fiber_package_publish_path;
+        if (!fiber_publish_path.empty()) {
+            output_path = (fs::path(output_path).parent_path() / fs::path(temporary_output_path(".fiber-pending.gcode")).filename()).string();
+            generated_temporary_paths.push_back(output_path);
+        }
         const fs::path output_parent = fs::path(output_path).parent_path();
         if (!output_parent.empty()) {
             fs::create_directories(output_parent);
@@ -3033,13 +3331,26 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             return result;
         }
 
+        if (Slic3r::fiber_active(print)) {
+            Slic3r::audit_fiber_final_file(print, result.output.path);
+            Slic3r::GCodeProcessor final_processor;
+            final_processor.init_filament_maps_and_nozzle_type_when_import_only_gcode();
+            final_processor.process_file(result.output.path, [&]() { if(cancellation_requested(callbacks)) throw Slic3r::CanceledException(); });
+            processor_result = final_processor.extract_result();
+        }
+
         const bool generate_gcode_3mf = request.generate_gcode_3mf || !request.output_gcode_3mf_path.empty();
         if (generate_gcode_3mf) {
             const bool package_temporary = request.output_gcode_3mf_path.empty();
-            const std::string package_path = package_temporary
+            std::string package_path = package_temporary
                 ? temporary_output_path(".gcode.3mf")
                 : request.output_gcode_3mf_path;
             if (package_temporary) {
+                generated_temporary_paths.push_back(package_path);
+            }
+            if (Slic3r::fiber_active(print) && !package_temporary) {
+                fiber_package_publish_path=package_path;
+                package_path=(fs::path(package_path).parent_path()/fs::path(temporary_output_path(".fiber-pending.gcode.3mf")).filename()).string();
                 generated_temporary_paths.push_back(package_path);
             }
             const fs::path package_parent = fs::path(package_path).parent_path();
@@ -3103,7 +3414,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
         if (request.generate_preview) {
             report_progress(callbacks, 0.96f, "Preparing toolpath preview");
-            result.preview = make_toolpath_preview(processor_result, &config, result.output.path,
+            result.preview = make_toolpath_preview(processor_result, &config, fiber_publish_path.empty()?result.output.path:fiber_publish_path,
                                                    print.belt_coordinate_system());
             if (!result.preview || result.preview->layers.empty() ||
                 result.preview->segments.empty()) {
@@ -3125,6 +3436,15 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         if (belt_support_debug_preview)
             result.preview = std::move(belt_support_debug_preview);
 
+        if (cancellation_requested(callbacks)) throw Slic3r::CanceledException();
+        if (!fiber_package_publish_path.empty()) {
+            fs::rename(result.gcode_3mf.path, fiber_package_publish_path);
+            result.gcode_3mf.path=fiber_package_publish_path;
+        }
+        if (!fiber_publish_path.empty()) {
+            fs::rename(result.output.path, fiber_publish_path);
+            result.output.path=fiber_publish_path;
+        }
         result.success = true;
         generated_temporary_paths.clear();
         report_progress(callbacks, 1.0f, "Slicing completed");
@@ -3475,6 +3795,9 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                     true});
             } else {
                 try {
+                    auto imported_bundle = std::make_unique<Slic3r::PresetBundle>();
+                    *imported_bundle = *preset_bundle;
+                    preset_bundle = imported_bundle.get();
                     Slic3r::DynamicPrintConfig resolved_config;
                     resolved_config.apply(Slic3r::FullPrintConfig::defaults());
                     resolved_config.apply(config);
@@ -3496,6 +3819,12 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                             diagnostic.key, diagnostic.message, true});
                     }
 
+                    auto state = std::make_unique<PresetState>();
+                    state->bundle = *preset_bundle;
+                    state->project_layout_initialized = true;
+                    for (const auto& name : preset_bundle->filament_presets)
+                        state->materials.push_back(*preset_bundle->filaments.find_preset(name, true));
+                    impl_->active_presets = std::move(state);
                     impl_->active_config = std::move(active);
                     impl_->active_selection.machine_model_id = machine->id;
                     impl_->active_selection.machine_variant_id = variant->id;

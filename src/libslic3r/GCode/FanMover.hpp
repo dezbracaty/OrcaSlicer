@@ -45,6 +45,7 @@ private:
     // in unit/second
     double m_current_speed = 1000 / 60.0;
     bool m_is_custom_gcode = false;
+    bool m_fiber_passthrough = false;
     uint16_t m_currrent_extruder = 0;
 
     // variable for when you add a line (front of the buffer)

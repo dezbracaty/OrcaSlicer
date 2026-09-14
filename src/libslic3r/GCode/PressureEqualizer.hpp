@@ -79,6 +79,7 @@ private:
     ExtrusionRole     m_current_extrusion_role;
     bool                            m_retracted;
     bool                            m_use_relative_e_distances;
+    bool                            m_fiber_protected = false;
 
 	// Maximum segment length to split a long segment if the initial and the final flow rate differ.
 	// Smaller value means a smoother transition between two different flow rates.
@@ -114,9 +115,10 @@ private:
             volumetric_extrusion_rate_end(0.f) 
             {}
 
+        bool        fiber_protected = false;
         bool        moving_xy()     const { return fabs(pos_end[0] - pos_start[0]) > 0.f || fabs(pos_end[1] - pos_start[1]) > 0.f; }
         bool        moving_z ()     const { return fabs(pos_end[2] - pos_start[2]) > 0.f; }
-        bool        extruding()     const { return moving_xy() && pos_end[3] > pos_start[3]; }
+        bool        extruding()     const { return !fiber_protected && moving_xy() && pos_end[3] > pos_start[3]; }
         bool        retracting()    const { return pos_end[3] < pos_start[3]; }
         bool        deretracting()  const { return ! moving_xy() && pos_end[3] > pos_start[3]; }
 

@@ -212,6 +212,12 @@ class Print;
             //BBS
             int  object_label_id{-1};
             float print_z{0.0f};
+            bool fiber_deposition{false}, fiber_tail{false};
+            unsigned char fiber_phase{0}, fiber_event{0};
+            std::string fiber_path_id;
+            unsigned int fiber_object{0xffffffffu}, fiber_instance{0xffffffffu};
+            float fiber_width_mm{0.0f};
+
 
             float volumetric_rate() const { return feedrate * mm3_per_mm; }
             float actual_volumetric_rate() const { return actual_feedrate * mm3_per_mm; }
@@ -806,6 +812,12 @@ class Print;
 // ORCA: Add Pressure Advance visualization support
         float m_pressure_advance;
         ExtrusionRole m_extrusion_role;
+        bool m_fiber_deposition{false}, m_fiber_tail{false};
+        unsigned char m_fiber_phase{0}, m_fiber_event{0};
+        std::string m_fiber_path_id;
+        unsigned int m_fiber_object{0xffffffffu}, m_fiber_instance{0xffffffffu};
+        float m_fiber_width_mm{0.0f};
+
         std::vector<int> m_filament_maps;
         std::vector<unsigned char> m_last_filament_id;
         std::vector<unsigned char> m_filament_id;

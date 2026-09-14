@@ -1003,6 +1003,8 @@ bool Preset::has_cali_lines(PresetBundle* preset_bundle)
 }
 
 static std::vector<std::string> s_Preset_print_options{
+    "fiber_z_down_speed", "fiber_travel_speed", "stress_range_tensile", "stress_range_compress", "generate_reinforced_perimeters", "outer_reinforced_perimeters_counts", "inner_reinforced_perimeters_counts", "generate_reinforced_infills", "reinforced_infill_density", "reinforced_infill_pattern", "reinforced_infill_filament", "reinforced_perimeters_filament", "fiber_travel_max_length", "fiber_offset_infill_ratio", "fiber_internal_offset_infill_ratio", "fiber_offset_perimeters_ratio", "fiber_layer_height_ratio", "fibercut_length", "fiber_restart_extra_length", "fiber_restart_speed", "fiber_z_hop", "fiber_z_hop_pause_adhesion", "fiber_tension_length", "fiber_angle_extend_ratio", "fiber_start_length", "fiber_infill_arc_ratio", "fiber_infill_length_ratio", "fiber_corner_overshoot", "fiber_corner_trim_length", "fiber_perimeters_length_ratio", "fiber_start_min_length", "fiber_end_min_length", "fiber_middle_min_length", "fiber_slow_length", "fiber_finish_ironing_distance", "fiber_start_max_speed", "fiber_start_min_speed", "fiber_start_min_limit_speed", "fiber_normal_max_speed", "fiber_normal_min_speed", "fiber_normal_min_limit_speed", "fiber_finish_max_speed", "fiber_finish_min_speed", "fiber_finish_min_limit_speed", "reinforced_perimeters_extrusion_width", "reinforced_infill_extrusion_width", "fiber_infill_acceleration", "fiber_perimeter_acceleration",
+
     "layer_height",
     "initial_layer_print_height",
     "wall_loops",
@@ -1306,7 +1308,9 @@ static std::vector<std::string> s_Preset_print_options{
     "ironing_expansion",
 };
 
-static std::vector<std::string> s_Preset_filament_options {/*"filament_colour", */ "default_filament_colour", "required_nozzle_HRC", "filament_diameter", "pellet_flow_coefficient", "volumetric_speed_coefficients", "filament_type",
+static std::vector<std::string> s_Preset_filament_options {
+    "filament_is_ccf",
+/*"filament_colour", */ "default_filament_colour", "required_nozzle_HRC", "filament_diameter", "pellet_flow_coefficient", "volumetric_speed_coefficients", "filament_type",
                                                           "filament_soluble", "filament_is_support", "filament_printable",
     "filament_max_volumetric_speed", "filament_adaptive_volumetric_speed",
     "filament_flow_ratio", "filament_density", "filament_adhesiveness_category", "filament_cost", "filament_minimal_purge_on_wipe_tower",
@@ -1360,6 +1364,8 @@ static std::vector<std::string> s_Preset_machine_limits_options {
 };
 
 static std::vector<std::string> s_Preset_printer_options {
+    "cut_fiber_gcode",
+
     "printer_technology",
     "printable_area", "extruder_printable_area", "support_parallel_printheads", "parallel_printheads_count", "parallel_printheads_bed_exclude_areas", "bed_exclude_area","bed_custom_texture", "bed_custom_model", "gcode_flavor",
     "fan_kickstart", "part_cooling_fan_min_pwm", "fan_speedup_time", "fan_speedup_overhangs",

@@ -2967,6 +2967,470 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(45));
 
+    for (const char* key : {"stress_range_tensile", "stress_range_compress"}) {
+        def = this->add(key, coFloat);
+        def->label = key;
+        def->category = L("Reinforced infill");
+        def->mode = comDevelop;
+        def->set_default_value(new ConfigOptionFloat(0.3));
+    }
+
+    // Continuous fiber compatibility keys: final effective bulber registrations.
+    def = this->add("cut_fiber_gcode", coString);
+    def->label = L("Cut Fiber G-code");
+    def->tooltip = L("This G-code will be used as a code for the cut fiber");
+    def->multiline = true;
+    def->full_width = true;
+    def->height = 12;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionString("M400\nS0\nM400\n"));
+
+    def = this->add("filament_is_ccf", coBools);
+    def->label = L("CCF material");
+    def->tooltip = L("CCF material is commonly used to print internal");
+    def->mode = comAdvanced;
+    def->readonly = true;
+    def->set_default_value(new ConfigOptionBools { false });
+
+    def = this->add("generate_reinforced_perimeters", coBool);
+    def->label = L("Generate reinforced perimeters");
+    def->category = L("Reinforced perimeter");
+    def->tooltip = L("Enable reinforced perimeters material generation.");
+    def->mode = comSimple;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("outer_reinforced_perimeters_counts", coInt);
+    def->label = L("Outer reinforced perimeters");
+    def->category = L("Reinforced perimeter");
+    def->tooltip = L("This option sets the number of outer reinforced perimeters to generate. "
+                   "if the Generate reinforced perimeters option is enabled.");
+    def->sidetext = L("(maxmum)");
+    def->aliases = { "perimeter_offsets" };
+    def->min = 1;
+    def->max = 10000;
+    def->mode     = comSimple;
+    def->set_default_value(new ConfigOptionInt(3));
+
+    def = this->add("inner_reinforced_perimeters_counts", coInt);
+    def->label = L("Inner reinforced perimeters");
+    def->category = L("Reinforced perimeter");
+    def->tooltip = L("This option sets the number of inner reinforced perimeters to generate. "
+                   "if the Generate reinforced perimeters option is enabled.");
+    def->sidetext = L("(maxmum)");
+    def->aliases = { "perimeter_offsets" };
+    def->min = 0;
+    def->max = 10000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("generate_reinforced_infills", coBool);
+    def->label = L("Generate reinforced infills");
+    def->category = L("Reinforced infill");
+    def->tooltip = L("Enable reinforced infills material generation.");
+    def->mode = comSimple;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("reinforced_infill_density", coPercent);
+    def->gui_flags = "show_value";
+    def->label = L("Reinforced infill density");
+    def->category = L("Reinforced infill");
+    def->tooltip = L("Density of reinforced infill, expressed in the range 0% - 100%.");
+    def->sidetext = L("%");
+    def->min = 0;
+    def->max = 100;
+    def->gui_type = ConfigOptionDef::GUIType::f_enum_open;
+
+    def->enum_values.push_back( "5");def->enum_labels.push_back( "5%");
+    def->enum_values.push_back("10");def->enum_labels.push_back("10%");
+    def->enum_values.push_back("15");def->enum_labels.push_back("15%");
+    def->enum_values.push_back("20");def->enum_labels.push_back("20%");
+    def->enum_values.push_back("25");def->enum_labels.push_back("25%");
+    def->enum_values.push_back("30");def->enum_labels.push_back("30%");
+    def->enum_values.push_back("35");def->enum_labels.push_back("35%");
+    def->enum_values.push_back("40");def->enum_labels.push_back("40%");
+    def->enum_values.push_back("45");def->enum_labels.push_back("45%");
+    def->enum_values.push_back("50");def->enum_labels.push_back("50%");
+    def->enum_values.push_back("55");def->enum_labels.push_back("55%");
+    def->enum_values.push_back("60");def->enum_labels.push_back("60%");
+    def->enum_values.push_back("65");def->enum_labels.push_back("65%");
+    def->enum_values.push_back("70");def->enum_labels.push_back("70%");
+    def->enum_values.push_back("75");def->enum_labels.push_back("75%");
+    def->enum_values.push_back("80");def->enum_labels.push_back("80%");
+    def->enum_values.push_back("85");def->enum_labels.push_back("85%");
+    def->enum_values.push_back("90");def->enum_labels.push_back("90%");
+    def->enum_values.push_back("95");def->enum_labels.push_back("95%");
+    def->enum_values.push_back("100");def->enum_labels.push_back("100%");
+
+    def->mode = comSimple;
+    def->set_default_value(new ConfigOptionPercent(100));
+
+    def = this->add("reinforced_infill_pattern", coEnum);
+    def->label = L("Reinforced infill pattern");
+    def->category = L("Reinforced infill");
+    def->tooltip = L("Reinforced infill pattern for general low-density infill.");
+    def->enum_keys_map = &ConfigOptionEnum<InfillPattern>::get_enum_values();
+    def->enum_values.push_back("concentric");
+    def->enum_values.push_back("rectilinear");
+    //def->enum_values.push_back("stress");
+    def->enum_labels.push_back(L("Concentric"));
+    def->enum_labels.push_back(L("Rectilinear"));
+    //def->enum_labels.push_back(L("Stress"));
+    def->mode = comSimple;
+    def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
+
+    def = this->add("reinforced_infill_filament", coInt);
+    def->label = L("Reinforced infill filament");
+    def->category = L("Filament");
+    def->tooltip = L("Filament to print reinforced infill.");
+    def->min = 1;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(2));
+
+    def = this->add("reinforced_perimeters_filament", coInt);
+    def->label = L("Reinforced perimeters filament");
+    def->category = L("Filament");
+    def->tooltip = L("Filament to print reinforced perimeters.");
+    def->min = 1;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(2));
+
+    def = this->add("fiber_travel_max_length", coFloat);
+    def->label = L("Reinforced travel length");
+    def->category = L("Advanced");
+    def->tooltip = L("Reinforced length for travel.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(5));
+
+    def = this->add("fiber_offset_infill_ratio", coFloat);
+    def->label = L("Fiber offset infill ratio");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber offset infill ratio.");
+    def->min = 0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def           = this->add("fiber_internal_offset_infill_ratio", coFloat);
+    def->label    = L("Fiber internal offset infill ratio");
+    def->category = L("Advanced");
+    def->tooltip  = L("Fiber internal offset infill ratio.");
+    def->min      = 0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.55));
+
+    def = this->add("fiber_offset_perimeters_ratio", coFloat);
+    def->label = L("Fiber offset perimeters ratio");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber offset perimeters ratio.");
+    def->min = 0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("fiber_layer_height_ratio", coInt);
+    def->label = L("Reinforced layer height ratio");
+    def->category = L("Reinforced Perimeters and Infills Ratio");
+    def->tooltip = L("This setting controls the reinforced height of the slices/layers. ");
+    def->min = 1;
+    def->mode     = comSimple;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("fibercut_length", coFloat);
+    def->label = L("Fiber cut length");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber cut length.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode     = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(23));
+
+    def = this->add("fiber_restart_extra_length", coFloat);
+    def->label = L("Fiber restart extra length");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber restart extra length.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode     = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(1));
+
+    def = this->add("fiber_restart_speed", coFloat);
+    def->label = L("fiber_restart_speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber_restart_speed.");
+    def->sidetext = L("mm/s");
+    def->min = 1;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(8));
+
+    def = this->add("fiber_z_hop", coFloat);
+    def->label = L("Fiber z hop");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber z hop.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.5));
+
+    def = this->add("fiber_z_down_speed", coFloat);
+    def->label = L("fiber first down speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber first down speed.");
+    def->sidetext = L("mm/s");
+    def->min = 1;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(8));
+
+    def = this->add("fiber_travel_speed", coFloat);
+    def->label = L("Fiber travel");
+    def->tooltip = L("Speed for fiber travel moves.");
+    def->sidetext = L("mm/s");
+    def->min = 1;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(80));
+
+    def = this->add("fiber_z_hop_pause_adhesion", coInt);
+    def->label = L("Fiber z hop pause adhesion");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber z hop pause adhesion.");
+    def->sidetext = L("ms");
+    def->min = 0;
+    def->mode     = comDevelop;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("fiber_tension_length", coFloat);
+    def->label = L("Fiber tension length");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber tension length.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.5));
+
+    def = this->add("fiber_angle_extend_ratio", coFloat);
+    def->label = L("Fiber angle extend ratio");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber angle ratio.");
+    def->min = 0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1));
+
+    def = this->add("fiber_start_length", coFloat);
+    def->label = L("Fiber start length");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber start length.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode     = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(5));
+
+    def = this->add("fiber_infill_arc_ratio", coFloat);
+    def->label = L("Fiber infill arc ratio");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber infill arc ratio.");
+    def->min = 0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("fiber_infill_length_ratio", coFloat);
+    def->label = L("Fiber infill length ratio");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber infill length ratio.");
+    def->min = 0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("fiber_corner_overshoot", coFloat);
+    def->label = L("Fiber corner overshoot");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber corner overshoot.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.5));
+
+    def           = this->add("fiber_corner_trim_length", coFloat);
+    def->label    = L("Fiber corner trim length");
+    def->category = L("Advanced");
+    def->tooltip  = L("Fiber length that needs to be trimmed for arc fitting.");
+    def->min      = 1.0;
+    def->max      = 2.0;
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("fiber_perimeters_length_ratio", coFloat);
+    def->label = L("Fiber perimeters length ratio");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber perimeters length ratio.");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("fiber_start_min_length", coFloat);
+    def->label = L("Fiber start min length");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber start min length.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(5));
+
+    def = this->add("fiber_end_min_length", coFloat);
+    def->label = L("Fiber end min length");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber end min length.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(5));
+
+    def = this->add("fiber_middle_min_length", coFloat);
+    def->label = L("Fiber middle min length");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber minddle min length.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("fiber_slow_length", coFloat);
+    def->label = L("Fiber slow length");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber slow length.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("fiber_finish_ironing_distance", coFloat);
+    def->label = L("Fiber finish ironing distance");
+    def->category = L("Advanced");
+    def->tooltip = L("Fiber  finish ironing distance");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("fiber_start_max_speed", coFloat);
+    def->label = L("fiber_start_max_speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber_start_max_speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(8));
+
+    def = this->add("fiber_start_min_speed", coFloat);
+    def->label = L("fiber_start_min_speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber_start_min_speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(4));
+
+    def = this->add("fiber_start_min_limit_speed", coFloat);
+    def->label = L("fiber_start_min_limit_speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber_start_min_limit_speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(2));
+
+    def = this->add("fiber_normal_max_speed", coFloat);
+    def->label = L("fiber_normal_max_speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber_normal_max_speed");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(10));
+
+    def = this->add("fiber_normal_min_speed", coFloat);
+    def->label = L("fiber_normal_min_speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber_normal_min_speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(6));
+
+    def = this->add("fiber_normal_min_limit_speed", coFloat);
+    def->label = L("fiber_normal_min_limit_speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber_normal_min_limit_speed");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(2));
+
+    def = this->add("fiber_finish_max_speed", coFloat);
+    def->label = L("fiber_finish_max_speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber_finish_max_speed");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(6));
+
+    def = this->add("fiber_finish_min_speed", coFloat);
+    def->label = L("fiber_finish_min_speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber_finish_min_speed.");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(4));
+
+    def = this->add("fiber_finish_min_limit_speed", coFloat);
+    def->label = L("fiber_finish_min_limit_speed");
+    def->category = L("Speed");
+    def->tooltip = L("fiber_finish_min_limit_speed");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloat(3));
+
+    def = this->add("reinforced_perimeters_extrusion_width", coFloatOrPercent);
+    def->label = L("Reinforced perimeters width");
+    def->category = L("Extrusion Width");
+    def->tooltip = L("Set this to a non-zero value to set a manual extrusion width for reinforced material. "
+                   "If left zero, default extrusion width will be used if set, otherwise nozzle diameter will be used. "
+                   "If expressed as percentage (for example 90%) it will be computed over layer height.");
+    def->sidetext = L("mm or %");
+    def->min = 0;
+    def->max_literal = 50;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(0.8, false));
+
+    def = this->add("reinforced_infill_extrusion_width", coFloatOrPercent);
+    def->label = L("Reinforced infill width");
+    def->category = L("Extrusion Width");
+    def->tooltip = L("Set this to a non-zero value to set a manual extrusion width for reinforced material. "
+                   "If left zero, default extrusion width will be used if set, otherwise nozzle diameter will be used. "
+                   "If expressed as percentage (for example 90%) it will be computed over layer height.");
+    def->sidetext = L("mm or %");
+    def->min = 0;
+    def->max_literal = 50;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloatOrPercent(0.8, false));
+
+    def = this->add("fiber_infill_acceleration", coFloat);
+    def->label = L("Fiber infill acceleration");
+    def->tooltip = L("Acceleration of fiber infill");
+    def->sidetext = L("mm/s²");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(500));
+
+    def = this->add("fiber_perimeter_acceleration", coFloat);
+    def->label = L("Fiber perimeter acceleration");
+    def->tooltip = L("Acceleration of fiber perimeter.");
+    def->sidetext = L("mm/s²");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(500));
+
     def = this->add("sparse_infill_density", coPercent);
     def->label = L("Sparse infill density");
     def->category = L("Strength");
@@ -8697,6 +9161,24 @@ void DynamicPrintConfig::normalize_fdm_1()
     return;
 }
 
+bool resolve_fixed_filament_map(DynamicPrintConfig& config, size_t filament_count)
+{
+    const auto* nozzles = config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto* mode = config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode");
+    const auto* model = config.option<ConfigOptionString>("printer_model");
+    const auto* semm = config.option<ConfigOptionBool>("single_extruder_multi_material");
+    if (!model || model->value != "CFSYS Alpha500 Printer" ||
+        !nozzles || nozzles->size() != 2 || filament_count != 2 ||
+        !mode || mode->value >= fmmManual || (semm && semm->value))
+        return false;
+    if (const auto* count = config.option<ConfigOptionInts>("extruder_max_nozzle_count"))
+        for (int value : count->values) if (value > 1) return false;
+    std::vector<int> map(filament_count);
+    for (size_t i = 0; i < filament_count; ++i) map[i] = int(i + 1);
+    config.set_key_value("filament_map", new ConfigOptionInts(map));
+    return true;
+}
+
 t_config_option_keys DynamicPrintConfig::normalize_fdm_2(int num_objects, int used_filaments)
 {
     t_config_option_keys changed_keys;
@@ -10363,11 +10845,17 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
     }
 
     // --filament-diameter
-    for (double fd : cfg.filament_diameter.values)
-        if (fd < 1) {
-            error_message.emplace("filament_diameter", L("invalid value ") + cfg.filament_diameter.serialize());
+    for (size_t i = 0; i < cfg.filament_diameter.values.size(); ++i) {
+        const double fd = cfg.filament_diameter.values[i];
+        // CFSYS continuous fiber is a 0.35 mm strand. This is a material
+        // property even while reinforcement is disabled in the current print.
+        const bool continuous_fiber = i < cfg.filament_type.values.size() &&
+            cfg.filament_type.values[i] == "CCF";
+        if (!std::isfinite(fd) || fd <= 0 || (!continuous_fiber && fd < 1)) {
+            error_message.emplace("filament_diameter", L("invalid value ") + std::to_string(fd));
             break;
         }
+    }
 
     // --nozzle-diameter
     for (double nd : cfg.nozzle_diameter.values)

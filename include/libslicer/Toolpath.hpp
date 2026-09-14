@@ -10,7 +10,7 @@ namespace libslicer {
 
 inline constexpr std::uint32_t invalid_toolpath_id = 0xffffffffu;
 inline constexpr std::uint16_t invalid_toolpath_small_id = 0xffffu;
-inline constexpr std::uint32_t toolpath_schema_version = 2u;
+inline constexpr std::uint32_t toolpath_schema_version = 3u;
 
 struct ToolpathPoint
 {
@@ -58,13 +58,18 @@ enum class ToolpathExtrusionRole : std::uint8_t
     Mixed
 };
 
+enum class ToolpathDepositionProcess : std::uint8_t { Plastic = 0, Fiber };
+enum class ToolpathPhase : std::uint8_t { ResinBase = 0, Fiber, ResinRepair };
+
 enum class ToolpathEventKind : std::uint8_t
 {
     Seam = 0,
     ToolChange,
     ColorChange,
     Pause,
-    CustomGCode
+    CustomGCode,
+    FiberStart,
+    FiberCut
 };
 
 enum class ToolpathColorSource : std::uint8_t
@@ -146,6 +151,11 @@ struct ToolpathSegment
     ToolpathMotionKind motion{ToolpathMotionKind::Travel};
     // Valid only for Extrusion. Travel and Wipe are guaranteed to use None.
     ToolpathExtrusionRole extrusion_role{ToolpathExtrusionRole::None};
+    ToolpathDepositionProcess deposition_process{ToolpathDepositionProcess::Plastic};
+    ToolpathPhase phase{ToolpathPhase::ResinBase};
+    std::string fiber_path_id;
+    bool fiber_tail{false};
+    float nominal_deposition_length_mm{0.0f};
     ToolpathPoint start_mm;
     ToolpathPoint end_mm;
     float extrusion_delta_mm{0.0f};
@@ -188,6 +198,9 @@ struct ToolpathEvent
     float print_z_mm{0.0f};
     float time_seconds{0.0f};
     std::string message;
+    std::string fiber_path_id;
+    std::uint32_t object_id{invalid_toolpath_id};
+    std::uint32_t instance_id{invalid_toolpath_id};
 };
 
 struct ToolpathBounds
@@ -236,6 +249,7 @@ struct ToolpathStatistics
     double total_extrusion_mm{0.0};
     double total_extrusion_volume_mm3{0.0};
     double total_print_distance_mm{0.0};
+    double total_fiber_deposition_length_mm{0.0};
     double total_travel_distance_mm{0.0};
     double total_filament_length_mm{0.0};
     double total_filament_weight_g{0.0};

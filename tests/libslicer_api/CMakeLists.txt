@@ -1,16 +1,18 @@
 add_executable(libslicer_api_tests
     test_config_api.cpp
+    test_continuous_fiber_api.cpp
 )
 
 target_link_libraries(libslicer_api_tests
     PRIVATE
         libslicer::libslicer
+        nlohmann_json
         Catch2::Catch2WithMain
         miniz
         PNG::PNG
 )
 
-target_include_directories(libslicer_api_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(libslicer_api_tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/deps_src)
 target_compile_definitions(libslicer_api_tests PRIVATE
     LIBSLICER_TEST_RESOURCE_DIR="${CMAKE_SOURCE_DIR}/resources"
     LIBSLICER_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data"

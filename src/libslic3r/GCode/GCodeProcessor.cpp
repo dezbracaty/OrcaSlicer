@@ -2424,6 +2424,8 @@ void GCodeProcessor::enable_stealth_time_estimator(bool enabled)
 
 void GCodeProcessor::reset()
 {
+    m_fiber_deposition=false; m_fiber_tail=false; m_fiber_event=0; m_fiber_phase=0; m_fiber_path_id.clear();
+
     m_units = EUnits::Millimeters;
     m_global_positioning_type = EPositioningType::Absolute;
     m_e_local_positioning_type = EPositioningType::Absolute;
@@ -3042,6 +3044,25 @@ bool GCodeProcessor::get_last_position_from_gcode(const std::string &gcode_str, 
 
 void GCodeProcessor::process_tags(const std::string_view comment, bool producers_enabled)
 {
+    if (comment.substr(0, 11) == "FIBER_BEGIN") {
+        m_fiber_deposition=false; m_fiber_tail=false; m_fiber_event=0;
+        std::istringstream fields{std::string(comment)}; std::string field;
+        while (fields >> field) {
+            const auto equal=field.find('='); if(equal==std::string::npos)continue;
+            const auto key=field.substr(0,equal),value=field.substr(equal+1);
+            if(key=="path")m_fiber_path_id=value;
+            else if(key=="object")m_fiber_object=std::stoul(value);
+            else if(key=="instance")m_fiber_instance=std::stoul(value);
+            else if(key=="width")m_fiber_width_mm=std::stof(value);
+        }
+        return;
+    }
+    if (comment.substr(0,11)=="FIBER_START") {m_fiber_deposition=true;m_fiber_event=1;store_move_vertex(EMoveType::Custom_GCode);m_fiber_event=0;return;}
+    if (comment.substr(0,9)=="FIBER_CUT") {m_fiber_event=2;store_move_vertex(EMoveType::Custom_GCode);m_fiber_event=0;return;}
+    if (comment.substr(0,10)=="FIBER_TAIL") {m_fiber_tail=true;return;}
+    if (comment.substr(0,9)=="FIBER_END") {m_fiber_deposition=false;m_fiber_tail=false;m_fiber_path_id.clear();return;}
+    if (comment.substr(0,11)=="FIBER_PHASE") {m_fiber_phase=static_cast<unsigned char>(std::stoi(std::string(comment.substr(12))));return;}
+
     // producers tags
     if (producers_enabled && process_producers_tags(comment))
         return;
@@ -5664,6 +5685,12 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         m_object_label_id,
         m_print_z
     });
+
+    auto& fiber_vertex=m_result.moves.back();
+    fiber_vertex.fiber_deposition=m_fiber_deposition;fiber_vertex.fiber_tail=m_fiber_tail;
+    fiber_vertex.fiber_phase=m_fiber_phase;fiber_vertex.fiber_event=m_fiber_event;
+    fiber_vertex.fiber_path_id=m_fiber_path_id;fiber_vertex.fiber_object=m_fiber_object;
+    fiber_vertex.fiber_instance=m_fiber_instance;fiber_vertex.fiber_width_mm=m_fiber_width_mm;
 
     if (type == EMoveType::Seam) {
         m_seams_count++;

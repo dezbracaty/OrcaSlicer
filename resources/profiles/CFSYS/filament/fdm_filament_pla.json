@@ -1,0 +1,169 @@
+{
+    "type": "filament",
+    "name": "fdm_filament_pla",
+    "from": "system",
+    "instantiation": "false",
+    "inherits": "fdm_filament_common",
+    "additional_cooling_fan_speed": [
+        "100"
+    ],
+    "fan_cooling_layer_time": [
+        "100"
+    ],
+    "filament_density": [
+        "1.2"
+    ],
+    "filament_cost": [
+        "24.99"
+    ],
+    "filament_flow_ratio": [
+        "0.98"
+    ],
+     "filament_deretraction_speed": [
+        "nil"
+    ],
+    "filament_max_volumetric_speed": [
+        "17"
+    ],
+    "filament_retract_before_wipe": [
+        "nil"
+    ],
+    "filament_retract_lift_above": [
+        "nil"
+    ],
+    "filament_retract_lift_below": [
+        "nil"
+    ],
+    "filament_retract_lift_enforce": [
+        "nil"
+    ],
+    "filament_retract_restart_extra": [
+        "nil"
+    ],
+    "filament_retract_when_changing_layer": [
+        "nil"
+    ],
+    "filament_retraction_minimum_travel": [
+        "nil"
+    ],
+    "filament_retraction_speed": [
+        "nil"
+    ],
+    "filament_settings_id": [
+        "PLA"
+    ],
+    "filament_shrink": [
+        "100%"
+    ],
+    "filament_type": [
+        "PLA"
+    ],
+    "filament_vendor": [
+        "CFSYS"
+    ],
+    "filament_z_hop": [
+        "nil"
+    ],
+    "cool_plate_temp" : [
+        "60"
+    ],
+    "eng_plate_temp" : [
+        "60"
+    ],
+    "hot_plate_temp" : [
+        "55"
+    ],
+    "textured_plate_temp" : [
+        "60"
+    ],
+    "cool_plate_temp_initial_layer" : [
+        "60"
+    ],
+    "eng_plate_temp_initial_layer" : [
+        "60"
+    ],
+    "hot_plate_temp_initial_layer" : [
+        "55"
+    ],
+    "textured_plate_temp_initial_layer" : [
+        "60"
+    ],
+    "reduce_fan_stop_start_freq": [
+        "1"
+    ],
+    "slow_down_for_layer_cooling": [
+        "1"
+    ],
+    "fan_max_speed": [
+        "100"
+    ],
+    "fan_min_speed": [
+        "100"
+    ],
+    "overhang_fan_speed": [
+        "60"
+    ],
+    "overhang_fan_threshold": [
+        "0%"
+    ],
+    "close_fan_the_first_x_layers": [
+        "1"
+    ],
+    "nozzle_temperature_initial_layer": [
+        "220"
+    ],
+    "nozzle_temperature": [
+        "220"
+    ],
+    "temperature_vitrification": [
+        "45"
+    ],
+    "nozzle_temperature_range_low": [
+        "200"
+    ],
+    "nozzle_temperature_range_high": [
+        "240"
+    ],
+    "filament_loading_speed": [
+        "60"
+    ],
+    "filament_loading_speed_start": [
+        "10"
+    ],
+    "enable_pressure_advance": [
+        "1"
+    ],
+    "pressure_advance": [
+        "0.035"
+    ],
+    "support_material_interface_fan_speed": [
+        "80"
+    ],
+    "during_print_exhaust_fan_speed": [
+        "0"
+    ],
+    "complete_print_exhaust_fan_speed": [
+        "0"
+    ],
+    "slow_down_min_speed": [
+        "20"
+    ],
+    "slow_down_layer_time": [
+        "4"
+    ],
+    "filament_retraction_length": [
+        "nil"
+    ],
+    "filament_wipe": [
+        "nil"
+    ],
+    "filament_wipe_distance": [
+        "nil"
+    ],
+    "filament_z_hop_types": [
+        "nil"
+    ],
+    "filament_start_gcode": [
+        "; filament start gcode\n"
+    ]
+}

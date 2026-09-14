@@ -254,6 +254,17 @@ static inline float parse_float(const char *&line, const size_t line_length)
 bool PressureEqualizer::process_line(const char *line, const char *line_end, GCodeLine &buf)
 {
     const size_t len = line_end - line;
+    const std::string fiber_line(line, line_end);
+    if (fiber_line.rfind(";FIBER_BEGIN ", 0) == 0) {
+        m_fiber_protected = true;
+        opened_extrude_set_speed_block = false;
+    }
+    buf.fiber_protected = m_fiber_protected;
+    if (fiber_line.rfind(";FIBER_END", 0) == 0) {
+        m_fiber_protected = false;
+        opened_extrude_set_speed_block = false;
+    }
+
     if (strncmp(line, EXTRUSION_ROLE_TAG.data(), EXTRUSION_ROLE_TAG.length()) == 0) {
         line += EXTRUSION_ROLE_TAG.length();
         int role = atoi(line);
@@ -460,6 +471,7 @@ bool PressureEqualizer::process_line(const char *line, const char *line_end, GCo
     }
     }
 
+    if (buf.fiber_protected) buf.adjustable_flow = false;
     buf.extruder_id = m_current_extruder;
     memcpy(buf.pos_end, m_current_pos, sizeof(float)*5);
 #ifdef PRESSURE_EQUALIZER_DEBUG

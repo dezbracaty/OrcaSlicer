@@ -129,6 +129,10 @@ set(lisbslic3r_sources
     Extruder.hpp
     ExtrusionEntityCollection.cpp
     ExtrusionEntityCollection.hpp
+    FiberPlanning.cpp
+    FiberPlanning.hpp
+    FiberProcess.cpp
+    FiberProcess.hpp
     ExtrusionEntity.cpp
     ExtrusionEntity.hpp
     ExtrusionSimulator.cpp

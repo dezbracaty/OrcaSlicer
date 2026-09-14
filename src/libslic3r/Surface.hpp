@@ -29,6 +29,8 @@ enum SurfaceType {
     // Inner/outer perimeters.
     stPerimeter,
     // Number of SurfaceType enums.
+    stInternalFiber,
+    stFiberPerimeter,
     stCount,
 };
 

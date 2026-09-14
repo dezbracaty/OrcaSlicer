@@ -1,0 +1,156 @@
+{
+  "complete_print_exhaust_fan_speed": [
+    "0"
+  ],
+  "default_filament_colour": [
+    "#FFFFFF"
+  ],
+  "during_print_exhaust_fan_speed": [
+    "0"
+  ],
+  "close_fan_the_first_x_layers": [
+    "3"
+  ],
+  "enable_pressure_advance": [
+    "1"
+  ],
+  "fan_cooling_layer_time": [
+    "8"
+  ],
+  "fan_max_speed": [
+    "100"
+  ],
+  "fan_min_speed": [
+    "5"
+  ],
+  "filament_cost": [
+    "100"
+  ],
+  "filament_deretraction_speed": [
+    "30"
+  ],
+  "filament_loading_speed": [
+    "60"
+  ],
+  "filament_loading_speed_start": [
+    "10"
+  ],
+  "filament_retract_before_wipe": [
+    "100%"
+  ],
+  "filament_retract_lift_above": [
+    "0"
+  ],
+  "filament_retract_lift_below": [
+    "0"
+  ],
+  "filament_retract_lift_enforce": [
+    "All Surfaces"
+  ],
+  "filament_retract_restart_extra": [
+    "0"
+  ],
+  "filament_retraction_minimum_travel": [
+    "2"
+  ],
+  "filament_retraction_speed": [
+    "30"
+  ],
+  "filament_is_support": [
+    "1"
+  ],
+  "filament_settings_id": [
+    "S-Multi"
+  ],
+  "filament_vendor": [
+    "CFSYS"
+  ],
+  "filament_wipe_distance": [
+    "1"
+  ],
+  "filament_z_hop": [
+    "0.8"
+  ],
+  "filament_z_hop_types": [
+    "Auto Lift"
+  ],
+  "filament_type": [
+    "S-Multi"
+  ],
+  "from": "system",
+  "inherits": "CFSYS PLA",
+  "is_custom_defined": "0",
+  "name": "CFSYS S-Multi",
+  "nozzle_temperature_range_high": [
+    "310"
+  ],
+  "nozzle_temperature_range_low": [
+    "270"
+  ],
+  "overhang_fan_speed": [
+    "60"
+  ],
+  "overhang_fan_threshold": [
+    "0%"
+  ],
+  "pressure_advance": [
+    "0.048"
+  ],
+  "slow_down_layer_time": [
+    "1"
+  ],
+  "slow_down_min_speed": [
+    "20"
+  ],
+  "support_material_interface_fan_speed": [
+    "100"
+  ],
+  "filament_density": [
+    "1.24"
+  ],
+  "dont_slow_down_outer_wall": [
+    "1"
+  ],
+  "additional_cooling_fan_speed": [
+    "0"
+  ],
+  "filament_flow_ratio": [
+    "0.98"
+  ],
+  "filament_max_volumetric_speed": [
+    "14"
+  ],
+  "filament_retract_when_changing_layer": [
+    "1"
+  ],
+  "filament_retraction_length": [
+    "1.6"
+  ],
+  "filament_shrink": [
+    "100%"
+  ],
+  "filament_wipe": [
+    "1"
+  ],
+  "hot_plate_temp": [
+    "100"
+  ],
+  "hot_plate_temp_initial_layer": [
+    "100"
+  ],
+  "nozzle_temperature": [
+    "290"
+  ],
+  "nozzle_temperature_initial_layer": [
+    "290"
+  ],
+  "reduce_fan_stop_start_freq": [
+    "0"
+  ],
+  "temperature_vitrification": [
+    "100"
+  ],
+  "version": "2.0.2.0",
+  "type": "filament",
+  "instantiation": "true"
+}

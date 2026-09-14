@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <string_view>
 #include <numeric>
+#include <memory>
 
 namespace Slic3r {
 
@@ -149,6 +150,36 @@ public:
 };
 
 typedef std::vector<ExtrusionEntity*> ExtrusionEntitiesPtr;
+
+struct PreparedFiberPath;
+// A finalized fiber chain is never copied into a plastic ExtrusionPath.
+class ExtrusionFiberPath final : public ExtrusionEntity {
+public:
+    explicit ExtrusionFiberPath(std::shared_ptr<const PreparedFiberPath> prepared);
+    std::shared_ptr<const PreparedFiberPath> prepared;
+    ExtrusionRole role() const override { return erCustom; }
+    bool can_reverse() const override { return false; }
+    bool can_sort() const override { return false; }
+    ExtrusionEntity* clone() const override { return new ExtrusionFiberPath(*this); }
+    ExtrusionEntity* clone_move() override { return new ExtrusionFiberPath(std::move(*this)); }
+    void reverse() override;
+    Point first_point() const override;
+    Point last_point() const override;
+    const Point3& first_point3() const override { return m_first; }
+    const Point3& last_point3() const override { return m_last; }
+    void polygons_covered_by_width(Polygons&,float) const override;
+    void polygons_covered_by_spacing(Polygons& out,float epsilon) const override { polygons_covered_by_width(out,epsilon); }
+    using ExtrusionEntity::polygons_covered_by_width;
+    double min_mm3_per_mm() const override { return 0; }
+    Polyline as_polyline() const override;
+    void collect_polylines(Polylines&) const override;
+    void collect_points(Points&) const override;
+    double length() const override;
+    double total_volume() const override { return 0; }
+    BoundingBox bounding_box() const;
+private:
+    Point3 m_first,m_last;
+};
 
 class ExtrusionPath : public ExtrusionEntity
 {

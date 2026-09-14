@@ -78,6 +78,8 @@ public:
         // part of Preset::filament_options()), but must travel with a project
         // so facet labels continue to address the correct material colors.
         const std::set<std::string> filament_project_keys{"filament_colour"};
+        // Plate mapping is project state exposed in the existing Printer group.
+        const std::set<std::string> printer_project_keys{"filament_map", "filament_map_mode", "flush_multiplier", "flush_volumes_matrix"};
 
         items.reserve(process_keys.size() + filament_keys.size() + printer_keys.size());
         for (const auto& [key, option] : Slic3r::print_config_def.options) {
@@ -86,8 +88,9 @@ public:
             const bool is_process  = process_keys.count(key) != 0 || process_project_keys.count(key) != 0;
             const bool is_filament = filament_keys.count(key) != 0 ||
                                      filament_project_keys.count(key) != 0;
-            const bool is_printer  = printer_keys.count(key) != 0;
+            const bool is_printer  = printer_keys.count(key) != 0 || printer_project_keys.count(key) != 0;
             const int group_count  = static_cast<int>(is_process) + static_cast<int>(is_filament) + static_cast<int>(is_printer);
+            static const std::set<std::string> inactive_fiber_keys={"stress_range_tensile","stress_range_compress","fiber_travel_max_length","fiber_infill_arc_ratio","fiber_end_min_length","fiber_middle_min_length","fiber_slow_length","fiber_start_max_speed","fiber_normal_min_limit_speed","fiber_finish_min_limit_speed"};
             if (option.printer_technology == Slic3r::ptSLA || !visible || option.readonly) {
                 continue;
             }
@@ -112,7 +115,7 @@ public:
             item.level       = public_level(option.mode);
             item.group       = is_process ? SettingGroup::Process : is_filament ? SettingGroup::Filament : SettingGroup::Printer;
             item.nullable    = option.nullable;
-            item.visible     = true;
+            item.visible     = inactive_fiber_keys.count(key) == 0;
             item.read_only   = option.readonly;
             item.multiline   = option.multiline;
 
@@ -342,6 +345,15 @@ SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std:
         return failure(last_key, error.what());
     }
 
+    const auto has_key = [&](std::string_view name) {
+        return std::any_of(patch.begin(), patch.end(), [&](const auto& entry) { return entry.first == name; });
+    };
+    if (has_key("reinforced_infill_pattern") && !has_key("generate_reinforced_perimeters")) {
+        const auto pattern = candidate.option<Slic3r::ConfigOptionEnum<Slic3r::InfillPattern>>("reinforced_infill_pattern")->value;
+        if (pattern == Slic3r::ipConcentric || pattern == Slic3r::ipRectilinear)
+            candidate.set_key_value("generate_reinforced_perimeters", new Slic3r::ConfigOptionBool(pattern == Slic3r::ipRectilinear));
+    }
+    Slic3r::resolve_fixed_filament_map(candidate, candidate.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size());
     const auto changed_keys = candidate.diff(impl_->current);
     impl_->current          = std::move(candidate);
     SettingsResult result;

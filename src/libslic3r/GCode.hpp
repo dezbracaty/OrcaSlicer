@@ -112,6 +112,7 @@ public:
     std::string tool_change(GCode &gcodegen, int extruder_id, bool finish_layer);
     bool is_empty_wipe_tower_gcode(GCode &gcodegen, int extruder_id, bool finish_layer);
     std::string finalize(GCode &gcodegen);
+    void validate_layer_consumed() const;
     std::vector<float> used_filament_length() const;
 
     bool is_first_print() const { return m_is_first_print;}
@@ -403,6 +404,8 @@ private:
     std::string     change_layer(coordf_t print_z);
     // Orca: pass the complete collection of region perimeters to the extrude loop to check whether the wipe before external loop
     // should be executed
+    std::string extrude_fiber(const ExtrusionFiberPath& entity);
+    std::size_t m_fiber_instance_id = 0;
     std::string extrude_entity(const ExtrusionEntity&      entity,
                                const std::string&          description       = "",
                                double                      speed             = -1.,

@@ -1,3 +1,5 @@
+#include "FiberPlanning.hpp"
+#include "FiberProcess.hpp"
 #include "BoundingBox.hpp"
 #include "Config.hpp"
 #include "GCodeWriter.hpp"
@@ -1556,6 +1558,16 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         return gcode;
     }
 
+    void WipeTowerIntegration::validate_layer_consumed() const
+    {
+        if (m_layer_idx < 0 || m_layer_idx >= int(m_tool_changes.size())) return;
+        const auto& changes = m_tool_changes[m_layer_idx];
+        const bool sparse = m_print_config->wipe_tower_no_sparse_layers.value && changes.size() == 1 &&
+            changes.front().initial_tool == changes.front().new_tool;
+        if (!sparse && size_t(m_tool_change_idx) != changes.size())
+            throw Slic3r::RuntimeError("Continuous fiber wipe tower layer was not fully consumed");
+    }
+
     bool WipeTowerIntegration::is_empty_wipe_tower_gcode(GCode &gcodegen, int extruder_id, bool finish_layer)
     {
         assert(m_layer_idx >= 0);
@@ -2293,6 +2305,14 @@ namespace DoExport {
     // leave print.tool_ordering() empty, so total_toolchanges stays 0 there (unchanged from before).
     static int total_toolchanges_from_ordering(const ToolOrdering &tool_ordering)
     {
+        bool fiber=false; int fiber_changes=0; unsigned previous=unsigned(-1);
+        for(const auto& layer:tool_ordering.layer_tools()) {
+            if(layer.fiber_visit_view.empty())continue;
+            fiber=true;
+            for(const auto& visit:layer.fiber_visit_view){if(previous!=unsigned(-1)&&previous!=visit.material)++fiber_changes;previous=visit.material;}
+        }
+        if(fiber)return fiber_changes;
+
         int changes = 0;
         int last    = -1;
         for (const LayerTools &lt : tool_ordering)
@@ -3543,6 +3563,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
         print.m_print_statistics,
         // Const input (tool-change fallback for non-wipe-tower prints)
         print.tool_ordering()));
+    if (fiber_active(print)) print.m_print_statistics.total_toolchanges = static_cast<int>(m_toolchange_count);
     print.m_print_statistics.initial_tool = initial_extruder_id;
     if (!is_bbl_printers) {
         file.write_format("; total filament used [g] = %.2lf\n",
@@ -4898,6 +4919,12 @@ LayerResult GCode::process_layer(
                 // Shall the support interface be printed with the active extruder, preferably with non-soluble, to avoid tool changes?
                 bool            interface_dontcare = object.config().support_interface_filament.value == 0;
 
+                if (!layer_tools.fiber_visit_view.empty()) {
+                    const unsigned resin = object.printing_region(0).config().internal_solid_filament_id.value - 1;
+                    if (support_dontcare) { support_extruder = resin; support_dontcare = false; }
+                    if (interface_dontcare) { interface_extruder = resin; interface_dontcare = false; }
+                }
+
                 // BBS: apply wiping overridden extruders
                 WipingExtrusions& wiping_extrusions = const_cast<LayerTools&>(layer_tools).wiping_extrusions();
                 if (support_dontcare) {
@@ -5022,6 +5049,12 @@ LayerResult GCode::process_layer(
                 // PrintObjects own the PrintRegions, thus the pointer to PrintRegion would be unique to a PrintObject, they would not
                 // identify the content of PrintRegion accross the whole print uniquely. Translate to a Print specific PrintRegion.
                 const PrintRegion &region = print.get_print_region(layerm->region().print_region_id());
+
+                // Material occurrence ownership exists even when this layer has only fiber/repair roots.
+                if (!layerm->fiber_paths.empty() || !layerm->fiber_repairs.empty()) {
+                    const unsigned resin = region.config().internal_solid_filament_id.value - 1;
+                    object_islands_by_extruder(by_extruder, resin, &layer_to_print - layers.data(), layers.size(), n_slices + 1);
+                }
 
                 // Now we must process perimeters and infills and create islands of extrusions in by_region std::map.
                 // It is also necessary to save which extrusions are part of MM wiping and which are not.
@@ -5151,6 +5184,29 @@ LayerResult GCode::process_layer(
         }
     }
 
+    // The shared plan fixes occurrence order before tower layout. Retain Orca's
+    // island ordering inside each occurrence, but consume objects in plan order.
+    if (!layer_tools.fiber_visit_view.empty()) {
+        for (auto& material_instances : filament_to_print_instances) {
+            const unsigned material = material_instances.first;
+            auto& instances = material_instances.second;
+            auto rank = [&](const InstanceToPrint& instance) {
+                const size_t object_id = size_t(std::find(print.objects().begin(), print.objects().end(), &instance.print_object) - print.objects().begin());
+                for (const auto& visit : layer_tools.fiber_visit_view)
+                    if (visit.phase == FiberPhase::ResinBase && visit.material == material &&
+                        visit.object == object_id && visit.instance == instance.instance_id) return visit.visit_index;
+                throw std::runtime_error("Continuous fiber ordinary occurrence missing from tool plan");
+            };
+            std::vector<const InstanceToPrint*> ordered;
+            for (const auto& instance : instances) ordered.push_back(&instance);
+            std::stable_sort(ordered.begin(), ordered.end(), [&](const InstanceToPrint* a, const InstanceToPrint* b) { return rank(*a) < rank(*b); });
+            std::vector<InstanceToPrint> sorted;
+            sorted.reserve(instances.size());
+            for (const auto* instance : ordered) sorted.push_back(*instance);
+            instances.swap(sorted);
+        }
+    }
+
     std::set<size_t> layer_object_label_ids;
     for (auto iter = filament_to_print_instances.begin(); iter != filament_to_print_instances.end(); ++iter) {
         for (const InstanceToPrint &instance : iter->second) {
@@ -5254,19 +5310,32 @@ LayerResult GCode::process_layer(
 
     // Extrude the skirt, brim, support, perimeters, infill ordered by the extruders.
     m_skirt_group_done.resize(print.skirt_brim_groups().size());
+    std::set<size_t> consumed_fiber_visits;
+    size_t material_visit_cursor = 0;
+    unsigned last_material_visit = unsigned(-1);
+    auto register_material_visit = [&](unsigned material) {
+        if (layer_tools.material_visits.empty()) return true;
+        if (material == last_material_visit) return false;
+        if (material_visit_cursor >= layer_tools.material_visits.size() ||
+            layer_tools.material_visits[material_visit_cursor] != material)
+            throw std::runtime_error("Continuous fiber tool visit differs from tower plan");
+        last_material_visit = material;
+        ++material_visit_cursor;
+        return true;
+    };
+    auto change_occurrence_tool = [&](unsigned material) {
+        if (!register_material_visit(material)) return std::string();
+        if (has_wipe_tower) {
+            const bool finish = material_visit_cursor == layer_tools.material_visits.size();
+            auto output = std::string(";FIBER_PHASE 0\n") + m_wipe_tower->tool_change(*this, material, finish);
+            m_last_processor_extrusion_role = erWipeTower;
+            return output;
+        }
+        return this->set_extruder(material, print_z);
+    };
+
     for (unsigned int extruder_id : layer_tools.extruders)
     {
-        if (print.config().skirt_type == stCombined && !print.skirt_brim_groups().empty()) {
-            for (size_t group_idx = 0; group_idx < print.skirt_brim_groups().size(); ++group_idx) {
-                const Print::SkirtBrimGroup& group = print.skirt_brim_groups()[group_idx];
-                if (group.skirt.empty())
-                    continue;
-
-                std::string skirt_gcode = generate_skirt(print, group.skirt, Point(0, 0), layer.object()->config().skirt_start_angle,
-                                                          layer_tools, layer, extruder_id, m_skirt_group_done[group_idx]);
-                gcode += std::move(skirt_gcode);
-            }
-        }
 
         if (print.config().print_sequence == PrintSequence::ByLayer && m_enable_exclude_object && print.config().support_object_skip_flush.value) {
             std::vector<size_t> filament_instances_id;
@@ -5274,9 +5343,14 @@ LayerResult GCode::process_layer(
             m_filament_instances_code = _encode_label_ids_to_base64(filament_instances_id);
         }
 
+        const bool new_material_visit = register_material_visit(extruder_id);
+        const bool final_material_visit = layer_tools.material_visits.empty() ? extruder_id == layer_tools.extruders.back() :
+            material_visit_cursor == layer_tools.material_visits.size();
         std::string gcode_toolchange;
-        if (has_wipe_tower) {
-            if (!m_wipe_tower->is_empty_wipe_tower_gcode(*this, extruder_id, extruder_id == layer_tools.extruders.back())) {
+        if (!new_material_visit) {
+            // Consecutive occurrences share their active tool and tower cursor.
+        } else if (has_wipe_tower) {
+            if (!m_wipe_tower->is_empty_wipe_tower_gcode(*this, extruder_id, final_material_visit)) {
                 if (need_insert_timelapse_gcode_for_traditional && !has_insert_timelapse_gcode) {
                     bool should_insert = true;
                     if (m_config.nozzle_diameter.values.size() == 2){
@@ -5299,7 +5373,7 @@ LayerResult GCode::process_layer(
                     gcode += insert_wrapping_detection_gcode();
                     has_insert_wrapping_detection_gcode = true;
                 }
-                gcode_toolchange = m_wipe_tower->tool_change(*this, extruder_id, extruder_id == layer_tools.extruders.back());
+                gcode_toolchange = m_wipe_tower->tool_change(*this, extruder_id, final_material_visit);
             }
         } else {
             if (need_insert_timelapse_gcode_for_traditional &&
@@ -5331,6 +5405,19 @@ LayerResult GCode::process_layer(
         
         gcode += std::move(gcode_toolchange);
 
+        if (print.config().skirt_type == stCombined && !print.skirt_brim_groups().empty()) {
+            for (size_t group_idx = 0; group_idx < print.skirt_brim_groups().size(); ++group_idx) {
+                const Print::SkirtBrimGroup& group = print.skirt_brim_groups()[group_idx];
+                if (group.skirt.empty())
+                    continue;
+
+                std::string skirt_gcode = generate_skirt(print, group.skirt, Point(0, 0), layer.object()->config().skirt_start_angle,
+                                                          layer_tools, layer, extruder_id, m_skirt_group_done[group_idx]);
+                gcode += std::move(skirt_gcode);
+            }
+        }
+
+
         // let analyzer tag generator aware of a role type change
         if (layer_tools.has_wipe_tower && m_wipe_tower)
             m_last_processor_extrusion_role = erWipeTower;
@@ -5344,6 +5431,20 @@ LayerResult GCode::process_layer(
                 gcode+="; PURGING FINISHED\n";
 
             for (InstanceToPrint &instance_to_print : instances_to_print) {
+                if (!layer_tools.fiber_visit_view.empty()) gcode += change_occurrence_tool(extruder_id);
+                m_fiber_instance_id = instance_to_print.instance_id;
+                const size_t fiber_object_id = size_t(std::find(print.objects().begin(), print.objects().end(),
+                    &instance_to_print.print_object) - print.objects().begin());
+                if (!print_wipe_extrusions) {
+                    for (const auto& visit : layer_tools.fiber_visit_view)
+                        if (visit.object == fiber_object_id && visit.instance == instance_to_print.instance_id &&
+                            visit.phase == FiberPhase::ResinBase && visit.material == extruder_id) {
+                            if (!consumed_fiber_visits.insert(visit.visit_index).second)
+                                throw std::runtime_error("Continuous fiber Base visit consumed twice");
+                            gcode += ";FIBER_PHASE 0 visit=" + std::to_string(visit.visit_index) + "\n";
+                        }
+                }
+
                 const auto& inst = instance_to_print.print_object.instances()[instance_to_print.instance_id];
                 const LayerToPrint &layer_to_print = layers[instance_to_print.layer_id];
                 if (print_wipe_extrusions == (is_anything_overridden ? 1 : 0)) {
@@ -5484,6 +5585,32 @@ LayerResult GCode::process_layer(
                     gcode += this->extrude_infill(print,by_region_specific, true);
                 }
 
+                // Finish the fixed Fiber -> ResinRepair phases in this exact occurrence context.
+                if (layer_to_print.object_layer && !print_wipe_extrusions) {
+                    for (const auto& visit : layer_tools.fiber_visit_view) {
+                        if (visit.object != fiber_object_id || visit.instance != instance_to_print.instance_id ||
+                            visit.phase == FiberPhase::ResinBase) continue;
+                        const auto* owner = layer_to_print.object_layer->regions().at(visit.root_ids.front());
+                        const unsigned resin = owner->region().config().internal_solid_filament_id.value - 1;
+                        if (extruder_id != resin) continue;
+                        if (!consumed_fiber_visits.insert(visit.visit_index).second)
+                            throw std::runtime_error("Continuous fiber visit consumed twice");
+                        gcode += change_occurrence_tool(visit.material);
+                        gcode += ";FIBER_PHASE " + std::to_string(int(visit.phase)) + " visit=" + std::to_string(visit.visit_index) + "\n";
+                        for (size_t region_id : visit.root_ids) {
+                            const auto* region = layer_to_print.object_layer->regions()[region_id];
+                            m_config.apply(region->region().config());
+                            const auto& roots = visit.phase == FiberPhase::Fiber ? region->fiber_paths : region->fiber_repairs;
+                            for (const auto* root : roots.entities) {
+                                if (const auto* collection = dynamic_cast<const ExtrusionEntityCollection*>(root)) {
+                                    for (const auto* entity : collection->entities) gcode += extrude_entity(*entity, "fiber repair");
+                                } else gcode += extrude_entity(*root, "fiber");
+                            }
+                        }
+                    }
+                    gcode += ";FIBER_PHASE 0\n";
+                }
+
                 if (this->config().gcode_label_objects) {
                     gcode += std::string("; stop printing object ") +
                              instance_to_print.print_object.model_object()->name +
@@ -5511,6 +5638,20 @@ LayerResult GCode::process_layer(
                 }
             }
         }
+    }
+    if (!layer_tools.material_visits.empty() && material_visit_cursor != layer_tools.material_visits.size())
+        throw std::runtime_error("Continuous fiber tool plan was not fully consumed");
+    if (has_wipe_tower && !layer_tools.material_visits.empty()) m_wipe_tower->validate_layer_consumed();
+    for (const auto& visit : layer_tools.fiber_visit_view) {
+        if (visit.object >= print.objects().size())
+            throw std::runtime_error("Continuous fiber visit has invalid object identity");
+        const auto* object = print.objects()[visit.object];
+        const bool in_scope = std::any_of(layers.begin(), layers.end(), [&](const LayerToPrint& item) {
+            return (item.object_layer && item.object_layer->object() == object) ||
+                   (item.support_layer && item.support_layer->object() == object);
+        });
+        if (in_scope && consumed_fiber_visits.count(visit.visit_index) == 0)
+            throw std::runtime_error("Continuous fiber planned visit was not consumed");
     }
     if (first_layer) {
         for (auto iter = by_extruder.begin(); iter != by_extruder.end(); ++iter) {
@@ -6105,7 +6246,9 @@ std::string GCode::extrude_entity(const ExtrusionEntity&      entity,
                                   double                      speed,
                                   const ExtrusionEntitiesPtr& region_perimeters)
 {
-    if (const ExtrusionPath* path = dynamic_cast<const ExtrusionPath*>(&entity))
+    if (const auto* fiber = dynamic_cast<const ExtrusionFiberPath*>(&entity))
+        return extrude_fiber(*fiber);
+    else if (const ExtrusionPath* path = dynamic_cast<const ExtrusionPath*>(&entity))
         return this->extrude_path(*path, description, speed);
     else if (const ExtrusionMultiPath* multipath = dynamic_cast<const ExtrusionMultiPath*>(&entity))
         return this->extrude_multi_path(*multipath, description, speed);
@@ -8278,3 +8421,81 @@ void GCode::ObjectByExtruder::Island::Region::append(const Type type, const Extr
 
 
 } // namespace Slic3r
+
+namespace Slic3r {
+std::string GCode::extrude_fiber(const ExtrusionFiberPath& entity)
+{
+    const auto& prepared = *entity.prepared;
+    const auto process = compile_fiber_process(prepared);
+    const auto& config = prepared.config.region;
+    std::string output = travel_to(prepared.entry, erCustom, "fiber travel");
+    output += m_writer.unlift();
+    output += ";FIBER_BEGIN v=1 path=" + prepared.source.id() + " instance=" + std::to_string(m_fiber_instance_id) +
+        " object=" + std::to_string(prepared.source.object) + " material=" + std::to_string(prepared.config.material) +
+        " width=" + std::to_string(prepared.config.width_mm) + "\n";
+    output += m_writer.set_print_acceleration(unsigned(prepared.perimeter_process ? config.fiber_perimeter_acceleration.value : config.fiber_infill_acceleration.value));
+    const double z = m_layer->print_z;
+    if (config.fiber_z_hop.value > 0) output += m_writer.travel_to_z(z + config.fiber_z_hop.value, "fiber hop", true);
+    bool prefed = false, adhesion = false, retraction_repaid = false;
+    bool start_pending = false, start_emitted = false;
+    auto finish_fiber_entry = [&] {
+        if (!adhesion) {
+            if (config.fiber_z_hop_pause_adhesion.value > 0)
+                output += "G4 P" + std::to_string(config.fiber_z_hop_pause_adhesion.value) + "\n";
+            adhesion = true;
+        }
+        if (start_pending) {
+            output += ";FIBER_START\n";
+            start_pending = false;
+            start_emitted = true;
+        }
+    };
+    for (const auto& action : process.actions) {
+        if (action.event_only) {
+            if (action.event == FiberEventKind::Start) start_pending = true;
+            else if (action.event == FiberEventKind::Cut) {
+                if (!start_emitted) throw std::runtime_error("Fiber cut occurred before deposition start");
+                output += ";FIBER_CUT s=" + std::to_string(action.distance_mm) + "\n";
+                const std::string macro = placeholder_parser_process("cut_fiber_gcode", m_config.cut_fiber_gcode.value, prepared.config.material);
+                std::istringstream lines(macro); std::string line;
+                while (std::getline(lines, line)) {
+                    const auto begin = line.find_first_not_of(" \t");
+                    if (begin == std::string::npos || line[begin] == ';') continue;
+                    const auto command = line.substr(begin, line.find_first_of(" \t;", begin) - begin);
+                    if (command != "M400" && command != "S0" && command != "G4" && command != "M42")
+                        throw std::runtime_error("cut_fiber_gcode contains an unsupported modal/state command: " + command);
+                }
+                output += macro + "\n";
+            } else if (action.event == FiberEventKind::Tail) output += ";FIBER_TAIL\n";
+            else if (action.event == FiberEventKind::Finish) output += ";FIBER_FINISH\n";
+            continue;
+        }
+        if (!prefed) { output += m_writer.fiber_prefeed(action.e_mm, action.speed_mm_s); prefed = true; continue; }
+        // The fixed implementation prefed while retracted. Without fiber hop
+        // it repaid retraction before deposition; with fiber hop its first
+        // zero-E diagonal move returned to the layer and repayment followed.
+        if (!retraction_repaid && config.fiber_z_hop.value<=0) {
+            output += m_writer.unretract();retraction_repaid=true;
+        }
+        // With no hop, the entry is complete before the first deposition move.
+        // With a hop, the first zero-E diagonal returns to the layer first.
+        if (start_pending && retraction_repaid) finish_fiber_entry();
+        const Vec2d xy = point_to_gcode_quantized(action.point);
+        double speed = action.speed_mm_s;
+        const auto& print_config = m_layer->object()->print()->config();
+        if (!print_config.machine_max_speed_x.values.empty()) speed = std::min(speed, print_config.machine_max_speed_x.values.front());
+        if (!print_config.machine_max_speed_y.values.empty()) speed = std::min(speed, print_config.machine_max_speed_y.values.front());
+        output += m_writer.fiber_move(Vec3d(xy.x(), xy.y(), z + action.z_offset_mm), action.e_mm, speed, action.tail || action.e_mm == 0);
+        if (!retraction_repaid) {
+            if (!start_pending || action.e_mm != 0)
+                throw std::runtime_error("Fiber hop entry must finish with a zero-E move");
+            output += m_writer.unretract();retraction_repaid=true;
+            finish_fiber_entry();
+        }
+    }
+    if (!start_emitted) throw std::runtime_error("Fiber deposition start was not emitted");
+    set_last_pos(process.exit);
+    output += ";FIBER_END\n";
+    return output;
+}
+}

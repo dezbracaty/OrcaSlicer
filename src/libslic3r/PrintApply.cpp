@@ -1136,9 +1136,30 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     std::vector <unsigned int> used_filaments = this->extruders(true);
     std::unordered_set <unsigned int> used_filament_set(used_filaments.begin(), used_filaments.end());
 
+    // Reuse the normal region resolver: a role value of zero means the
+    // object's/default material, not absence of resin demand.
+    auto include_fiber_materials = [&](size_t ordinary_count) {
+        std::set<int> demand;
+        PrintRegionConfig defaults;
+        defaults.apply(new_full_config, true);
+        const size_t materials = new_full_config.option<ConfigOptionFloats>("filament_diameter")->size();
+        for (const auto* object : model.objects) {
+            for (const auto* volume : object->volumes) {
+                const auto region = region_config_from_model_volume(defaults, nullptr, *volume, materials);
+                if (!fiber_active(region)) continue;
+                if (region.generate_reinforced_perimeters.value) demand.insert(region.reinforced_perimeters_filament.value);
+                if (region.generate_reinforced_infills.value) demand.insert(region.reinforced_infill_filament.value);
+                for (int material : {region.inner_wall_filament_id.value, region.outer_wall_filament_id.value,
+                     region.sparse_infill_filament_id.value, region.internal_solid_filament_id.value,
+                     region.top_surface_filament_id.value, region.bottom_surface_filament_id.value}) demand.insert(material);
+            }
+        }
+        return int(std::max(ordinary_count, demand.size()));
+    };
     //new_full_config.normalize_fdm(used_filaments);
     new_full_config.normalize_fdm_1();
-    t_config_option_keys changed_keys = new_full_config.normalize_fdm_2(objects().size(), used_filaments.size());
+    resolve_fixed_filament_map(new_full_config, new_full_config.option<ConfigOptionFloats>("filament_diameter")->size());
+    t_config_option_keys changed_keys = new_full_config.normalize_fdm_2(objects().size(), include_fiber_materials(used_filaments.size()));
     if (changed_keys.size() > 0) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got changed_keys, size=%1%")%changed_keys.size();
         for (int i = 0; i < changed_keys.size(); i++)
@@ -1628,7 +1649,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     //BBS: check the config again
     int new_used_filaments = this->extruders(true).size();
-    t_config_option_keys new_changed_keys = new_full_config.normalize_fdm_2(objects().size(), new_used_filaments);
+    t_config_option_keys new_changed_keys = new_full_config.normalize_fdm_2(objects().size(), include_fiber_materials(new_used_filaments));
     if (new_changed_keys.size() > 0) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got new_changed_keys, size=%1%")%new_changed_keys.size();
         for (int i = 0; i < new_changed_keys.size(); i++)

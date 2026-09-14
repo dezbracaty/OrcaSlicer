@@ -618,8 +618,8 @@ std::string GCodeWriter::travel_to_xy(const Vec2d &point, const std::string &com
 
     GCodeG1Formatter w;
     w.emit_xy(machine.head<2>());
-    auto speed = m_is_first_layer
-        ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value;
+    auto speed = comment == "fiber travel" ? this->config.fiber_travel_speed.value :
+        (m_is_first_layer ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value);
     w.emit_f(speed * 60.0);
     //BBS
     w.emit_comment(GCodeWriter::full_gcode_comment, comment);
@@ -705,7 +705,8 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
         // BBS
     Vec3d dest_point = point;
     auto travel_speed =
-        m_is_first_layer ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value;
+        comment == "fiber travel" ? this->config.fiber_travel_speed.value :
+        (m_is_first_layer ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value);
 
     // Belt profiles disable Z hop. In belt mode the internal position remains in
     // the oriented slicing frame; only the coordinates emitted to G-code are
@@ -802,7 +803,7 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
             m_lifted = 0.;
         //BBS
         this->set_current_position_clear(true);
-        return this->travel_to_xy(to_2d(point));
+        return this->travel_to_xy(to_2d(point), comment);
     }
     else {
         /*  In all the other cases, we perform an actual XYZ move and cancel
@@ -812,19 +813,20 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
 
     //BBS: take plate offset into consider
     Vec3d point_on_plate = { dest_point(0) - m_x_offset, dest_point(1) - m_y_offset, dest_point(2) };
+    const double final_travel_speed = comment == "fiber travel" ? travel_speed : this->config.travel_speed.value;
     std::string out_string;
     GCodeG1Formatter w;
     if (!this->is_current_position_clear())
     {
         //force to move xy first then z after filament change
         w.emit_xy(Vec2d(point_on_plate.x(), point_on_plate.y()));
-        w.emit_f(this->config.travel_speed.value * 60.0);
+        w.emit_f(final_travel_speed * 60.0);
         w.emit_comment(GCodeWriter::full_gcode_comment, comment);
         out_string = w.string() + _travel_to_z(point_on_plate.z(), comment);
     } else {
         GCodeG1Formatter w;
         w.emit_xyz(point_on_plate);
-        w.emit_f(this->config.travel_speed.value * 60.0);
+        w.emit_f(final_travel_speed * 60.0);
         w.emit_comment(GCodeWriter::full_gcode_comment, comment);
         out_string = w.string();
     }
@@ -1312,3 +1314,21 @@ void GCodeFormatter::emit_axis(const char axis, const double v, size_t digits) {
 }
 
 } // namespace Slic3r
+
+namespace Slic3r {
+std::string GCodeWriter::fiber_move(const Vec3d& point, double e_mm, double speed_mm_s, bool no_e)
+{
+    if (!point.allFinite() || !std::isfinite(e_mm) || !std::isfinite(speed_mm_s) || speed_mm_s <= 0)
+        throw std::runtime_error("Invalid fiber Writer motion");
+    if (no_e && point.z() < m_pos.z() - EPSILON) speed_mm_s = config.fiber_z_down_speed.value;
+    return set_speed(speed_mm_s * 60.) + extrude_to_xyz(point, e_mm, "fiber", no_e);
+}
+std::string GCodeWriter::fiber_prefeed(double e_mm, double speed_mm_s)
+{
+    if (!filament() || !std::isfinite(e_mm) || e_mm < 0 || !std::isfinite(speed_mm_s) || speed_mm_s <= 0)
+        throw std::runtime_error("Invalid fiber prefeed");
+    filament()->extrude(e_mm);
+    GCodeG1Formatter formatter; formatter.emit_e(filament()->E());
+    return set_speed(speed_mm_s * 60.) + formatter.string();
+}
+}

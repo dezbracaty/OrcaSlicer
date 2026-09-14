@@ -1075,6 +1075,54 @@ PRINT_CONFIG_CLASS_DEFINE(
 PRINT_CONFIG_CLASS_DEFINE(
     PrintRegionConfig,
 
+    // Continuous fiber effective legacy configuration.
+    ((ConfigOptionBool,                 generate_reinforced_perimeters))
+    ((ConfigOptionInt,                  outer_reinforced_perimeters_counts))
+    ((ConfigOptionInt,                  inner_reinforced_perimeters_counts))
+    ((ConfigOptionBool,                 generate_reinforced_infills))
+    ((ConfigOptionPercent,              reinforced_infill_density))
+    ((ConfigOptionEnum<InfillPattern>,  reinforced_infill_pattern))
+    ((ConfigOptionInt,                  reinforced_infill_filament))
+    ((ConfigOptionInt,                  reinforced_perimeters_filament))
+    ((ConfigOptionFloat,                fiber_travel_max_length))
+    ((ConfigOptionFloat,                fiber_offset_infill_ratio))
+    ((ConfigOptionFloat,                fiber_internal_offset_infill_ratio))
+    ((ConfigOptionFloat,                fiber_offset_perimeters_ratio))
+    ((ConfigOptionInt,                  fiber_layer_height_ratio))
+    ((ConfigOptionFloat,                fibercut_length))
+    ((ConfigOptionFloat,                fiber_restart_extra_length))
+    ((ConfigOptionFloat,                fiber_restart_speed))
+    ((ConfigOptionFloat,                fiber_z_hop))
+    ((ConfigOptionInt,                  fiber_z_hop_pause_adhesion))
+    ((ConfigOptionFloat,                fiber_tension_length))
+    ((ConfigOptionFloat,                fiber_angle_extend_ratio))
+    ((ConfigOptionFloat,                stress_range_tensile))
+    ((ConfigOptionFloat,                stress_range_compress))
+    ((ConfigOptionFloat,                fiber_start_length))
+    ((ConfigOptionFloat,                fiber_infill_arc_ratio))
+    ((ConfigOptionFloat,                fiber_infill_length_ratio))
+    ((ConfigOptionFloat,                fiber_corner_overshoot))
+    ((ConfigOptionFloat,                fiber_corner_trim_length))
+    ((ConfigOptionFloat,                fiber_perimeters_length_ratio))
+    ((ConfigOptionFloat,                fiber_start_min_length))
+    ((ConfigOptionFloat,                fiber_end_min_length))
+    ((ConfigOptionFloat,                fiber_middle_min_length))
+    ((ConfigOptionFloat,                fiber_slow_length))
+    ((ConfigOptionFloat,                fiber_finish_ironing_distance))
+    ((ConfigOptionFloat,                fiber_start_max_speed))
+    ((ConfigOptionFloat,                fiber_start_min_speed))
+    ((ConfigOptionFloat,                fiber_start_min_limit_speed))
+    ((ConfigOptionFloat,                fiber_normal_max_speed))
+    ((ConfigOptionFloat,                fiber_normal_min_speed))
+    ((ConfigOptionFloat,                fiber_normal_min_limit_speed))
+    ((ConfigOptionFloat,                fiber_finish_max_speed))
+    ((ConfigOptionFloat,                fiber_finish_min_speed))
+    ((ConfigOptionFloat,                fiber_finish_min_limit_speed))
+    ((ConfigOptionFloatOrPercent,       reinforced_perimeters_extrusion_width))
+    ((ConfigOptionFloatOrPercent,       reinforced_infill_extrusion_width))
+    ((ConfigOptionFloat,              fiber_infill_acceleration))
+    ((ConfigOptionFloat,              fiber_perimeter_acceleration))
+
     ((ConfigOptionInts,  print_extruder_id))
     ((ConfigOptionStrings,  print_extruder_variant))
     ((ConfigOptionInt,                  bottom_shell_layers))
@@ -1299,6 +1347,12 @@ PRINT_CONFIG_CLASS_DEFINE(
 // This object is mapped to Perl as Slic3r::Config::GCode.
 PRINT_CONFIG_CLASS_DEFINE(
     GCodeConfig,
+
+    // Continuous fiber effective legacy configuration.
+    ((ConfigOptionString,              cut_fiber_gcode))
+    ((ConfigOptionBools,               filament_is_ccf))
+    ((ConfigOptionFloat,               fiber_z_down_speed))
+    ((ConfigOptionFloat,               fiber_travel_speed))
 
     ((ConfigOptionString,              before_layer_change_gcode))
     ((ConfigOptionString,              printing_by_object_gcode))
@@ -2157,6 +2211,8 @@ static void set_flush_volumes_matrix(std::vector<T> &out_matrix, const std::vect
 }
 
 size_t get_extruder_index(const GCodeConfig& config, unsigned int filament_id);
+// Resolve the Alpha500 fixed independent-tool Auto rule before geometry.
+bool resolve_fixed_filament_map(DynamicPrintConfig& config, size_t filament_count);
 
 } // namespace Slic3r
 

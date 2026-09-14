@@ -1,3 +1,4 @@
+#include "FiberPlanning.hpp"
 #include "Exception.hpp"
 #include "Model.hpp"
 #include "Point.hpp"
@@ -709,7 +710,24 @@ void PrintObject::prepare_infill()
 
     // the following step needs to be done before combination because it may need
     // to remove only half of the combined infill
+    // Retain the old candidate classification only in reinforced regions.
+    std::vector<std::vector<SurfaceCollection>> fiber_before_bridge(m_layers.size());
+    for(size_t l=0;l<m_layers.size();++l)for(const auto* region:m_layers[l]->regions())
+        fiber_before_bridge[l].push_back(fiber_active(region->region().config()) ? region->fill_surfaces : SurfaceCollection{});
     this->bridge_over_infill();
+    for(size_t l=0;l<m_layers.size();++l)for(size_t r=0;r<m_layers[l]->regions().size();++r){
+        auto* region=m_layers[l]->regions()[r];if(!fiber_active(region->region().config()))continue;
+        const auto& config=region->region().config();
+        const auto selected=l<size_t(config.bottom_shell_layers.value)?stInternal:(std::abs(config.sparse_infill_density.value-100.)<EPSILON?stInternalSolid:stInternal);
+        const auto candidates=to_expolygons(fiber_before_bridge[l][r].filter_by_type(selected));
+        SurfaceCollection adapted;
+        for(const auto& surface:region->fill_surfaces.surfaces)adapted.append(diff_ex(ExPolygons{surface.expolygon},candidates),surface);
+        adapted.append(candidates,selected);region->fill_surfaces=std::move(adapted);
+    }
+
+    m_print->throw_if_canceled();
+
+    prepare_fiber_regions(*this);
     m_print->throw_if_canceled();
 
     // combine fill surfaces to honor the "infill every N layers" option
@@ -1136,6 +1154,7 @@ bool PrintObject::invalidate_state_by_config_options(
     std::vector<PrintObjectStep> steps;
     bool invalidated = false;
     for (const t_config_option_key &opt_key : opt_keys) {
+        if (fiber_config_key(opt_key)) { this->invalidate_step(posPrepareInfill); continue; }
         if (   opt_key == "brim_width"
             || opt_key == "brim_object_gap"
             || opt_key == "brim_use_efc_outline"
@@ -4208,6 +4227,8 @@ void PrintObject::combine_infill()
     // Work on each region separately.
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
         const PrintRegion &region = this->printing_region(region_id);
+        if (fiber_active(region.config())) continue; // All reinforced layers retain single-layer semantics.
+
         //BBS
         const bool enable_combine_infill = region.config().infill_combination.value;
         if (enable_combine_infill == false || region.config().sparse_infill_density == 0.)

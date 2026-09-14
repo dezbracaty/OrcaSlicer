@@ -11,6 +11,7 @@
 #include "../FilamentGroup.hpp"
 #include "../ExtrusionEntity.hpp"
 #include "../PrintConfig.hpp"
+#include "../FiberPlanning.hpp"
 
 namespace Slic3r {
 
@@ -128,6 +129,14 @@ struct FilamentChangeStats
 class LayerTools
 {
 public:
+    std::vector<FiberVisit> fiber_visit_view;
+    // Ordered material occurrences, including attachment entries and returns to
+    // Base for the next instance. Unlike extruders, this is not a demand set.
+    std::vector<unsigned> material_visits;
+    const std::vector<unsigned>& tool_visit_materials() const {
+        return material_visits.empty() ? extruders : material_visits;
+    }
+    void build_material_visits();
     LayerTools(const coordf_t z) : print_z(z) {}
 
     // Changing these operators to epsilon version can make a problem in cases where support and object layers get close to each other.
@@ -233,6 +242,7 @@ public:
     std::vector<LayerTools>::const_iterator end()   const { return m_layer_tools.end(); }
     bool 				empty()       const { return m_layer_tools.empty(); }
     std::vector<LayerTools>& layer_tools() { return m_layer_tools; }
+    const std::vector<LayerTools>& layer_tools() const { return m_layer_tools; }
     bool 				has_wipe_tower() const { return ! m_layer_tools.empty() && m_first_printing_extruder != (unsigned int)-1 && m_layer_tools.front().has_wipe_tower; }
 
     int                 get_most_used_extruder() const { return most_used_extruder; }

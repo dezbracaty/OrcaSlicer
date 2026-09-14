@@ -118,6 +118,9 @@ struct FilamentSlotInfo
     std::string material_type;
     Rgba8 color;
     double diameter_mm{1.75};
+    std::size_t physical_tool_index{0};
+    std::string physical_tool_name;
+    double nozzle_diameter_mm{0.0};
 };
 
 struct ActiveConfigView
@@ -474,6 +477,8 @@ public:
 private:
     Library();
 
+    class PresetState;
+    ConfigCreateResult create_config_impl(const ConfigSelection&, std::unique_ptr<PresetState>*) const;
     class Impl;
     std::unique_ptr<Impl> impl_;
 };

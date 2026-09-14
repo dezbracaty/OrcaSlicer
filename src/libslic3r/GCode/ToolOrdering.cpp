@@ -673,6 +673,19 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
     // Collect the object extruders.
     for (auto layer : object.layers()) {
         LayerTools &layer_tools = this->tools_for_layer(layer->print_z);
+        for (size_t instance = 0; instance < object.instances().size(); ++instance) {
+            auto visits = fiber_visits(*layer, instance);
+            for (auto& visit : visits) {
+                visit.visit_index = layer_tools.fiber_visit_view.size();
+                if (visit.phase != FiberPhase::ResinBase) {
+                    layer_tools.extruders.push_back(visit.material + 1);
+                    // Keep the resin occurrence owning these roots even if model Base is empty.
+                    layer_tools.extruders.push_back(layer->regions().at(visit.root_ids.front())->region().config().internal_solid_filament_id.value);
+                }
+                layer_tools.fiber_visit_view.push_back(std::move(visit));
+            }
+        }
+
 
         // Override extruder with the next
     	for (; it_per_layer_extruder_override != per_layer_extruder_switches.end() && it_per_layer_extruder_override->first < layer->print_z + EPSILON; ++ it_per_layer_extruder_override)
@@ -796,6 +809,23 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             }
         }
         if (has_interface) layer_tools.extruders.push_back(extruder_interface);
+        if ((has_support || has_interface) && fiber_active(*object.print())) {
+            const size_t object_id = size_t(std::find(object.print()->objects().begin(), object.print()->objects().end(), &object) - object.print()->objects().begin());
+            const unsigned resin = object.printing_region(0).config().internal_solid_filament_id.value - 1;
+            for (size_t instance = 0; instance < object.instances().size(); ++instance) {
+                const bool registered = std::any_of(layer_tools.fiber_visit_view.begin(), layer_tools.fiber_visit_view.end(), [&](const FiberVisit& visit) {
+                    return visit.object == object_id && visit.instance == instance && visit.phase == FiberPhase::ResinBase;
+                });
+                if (!registered) {
+                    FiberVisit base;
+                    base.object = object_id; base.instance = instance; base.material = resin;
+                    base.tool = object.print()->get_filament_maps().at(resin) - 1;
+                    base.visit_index = layer_tools.fiber_visit_view.size();
+                    layer_tools.fiber_visit_view.push_back(std::move(base));
+                }
+            }
+            if (extruder_support == 0 || extruder_interface == 0) layer_tools.extruders.push_back(resin + 1);
+        }
         if (has_support || has_interface) {
             layer_tools.has_support = true;
             layer_tools.wiping_extrusions().is_support_overriddable_and_mark(role, object);
@@ -813,6 +843,26 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
 }
 
 
+void LayerTools::build_material_visits()
+{
+    material_visits.clear();
+    if (fiber_visit_view.empty()) return;
+    auto append_material = [&](unsigned material) {
+        if (material_visits.empty() || material_visits.back() != material)
+            material_visits.push_back(material);
+    };
+    for (unsigned material : extruders) {
+        append_material(material); // Shared skirt / tower attachment entry.
+        for (const auto& base : fiber_visit_view) {
+            if (base.phase != FiberPhase::ResinBase || base.material != material) continue;
+            append_material(material);
+            for (const auto& visit : fiber_visit_view)
+                if (visit.object == base.object && visit.instance == base.instance && visit.phase != FiberPhase::ResinBase)
+                    append_material(visit.material);
+        }
+    }
+}
+
 void ToolOrdering::fill_wipe_tower_partitions(const PrintConfig &config, coordf_t object_bottom_z, coordf_t max_layer_height)
 {
     if (m_layer_tools.empty())
@@ -821,12 +871,14 @@ void ToolOrdering::fill_wipe_tower_partitions(const PrintConfig &config, coordf_
     // Count the minimum number of tool changes per layer.
     size_t last_extruder = size_t(-1);
     for (LayerTools &lt : m_layer_tools) {
-        lt.wipe_tower_partitions = lt.extruders.size();
-        if (! lt.extruders.empty()) {
-            if (last_extruder == size_t(-1) || last_extruder == lt.extruders.front())
+        lt.build_material_visits();
+        const auto& visits = lt.tool_visit_materials();
+        lt.wipe_tower_partitions = visits.size();
+        if (! visits.empty()) {
+            if (last_extruder == size_t(-1) || last_extruder == visits.front())
                 // The first extruder on this layer is equal to the current one, no need to do an initial tool change.
                 -- lt.wipe_tower_partitions;
-            last_extruder = lt.extruders.back();
+            last_extruder = visits.back();
         }
     }
 
@@ -923,16 +975,17 @@ void ToolOrdering::collect_extruder_statistics(bool prime_multi_material)
     m_first_printing_extruder = (unsigned int)-1;
     for (const auto &lt : m_layer_tools)
         if (! lt.extruders.empty()) {
-            m_first_printing_extruder = lt.extruders.front();
+            m_first_printing_extruder = lt.tool_visit_materials().front();
             break;
         }
 
     m_last_printing_extruder = (unsigned int)-1;
     for (auto lt_it = m_layer_tools.rbegin(); lt_it != m_layer_tools.rend(); ++ lt_it)
         if (! lt_it->extruders.empty()) {
-            m_last_printing_extruder = lt_it->extruders.back();
+            m_last_printing_extruder = lt_it->tool_visit_materials().back();
             break;
         }
+
 
     m_all_printing_extruders.clear();
     for (const auto &lt : m_layer_tools) {

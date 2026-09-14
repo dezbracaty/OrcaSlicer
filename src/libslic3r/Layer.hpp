@@ -4,6 +4,7 @@
 #include "libslic3r.h"
 #include "BoundingBox.hpp"
 #include "Flow.hpp"
+#include "FiberPlanning.hpp"
 #include "SurfaceCollection.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include "BoundingBox.hpp"
@@ -57,6 +58,11 @@ public:
     ExPolygons                  fill_expolygons;
     // collection of surfaces for infill generation
     SurfaceCollection           fill_surfaces;
+    SurfaceCollection           fiber_original_surfaces;
+    std::vector<FiberRegionRecipe> fiber_recipes;
+    std::vector<ResinRequest> fiber_resin_requests;
+    ExtrusionEntityCollection fiber_paths;
+    ExtrusionEntityCollection fiber_repairs;
     // BBS: Unspecified fill polygons, used for interecting when we don't want the infill/perimeter overlap
     ExPolygons                  fill_no_overlap_expolygons;
 

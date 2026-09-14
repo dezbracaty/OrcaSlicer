@@ -1,0 +1,150 @@
+{
+  "cases": [
+    {
+      "id": "A0",
+      "model": "rectangle.obj",
+      "patch": {
+        "generate_reinforced_perimeters": "0",
+        "generate_reinforced_infills": "0"
+      }
+    },
+    {
+      "id": "A1_0",
+      "model": "rectangle.obj",
+      "patch": {
+        "sparse_infill_density": "0%"
+      }
+    },
+    {
+      "id": "A1_15",
+      "model": "rectangle.obj",
+      "patch": {
+        "sparse_infill_density": "15%"
+      }
+    },
+    {
+      "id": "A1_100",
+      "model": "rectangle.obj",
+      "patch": {
+        "sparse_infill_density": "100%"
+      }
+    },
+    {
+      "id": "A2_perimeter",
+      "model": "rectangle.obj",
+      "patch": {
+        "generate_reinforced_infills": "0"
+      }
+    },
+    {
+      "id": "A2_rectilinear",
+      "model": "rectangle.obj",
+      "patch": {
+        "generate_reinforced_perimeters": "0"
+      }
+    },
+    {
+      "id": "A2_concentric",
+      "model": "rectangle.obj",
+      "patch": {
+        "reinforced_infill_pattern": "concentric"
+      }
+    },
+    {
+      "id": "A2_combined",
+      "model": "rectangle.obj",
+      "patch": {}
+    },
+    {
+      "id": "A3_1",
+      "model": "tall_rectangle.obj",
+      "patch": {
+        "fiber_layer_height_ratio": "1",
+        "solid_infill_rotate_template": "0,45,90,135"
+      }
+    },
+    {
+      "id": "A3_2",
+      "model": "tall_rectangle.obj",
+      "patch": {
+        "fiber_layer_height_ratio": "2",
+        "solid_infill_rotate_template": "0,45,90,135"
+      }
+    },
+    {
+      "id": "A3_3",
+      "model": "tall_rectangle.obj",
+      "patch": {
+        "fiber_layer_height_ratio": "3",
+        "solid_infill_rotate_template": "0,45,90,135"
+      }
+    },
+    {
+      "id": "A4_hole",
+      "model": "hole.obj",
+      "patch": {}
+    },
+    {
+      "id": "A4_double_island",
+      "model": "double_island.obj",
+      "patch": {}
+    },
+    {
+      "id": "A4_narrow_tail",
+      "model": "narrow_tail.obj",
+      "patch": {}
+    },
+    {
+      "id": "A7_hop_0",
+      "model": "rectangle.obj",
+      "patch": {
+        "fiber_z_hop": "0"
+      }
+    },
+    {
+      "id": "A7_hop_0.5",
+      "model": "rectangle.obj",
+      "patch": {
+        "fiber_z_hop": "0.5"
+      }
+    },
+    {
+      "id": "A9_finish",
+      "model": "rectangle.obj",
+      "patch": {
+        "fiber_slow_length": "2",
+        "fiber_finish_ironing_distance": "3"
+      }
+    },
+    {
+      "id": "A10_swap",
+      "model": "narrow_tail.obj",
+      "patch": {
+        "filament_map": "2,1"
+      }
+    },
+    {
+      "id": "A11_instances",
+      "model": "rectangle.obj",
+      "patch": {
+        "skirt_loops": "1",
+        "brim_width": "2",
+        "brim_type": "outer_only"
+      }
+    },
+    {
+      "id": "A12_reslice",
+      "model": "rectangle.obj",
+      "patch": {
+        "fiber_layer_height_ratio": "2"
+      }
+    },
+    {
+      "id": "A13_tower",
+      "model": "rectangle.obj",
+      "patch": {
+        "enable_prime_tower": "1"
+      }
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+#include "FiberPlanning.hpp"
 #include "Config.hpp"
 #include "Exception.hpp"
 #include "Print.hpp"
@@ -2276,6 +2277,8 @@ void Print::normalize_belt_print_origin()
 // Slicing process, running at a background thread.
 void Print::process(long long *time_cost_with_cache, bool use_cache)
 {
+    validate_fiber_configuration(*this);
+    if (fiber_active(*this)) use_cache = false;
     long long start_time = 0, end_time = 0;
     if (time_cost_with_cache)
         *time_cost_with_cache = 0;
@@ -3591,7 +3594,7 @@ void Print::_make_wipe_tower()
 
             used_filament_ids.insert(layer_tools.extruders.begin(), layer_tools.extruders.end());
 
-            for (const auto filament_id : layer_tools.extruders) {
+            for (const auto filament_id : layer_tools.tool_visit_materials()) {
                 if (filament_id == current_filament_id)
                     continue;
 
@@ -3715,7 +3718,7 @@ void Print::_make_wipe_tower()
                 bool first_layer = &layer_tools == &m_wipe_tower_data.tool_ordering.front();
                 wipe_tower.plan_toolchange((float) layer_tools.print_z, (float) layer_tools.wipe_tower_layer_height, current_extruder_id,
                                            current_extruder_id, false);
-                for (const auto extruder_id : layer_tools.extruders) {
+                for (const auto extruder_id : layer_tools.tool_visit_materials()) {
                     if ((first_layer && extruder_id == m_wipe_tower_data.tool_ordering.all_extruders().back()) || extruder_id !=
                         current_extruder_id) {
                         float volume_to_wipe = m_config.prime_volume;
@@ -4755,6 +4758,8 @@ static void from_json(const json& j, groupedVolumeSlices& firstlayer_group)
 
 int Print::export_cached_data(const std::string& directory, bool with_space)
 {
+    if (fiber_active(*this)) return 0; // Fiber process metadata is not stored in completed-layer JSON.
+
     int ret = 0;
     boost::filesystem::path directory_path(directory);
 
@@ -5023,6 +5028,8 @@ int Print::export_cached_data(const std::string& directory, bool with_space)
 
 int Print::load_cached_data(const std::string& directory)
 {
+    if (fiber_active(*this)) return 0; // Fiber process metadata is not stored in completed-layer JSON.
+
     int ret = 0;
     boost::filesystem::path directory_path(directory);
 

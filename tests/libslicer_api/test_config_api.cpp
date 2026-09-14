@@ -82,11 +82,16 @@ TEST_CASE("configuration exposes one grouped settings snapshot", "[libslicer_api
     const auto items = libslicer::Config::defaults().settings();
     REQUIRE(items.size() > 100);
 
+    const std::set<std::string> compatibility_only_keys{"stress_range_tensile", "stress_range_compress",
+        "fiber_travel_max_length", "fiber_infill_arc_ratio", "fiber_end_min_length",
+        "fiber_middle_min_length", "fiber_slow_length", "fiber_start_max_speed",
+        "fiber_normal_min_limit_speed", "fiber_finish_min_limit_speed"};
     std::set<std::string> unique_keys;
     for (const auto& item : items) {
-        CHECK(item.visible);
+        CHECK(item.visible == (compatibility_only_keys.count(item.key) == 0));
         CHECK(unique_keys.insert(item.key).second);
     }
+    for (const auto& key : compatibility_only_keys) CHECK(unique_keys.count(key) == 1);
 
     const auto* layer_height = find_item(items, "layer_height");
     REQUIRE(layer_height != nullptr);
@@ -271,6 +276,7 @@ TEST_CASE("library resizes variable filament slots atomically", "[libslicer_api]
     auto activated = library->activate_config(selection);
     REQUIRE(activated.success);
     REQUIRE(activated.view.filament_slots.size() == 1);
+    const auto preset_default_color = activated.view.filament_slots.front().color;
     REQUIRE(library->set_active_filament_color(0, {0x24, 0x74, 0xd8, 0xff}));
 
     const auto resized = library->resize_active_filament_slots(4);
@@ -278,7 +284,10 @@ TEST_CASE("library resizes variable filament slots atomically", "[libslicer_api]
     REQUIRE(resized.view.filament_slots.size() == 4);
     CHECK(resized.view.selection.filament_preset_ids.size() == 4);
     CHECK(resized.view.filament_slots[0].color.red == 0x24);
-    CHECK(resized.view.filament_slots[3].color.blue == 0xd8);
+    CHECK(resized.view.filament_slots[3].color.red == preset_default_color.red);
+    CHECK(resized.view.filament_slots[3].color.green == preset_default_color.green);
+    CHECK(resized.view.filament_slots[3].color.blue == preset_default_color.blue);
+    CHECK(resized.view.filament_slots[3].color.alpha == preset_default_color.alpha);
     CHECK(library->validate_active_config().empty());
 
     const auto rejected = library->resize_active_filament_slots(5);

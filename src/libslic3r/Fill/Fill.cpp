@@ -1,3 +1,4 @@
+#include "../FiberPlanning.hpp"
 #include <assert.h>
 #include <stdio.h>
 #include <memory>
@@ -1219,6 +1220,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
+    prepare_fiber_fill_sources(*this);
     LockRegionParam lock_param;
     std::vector<SurfaceFill>     surface_fills = group_fills(*this, lock_param);
 	const Slic3r::BoundingBox bbox 			= this->object()->bounding_box();
@@ -1357,6 +1359,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 		}
     }
 
+    make_fiber_fills(*this);
+
     // add thin fill regions
     // Unpacks the collection, creates multiple collections per path.
     // The path type could be ExtrusionPath, ExtrusionLoop or ExtrusionEntityCollection.
@@ -1367,6 +1371,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 	        layerm->fills.entities.push_back(&collection);
 	        collection.entities.push_back(thin_fill->clone());
 	    }
+
+    check_fiber_resin_coverage(*this);
 
 #ifndef NDEBUG
 	for (LayerRegion *layerm : m_regions)

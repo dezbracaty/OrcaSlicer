@@ -3,6 +3,7 @@
 #include "ExPolygon.hpp"
 #include "ClipperUtils.hpp"
 #include "Extruder.hpp"
+#include "FiberProcess.hpp"
 #include "Flow.hpp"
 #include <cmath>
 #include <limits>
@@ -676,4 +677,38 @@ void ExtrusionPathContoured::reverse() {
     std::reverse(this->z_diffs.begin(), this->z_diffs.end());
 }
 
+ExtrusionFiberPath::ExtrusionFiberPath(std::shared_ptr<const PreparedFiberPath> path)
+    : prepared(std::move(path))
+    , m_first(Vec2crd(prepared->entry), coord_t(0))
+    , m_last(Vec2crd(prepared->exit), coord_t(0))
+{}
+
+void ExtrusionFiberPath::reverse()
+{
+    throw std::logic_error("Cannot reverse a finalized continuous fiber chain");
 }
+
+Point ExtrusionFiberPath::first_point() const { return prepared->entry; }
+Point ExtrusionFiberPath::last_point() const { return prepared->exit; }
+
+void ExtrusionFiberPath::polygons_covered_by_width(Polygons& out, float epsilon) const
+{
+    append(out, offset(prepared->display, scale_(prepared->config.width_mm * 0.5) + epsilon));
+}
+
+Polyline ExtrusionFiberPath::as_polyline() const { return prepared->display; }
+
+void ExtrusionFiberPath::collect_polylines(Polylines& out) const
+{
+    out.push_back(prepared->display);
+}
+
+void ExtrusionFiberPath::collect_points(Points& out) const
+{
+    append(out, prepared->display.points);
+}
+
+double ExtrusionFiberPath::length() const { return scale_(prepared->length_mm); }
+BoundingBox ExtrusionFiberPath::bounding_box() const { return prepared->display.bounding_box(); }
+
+} // namespace Slic3r

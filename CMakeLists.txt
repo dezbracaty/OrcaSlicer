@@ -300,6 +300,7 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Flashforge.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/BBL.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Ideaformer.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/CFSYS.json"
     DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/profiles"
 )
 install(DIRECTORY
@@ -307,6 +308,7 @@ install(DIRECTORY
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Flashforge"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/BBL"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Ideaformer"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/CFSYS"
     DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/profiles"
 )
 install(FILES

@@ -1,0 +1,55 @@
+{
+    "type": "filament",
+    "filament_id": "GFL99",
+    "setting_id": "GFSA04",
+    "name": "CFSYS PLA",
+    "from": "system",
+    "instantiation": "true",
+    "inherits": "fdm_filament_pla",
+    "default_filament_colour": [
+        "#00DD00"
+    ],
+    "enable_pressure_advance": [
+        "1"
+    ],
+    "pressure_advance": [
+        "0.032"
+    ],
+    "slow_down_layer_time": [
+        "4"
+    ],
+    "filament_density": [
+        "1.24"
+    ],
+    "filament_max_volumetric_speed": [
+        "12"
+    ],
+    "hot_plate_temp": [
+        "60"
+    ],
+    "hot_plate_temp_initial_layer": [
+        "60"
+    ],
+    "nozzle_temperature": [
+        "210"
+    ],
+    "nozzle_temperature_initial_layer": [
+        "210"
+    ],
+    "nozzle_temperature_range_low": [
+        "190"
+    ],
+    "slow_down_min_speed": [
+        "10"
+    ],
+    "support_material_interface_fan_speed": [
+        "100"
+    ],
+    "compatible_printers": [
+      "CFSYS Alpha500 0.4 nozzle",
+	  "CFSYS Alpha500 Printer 0.2 nozzle",
+	  "CFSYS Alpha500 Printer 0.4 nozzle",
+	  "CFSYS Alpha500 Printer 0.6 nozzle",
+	  "CFSYS Alpha500 Printer 0.8 nozzle"
+    ]
+}

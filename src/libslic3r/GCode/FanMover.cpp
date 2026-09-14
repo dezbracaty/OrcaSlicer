@@ -278,6 +278,27 @@ void FanMover::_process_T(const std::string_view command)
 
 void FanMover::_process_gcode_line(GCodeReader& reader, const GCodeReader::GCodeLine& line)
 {
+    // Fiber blocks retain their original E/F and command boundaries. GCodeReader
+    // still parses every line and updates the position used by subsequent plastic.
+    if (line.raw().find(";FIBER_BEGIN ") == 0) {
+        for (auto it = m_buffer.begin(); it != m_buffer.end();) {
+            m_process_output += it->raw + "\n";
+            if (it->fan_speed >= 0) m_front_buffer_fan_speed = it->fan_speed;
+            it = remove_from_buffer(it);
+        }
+        m_current_kickstart.time = -1;
+        m_fiber_passthrough = true;
+    }
+    if (m_fiber_passthrough) {
+        if (line.has_f()) m_current_speed = line.f() / 60.0;
+        const std::string command(line.cmd());
+        if (!command.empty() && (command.front() == 'T' || command.front() == 't')) _process_T(command);
+        const int speed = get_fan_speed(line.raw(), m_writer.config.gcode_flavor);
+        if (speed >= 0) m_front_buffer_fan_speed = m_back_buffer_fan_speed = 100 * speed / 255;
+        m_process_output += line.raw() + "\n";
+        if (line.raw().find(";FIBER_END") == 0) m_fiber_passthrough = false;
+        return;
+    }
     // processes 'normal' gcode lines
     bool need_flush = false;
     std::string cmd(line.cmd());

@@ -77,6 +77,12 @@ void PrintRegion::collect_object_printing_extruders(const PrintConfig &print_con
     	int i = std::max(0, extruder_id - 1);
         object_extruders.emplace_back((i >= num_extruders) ? 0 : i);
     };
+    if (region_config.generate_reinforced_infills.value)
+        object_extruders.push_back(region_config.reinforced_infill_filament.value - 1);
+    if (region_config.generate_reinforced_perimeters.value)
+        object_extruders.push_back(region_config.reinforced_perimeters_filament.value - 1);
+    if (region_config.generate_reinforced_infills.value || region_config.generate_reinforced_perimeters.value)
+        object_extruders.push_back(region_config.internal_solid_filament_id.value - 1);
     if (region_config.wall_loops.value > 0 || has_brim) {
     	emplace_extruder(region_config.outer_wall_filament_id);
                 if (region_config.wall_loops.value > 1)
