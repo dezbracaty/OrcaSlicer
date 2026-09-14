@@ -103,26 +103,21 @@ TEST_CASE("A11 planned fiber visits retain two object and two instance identitie
  CHECK(occurrences.size()==4);
 }
 
-TEST_CASE("Alpha500 alone resolves the fixed two-tool Auto mapping", "[fiber][config][mapping]")
+TEST_CASE("Fixed physical filament slots normalize to identity mapping", "[fiber][config][mapping]")
 {
     auto settings = DynamicPrintConfig::full_print_config();
     settings.set_num_extruders(2);
     settings.set_num_filaments(2);
-    settings.set_key_value("filament_map_mode", new ConfigOptionEnum<FilamentMapMode>(fmmAutoForFlush));
-    settings.set_key_value("filament_map", new ConfigOptionInts({2, 1}));
-
-    settings.set_key_value("printer_model", new ConfigOptionString("Unrelated dual-tool printer"));
-    CHECK_FALSE(resolve_fixed_filament_map(settings, 2));
-    CHECK(settings.option<ConfigOptionInts>("filament_map")->values == std::vector<int>{2, 1});
-
-    settings.set_key_value("printer_model", new ConfigOptionString("CFSYS Alpha500 Printer"));
-    CHECK(resolve_fixed_filament_map(settings, 2));
-    CHECK(settings.option<ConfigOptionInts>("filament_map")->values == std::vector<int>{1, 2});
-
     settings.set_key_value("filament_map_mode", new ConfigOptionEnum<FilamentMapMode>(fmmManual));
     settings.set_key_value("filament_map", new ConfigOptionInts({2, 1}));
-    CHECK_FALSE(resolve_fixed_filament_map(settings, 2));
+
+    CHECK_FALSE(normalize_fixed_filament_slots(settings, 2));
     CHECK(settings.option<ConfigOptionInts>("filament_map")->values == std::vector<int>{2, 1});
+
+    settings.set_key_value("filament_slots_bound_to_physical_tools", new ConfigOptionBool(true));
+    CHECK(normalize_fixed_filament_slots(settings, 2));
+    CHECK(settings.option<ConfigOptionInts>("filament_map")->values == std::vector<int>{1, 2});
+    CHECK(settings.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode")->value == fmmDefault);
 }
 
 TEST_CASE("D5 coverage permits unprintable boundary remnants and rejects missing resin", "[fiber][D5][coverage]") {
@@ -155,14 +150,14 @@ TEST_CASE("D5 coverage permits unprintable boundary remnants and rejects missing
 }
 
 TEST_CASE("CFSYS CCF accepts its real diameter with reinforcement on or off", "[fiber][config][CFSYS]") {
- FullPrintConfig settings;settings.filament_diameter.values={1.75,.35};settings.filament_type.values={"PLA","CCF"};
+ FullPrintConfig settings;settings.filament_diameter.values={1.75,.35};settings.filament_type.values={"PLA","Renamed continuous fiber"};settings.filament_is_ccf.values={false,true};
  for(bool active:{false,true}) {
   settings.generate_reinforced_infills.value=active;
   CHECK(validate(settings).count("filament_diameter")==0);
  }
- settings.filament_type.values[1]="PLA";
+ settings.filament_is_ccf.values[1]=false;
  CHECK(validate(settings).count("filament_diameter")==1);
- settings.filament_type.values[1]="CCF";
+ settings.filament_is_ccf.values[1]=true;
  for(double invalid:{0.,-.35,std::numeric_limits<double>::infinity(),std::numeric_limits<double>::quiet_NaN()}) {
   settings.filament_diameter.values[1]=invalid;
   CHECK(validate(settings).count("filament_diameter")==1);

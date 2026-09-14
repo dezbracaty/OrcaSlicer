@@ -48,14 +48,19 @@ TEST_CASE("A12 reslice cancellation preserves saved output and reimport semantic
  libslicer::SliceRequest request;request.config=config.snapshot();
  request.objects.push_back({(assets()/"rectangle.obj").string(),{}});
  request.output_gcode_path=(std::filesystem::current_path()/"fiber-A12-semantics.gcode").string();
+ request.output_gcode_3mf_path=(std::filesystem::current_path()/"fiber-A12-semantics.gcode.3mf").string();
  auto initial=sdk->slice(request);REQUIRE(initial.success);REQUIRE(initial.preview);assert_fiber(*initial.preview);
  REQUIRE(config.set("fiber_layer_height_ratio","2").success);request.config=config.snapshot();
  auto changed=sdk->slice(request);REQUIRE(changed.success);REQUIRE(changed.preview);
  const auto saved_text=[&request](){std::ifstream input(request.output_gcode_path);REQUIRE(input.is_open());return std::string((std::istreambuf_iterator<char>(input)),{});};
  const auto saved=saved_text();REQUIRE_FALSE(saved.empty());
+ const auto package_path=request.output_gcode_3mf_path;
+ const auto saved_package=[&package_path](){std::ifstream input(package_path,std::ios::binary);REQUIRE(input.is_open());return std::string((std::istreambuf_iterator<char>(input)),{});};
+ const auto packaged=saved_package();REQUIRE_FALSE(packaged.empty());
  libslicer::SliceCallbacks cancel;cancel.is_cancelled=[](){return true;};
  const auto cancelled=sdk->slice(request,cancel);CHECK(cancelled.cancelled);CHECK_FALSE(cancelled.success);
  CHECK(saved_text()==saved);
+ CHECK(saved_package()==packaged);
  auto retried=sdk->slice(request);REQUIRE(retried.success);REQUIRE(retried.preview);
  CHECK(fiber_semantics(*changed.preview)==fiber_semantics(*retried.preview));
  auto fresh_library=library();REQUIRE(fresh_library);
@@ -66,10 +71,11 @@ TEST_CASE("A12 reslice cancellation preserves saved output and reimport semantic
  CHECK(fiber_semantics(*reloaded.preview)==fiber_semantics(*fresh.preview));
  CHECK(reloaded.preview->statistics.total_fiber_deposition_length_mm==Catch::Approx(fresh.preview->statistics.total_fiber_deposition_length_mm));
  std::filesystem::remove(request.output_gcode_path);
+ std::filesystem::remove(request.output_gcode_3mf_path);
 }
 TEST_CASE("A13 belt object-order and dedicated support conflict diagnostics identify keys", "[libslicer_api][fiber][A13]") {
  auto sdk=library();REQUIRE(sdk);
- for(const auto& patch:nlohmann::json::array({{{"printer_structure","belt"}},{{"print_sequence","by object"}},{{"enable_support","1"},{"support_filament","2"}}})){
+ for(const auto& patch:nlohmann::json::array({{{"printer_structure","belt"}},{{"print_sequence","by object"}},{{"enable_support","1"},{"support_filament","2"}},{{"infill_combination","1"}}})){
   auto config=fixture_config(patch);libslicer::SliceRequest request;request.config=config.snapshot();request.objects.push_back({(assets()/"rectangle.obj").string(),{}});auto result=sdk->slice(request);CHECK_FALSE(result.success);REQUIRE_FALSE(result.diagnostics.empty());std::string diagnostics;for(const auto& d:result.diagnostics)diagnostics+=d.message;CHECK(diagnostics.find("Continuous fiber configuration conflict")!=std::string::npos);
  }
 }
@@ -84,6 +90,31 @@ TEST_CASE("Legacy ineffective controls remain parseable and persist without inve
   REQUIRE(found!=definitions.end());CHECK_FALSE(found->visible);CHECK(found->value=="7");
   REQUIRE(configuration.reset(item.key()).success);CHECK(saved.value(item.key())=="7");
  }
+}
+
+TEST_CASE("Changing the fiber pattern does not mutate the perimeter enable flag", "[libslicer_api][fiber][config]") {
+ auto configuration=libslicer::Config::defaults();
+ REQUIRE(configuration.set("generate_reinforced_perimeters","0").success);
+ REQUIRE(configuration.set("reinforced_infill_pattern","rectilinear").success);
+ CHECK(configuration.snapshot().value("generate_reinforced_perimeters")=="0");
+ REQUIRE(configuration.set("generate_reinforced_perimeters","1").success);
+ REQUIRE(configuration.set("reinforced_infill_pattern","concentric").success);
+ CHECK(configuration.snapshot().value("generate_reinforced_perimeters")=="1");
+}
+
+TEST_CASE("Malformed external fiber tags degrade to ordinary preview motion", "[libslicer_api][fiber][gcode]") {
+ const auto path=std::filesystem::current_path()/"malformed-fiber-tags.gcode";
+ {
+  std::ofstream out(path);
+  out<<"G21\nG90\nM83\n;LAYER:0\nG1 X0 Y0 Z0.2 F1200\n"
+       ";FIBER_PHASE invalid\n;FIBER_BEGIN v=2 path=bad object=x instance=0 width=-1\n"
+       ";FIBER_START\nG1 X20 Y0 E1 F600\n;FIBER_END\n";
+  REQUIRE(out.good());
+ }
+ auto sdk=library();REQUIRE(sdk);libslicer::GCodePreviewRequest request;request.gcode_path=path.string();
+ const auto imported=sdk->load_gcode_preview(request);std::filesystem::remove(path);
+ REQUIRE(imported.success);REQUIRE(imported.preview);CHECK_FALSE(imported.diagnostics.empty());
+ CHECK(std::all_of(imported.preview->segments.begin(),imported.preview->segments.end(),[](const auto& segment){return segment.deposition_process==libslicer::ToolpathDepositionProcess::Plastic;}));
 }
 
 TEST_CASE("Manual mapping project keys are writable without changing the Auto default", "[libslicer_api][fiber][config]") {
@@ -115,8 +146,11 @@ TEST_CASE("A12 original fixed dual tools preserve independent material edits and
         return model.id.rfind("CFSYS", 0) == 0;
     }) == 1);
     REQUIRE(cfsys->variants.size() == 1);
+    CHECK(std::filesystem::is_regular_file(cfsys->bed_model_path));
+    CHECK(cfsys->bed_texture_path.empty());
     CHECK(cfsys->variants.front().id == "0.4");
     CHECK(cfsys->variants.front().physical_tool_count == 2);
+    CHECK(cfsys->variants.front().filament_slots_bound_to_physical_tools);
     libslicer::ConfigSelection selection;
     selection.machine_model_id = "CFSYS Alpha500 Printer";
     selection.machine_variant_id = "0.4";
@@ -126,6 +160,12 @@ TEST_CASE("A12 original fixed dual tools preserve independent material edits and
     CHECK(sdk->active_config()->selection.filament_preset_ids ==
           std::vector<std::string>{"CFSYS CIRON", "CFSYS CCF"});
     REQUIRE(sdk->active_config()->filament_slots.size() == 2);
+    CHECK(sdk->active_config()->filament_slots[0].physical_tool_index == 0);
+    CHECK(sdk->active_config()->filament_slots[0].physical_tool_role == "substrate");
+    CHECK(sdk->active_config()->filament_slots[0].physical_tool_side == "right");
+    CHECK(sdk->active_config()->filament_slots[1].physical_tool_index == 1);
+    CHECK(sdk->active_config()->filament_slots[1].physical_tool_role == "continuous_fiber");
+    CHECK(sdk->active_config()->filament_slots[1].physical_tool_side == "left");
     CHECK(sdk->active_config()->filament_slots[0].color.red == 0x80);
     CHECK(sdk->active_config()->filament_slots[0].color.green == 0x80);
     CHECK(sdk->active_config()->filament_slots[0].color.blue == 0x80);
@@ -134,36 +174,41 @@ TEST_CASE("A12 original fixed dual tools preserve independent material edits and
     CHECK(sdk->active_config()->filament_slots[1].color.blue == 0x80);
     auto snapshot = *sdk->active_config_snapshot();
     CHECK(snapshot.value("filament_map") == "1,2");
+    CHECK(snapshot.value("filament_map_mode") == "Default");
     CHECK(snapshot.value("initial_layer_print_height") == "0.15");
     CHECK(snapshot.value("layer_height") == "0.13");
     CHECK(snapshot.value("sparse_infill_density") == "40%");
     CHECK(snapshot.value("travel_acceleration") == "5000");
     CHECK(snapshot.value("fiber_travel_speed") == "60");
     CHECK(snapshot.value("fiber_z_down_speed") == "3");
-    REQUIRE(sdk->set_active_filament_preset(1, "CFSYS CIRON"));
-    REQUIRE(sdk->apply_active_config_patch({{"filament_map_mode", "Manual"}, {"filament_map", "2,1"},
+    REQUIRE(sdk->set_active_filament_preset(0, "CFSYS ABS"));
+    CHECK(sdk->active_config_snapshot()->value("filament_map") == "1,2");
+    const auto valid_base_material = *sdk->active_config_snapshot();
+    CHECK_FALSE(sdk->set_active_filament_preset(1, "CFSYS CIRON"));
+    CHECK(sdk->active_config_snapshot()->values() == valid_base_material.values());
+    CHECK_FALSE(sdk->apply_active_config_patch({{"filament_map_mode", "Manual"}, {"filament_map", "2,1"}}));
+    REQUIRE(sdk->apply_active_config_patch({
         {"fiber_layer_height_ratio", "3"}, {"nozzle_temperature", "271,279"}}));
     REQUIRE(sdk->set_active_filament_color(0, {18, 52, 86, 255}));
-    REQUIRE(sdk->set_active_filament_preset(1, "CFSYS CCF"));
     snapshot = *sdk->active_config_snapshot();
-    CHECK(snapshot.value("filament_map_mode") == "Manual");
-    CHECK(snapshot.value("filament_map") == "2,1");
+    CHECK(snapshot.value("filament_map_mode") == "Default");
+    CHECK(snapshot.value("filament_map") == "1,2");
     CHECK(snapshot.value("fiber_layer_height_ratio") == "3");
     REQUIRE(snapshot.value("nozzle_temperature"));
     CHECK(snapshot.value("nozzle_temperature")->rfind("271,", 0) == 0);
     CHECK(snapshot.value("nozzle_temperature") != "271,279");
     CHECK(snapshot.value("filament_is_ccf") == "0,1");
     CHECK(sdk->active_config()->filament_slots[0].color.red == 18);
-    CHECK(sdk->active_config()->filament_slots[0].physical_tool_index == 1);
+    CHECK(sdk->active_config()->filament_slots[0].physical_tool_index == 0);
     CHECK(sdk->active_config()->filament_slots[1].color.red == 0xff);
     CHECK(sdk->active_config()->filament_slots[1].color.green == 0x00);
     CHECK(sdk->active_config()->filament_slots[1].color.blue == 0x80);
-    CHECK(sdk->active_config()->filament_slots[1].physical_tool_index == 0);
+    CHECK(sdk->active_config()->filament_slots[1].physical_tool_index == 1);
     const auto revision = sdk->active_config()->revision;
     CHECK_FALSE(sdk->set_active_filament_preset(1, "missing material"));
     CHECK(sdk->active_config()->revision == revision);
     CHECK(sdk->active_config_snapshot()->values() == snapshot.values());
-    REQUIRE(sdk->apply_active_config_patch({{"filament_map_mode", "Auto For Flush"}}));
+    CHECK_FALSE(sdk->set_active_filament_preset(0, "CFSYS CCF"));
     CHECK(sdk->active_config_snapshot()->value("filament_map") == "1,2");
     CHECK(sdk->active_config_snapshot()->value("fiber_layer_height_ratio") == "3");
 }
@@ -176,9 +221,7 @@ TEST_CASE("A11 original Alpha500 settings slice with tower and flush flags intac
     selection.process_preset_id = "CCF&CIRON @CFSYS";
     selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
     REQUIRE(sdk->activate_config(selection));
-    for (const bool swap : {false, true}) {
-        CAPTURE(swap);
-        if (swap) REQUIRE(sdk->apply_active_config_patch({{"filament_map_mode", "Manual"}, {"filament_map", "2,1"}}));
+    {
         libslicer::SliceRequest request;
         request.config = *sdk->active_config_snapshot();
         CHECK(request.config.value("enable_prime_tower") == "1");
@@ -192,7 +235,7 @@ TEST_CASE("A11 original Alpha500 settings slice with tower and flush flags intac
         size_t tower_segments = 0;
         for (const auto& segment : result.preview->segments) {
             if (segment.deposition_process == libslicer::ToolpathDepositionProcess::Fiber)
-                CHECK(segment.tool_id == (swap ? 0 : 1));
+                CHECK(segment.tool_id == 1);
             if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::WipeTower) ++tower_segments;
         }
         CHECK(tower_segments > 0);

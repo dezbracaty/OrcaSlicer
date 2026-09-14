@@ -1612,6 +1612,7 @@ void GCodeProcessorResult::reset() {
     optimal_assignment.clear();
     filament_change_count_map.clear();
     warnings.clear();
+    fiber_tag_diagnostics.clear();
 
     //BBS: add mutex for protection of gcode result
     unlock();
@@ -2424,7 +2425,9 @@ void GCodeProcessor::enable_stealth_time_estimator(bool enabled)
 
 void GCodeProcessor::reset()
 {
-    m_fiber_deposition=false; m_fiber_tail=false; m_fiber_event=0; m_fiber_phase=0; m_fiber_path_id.clear();
+    m_fiber_deposition=false; m_fiber_tail=false; m_fiber_block_valid=false;
+    m_fiber_event=0; m_fiber_phase=0; m_fiber_path_id.clear();
+    m_fiber_object=0xffffffffu; m_fiber_instance=0xffffffffu; m_fiber_width_mm=0.0f;
 
     m_units = EUnits::Millimeters;
     m_global_positioning_type = EPositioningType::Absolute;
@@ -3044,24 +3047,43 @@ bool GCodeProcessor::get_last_position_from_gcode(const std::string &gcode_str, 
 
 void GCodeProcessor::process_tags(const std::string_view comment, bool producers_enabled)
 {
+    const auto invalid_fiber_tag = [this](std::string message) {
+        m_result.fiber_tag_diagnostics.push_back(
+            "Line " + std::to_string(m_line_id) + ": " + std::move(message));
+    };
     if (comment.substr(0, 11) == "FIBER_BEGIN") {
-        m_fiber_deposition=false; m_fiber_tail=false; m_fiber_event=0;
+        m_fiber_deposition=false; m_fiber_tail=false; m_fiber_block_valid=false; m_fiber_event=0;
+        m_fiber_path_id.clear();m_fiber_object=0xffffffffu;m_fiber_instance=0xffffffffu;m_fiber_width_mm=0.0f;
+        unsigned version=0;bool has_version=false,has_path=false,has_object=false,has_instance=false,has_width=false,valid=true;
         std::istringstream fields{std::string(comment)}; std::string field;
         while (fields >> field) {
             const auto equal=field.find('='); if(equal==std::string::npos)continue;
             const auto key=field.substr(0,equal),value=field.substr(equal+1);
-            if(key=="path")m_fiber_path_id=value;
-            else if(key=="object")m_fiber_object=std::stoul(value);
-            else if(key=="instance")m_fiber_instance=std::stoul(value);
-            else if(key=="width")m_fiber_width_mm=std::stof(value);
+            if(key=="v") {has_version=parse_number(value,version);valid=valid&&has_version&&version==1;}
+            else if(key=="path") {m_fiber_path_id=value;has_path=!value.empty();valid=valid&&has_path;}
+            else if(key=="object") {has_object=parse_number(value,m_fiber_object);valid=valid&&has_object;}
+            else if(key=="instance") {has_instance=parse_number(value,m_fiber_instance);valid=valid&&has_instance;}
+            else if(key=="width") {has_width=parse_number(value,m_fiber_width_mm);valid=valid&&has_width&&std::isfinite(m_fiber_width_mm)&&m_fiber_width_mm>0;}
         }
+        m_fiber_block_valid=valid&&has_version&&has_path&&has_object&&has_instance&&has_width;
+        if(!m_fiber_block_valid)invalid_fiber_tag("invalid or unsupported FIBER_BEGIN tag; block imported as ordinary motion");
         return;
     }
-    if (comment.substr(0,11)=="FIBER_START") {m_fiber_deposition=true;m_fiber_event=1;store_move_vertex(EMoveType::Custom_GCode);m_fiber_event=0;return;}
-    if (comment.substr(0,9)=="FIBER_CUT") {m_fiber_event=2;store_move_vertex(EMoveType::Custom_GCode);m_fiber_event=0;return;}
-    if (comment.substr(0,10)=="FIBER_TAIL") {m_fiber_tail=true;return;}
-    if (comment.substr(0,9)=="FIBER_END") {m_fiber_deposition=false;m_fiber_tail=false;m_fiber_path_id.clear();return;}
-    if (comment.substr(0,11)=="FIBER_PHASE") {m_fiber_phase=static_cast<unsigned char>(std::stoi(std::string(comment.substr(12))));return;}
+    if (comment.substr(0,11)=="FIBER_START") {if(m_fiber_block_valid){m_fiber_deposition=true;m_fiber_event=1;store_move_vertex(EMoveType::Custom_GCode);m_fiber_event=0;}return;}
+    if (comment.substr(0,9)=="FIBER_CUT") {if(m_fiber_block_valid){m_fiber_event=2;store_move_vertex(EMoveType::Custom_GCode);m_fiber_event=0;}return;}
+    if (comment.substr(0,10)=="FIBER_TAIL") {if(m_fiber_block_valid)m_fiber_tail=true;return;}
+    if (comment.substr(0,9)=="FIBER_END") {m_fiber_deposition=false;m_fiber_tail=false;m_fiber_block_valid=false;m_fiber_path_id.clear();return;}
+    if (comment.substr(0,11)=="FIBER_PHASE") {
+        int phase=0;
+        const auto value=comment.substr(11);
+        const auto first=value.find_first_not_of(" \t");
+        auto text=first==value.npos?std::string_view{}:value.substr(first);
+        const auto end=text.find_first_of(" \t");
+        if(end!=text.npos)text=text.substr(0,end);
+        if(!parse_number(text,phase)||phase<0||phase>2){invalid_fiber_tag("invalid FIBER_PHASE tag; ResinBase used");m_fiber_phase=0;}
+        else m_fiber_phase=static_cast<unsigned char>(phase);
+        return;
+    }
 
     // producers tags
     if (producers_enabled && process_producers_tags(comment))

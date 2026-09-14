@@ -1139,7 +1139,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     // Reuse the normal region resolver: a role value of zero means the
     // object's/default material, not absence of resin demand.
     auto include_fiber_materials = [&](size_t ordinary_count) {
-        std::set<int> demand;
+        size_t required_count = ordinary_count;
         PrintRegionConfig defaults;
         defaults.apply(new_full_config, true);
         const size_t materials = new_full_config.option<ConfigOptionFloats>("filament_diameter")->size();
@@ -1147,18 +1147,22 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             for (const auto* volume : object->volumes) {
                 const auto region = region_config_from_model_volume(defaults, nullptr, *volume, materials);
                 if (!fiber_active(region)) continue;
-                if (region.generate_reinforced_perimeters.value) demand.insert(region.reinforced_perimeters_filament.value);
-                if (region.generate_reinforced_infills.value) demand.insert(region.reinforced_infill_filament.value);
+                const auto require = [&required_count](int material) {
+                    if (material > 0)
+                        required_count = std::max(required_count, size_t(material));
+                };
+                if (region.generate_reinforced_perimeters.value) require(region.reinforced_perimeters_filament.value);
+                if (region.generate_reinforced_infills.value) require(region.reinforced_infill_filament.value);
                 for (int material : {region.inner_wall_filament_id.value, region.outer_wall_filament_id.value,
                      region.sparse_infill_filament_id.value, region.internal_solid_filament_id.value,
-                     region.top_surface_filament_id.value, region.bottom_surface_filament_id.value}) demand.insert(material);
+                     region.top_surface_filament_id.value, region.bottom_surface_filament_id.value}) require(material);
             }
         }
-        return int(std::max(ordinary_count, demand.size()));
+        return int(required_count);
     };
     //new_full_config.normalize_fdm(used_filaments);
     new_full_config.normalize_fdm_1();
-    resolve_fixed_filament_map(new_full_config, new_full_config.option<ConfigOptionFloats>("filament_diameter")->size());
+    normalize_fixed_filament_slots(new_full_config, new_full_config.option<ConfigOptionFloats>("filament_diameter")->size());
     t_config_option_keys changed_keys = new_full_config.normalize_fdm_2(objects().size(), include_fiber_materials(used_filaments.size()));
     if (changed_keys.size() > 0) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got changed_keys, size=%1%")%changed_keys.size();

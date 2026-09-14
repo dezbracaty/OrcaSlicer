@@ -4919,10 +4919,9 @@ LayerResult GCode::process_layer(
                 // Shall the support interface be printed with the active extruder, preferably with non-soluble, to avoid tool changes?
                 bool            interface_dontcare = object.config().support_interface_filament.value == 0;
 
-                if (!layer_tools.fiber_visit_view.empty()) {
-                    const unsigned resin = object.printing_region(0).config().internal_solid_filament_id.value - 1;
-                    if (support_dontcare) { support_extruder = resin; support_dontcare = false; }
-                    if (interface_dontcare) { interface_extruder = resin; interface_dontcare = false; }
+                if (const auto resin = fiber_resin_material(object)) {
+                    if (support_dontcare) { support_extruder = *resin; support_dontcare = false; }
+                    if (interface_dontcare) { interface_extruder = *resin; interface_dontcare = false; }
                 }
 
                 // BBS: apply wiping overridden extruders

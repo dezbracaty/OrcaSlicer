@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <fstream>
 #include <limits>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 namespace Slic3r {
@@ -54,6 +55,22 @@ FiberConfig resolve_fiber_config(const LayerRegion& layer,bool perimeter)
     out.perimeter_width_mm=Flow::new_from_config_width(frPerimeter,out.region.reinforced_perimeters_extrusion_width,out.nozzle_mm,out.height_mm).width();
     out.resin_width_mm=Flow::new_from_config_width(frSolidInfill,out.region.internal_solid_infill_line_width,out.resin_nozzle_mm,out.height_mm).width();
     out.flow_ratio=config.filament_flow_ratio.get_at(out.material);return out;
+}
+std::optional<unsigned> fiber_resin_material(const PrintObject& object)
+{
+    std::optional<unsigned> material;
+    for (size_t region_id = 0; region_id < object.num_printing_regions(); ++region_id) {
+        const auto& config = object.printing_region(region_id).config();
+        if (!fiber_active(config))
+            continue;
+        if (config.internal_solid_filament_id.value <= 0)
+            throw std::runtime_error("Continuous fiber resin material reference is invalid");
+        const unsigned candidate = unsigned(config.internal_solid_filament_id.value - 1);
+        if (material && *material != candidate)
+            throw std::runtime_error("Continuous fiber regions require one common resin material");
+        material = candidate;
+    }
+    return material;
 }
 static void prepare_legacy_regions(PrintObject& object)
 {
@@ -392,6 +409,7 @@ void validate_fiber_configuration(const Print& print)
         if(object->config().raft_layers.value>0)fail("raft_layers");
         for(size_t r=0;r<object->num_printing_regions();++r){const auto& c=object->printing_region(r).config();if(!fiber_active(c))continue;
             if(c.fiber_layer_height_ratio.value<=0)fail("fiber_layer_height_ratio");
+            if(c.infill_combination.value)fail("infill_combination");
             if(c.generate_reinforced_infills.value && c.reinforced_infill_pattern.value!=ipRectilinear &&
                c.reinforced_infill_pattern.value!=ipConcentric)
                 fail("reinforced_infill_pattern");
@@ -406,6 +424,18 @@ void validate_fiber_configuration(const Print& print)
     if(fiber<0 || resin<0 || size_t(fiber)>=maps.size() || size_t(resin)>=maps.size())fail("material reference");
     if(maps[fiber]<=0 || maps[resin]<=0 || maps[fiber]==maps[resin])fail("fiber and resin need distinct physical tools");
     if(size_t(maps[fiber])>config.nozzle_diameter.values.size() || size_t(maps[resin])>config.nozzle_diameter.values.size())fail("physical tool reference");
+    if(config.filament_slots_bound_to_physical_tools.value) {
+        if(maps.size()!=config.nozzle_diameter.values.size())fail("fixed physical tool slot count");
+        for(size_t i=0;i<maps.size();++i)if(maps[i]!=int(i+1))fail("fixed physical tool mapping");
+        if(config.physical_tool_roles.values.size()!=config.nozzle_diameter.values.size())fail("physical_tool_roles");
+        auto accepts=[&](int material,const char* required){
+            const int tool=maps[size_t(material)]-1;
+            const auto& role=config.physical_tool_roles.values[size_t(tool)];
+            return role=="universal" || role==required;
+        };
+        if(!accepts(fiber,"continuous_fiber"))fail("fiber material requires the continuous-fiber physical tool");
+        if(!accepts(resin,"substrate"))fail("resin material requires the substrate physical tool");
+    }
 }
 void prepare_fiber_regions(PrintObject& object)
 {
@@ -516,13 +546,19 @@ static ResinRequest fiber_repair_request(const FiberRegionRecipe& recipe,Polylin
 }
 FiberPathResult plan_fiber_paths(const FiberRegionRecipe& recipe,double angle_rad,bool fixed_angle,size_t layer_id,double seam_gap_mm,const std::function<void()>& cancel)
 {
-    FiberPathResult result;ExPolygons pattern_other;
-    if(recipe.purpose!=FiberPurpose::Infill)result.candidates=fiber_concentric(recipe,seam_gap_mm,pattern_other,cancel);
-    else if(recipe.config.region.reinforced_infill_density.value>0){
+    auto generate_candidates = [&](double direction_offset) {
+        if(direction_offset==0 && recipe.candidates_prepared)
+            return recipe.planned_candidates;
+        if(recipe.purpose!=FiberPurpose::Infill) {
+            ExPolygons pattern_other;
+            return fiber_concentric(recipe,seam_gap_mm,pattern_other,cancel);
+        }
+        if(recipe.config.region.reinforced_infill_density.value<=0)
+            return Polylines{};
         const InfillPattern pattern=recipe.config.region.reinforced_infill_pattern.value;
         std::unique_ptr<Fill> filler(Fill::new_from_type(pattern));filler->set_bounding_box(recipe.fill_bounding_box);
         filler->spacing=recipe.config.width_mm;filler->layer_id=layer_id;filler->z=recipe.print_z;
-        filler->angle=angle_rad+recipe.align_angle_rad;
+        filler->angle=angle_rad+recipe.align_angle_rad+direction_offset;
         if(pattern==ipRectilinear && !fixed_angle)
             filler->angle+=(layer_id/std::max<unsigned>(1,recipe.candidate.thickness_layers)%4)*M_PI/4;
         filler->fixed_angle=pattern==ipRectilinear || fixed_angle;filler->loop_clipping=scale_(seam_gap_mm);
@@ -533,45 +569,77 @@ FiberPathResult plan_fiber_paths(const FiberRegionRecipe& recipe,double angle_ra
         FillParams params;params.density=recipe.config.region.reinforced_infill_density.value*0.01;params.config=&recipe.config.region;params.dont_adjust=false;params.flow=Flow(recipe.config.width_mm,recipe.config.height_mm,recipe.config.nozzle_mm);
         params.anchor_length=recipe.anchor_length;params.anchor_length_max=recipe.anchor_length_max;params.resolution=recipe.resolution;
         params.layer_height=recipe.config.height_mm;params.multiline=1;params.extrusion_role=erInternalInfill;params.using_internal_flow=true;params.pattern=pattern;
-        result.candidates=filler->fill_surface(&recipe.candidate,params);
-    }
-    // prepare_fiber_fill_sources owns _polygon_other because it must reserve
-    // the surrounding ordinary surfaces before Orca groups their fills.
-    auto reject=[&](const Polyline& path,const std::string& reason){
-        try {
-            result.rejected.push_back(path);result.rejection_reasons.push_back(reason);result.resin_requests.push_back(fiber_repair_request(recipe,path,reason));
-        } catch(const std::exception& error) {
-            throw std::runtime_error("Fiber repair candidate="+std::to_string(result.rejected.size())+" reason="+reason+": "+error.what());
-        }
+        return filler->fill_surface(&recipe.candidate,params);
     };
-    for(size_t c=0;c<result.candidates.size();++c){cancel();Polyline candidate=result.candidates[c];Polylines retained;
-        auto filter=[&](int type,Polylines& output) {
-            try { return filter_fiber_legacy(candidate,recipe.config.region.fiber_start_min_length.value,type,output); }
-            catch(const std::exception& error) { throw std::runtime_error("Fiber filter type="+std::to_string(type)+" candidate="+std::to_string(c)+": "+error.what()); }
-        };
-        if(recipe.purpose==FiberPurpose::Infill){if(candidate.length()<=scale_(recipe.config.length_budget_mm())){reject(candidate,"internal initial L <= Lmin");continue;}
-            candidate.simplify(scale_(0.1));
-            for(int type:{0,2}) {
-                Polylines ignored;
-                for(const auto& path:filter(type,ignored))
-                    reject(path,type==0?"legacy start filter":"legacy end filter");
-                if(candidate.points.size()<2 || candidate.length()<scale_(recipe.config.length_budget_mm())) {
-                    if(candidate.is_valid())
-                        reject(candidate,type==0?"post-start L < Lmin":"post-end L < Lmin");
-                    candidate.points.clear();
-                    break;
-                }
+
+    auto evaluate = [&](Polylines candidates) {
+        FiberPathResult result;
+        result.candidates=std::move(candidates);
+        // Rejected paths become resin repair requests only for the direction
+        // that is finally selected.
+        auto reject=[&](const Polyline& path,const std::string& reason){
+            try {
+                result.rejected.push_back(path);result.rejection_reasons.push_back(reason);result.resin_requests.push_back(fiber_repair_request(recipe,path,reason));
+            } catch(const std::exception& error) {
+                throw std::runtime_error("Fiber repair candidate="+std::to_string(result.rejected.size())+" reason="+reason+": "+error.what());
             }
-            if(candidate.points.size()<2)continue;
-            for(const auto& path:filter(1,retained))reject(path,"legacy middle filter");
-        }else retained.push_back(candidate);
-        for(size_t n=0;n<retained.size();++n){if(recipe.purpose==FiberPurpose::Infill && retained[n].length()<=scale_(recipe.config.length_budget_mm())){reject(retained[n],"final internal L <= Lmin");continue;}
-            FiberSource source=recipe.source;source.candidate=c*100000+n;std::string rejection;
-            auto prepared=prepare_fiber_path(retained[n],recipe.config,source,recipe.purpose,recipe.source_is_fiber_perimeter,recipe.purpose!=FiberPurpose::Infill,rejection);
-            if(prepared)result.retained.push_back(std::move(prepared));else reject(retained[n],rejection);}
+        };
+        for(size_t c=0;c<result.candidates.size();++c){cancel();Polyline candidate=result.candidates[c];Polylines retained;
+            auto filter=[&](int type,Polylines& output) {
+                try { return filter_fiber_legacy(candidate,recipe.config.region.fiber_start_min_length.value,type,output); }
+                catch(const std::exception& error) { throw std::runtime_error("Fiber filter type="+std::to_string(type)+" candidate="+std::to_string(c)+": "+error.what()); }
+            };
+            if(recipe.purpose==FiberPurpose::Infill){if(candidate.length()<=scale_(recipe.config.length_budget_mm())){reject(candidate,"internal initial L <= Lmin");continue;}
+                candidate.simplify(scale_(0.1));
+                for(int type:{0,2}) {
+                    Polylines ignored;
+                    for(const auto& path:filter(type,ignored))
+                        reject(path,type==0?"legacy start filter":"legacy end filter");
+                    if(candidate.points.size()<2 || candidate.length()<scale_(recipe.config.length_budget_mm())) {
+                        if(candidate.is_valid())
+                            reject(candidate,type==0?"post-start L < Lmin":"post-end L < Lmin");
+                        candidate.points.clear();
+                        break;
+                    }
+                }
+                if(candidate.points.size()<2)continue;
+                for(const auto& path:filter(1,retained))reject(path,"legacy middle filter");
+            }else retained.push_back(candidate);
+            for(size_t n=0;n<retained.size();++n){if(recipe.purpose==FiberPurpose::Infill && retained[n].length()<=scale_(recipe.config.length_budget_mm())){reject(retained[n],"final internal L <= Lmin");continue;}
+                FiberSource source=recipe.source;source.candidate=c*100000+n;std::string rejection;
+                auto prepared=prepare_fiber_path(retained[n],recipe.config,source,recipe.purpose,recipe.source_is_fiber_perimeter,recipe.purpose!=FiberPurpose::Infill,rejection);
+                if(prepared)result.retained.push_back(std::move(prepared));else reject(retained[n],rejection);}
+        }
+        // Legacy contour ordering examines the first two chains before committing their order.
+        if(result.retained.size()>1 && recipe.purpose!=FiberPurpose::Infill && result.retained[0]->length_mm>result.retained[1]->length_mm)std::reverse(result.retained.begin(),result.retained.end());
+        return result;
+    };
+
+    FiberPathResult result=evaluate(generate_candidates(0));
+    const bool may_retry=recipe.purpose==FiberPurpose::Infill &&
+        recipe.config.region.reinforced_infill_pattern.value==ipRectilinear && !fixed_angle &&
+        recipe.config.region.reinforced_infill_density.value>0 && result.retained.empty();
+    if(may_retry) {
+        std::optional<FiberPathResult> selected;
+        double selected_length = 0.0;
+        for(const double offset:{M_PI/2,M_PI/4,3*M_PI/4}) {
+            auto alternative=evaluate(generate_candidates(offset));
+            if(alternative.retained.empty())continue;
+            alternative.direction_offset_rad=offset;
+            alternative.used_direction_fallback=true;
+            const double total_length=std::accumulate(
+                alternative.retained.begin(), alternative.retained.end(), 0.0,
+                [](double sum, const auto& path) { return sum + path->length_mm; });
+            const bool better=!selected || total_length>selected_length+EPSILON ||
+                (std::abs(total_length-selected_length)<=EPSILON &&
+                 alternative.retained.size()<selected->retained.size());
+            if(better) {
+                selected_length=total_length;
+                selected=std::move(alternative);
+            }
+        }
+        if(selected)return std::move(*selected);
     }
-    // Legacy contour ordering examines the first two chains before committing their order.
-    if(result.retained.size()>1 && recipe.purpose!=FiberPurpose::Infill && result.retained[0]->length_mm>result.retained[1]->length_mm)std::reverse(result.retained.begin(),result.retained.end());
     return result;
 }
 extern double calculate_infill_rotation_angle(const PrintObject*,size_t,const double&,const std::string&);
@@ -656,10 +724,13 @@ void prepare_fiber_fill_sources(Layer& layer)
         if (region->fiber_recipes.empty()) continue;
         ExPolygons thick_coverage, pattern_other;
         auto cancel = [&]() { fiber_throw_if_canceled(*layer.object()->print()); };
-        for (const auto& recipe : region->fiber_recipes) {
+        for (auto& recipe : region->fiber_recipes) {
             if (recipe.purpose == FiberPurpose::Infill) continue;
             ExPolygons other;
-            const auto paths = fiber_concentric(recipe, recipe.config.region.seam_gap.get_abs_value(recipe.config.nozzle_mm), other, cancel);
+            recipe.planned_candidates = fiber_concentric(
+                recipe, recipe.config.region.seam_gap.get_abs_value(recipe.config.nozzle_mm), other, cancel);
+            recipe.candidates_prepared = true;
+            const auto& paths = recipe.planned_candidates;
             // to_thick_polylines in old FillConcentricCorners used min_spacing as width.front().
             const double first_width = scale_(Flow(recipe.config.width_mm, recipe.config.height_mm, recipe.config.nozzle_mm).spacing());
             for (const auto& path : paths) append(thick_coverage, union_ex(offset(path, 1.5 * first_width)));
@@ -773,6 +844,8 @@ void audit_fiber_final_file(const Print& print,const std::string& filename)
         throw std::runtime_error("Each final fiber occurrence requires exactly one Begin, Finish, and End boundary");
     GCodeProcessor processor;processor.init_filament_maps_and_nozzle_type_when_import_only_gcode();
     processor.process_file(filename,[&](){fiber_throw_if_canceled(print);});
+    if(!processor.get_result().fiber_tag_diagnostics.empty())
+        throw std::runtime_error(processor.get_result().fiber_tag_diagnostics.front());
     for(const auto& move:processor.get_result().moves){if(move.fiber_path_id.empty())continue;
         auto found=expected.find({move.fiber_path_id,move.fiber_instance});
         if(found==expected.end())throw std::runtime_error("Final G-code contains an unknown fiber occurrence");

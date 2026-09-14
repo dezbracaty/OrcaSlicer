@@ -345,15 +345,7 @@ SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std:
         return failure(last_key, error.what());
     }
 
-    const auto has_key = [&](std::string_view name) {
-        return std::any_of(patch.begin(), patch.end(), [&](const auto& entry) { return entry.first == name; });
-    };
-    if (has_key("reinforced_infill_pattern") && !has_key("generate_reinforced_perimeters")) {
-        const auto pattern = candidate.option<Slic3r::ConfigOptionEnum<Slic3r::InfillPattern>>("reinforced_infill_pattern")->value;
-        if (pattern == Slic3r::ipConcentric || pattern == Slic3r::ipRectilinear)
-            candidate.set_key_value("generate_reinforced_perimeters", new Slic3r::ConfigOptionBool(pattern == Slic3r::ipRectilinear));
-    }
-    Slic3r::resolve_fixed_filament_map(candidate, candidate.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size());
+    Slic3r::normalize_fixed_filament_slots(candidate, candidate.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size());
     const auto changed_keys = candidate.diff(impl_->current);
     impl_->current          = std::move(candidate);
     SettingsResult result;
@@ -377,12 +369,17 @@ SettingsResult Config::reset(std::string_view key)
     if (definition->read_only) {
         return failure(owned_key, "Configuration option is read-only");
     }
-    const bool changed = impl_->current.opt_serialize(owned_key) != impl_->defaults.opt_serialize(owned_key);
+    const Slic3r::DynamicPrintConfig before = impl_->current;
     impl_->current.apply_only(impl_->defaults, {owned_key});
+    Slic3r::normalize_fixed_filament_slots(
+        impl_->current,
+        impl_->current.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size());
+    const auto changed_keys = impl_->current.diff(before);
     SettingsResult result;
     result.success = true;
-    if (changed) {
-        if (auto item = current_item(impl_->current, impl_->defaults, owned_key)) {
+    result.changed_items.reserve(changed_keys.size());
+    for (const std::string& changed_key : changed_keys) {
+        if (auto item = current_item(impl_->current, impl_->defaults, changed_key)) {
             result.changed_items.push_back(std::move(*item));
         }
     }

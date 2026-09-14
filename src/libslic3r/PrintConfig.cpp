@@ -580,7 +580,8 @@ CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(NozzleVolumeType)
 static const t_config_enum_values s_keys_map_FilamentMapMode = {
     { "Auto For Flush", fmmAutoForFlush },
     { "Auto For Match", fmmAutoForMatch },
-    { "Manual", fmmManual }
+    { "Manual", fmmManual },
+    { "Default", fmmDefault }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(FilamentMapMode)
 
@@ -5316,6 +5317,27 @@ void PrintConfigDef::init_fff_params()
     def->max = 100;
     def->set_default_value(new ConfigOptionFloats { 0.4 });
 
+    def = this->add("filament_slots_bound_to_physical_tools", coBool);
+    def->label = "Bind filament slots to physical tools";
+    def->tooltip = "Keep each filament slot attached to the physical tool with the same zero-based index.";
+    def->mode = comDevelop;
+    def->readonly = true;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("physical_tool_roles", coStrings);
+    def->label = "Physical tool roles";
+    def->tooltip = "Material role accepted by each physical tool: universal, substrate, or continuous_fiber.";
+    def->mode = comDevelop;
+    def->readonly = true;
+    def->set_default_value(new ConfigOptionStrings { "universal" });
+
+    def = this->add("physical_tool_sides", coStrings);
+    def->label = "Physical tool sides";
+    def->tooltip = "Physical position of each tool: unknown, left, or right.";
+    def->mode = comDevelop;
+    def->readonly = true;
+    def->set_default_value(new ConfigOptionStrings { "unknown" });
+
     def = this->add("notes", coString);
     def->label = L("Configuration notes");
     def->tooltip = L("You can put here your personal notes. This text will be added to the G-code "
@@ -7807,7 +7829,7 @@ void PrintConfigDef::init_extruder_option_keys()
 {
     // ConfigOptionFloats, ConfigOptionPercents, ConfigOptionBools, ConfigOptionStrings
     m_extruder_option_keys = {
-        "extruder_type", "nozzle_diameter", "default_nozzle_volume_type", "min_layer_height", "max_layer_height", "extruder_offset",
+        "extruder_type", "nozzle_diameter", "physical_tool_roles", "physical_tool_sides", "default_nozzle_volume_type", "min_layer_height", "max_layer_height", "extruder_offset",
         "extruder_printable_height", "nozzle_volume", "nozzle_type", "nozzle_flush_dataset",
         "retraction_length", "z_hop", "z_hop_types", "travel_slope", "retract_lift_above", "retract_lift_below", "retract_lift_enforce", "retraction_speed", "deretraction_speed",
         "retract_before_wipe", "retract_restart_extra", "retraction_minimum_travel", "wipe", "wipe_distance",
@@ -9161,21 +9183,16 @@ void DynamicPrintConfig::normalize_fdm_1()
     return;
 }
 
-bool resolve_fixed_filament_map(DynamicPrintConfig& config, size_t filament_count)
+bool normalize_fixed_filament_slots(DynamicPrintConfig& config, size_t filament_count)
 {
     const auto* nozzles = config.option<ConfigOptionFloats>("nozzle_diameter");
-    const auto* mode = config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode");
-    const auto* model = config.option<ConfigOptionString>("printer_model");
-    const auto* semm = config.option<ConfigOptionBool>("single_extruder_multi_material");
-    if (!model || model->value != "CFSYS Alpha500 Printer" ||
-        !nozzles || nozzles->size() != 2 || filament_count != 2 ||
-        !mode || mode->value >= fmmManual || (semm && semm->value))
+    const auto* fixed = config.option<ConfigOptionBool>("filament_slots_bound_to_physical_tools");
+    if (!fixed || !fixed->value || !nozzles || nozzles->size() != filament_count)
         return false;
-    if (const auto* count = config.option<ConfigOptionInts>("extruder_max_nozzle_count"))
-        for (int value : count->values) if (value > 1) return false;
     std::vector<int> map(filament_count);
     for (size_t i = 0; i < filament_count; ++i) map[i] = int(i + 1);
     config.set_key_value("filament_map", new ConfigOptionInts(map));
+    config.set_key_value("filament_map_mode", new ConfigOptionEnum<FilamentMapMode>(fmmDefault));
     return true;
 }
 
@@ -10849,8 +10866,8 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
         const double fd = cfg.filament_diameter.values[i];
         // CFSYS continuous fiber is a 0.35 mm strand. This is a material
         // property even while reinforcement is disabled in the current print.
-        const bool continuous_fiber = i < cfg.filament_type.values.size() &&
-            cfg.filament_type.values[i] == "CCF";
+        const bool continuous_fiber = i < cfg.filament_is_ccf.values.size() &&
+            cfg.filament_is_ccf.values[i];
         if (!std::isfinite(fd) || fd <= 0 || (!continuous_fiber && fd < 1)) {
             error_message.emplace("filament_diameter", L("invalid value ") + std::to_string(fd));
             break;

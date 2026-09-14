@@ -809,9 +809,10 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             }
         }
         if (has_interface) layer_tools.extruders.push_back(extruder_interface);
-        if ((has_support || has_interface) && fiber_active(*object.print())) {
+        const auto fiber_resin = fiber_resin_material(object);
+        if ((has_support || has_interface) && fiber_resin) {
             const size_t object_id = size_t(std::find(object.print()->objects().begin(), object.print()->objects().end(), &object) - object.print()->objects().begin());
-            const unsigned resin = object.printing_region(0).config().internal_solid_filament_id.value - 1;
+            const unsigned resin = *fiber_resin;
             for (size_t instance = 0; instance < object.instances().size(); ++instance) {
                 const bool registered = std::any_of(layer_tools.fiber_visit_view.begin(), layer_tools.fiber_visit_view.end(), [&](const FiberVisit& visit) {
                     return visit.object == object_id && visit.instance == instance && visit.phase == FiberPhase::ResinBase;

@@ -1402,6 +1402,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                support_object_skip_flush))
     ((ConfigOptionEnum<BedTempFormula>, bed_temperature_formula))
     ((ConfigOptionInts,                physical_extruder_map))
+    ((ConfigOptionBool,                filament_slots_bound_to_physical_tools))
+    ((ConfigOptionStrings,             physical_tool_roles))
+    ((ConfigOptionStrings,             physical_tool_sides))
     ((ConfigOptionIntsNullable,        nozzle_flush_dataset))
     ((ConfigOptionFloatsNullable,      filament_flush_volumetric_speed))
     ((ConfigOptionIntsNullable,        filament_flush_temp))
@@ -2212,7 +2215,7 @@ static void set_flush_volumes_matrix(std::vector<T> &out_matrix, const std::vect
 
 size_t get_extruder_index(const GCodeConfig& config, unsigned int filament_id);
 // Resolve the Alpha500 fixed independent-tool Auto rule before geometry.
-bool resolve_fixed_filament_map(DynamicPrintConfig& config, size_t filament_count);
+bool normalize_fixed_filament_slots(DynamicPrintConfig& config, size_t filament_count);
 
 } // namespace Slic3r
 

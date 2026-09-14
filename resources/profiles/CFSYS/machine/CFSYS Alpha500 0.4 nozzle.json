@@ -11,6 +11,15 @@
     "CFSYS CIRON",
     "CFSYS CCF"
   ],
+  "filament_slots_bound_to_physical_tools": "1",
+  "physical_tool_roles": [
+    "substrate",
+    "continuous_fiber"
+  ],
+  "physical_tool_sides": [
+    "right",
+    "left"
+  ],
   "emit_machine_limits_to_gcode": "1",
   "deretraction_speed": [
     "30",

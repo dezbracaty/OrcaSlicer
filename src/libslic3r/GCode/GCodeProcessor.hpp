@@ -267,6 +267,7 @@ class Print;
         bool spiral_vase_mode;
         //BBS
         std::vector<SliceWarning> warnings;
+        std::vector<std::string> fiber_tag_diagnostics;
         int nozzle_hrc;
         std::vector<NozzleType> nozzle_type;
         // first key stores filaments, second keys stores the layer ranges(enclosed) that use the filaments
@@ -306,6 +307,7 @@ class Print;
             custom_gcode_per_print_z = other.custom_gcode_per_print_z;
             spiral_vase_mode = other.spiral_vase_mode;
             warnings = other.warnings;
+            fiber_tag_diagnostics = other.fiber_tag_diagnostics;
             bed_type = other.bed_type;
             gcode_check_result = other.gcode_check_result;
             limit_filament_maps = other.limit_filament_maps;
@@ -813,6 +815,7 @@ class Print;
         float m_pressure_advance;
         ExtrusionRole m_extrusion_role;
         bool m_fiber_deposition{false}, m_fiber_tail{false};
+        bool m_fiber_block_valid{false};
         unsigned char m_fiber_phase{0}, m_fiber_event{0};
         std::string m_fiber_path_id;
         unsigned int m_fiber_object{0xffffffffu}, m_fiber_instance{0xffffffffu};
@@ -1152,4 +1155,3 @@ class Print;
 } /* namespace Slic3r */
 
 #endif /* slic3r_GCodeProcessor_hpp_ */
-

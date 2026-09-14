@@ -6,6 +6,7 @@
 #include "BoundingBox.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include <functional>
+#include <optional>
 namespace Slic3r {
 class Layer; class LayerRegion; class Print; class PrintObject;
 struct ResinRequest {
@@ -54,12 +55,16 @@ struct FiberRegionRecipe {
     float anchor_length_max = 1000;
     bool dont_alternate_fill_direction = false;
     std::vector<ResinRequest> resin_requests;
+    Polylines planned_candidates;
+    bool candidates_prepared = false;
 };
 struct FiberPathResult {
     Polylines candidates, rejected;
     std::vector<std::string> rejection_reasons;
     std::vector<std::shared_ptr<const PreparedFiberPath>> retained;
     std::vector<ResinRequest> resin_requests;
+    double direction_offset_rad = 0;
+    bool used_direction_fallback = false;
 };
 struct FiberVisit {
     size_t object = 0, instance = 0, visit_index = 0;
@@ -71,6 +76,7 @@ bool fiber_active(const PrintRegionConfig&);
 bool fiber_active(const Print&);
 bool fiber_config_key(const std::string&);
 FiberConfig resolve_fiber_config(const LayerRegion&, bool perimeter);
+std::optional<unsigned> fiber_resin_material(const PrintObject&);
 void validate_fiber_configuration(const Print&);
 void prepare_fiber_regions(PrintObject&);
 void prepare_fiber_fill_sources(Layer&);
