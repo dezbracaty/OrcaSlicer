@@ -1,4 +1,5 @@
-// Legacy formulas originate in bulber 643d319bd140ea54347a23d1b6520e5474b49ed6.
+// Legacy path and cut formulas originate in bulber origin/dev
+// 4495baa0083c5a6bdb443bef5785d19496cac45a (Fill/Fill.cpp and GCode.cpp).
 #include "FiberProcess.hpp"
 #include "Line.hpp"
 #include <algorithm>

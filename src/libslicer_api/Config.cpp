@@ -259,6 +259,63 @@ Config& Config::operator=(const Config& other)
 Config& Config::operator=(Config&&) noexcept = default;
 Config::~Config()                            = default;
 
+namespace {
+bool has_continuous_fiber_material(const Slic3r::DynamicPrintConfig& config)
+{
+    const auto* values = config.option<Slic3r::ConfigOptionBools>("filament_is_ccf");
+    return values != nullptr && std::any_of(values->values.begin(), values->values.end(), [](unsigned char value) {
+        return value != 0;
+    });
+}
+
+bool enabled_option(const Slic3r::DynamicPrintConfig& config, const char* key)
+{
+    const auto* option = config.option<Slic3r::ConfigOptionBool>(key);
+    return option != nullptr && option->value;
+}
+
+void apply_runtime_presentation(SettingItem& item, const Slic3r::DynamicPrintConfig& config)
+{
+    const bool has_fiber = has_continuous_fiber_material(config);
+    if (item.key == "generate_reinforced_perimeters" || item.key == "generate_reinforced_infills") {
+        item.enabled = has_fiber;
+    } else if (item.key == "outer_reinforced_perimeters_counts" || item.key == "inner_reinforced_perimeters_counts") {
+        item.enabled = has_fiber && enabled_option(config, "generate_reinforced_perimeters");
+    } else if (item.key == "reinforced_infill_pattern" || item.key == "reinforced_infill_density") {
+        item.enabled = has_fiber && enabled_option(config, "generate_reinforced_infills");
+    }
+}
+
+bool contains_key(const std::vector<std::string>& keys, std::string_view key)
+{
+    return std::find(keys.begin(), keys.end(), key) != keys.end();
+}
+
+std::vector<std::string> presentation_changed_keys(std::vector<std::string> changed_keys)
+{
+    auto append = [&changed_keys](const char* key) {
+        if (!contains_key(changed_keys, key)) changed_keys.emplace_back(key);
+    };
+    if (contains_key(changed_keys, "filament_is_ccf")) {
+        append("generate_reinforced_perimeters");
+        append("generate_reinforced_infills");
+        append("outer_reinforced_perimeters_counts");
+        append("inner_reinforced_perimeters_counts");
+        append("reinforced_infill_pattern");
+        append("reinforced_infill_density");
+    }
+    if (contains_key(changed_keys, "generate_reinforced_perimeters")) {
+        append("outer_reinforced_perimeters_counts");
+        append("inner_reinforced_perimeters_counts");
+    }
+    if (contains_key(changed_keys, "generate_reinforced_infills")) {
+        append("reinforced_infill_pattern");
+        append("reinforced_infill_density");
+    }
+    return changed_keys;
+}
+} // namespace
+
 std::vector<SettingItem> Config::settings() const
 {
     std::vector<SettingItem> result;
@@ -273,6 +330,7 @@ std::vector<SettingItem> Config::settings() const
         if (const auto* baseline = impl_->defaults.option(definition.key)) {
             item.default_value = baseline->serialize();
         }
+        apply_runtime_presentation(item, impl_->current);
         result.push_back(std::move(item));
     }
     return result;
@@ -300,6 +358,7 @@ std::optional<SettingItem> current_item(const Slic3r::DynamicPrintConfig& config
     if (const auto* baseline = defaults.option(definition->key)) {
         item.default_value = baseline->serialize();
     }
+    apply_runtime_presentation(item, config);
     return item;
 }
 } // namespace
@@ -346,7 +405,7 @@ SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std:
     }
 
     Slic3r::normalize_fixed_filament_slots(candidate, candidate.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size());
-    const auto changed_keys = candidate.diff(impl_->current);
+    const auto changed_keys = presentation_changed_keys(candidate.diff(impl_->current));
     impl_->current          = std::move(candidate);
     SettingsResult result;
     result.success = true;
@@ -374,7 +433,7 @@ SettingsResult Config::reset(std::string_view key)
     Slic3r::normalize_fixed_filament_slots(
         impl_->current,
         impl_->current.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size());
-    const auto changed_keys = impl_->current.diff(before);
+    const auto changed_keys = presentation_changed_keys(impl_->current.diff(before));
     SettingsResult result;
     result.success = true;
     result.changed_items.reserve(changed_keys.size());

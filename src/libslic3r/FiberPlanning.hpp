@@ -50,7 +50,6 @@ struct FiberRegionRecipe {
     const PrintObjectConfig* print_object_config = nullptr;
     double print_z = 0;
     double resolution = 0.0125;
-    double align_angle_rad = 0;
     float anchor_length = 1000;
     float anchor_length_max = 1000;
     bool dont_alternate_fill_direction = false;
@@ -63,8 +62,6 @@ struct FiberPathResult {
     std::vector<std::string> rejection_reasons;
     std::vector<std::shared_ptr<const PreparedFiberPath>> retained;
     std::vector<ResinRequest> resin_requests;
-    double direction_offset_rad = 0;
-    bool used_direction_fallback = false;
 };
 struct FiberVisit {
     size_t object = 0, instance = 0, visit_index = 0;
