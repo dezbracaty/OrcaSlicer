@@ -489,12 +489,12 @@ std::vector<Vec3d> intersect_convex_vertices_with_belt_plane(
     const BeltCoordinateSystem& coordinates)
 {
     constexpr double plane_tolerance = 1e-7;
-    constexpr double point_tolerance = 1e-6;
     std::vector<Vec3d> intersections;
     auto append_unique = [&intersections](const Vec3d& point) {
         const bool duplicate = std::any_of(
             intersections.begin(), intersections.end(),
             [&point](const Vec3d& existing) {
+                constexpr double point_tolerance = 1e-6;
                 return (existing - point).norm() <= point_tolerance;
             });
         if (!duplicate)

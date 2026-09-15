@@ -286,8 +286,18 @@ write_basic_package_version_file(
     COMPATIBILITY SameMajorVersion
 )
 
+set(_libslicer_runtime_dependencies)
+if(WIN32)
+    # Private DLL dependencies are not propagated by the public API target.
+    set(_libslicer_runtime_dependencies
+        RUNTIME_DEPENDENCIES
+        DIRECTORIES "$<TARGET_FILE_DIR:TKernel>" "${GMP_ROOT}/bin"
+        PRE_EXCLUDE_REGEXES "api-ms-.*" "ext-ms-.*"
+        POST_EXCLUDE_REGEXES ".*[/\\\\][Ww][Ii][Nn][Dd][Oo][Ww][Ss][/\\\\].*")
+endif()
 install(TARGETS libslicer_api
     EXPORT libslicerTargets
+    ${_libslicer_runtime_dependencies}
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"

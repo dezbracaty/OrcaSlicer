@@ -163,6 +163,12 @@ elseif(EIGEN_STATUS STREQUAL "SOURCE_ONLY")
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
             -DBUILD_TESTING=OFF
             -DEIGEN_BUILD_TESTING=OFF
+            # Consumers link the header-only Eigen3::Eigen target. Do not build
+            # optional BLAS/LAPACK libraries or introduce a Fortran toolchain.
+            -DEIGEN_BUILD_BLAS=OFF
+            -DEIGEN_BUILD_LAPACK=OFF
+            -DEIGEN_BUILD_DOC=OFF
+            -DEIGEN_BUILD_DEMOS=OFF
         RESULT_VARIABLE config_result
     )
     unset(_eigen_extra_flags)

@@ -1,2 +1,5 @@
 # Set the default behavior, in case people don't have core.autocrlf set.
 * text=auto
+
+# Git patches must retain LF endings for git apply on Windows.
+*.patch text eol=lf
