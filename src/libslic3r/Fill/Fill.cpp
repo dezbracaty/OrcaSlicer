@@ -1209,6 +1209,144 @@ void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> 
 }
 #endif
 
+struct FillExecutionPolicy {
+    bool enable_arachne = true;
+    bool enable_gap_fill = true;
+};
+
+struct FillExecutionContext {
+    Layer&                    layer;
+    LockRegionParam&          lock_param;
+    FillAdaptive::Octree*     adaptive_fill_octree;
+    FillAdaptive::Octree*     support_fill_octree;
+    FillLightning::Generator* lightning_generator;
+    const BoundingBox&        object_bbox;
+    double                    resolution;
+};
+
+static void execute_surface_fill_job(
+    const FillExecutionContext& context,
+    SurfaceFill&                surface_fill,
+    ExtrusionEntitiesPtr&       destination,
+    const FillExecutionPolicy&  policy)
+{
+    Layer& layer = context.layer;
+    LayerRegion* layerm = layer.regions()[surface_fill.region_id];
+
+    std::unique_ptr<Fill> f(Fill::new_from_type(surface_fill.params.pattern));
+    f->set_bounding_box(context.object_bbox);
+    f->layer_id = layer.id();
+    {
+        const auto& rcfg = layerm->region().config();
+        f->dont_alternate_fill_direction = rcfg.zaa_enabled && rcfg.zaa_dont_alternate_fill_direction;
+    }
+    f->z = layer.print_z;
+    f->angle = surface_fill.params.angle;
+    f->fixed_angle = surface_fill.params.fixed_angle;
+    f->adapt_fill_octree = surface_fill.params.pattern == ipSupportCubic
+        ? context.support_fill_octree
+        : context.adaptive_fill_octree;
+    f->print_config = &layer.object()->print()->config();
+    f->print_object_config = &layer.object()->config();
+    if (surface_fill.params.pattern == ipConcentricInternal) {
+        auto* fill_concentric = dynamic_cast<FillConcentricInternal*>(f.get());
+        assert(fill_concentric != nullptr);
+        fill_concentric->print_config = &layer.object()->print()->config();
+        fill_concentric->print_object_config = &layer.object()->config();
+    } else if (surface_fill.params.pattern == ipConcentric) {
+        auto* fill_concentric = dynamic_cast<FillConcentric*>(f.get());
+        assert(fill_concentric != nullptr);
+        fill_concentric->print_config = &layer.object()->print()->config();
+        fill_concentric->print_object_config = &layer.object()->config();
+    } else if (surface_fill.params.pattern == ipLightning) {
+        dynamic_cast<FillLightning::Filler*>(f.get())->generator = context.lightning_generator;
+    }
+
+    const bool using_internal_flow = !surface_fill.surface.is_solid() && !surface_fill.params.bridge;
+    double link_max_length = 0.;
+    if (!surface_fill.params.bridge && surface_fill.params.density > 80.)
+        link_max_length = 3. * f->spacing;
+
+    f->link_max_length = coord_t(scale_(link_max_length));
+    f->loop_clipping = coord_t(scale_(layerm->region().config().seam_gap.get_abs_value(
+        surface_fill.params.flow.nozzle_diameter())));
+
+    FillParams params;
+    params.density = float(0.01 * surface_fill.params.density);
+    params.multiline = surface_fill.params.multiline;
+    params.dont_adjust = false;
+    params.anchor_length = surface_fill.params.anchor_length;
+    params.anchor_length_max = surface_fill.params.anchor_length_max;
+    params.resolution = context.resolution;
+    params.use_arachne = policy.enable_arachne &&
+        (surface_fill.params.pattern == ipConcentric || surface_fill.params.pattern == ipConcentricInternal);
+    params.enable_gap_fill = policy.enable_gap_fill;
+    params.layer_height = layerm->layer()->height;
+    params.lateral_lattice_angle_1 = surface_fill.params.lateral_lattice_angle_1;
+    params.lateral_lattice_angle_2 = surface_fill.params.lateral_lattice_angle_2;
+    params.infill_overhang_angle = surface_fill.params.infill_overhang_angle;
+    params.gyroid_optimized = surface_fill.params.gyroid_optimized;
+    params.flow = surface_fill.params.flow;
+    params.extrusion_role = surface_fill.params.extrusion_role;
+    params.using_internal_flow = using_internal_flow;
+    params.no_extrusion_overlap = surface_fill.params.overlap;
+
+    auto& region_config = layerm->region().config();
+    params.config = &region_config;
+    params.pattern = surface_fill.params.pattern;
+
+    if (surface_fill.params.pattern == ipLockedZag) {
+        params.locked_zag = true;
+        params.infill_lock_depth = surface_fill.params.infill_lock_depth;
+        params.skin_infill_depth = surface_fill.params.skin_infill_depth;
+        f->set_lock_region_param(context.lock_param);
+    }
+    if (surface_fill.params.pattern == ipCrossZag || surface_fill.params.pattern == ipLockedZag) {
+        if (f->layer_id % 2 == 0)
+            params.horiz_move -= scale_(region_config.infill_shift_step) * (f->layer_id / 2);
+        else
+            params.horiz_move += scale_(region_config.infill_shift_step) * (f->layer_id / 2);
+        params.symmetric_infill_y_axis = surface_fill.params.symmetric_infill_y_axis;
+    } else if (surface_fill.params.pattern == ipZigZag) {
+        params.symmetric_infill_y_axis = surface_fill.params.symmetric_infill_y_axis;
+    }
+    if (surface_fill.params.pattern == ipGrid)
+        params.can_reverse = false;
+
+    for (ExPolygon& expoly : surface_fill.expolygons) {
+        f->no_overlap_expolygons = intersection_ex(
+            surface_fill.no_overlap_expolygons,
+            ExPolygons() = {expoly},
+            ApplySafetyOffset::Yes);
+        if (params.symmetric_infill_y_axis) {
+            params.symmetric_y_axis = f->extended_object_bounding_box().center().x();
+            expoly.symmetric_y(params.symmetric_y_axis);
+        }
+
+        f->spacing = surface_fill.params.spacing;
+        surface_fill.surface.expolygon = std::move(expoly);
+
+        if (surface_fill.params.bridge && surface_fill.surface.is_external() && surface_fill.params.density > 99.0) {
+            params.density = layerm->region().config().bridge_density.get_abs_value(1.0);
+            params.dont_adjust = true;
+        }
+        if (surface_fill.surface.is_internal_bridge()) {
+            params.density = f->print_object_config->internal_bridge_density.get_abs_value(1.0);
+            params.dont_adjust = true;
+        }
+        const float elephant_density = f->print_object_config->elefant_foot_layers_density.get_abs_value(1.0);
+        if (!is_approx(elephant_density, 1.0f) && surface_fill.surface.is_solid_infill()) {
+            const size_t elephant_layers = f->print_object_config->elefant_foot_compensation_layers.value;
+            if (f->layer_id > 0 && f->layer_id <= elephant_layers) {
+                params.density = 1.0f - (1.0f - elephant_density) *
+                    (elephant_layers - (f->layer_id - 1)) / elephant_layers;
+            }
+        }
+
+        f->fill_surface_extrusion(&surface_fill.surface, params, destination);
+    }
+}
+
 // friend to Layer
 void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
 {
@@ -1231,130 +1369,22 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 	}
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
 
-    for (SurfaceFill &surface_fill : surface_fills) {
-        // Create the filler object.
-        std::unique_ptr<Fill> f = std::unique_ptr<Fill>(Fill::new_from_type(surface_fill.params.pattern));
-        f->set_bounding_box(bbox);
-        f->layer_id = this->id();
-        {
-            const auto &rcfg = m_regions[surface_fill.region_id]->region().config();
-            f->dont_alternate_fill_direction = rcfg.zaa_enabled && rcfg.zaa_dont_alternate_fill_direction;
-        }
-        f->z 		= this->print_z;
-        f->angle 	= surface_fill.params.angle;
-        f->fixed_angle = surface_fill.params.fixed_angle;
-        f->adapt_fill_octree   = (surface_fill.params.pattern == ipSupportCubic) ? support_fill_octree : adaptive_fill_octree;
-        f->print_config        = &this->object()->print()->config();
-        f->print_object_config = &this->object()->config();
-		if (surface_fill.params.pattern == ipConcentricInternal) {
-            FillConcentricInternal *fill_concentric = dynamic_cast<FillConcentricInternal *>(f.get());
-            assert(fill_concentric != nullptr);
-            fill_concentric->print_config        = &this->object()->print()->config();
-            fill_concentric->print_object_config = &this->object()->config();
-        } else if (surface_fill.params.pattern == ipConcentric) {
-            FillConcentric *fill_concentric = dynamic_cast<FillConcentric *>(f.get());
-            assert(fill_concentric != nullptr);
-            fill_concentric->print_config = &this->object()->print()->config();
-            fill_concentric->print_object_config = &this->object()->config();
-        } else if (surface_fill.params.pattern == ipLightning)
-            dynamic_cast<FillLightning::Filler*>(f.get())->generator = lightning_generator;
-        // calculate flow spacing for infill pattern generation
-        bool using_internal_flow = ! surface_fill.surface.is_solid() && ! surface_fill.params.bridge;
-        double link_max_length = 0.;
-        if (! surface_fill.params.bridge) {
-#if 0
-            link_max_length = layerm.region()->config().get_abs_value(surface.is_external() ? "external_fill_link_max_length" : "fill_link_max_length", flow.spacing());
-//            printf("flow spacing: %f,  is_external: %d, link_max_length: %lf\n", flow.spacing(), int(surface.is_external()), link_max_length);
-#else
-            if (surface_fill.params.density > 80.) // 80%
-                link_max_length = 3. * f->spacing;
-#endif
-        }
-
-        LayerRegion* layerm = this->m_regions[surface_fill.region_id];
-
-        // Maximum length of the perimeter segment linking two infill lines.
-        f->link_max_length = (coord_t)scale_(link_max_length);
-        // Used by the concentric infill pattern to clip the loops to create extrusion paths.
-        f->loop_clipping = coord_t(scale_(layerm->region().config().seam_gap.get_abs_value(surface_fill.params.flow.nozzle_diameter())));
-
-        // apply half spacing using this flow's own spacing and generate infill
-        FillParams params;
-        params.density 		     = float(0.01 * surface_fill.params.density);
-        params.multiline         = surface_fill.params.multiline;
-		params.dont_adjust		 = false; //  surface_fill.params.dont_adjust;
-        params.anchor_length     = surface_fill.params.anchor_length;
-		params.anchor_length_max = surface_fill.params.anchor_length_max;
-		params.resolution        = resolution;
-        params.use_arachne       = surface_fill.params.pattern == ipConcentric || surface_fill.params.pattern == ipConcentricInternal;
-        params.layer_height      = layerm->layer()->height;
-        params.lateral_lattice_angle_1   = surface_fill.params.lateral_lattice_angle_1;
-        params.lateral_lattice_angle_2   = surface_fill.params.lateral_lattice_angle_2;
-        params.infill_overhang_angle   = surface_fill.params.infill_overhang_angle;
-        params.gyroid_optimized          = surface_fill.params.gyroid_optimized;
-
-		// BBS
-		params.flow = surface_fill.params.flow;
-		params.extrusion_role = surface_fill.params.extrusion_role;
-		params.using_internal_flow = using_internal_flow;
-		params.no_extrusion_overlap = surface_fill.params.overlap;
-        auto &region_config = layerm->region().config();
-        params.config               = &region_config;
-        params.pattern              = surface_fill.params.pattern;
-
-        if( surface_fill.params.pattern == ipLockedZag ) {
-			params.locked_zag = true;
-            params.infill_lock_depth = surface_fill.params.infill_lock_depth;
-            params.skin_infill_depth = surface_fill.params.skin_infill_depth;
-            f->set_lock_region_param(lock_param);
-		}
-        if (surface_fill.params.pattern == ipCrossZag || surface_fill.params.pattern == ipLockedZag) {
-            if (f->layer_id % 2 == 0) {
-                params.horiz_move -= scale_(region_config.infill_shift_step) * (f->layer_id / 2);
-            } else {
-                params.horiz_move += scale_(region_config.infill_shift_step) * (f->layer_id / 2);
-            }
-
-            params.symmetric_infill_y_axis = surface_fill.params.symmetric_infill_y_axis;
-
-        } else if (surface_fill.params.pattern == ipZigZag) {
-            params.symmetric_infill_y_axis = surface_fill.params.symmetric_infill_y_axis;
-
-        }
-		if (surface_fill.params.pattern == ipGrid)
-			params.can_reverse = false;
-		for (ExPolygon& expoly : surface_fill.expolygons) {
-
-      f->no_overlap_expolygons = intersection_ex(surface_fill.no_overlap_expolygons, ExPolygons() = {expoly}, ApplySafetyOffset::Yes);
-            if (params.symmetric_infill_y_axis) {
-                params.symmetric_y_axis = f->extended_object_bounding_box().center().x();
-                expoly.symmetric_y(params.symmetric_y_axis);
-            }
-
-			// Spacing is modified by the filler to indicate adjustments. Reset it for each expolygon.
-			f->spacing = surface_fill.params.spacing;
-			surface_fill.surface.expolygon = std::move(expoly);
-
-			if(surface_fill.params.bridge && surface_fill.surface.is_external() && surface_fill.params.density > 99.0){
-				params.density = layerm->region().config().bridge_density.get_abs_value(1.0);
-				params.dont_adjust = true;
-			}
-            if(surface_fill.surface.is_internal_bridge()){
-                params.density = f->print_object_config->internal_bridge_density.get_abs_value(1.0);
-                params.dont_adjust = true;
-            }
-            // Orca: Elephant foot compensation for solid layers above bottommost by infill density manipulation.
-            float elefant_density = f->print_object_config->elefant_foot_layers_density.get_abs_value(1.0);
-            if (!is_approx(elefant_density, 1.0f) && surface_fill.surface.is_solid_infill()) {
-                size_t elefant_layers = f->print_object_config->elefant_foot_compensation_layers.value;
-                if (f->layer_id > 0 && f->layer_id <= elefant_layers)
-                    params.density = 1.0f - (1.0f - elefant_density) * (elefant_layers - (f->layer_id - 1)) / elefant_layers; // Reverse calculation - The higher layer number means the higher density. Counting starts from the second layer.
-            }
-            // make fill
-			f->fill_surface_extrusion(&surface_fill.surface,
-				params,
-				m_regions[surface_fill.region_id]->fills.entities);
-		}
+    const FillExecutionContext execution_context {
+        *this,
+        lock_param,
+        adaptive_fill_octree,
+        support_fill_octree,
+        lightning_generator,
+        bbox,
+        resolution
+    };
+    const FillExecutionPolicy ordinary_fill_policy {};
+    for (SurfaceFill& surface_fill : surface_fills) {
+        execute_surface_fill_job(
+            execution_context,
+            surface_fill,
+            m_regions[surface_fill.region_id]->fills.entities,
+            ordinary_fill_policy);
     }
 
     // add thin fill regions

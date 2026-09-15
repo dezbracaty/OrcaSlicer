@@ -185,8 +185,10 @@ void Fill::fill_surface_extrusion(const Surface* surface, const FillParams& para
                 eec->entities[i]->set_reverse();
         }
 
-        // Orca: run gap fill
-        this->_create_gap_fill(surface, params, eec);
+        // Orca: run gap fill. Sidecar candidate generation disables this pass
+        // because variable-width residual paths are not valid fiber candidates.
+        if (params.enable_gap_fill)
+            this->_create_gap_fill(surface, params, eec);
     }
 }
 

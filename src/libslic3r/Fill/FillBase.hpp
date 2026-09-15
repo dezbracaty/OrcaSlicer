@@ -76,6 +76,9 @@ struct FillParams
 
     // For Concentric infill, to switch between Classic and Arachne.
     bool        use_arachne{ false };
+    // Candidate-only callers may disable Orca's residual gap-fill pass while
+    // still using the same fill implementation as ordinary material jobs.
+    bool        enable_gap_fill{ true };
     // Layer height for Concentric infill with Arachne.
     coordf_t    layer_height    { 0.f };
 
