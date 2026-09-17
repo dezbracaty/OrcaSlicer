@@ -81,6 +81,7 @@
     "inherits": "CFSYS PLA",
     "is_custom_defined": "0",
     "name": "CFSYS S-Multi",
+    "instantiation": "true",
     "nozzle_temperature_range_high": [
         "310"
     ],

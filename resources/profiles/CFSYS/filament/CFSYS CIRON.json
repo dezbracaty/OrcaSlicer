@@ -201,6 +201,7 @@
     ],
     "inherits": "fdm_filament_common",
     "name": "CFSYS CIRON",
+    "instantiation": "true",
     "filament_id": "GFC98",
     "nozzle_temperature": [
         "300"

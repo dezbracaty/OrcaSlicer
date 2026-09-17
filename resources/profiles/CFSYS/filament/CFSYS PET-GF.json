@@ -60,6 +60,7 @@
     "inherits": "CFSYS PET-CF",
     "is_custom_defined": "0",
     "name": "CFSYS PET-GF",
+    "instantiation": "true",
     "support_material_interface_fan_speed": [
         "0"
     ],

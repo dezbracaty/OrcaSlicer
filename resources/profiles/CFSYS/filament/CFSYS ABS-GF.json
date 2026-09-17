@@ -18,6 +18,7 @@
     "inherits": "CFSYS ABS",
     "is_custom_defined": "0",
     "name": "CFSYS ABS-GF",
+    "instantiation": "true",
     "reduce_fan_stop_start_freq": [
         "0"
     ],

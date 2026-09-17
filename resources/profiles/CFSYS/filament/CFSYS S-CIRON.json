@@ -20,6 +20,7 @@
     ],
     "inherits": "CFSYS S-Multi",
     "name": "CFSYS S-CIRON",
+    "instantiation": "true",
     "nozzle_temperature_range_high": [
         "330"
     ],

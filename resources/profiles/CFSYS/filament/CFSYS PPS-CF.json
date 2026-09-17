@@ -51,6 +51,7 @@
     "inherits": "CFSYS PLA",
     "is_custom_defined": "0",
     "name": "CFSYS PPS-CF",
+    "instantiation": "true",
     "nozzle_temperature": [
         "330"
     ],

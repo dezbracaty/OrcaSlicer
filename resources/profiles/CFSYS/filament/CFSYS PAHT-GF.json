@@ -33,6 +33,7 @@
     "from": "system",
     "inherits": "CFSYS PAHT-CF",
     "name": "CFSYS PAHT-GF",
+    "instantiation": "true",
     "additional_cooling_fan_speed": [
         "100"
     ],

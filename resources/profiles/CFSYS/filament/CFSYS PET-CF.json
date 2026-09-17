@@ -99,6 +99,7 @@
     "inherits": "CFSYS PLA",
     "is_custom_defined": "0",
     "name": "CFSYS PET-CF",
+    "instantiation": "true",
     "nozzle_temperature": [
         "295"
     ],

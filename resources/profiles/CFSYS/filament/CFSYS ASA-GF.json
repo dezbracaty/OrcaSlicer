@@ -15,6 +15,7 @@
     "inherits": "CFSYS ASA",
     "is_custom_defined": "0",
     "name": "CFSYS ASA-GF",
+    "instantiation": "true",
     "slow_down_layer_time": [
         "8"
     ],

@@ -108,6 +108,7 @@
     "inherits": "CFSYS PLA",
     "is_custom_defined": "0",
     "name": "CFSYS S-PAHT",
+    "instantiation": "true",
     "nozzle_temperature": [
         "320"
     ],

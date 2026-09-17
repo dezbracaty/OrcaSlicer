@@ -80,6 +80,7 @@
     ],
     "inherits": "fdm_filament_tpu",
     "name": "CFSYS TPU 95A",
+    "instantiation": "true",
     "filament_id": "GFU99",
     "setting_id": "GFSA04",
     "compatible_printers": [
