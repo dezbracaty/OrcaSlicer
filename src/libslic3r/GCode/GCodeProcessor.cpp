@@ -2481,6 +2481,7 @@ void GCodeProcessor::reset()
     m_g1_line_id = 0;
     m_layer_id = 0;
     m_last_numbered_layer.reset();
+    m_print_z = 0.0f;
     m_cp_color.reset();
 
     m_producer = EProducer::Unknown;
@@ -3145,8 +3146,9 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
         return;
     }
 
-    // ; Z_HEIGHT:
-    if (boost::starts_with(comment, " Z_HEIGHT:")) {
+    // Nominal layer height in both exporter dialects. Using the first
+    // depositing move's Z is wrong for fiber landing (it starts above the layer).
+    if (boost::starts_with(comment, " Z_HEIGHT:") || boost::starts_with(comment, "Z:")) {
         m_print_z = get_z_height(comment);
         return;
     }

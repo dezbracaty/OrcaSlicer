@@ -1013,6 +1013,7 @@ static std::vector<std::string> s_Preset_print_options{
     "reinforced_perimeters_extrusion_width",
     "reinforced_infill_extrusion_width",
     "fiber_layer_height_ratio",
+    "fiber_fill_debug",
     "fiber_minimum_path_length",
     "fiber_minimum_segment_length",
     "fiber_maximum_turn_angle",

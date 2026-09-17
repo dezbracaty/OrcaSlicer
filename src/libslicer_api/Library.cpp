@@ -3416,8 +3416,44 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
         if (request.generate_preview) {
             report_progress(callbacks, 0.96f, "Preparing toolpath preview");
-            result.preview = make_toolpath_preview(processor_result, &config, result.output.path,
+            auto preview = make_toolpath_preview(processor_result, &config, result.output.path,
                                                    print.belt_coordinate_system());
+            if (preview && print.config().fiber_fill_debug.value) {
+                for (size_t oi = 0; oi < print.objects().size(); ++oi) {
+                    const auto* object = print.objects()[oi];
+                    for (const auto* layer : object->layers()) {
+                        const auto preview_layer = std::find_if(preview->layers.begin(), preview->layers.end(),
+                            [&](const auto& value) { return std::abs(value.print_z_mm - layer->print_z) < 1e-4; });
+                        if (preview_layer == preview->layers.end()) {
+                            if (!layer->fiber_fill_diagnostics.empty())
+                                result.diagnostics.push_back({"fiber_debug_layer", "Unmapped debug layer z=" + std::to_string(layer->print_z), true});
+                            continue;
+                        }
+                        for (size_t ii = 0; ii < object->instances().size(); ++ii) {
+                            const auto shift = object->instances()[ii].shift;
+                            for (const auto& source : layer->fiber_fill_diagnostics) {
+                                FiberFillDiagnosticPath path;
+                                path.reason = source.reason;
+                                path.contour = source.contour;
+                                path.source_length_mm = source.source_length_mm;
+                                path.layer_index = preview_layer->index;
+                                path.object_index = oi;
+                                path.instance_index = ii;
+                                for (const auto& point : source.geometry.points) {
+                                    Slic3r::Vec3d position(Slic3r::unscale<double>(point.x() + shift.x()),
+                                        Slic3r::unscale<double>(point.y() + shift.y()), layer->print_z);
+                                    if (const auto* belt = print.belt_coordinate_system())
+                                        position = belt->oriented_to_world(position);
+                                    path.points.push_back({float(position.x()), float(position.y()), float(position.z())});
+                                }
+                                if (path.points.size() >= 2)
+                                    preview->fiber_fill_diagnostics.push_back(std::move(path));
+                            }
+                        }
+                    }
+                }
+            }
+            result.preview = std::move(preview);
             if (!result.preview || result.preview->layers.empty() ||
                 result.preview->segments.empty()) {
                 result.diagnostics.push_back({"preview", "Slicer generated no drawable toolpath preview", false});

@@ -37,6 +37,23 @@ void require_same_area(const ExPolygons& lhs, const ExPolygons& rhs)
 
 } // namespace
 
+TEST_CASE("fiber debug belongs to serializable print configuration", "[Config][FiberFillDebug]")
+{
+    PrintConfig defaults;
+    CHECK_FALSE(defaults.fiber_fill_debug.value);
+    DynamicPrintConfig config;
+    config.set_deserialize_strict("fiber_fill_debug", "1");
+    std::stringstream buffer;
+    { cereal::BinaryOutputArchive archive(buffer); archive(config); }
+    DynamicPrintConfig restored;
+    { cereal::BinaryInputArchive archive(buffer); archive(restored); }
+    REQUIRE(restored.has("fiber_fill_debug"));
+    CHECK(restored.opt_bool("fiber_fill_debug"));
+    PrintConfig runtime;
+    runtime.apply(restored);
+    CHECK(runtime.fiber_fill_debug.value);
+}
+
 TEST_CASE("bed exclude area preserves Orca single polygon semantics", "[Config][BedExcludeArea]")
 {
     FullPrintConfig config;

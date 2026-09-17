@@ -1538,6 +1538,9 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     PrintConfig,
     (MachineEnvelopeConfig, GCodeConfig),
 
+    // Process-wide diagnostic collection, persisted with the print preset.
+    ((ConfigOptionBool,               fiber_fill_debug))
+
     //BBS
     ((ConfigOptionInts,               additional_cooling_fan_speed))
     ((ConfigOptionInts,               close_additional_fan_first_x_layers))

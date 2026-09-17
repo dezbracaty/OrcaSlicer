@@ -234,6 +234,15 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
     const auto* contour_count = find_item(items, "outer_reinforced_perimeters_counts");
     const auto* infill_density = find_item(items, "reinforced_infill_density");
     const auto* layer_interval = find_item(items, "fiber_layer_height_ratio");
+    const auto* fill_debug = find_item(items, "fiber_fill_debug");
+    REQUIRE(fill_debug != nullptr);
+    CHECK(fill_debug->type == libslicer::SettingType::Boolean);
+    CHECK(fill_debug->group == libslicer::SettingGroup::Process);
+    CHECK(fill_debug->level == libslicer::SettingLevel::Simple);
+    CHECK(fill_debug->category == "Continuous fiber");
+    CHECK(fill_debug->visible);
+    CHECK(fill_debug->default_value == "0");
+    CHECK_FALSE(fill_debug->enabled);
     const auto* minimum_segment = find_item(items, "fiber_minimum_segment_length");
     const auto* maximum_turn = find_item(items, "fiber_maximum_turn_angle");
     const auto* contour_infill_clearance = find_item(items, "fiber_contour_infill_clearance");
@@ -261,6 +270,12 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
     items = config.settings();
     CHECK(find_item(items, "outer_reinforced_perimeters_counts")->enabled);
     CHECK(find_item(items, "fiber_layer_height_ratio")->enabled);
+    CHECK(find_item(items, "fiber_fill_debug")->enabled);
+    REQUIRE(config.set("fiber_fill_debug", "1").success);
+    const auto debug_snapshot = config.snapshot();
+    REQUIRE(config.reset("fiber_fill_debug").success);
+    CHECK(debug_snapshot.value("fiber_fill_debug") == "1");
+    CHECK(config.snapshot().value("fiber_fill_debug") == "0");
     CHECK(find_item(items, "fiber_minimum_segment_length")->enabled);
     CHECK(find_item(items, "fiber_maximum_turn_angle")->enabled);
     CHECK_FALSE(find_item(items, "reinforced_infill_density")->enabled);
@@ -600,6 +615,105 @@ libslicer::SliceObjectInput fiber_infill_block()
     object.volumes.push_back(std::move(volume));
     return object;
 }
+}
+
+TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libslicer_api][fiber-fill-debug]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0,1};
+    const char* model = std::getenv("LIBSLICER_FIBER_VALIDATION_MODEL");
+    // Synthetic fixture deliberately rejects candidates; the optional real model
+    // uses the unmodified production process budget.
+    REQUIRE(library->activate_config(selection, {{"generate_reinforced_infills", "1"}}).success);
+    if (!model) REQUIRE(library->apply_active_config_patch({{"fiber_minimum_path_length", "1000"}}).success);
+    libslicer::SliceRequest request;
+    request.config = *library->active_config_snapshot();
+    request.center_on_build_plate = model != nullptr;
+    request.objects.push_back(model ? binary_stl_on_bed(model) : fiber_infill_block());
+    const auto normal = library->slice(request);
+    for (const auto& d : normal.diagnostics) INFO(d.message);
+    REQUIRE(normal.success);
+    REQUIRE(normal.preview);
+    CHECK(normal.preview->fiber_fill_diagnostics.empty());
+    REQUIRE(request.config.value("fiber_fill_debug") == "0");
+    REQUIRE(library->apply_active_config_patch({{"fiber_fill_debug", "1"}}).success);
+    request.config = *library->active_config_snapshot();
+    REQUIRE(request.config.value("fiber_fill_debug") == "1");
+    // A later UI edit cannot change the already captured slice configuration.
+    REQUIRE(library->apply_active_config_patch({{"fiber_fill_debug", "0"}}).success);
+    const auto debug = library->slice(request);
+    for (const auto& d : debug.diagnostics) INFO(d.message);
+    REQUIRE(debug.success);
+    REQUIRE(debug.preview);
+    REQUIRE_FALSE(debug.preview->fiber_fill_diagnostics.empty());
+    size_t contour_count = 0, infill_count = 0;
+    for (const auto& path : debug.preview->fiber_fill_diagnostics) {
+        REQUIRE(path.points.size() >= 2);
+        CHECK_FALSE(path.reason.empty());
+        CHECK(path.source_length_mm > 0);
+        REQUIRE(path.layer_index < debug.preview->layers.size());
+        CHECK(path.object_index == 0);
+        CHECK(path.instance_index == 0);
+        path.contour ? ++contour_count : ++infill_count;
+        for (const auto& p : path.points) {
+            CHECK(std::isfinite(p.x)); CHECK(std::isfinite(p.y));
+            CHECK(p.z == Catch::Approx(debug.preview->layers[path.layer_index].print_z_mm));
+            if (!model) {
+                CHECK(p.x >= 100); CHECK(p.x <= 160);
+                CHECK(p.y >= 100); CHECK(p.y <= 140);
+            }
+        }
+    }
+    CHECK(contour_count > 0);
+    CHECK(infill_count > 0);
+    CHECK(debug.preview->segments.size() == normal.preview->segments.size());
+    CHECK(debug.summary.filament_used_mm == Catch::Approx(normal.summary.filament_used_mm));
+    CHECK(debug.summary.estimated_time_seconds == Catch::Approx(normal.summary.estimated_time_seconds));
+    const auto commands = [](const std::string& path) {
+        std::ifstream input(path);
+        std::vector<std::string> result;
+        for (std::string line; std::getline(input, line);) {
+            // Timestamps and file names live in comments, never compare those.
+            line = line.substr(0, line.find(';'));
+            if (!line.empty()) result.push_back(std::move(line));
+        }
+        return result;
+    };
+    CHECK(commands(debug.output.path) == commands(normal.output.path));
+    std::cout << "[FiberFillDebug] contour_rejected=" << contour_count
+              << " infill_rejected=" << infill_count << " commands_unchanged\n";
+    for (const auto& diagnostic : debug.diagnostics)
+        if (diagnostic.code == "fiber_infill_summary" || diagnostic.code == "fiber_infill_empty") {
+            std::cout << "[FiberFillDebug] " << diagnostic.message << '\n';
+            const auto start = diagnostic.message.find("Rejected fragments:");
+            REQUIRE(start != std::string::npos);
+            std::istringstream counts(diagnostic.message.substr(start + 19));
+            size_t rejected = 0;
+            for (std::string entry; counts >> entry;) {
+                const auto equal = entry.find('=');
+                REQUIRE(equal != std::string::npos);
+                rejected += std::stoul(entry.substr(equal+1));
+            }
+            CHECK(infill_count == rejected);
+        }
+    CHECK(std::none_of(debug.diagnostics.begin(), debug.diagnostics.end(), [](const auto& d) { return d.code == "fiber_debug_layer"; }));
+    libslicer::GCodePreviewRequest imported_request;
+    imported_request.gcode_path = debug.output.path;
+    const auto imported = library->load_gcode_preview(imported_request);
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview);
+    CHECK(imported.preview->fiber_fill_diagnostics.empty());
+    std::filesystem::remove(normal.output.path);
+    std::filesystem::remove(debug.output.path);
 }
 
 TEST_CASE("CFSYS default finish permits internal fiber output on T1", "[libslicer_api][fiber][fiber-infill-output]")
@@ -1615,6 +1729,7 @@ TEST_CASE("external layer tags assign motions without double counting",
     std::string first = "; LAYER:1 [0.2]\r\n";
     std::string second = "; LAYER:2 [0.4]\r\n";
     std::string duplicate = first;
+    bool elevated_first_move = false;
     SECTION("FibreSeek numbered layers") {}
     SECTION("whitespace and zero-based layers") {
         first = ";\t LAYER: 0 [ 0.2 ] \t\r\n";
@@ -1640,6 +1755,18 @@ TEST_CASE("external layer tags assign motions without double counting",
         second = ";LAYER_CHANGE\n";
         duplicate.clear();
     }
+    SECTION("compatible nominal Z is independent of landing height") {
+        first = ";LAYER_CHANGE\n;Z:0.2\n";
+        second = ";LAYER_CHANGE\n;Z:0.4\n";
+        duplicate.clear();
+        elevated_first_move = true;
+    }
+    SECTION("Orca nominal Z is independent of landing height") {
+        first = "; CHANGE_LAYER\n; Z_HEIGHT: 0.2\n";
+        second = "; CHANGE_LAYER\n; Z_HEIGHT: 0.4\n";
+        duplicate.clear();
+        elevated_first_move = true;
+    }
 
     const auto path = std::filesystem::temp_directory_path() / "libslicer_layer_tags.gcode";
     {
@@ -1650,7 +1777,7 @@ TEST_CASE("external layer tags assign motions without double counting",
                  "; LAYER:invalid\n; LAYER:9999999999999999999999\n"
                  "; LAYER:12garbage\n; LAYER:12 [bad]\n"
               << first
-              << "G0 X0 Y0 Z0.2 F1200\nG1 X10 E1\n"
+              << (elevated_first_move ? "G0 X0 Y0 Z2 F1200\nG1 X10 E1\n" : "G0 X0 Y0 Z0.2 F1200\nG1 X10 E1\n")
               << duplicate
               << "G0 Z2\nG0 Z0.2\nG1 X20 E1\n"
               << second
@@ -1668,6 +1795,9 @@ TEST_CASE("external layer tags assign motions without double counting",
     REQUIRE(imported.success);
     REQUIRE(imported.preview != nullptr);
     CHECK(imported.preview->statistics.total_layers == 2);
+    REQUIRE(imported.preview->layers.size() == 2);
+    CHECK(imported.preview->layers[0].print_z_mm == Catch::Approx(0.2));
+    CHECK(imported.preview->layers[1].print_z_mm == Catch::Approx(0.4));
     std::set<std::uint32_t> extrusion_layers;
     for (const auto& segment : imported.preview->segments) {
         if (segment.motion == libslicer::ToolpathMotionKind::Extrusion) {

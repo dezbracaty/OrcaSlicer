@@ -1843,6 +1843,13 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         for (const FiberFragmentAssignment& assignment : validation.assignments) {
             if (assignment.kind != FiberAssignmentKind::Rejected)
                 continue;
+            if (context.layer.object()->print()->config().fiber_fill_debug.value && assignment.centerline) {
+                context.layer.fiber_fill_diagnostics.push_back({
+                    assignment.centerline->polyline.to_polyline(),
+                    fiber_rejection_reason_name(assignment.reason),
+                    assignment.id.parent.purpose == FiberPathPurpose::Contour,
+                    assignment.source_end_mm - assignment.source_begin_mm});
+            }
             BOOST_LOG_TRIVIAL(debug)
                 << "[FiberRejected] layer=" << context.layer.id()
                 << " policy_group=" << assignment.id.parent.domain.policy_group_id
@@ -1908,6 +1915,7 @@ FillSurfaceView build_resin_surface_view(
 void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
 {
     fiber_infill_statistics = {};
+    fiber_fill_diagnostics.clear();
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");

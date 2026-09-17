@@ -1010,6 +1010,13 @@ void PrintConfigDef::init_fff_params()
     def->min = 1;
     def->set_default_value(new ConfigOptionInt(1));
 
+    def = this->add("fiber_fill_debug", coBool);
+    def->label = L("Enable continuous fiber fill debugging");
+    def->category = L("Continuous fiber");
+    def->tooltip = L("Collect rejected fiber contour and infill candidate paths for preview diagnostics. Does not change the generated print moves. Regions without candidate paths are not included.");
+    def->mode = comSimple;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("fiber_minimum_path_length", coFloat);
     def->label = L("Minimum continuous fiber path length");
     def->category = L("Continuous fiber");

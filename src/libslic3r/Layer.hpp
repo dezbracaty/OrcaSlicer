@@ -131,6 +131,13 @@ public:
         std::map<std::string, size_t> rejected_fragments;
     };
     FiberInfillStatistics fiber_infill_statistics;
+    struct FiberFillDiagnostic {
+        Polyline geometry;
+        std::string reason;
+        bool contour {false};
+        double source_length_mm {0.0};
+    };
+    std::vector<FiberFillDiagnostic> fiber_fill_diagnostics;
     // Sequential index of this layer in PrintObject::m_layers, offsetted by the number of raft layers.
     size_t              id() const          { return m_id; }
     void                set_id(size_t id)   { m_id = id; }

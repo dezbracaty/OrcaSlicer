@@ -206,6 +206,7 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
     } else if (item.key == "fiber_contour_infill_clearance") {
         item.enabled = contour_enabled && infill_enabled;
     } else if (key_is(item.key, {"fiber_layer_height_ratio",
+                                 "fiber_fill_debug",
                                  "fiber_minimum_path_length",
                                  "fiber_minimum_segment_length",
                                  "fiber_maximum_turn_angle",
