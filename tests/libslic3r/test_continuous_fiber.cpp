@@ -730,6 +730,38 @@ TEST_CASE("fiber tool resolution keeps material logical extruder and physical to
     CHECK_THROWS(resolve_fiber_tool(config, 1));
 }
 
+TEST_CASE("CFSYS physical tool ownership is independent of material order", "[ContinuousFiber][mapping][tool-materials]")
+{
+    GCodeConfig config;
+    config.gcode_flavor.value = gcfKlipper;
+    config.filament_process_type.values = {"thermoplastic", "thermoplastic", "continuous_fiber"};
+    config.filament_diameter.values = {1.75, 1.75, 0.35};
+    config.filament_map.values = {2, 2, 1};
+    config.physical_extruder_map.values = {1, 0};
+    config.toolhead_process_capabilities.values = {"thermoplastic", "continuous_fiber"};
+    config.toolhead_filament_capacity.values = {4, 1};
+    config.toolhead_fiber_protocol_id.values = {"", "cfsys-v1"};
+    config.toolhead_fiber_e_units_per_mm.values = {1, 1};
+    REQUIRE_NOTHROW(validate_material_tool_bindings(config));
+    const auto tool = resolve_fiber_tool(config, 2);
+    CHECK(tool.logical_filament_id == 2);
+    CHECK(tool.logical_extruder_id == 0);
+    CHECK(tool.physical_tool_id == 1);
+    SECTION("base material cannot use T1") {
+        config.filament_map.values[0] = 1;
+        CHECK_THROWS(validate_material_tool_bindings(config));
+    }
+    SECTION("fiber cannot use T0") {
+        config.filament_map.values[2] = 2;
+        CHECK_THROWS(resolve_fiber_tool(config, 2));
+    }
+    SECTION("fiber capacity is one regardless of slot positions") {
+        config.filament_process_type.values[0] = "continuous_fiber";
+        config.filament_map.values[0] = 1;
+        CHECK_THROWS(validate_material_tool_bindings(config));
+    }
+}
+
 TEST_CASE("fiber script boundary rejects unknown macros and unowned E", "[ContinuousFiber][scripts]")
 {
     CHECK_NOTHROW(require_fiber_safe_script("; only comments\n", "test"));

@@ -1402,6 +1402,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInts,                physical_extruder_map))
     ((ConfigOptionBool,                filament_slots_bound_to_physical_tools))
     ((ConfigOptionStrings,             toolhead_process_capabilities))
+    ((ConfigOptionInts,                toolhead_filament_capacity))
     ((ConfigOptionStrings,             physical_tool_sides))
     ((ConfigOptionIntsNullable,        nozzle_flush_dataset))
     ((ConfigOptionFloatsNullable,      filament_flush_volumetric_speed))

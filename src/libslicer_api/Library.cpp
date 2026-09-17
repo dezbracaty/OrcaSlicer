@@ -7,6 +7,7 @@
 #include <libslic3r/Model.hpp>
 #include <libslic3r/Print.hpp>
 #include <libslic3r/PrintConfig.hpp>
+#include <libslic3r/ContinuousFiber/ContinuousFiberConfig.hpp>
 #include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/GCode/ThumbnailData.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
@@ -236,6 +237,26 @@ std::string first_compatible_preset_name(const Slic3r::PresetCollection& presets
         }
     }
     return {};
+}
+
+Slic3r::FullPrintConfig tool_config(const Slic3r::DynamicPrintConfig& config)
+{
+    Slic3r::FullPrintConfig tools;
+    tools.apply(config, true);
+    return tools;
+}
+
+std::string preset_process(const Slic3r::Preset& preset)
+{
+    const auto* types = preset.config.option<Slic3r::ConfigOptionStrings>("filament_process_type");
+    return types && !types->values.empty() ? types->values.front() : "thermoplastic";
+}
+
+bool tool_owned_setting(std::string_view key)
+{
+    return key == "filament_process_type" || key == "filament_map" || key == "physical_extruder_map" ||
+        key == "toolhead_process_capabilities" || key == "toolhead_filament_capacity" ||
+        key == "toolhead_fiber_protocol_id" || key == "filament_slots_bound_to_physical_tools";
 }
 
 std::vector<std::pair<std::string, std::string>> serialized_values(const Slic3r::DynamicPrintConfig& config)
@@ -2278,6 +2299,16 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
                         option.max_filament_slots = option.variable_filament_slots
                             ? 4
                             : option.physical_tool_count;
+                        if (const auto* capacities = preset->config.option<Slic3r::ConfigOptionInts>("toolhead_filament_capacity");
+                            capacities && !capacities->values.empty()) {
+                            if (capacities->size() != option.physical_tool_count ||
+                                std::any_of(capacities->values.begin(), capacities->values.end(), [](int count) { return count < 1; }))
+                                throw std::invalid_argument("Invalid per-tool material capacity: " + preset->name);
+                            option.max_filament_slots = 0;
+                            option.toolhead_filament_capacity = capacities->values;
+                            for (int count : capacities->values) option.max_filament_slots += size_t(count);
+                            option.variable_filament_slots = option.max_filament_slots > option.physical_tool_count;
+                        }
                         populate_printable_volume(preset->config, option);
                         machine.variants.push_back(std::move(option));
                     }
@@ -2420,6 +2451,23 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
             if (const auto* defaults = active_printer.config.option<Slic3r::ConfigOptionStrings>("default_filament_profile")) {
                 filament_names = defaults->values;
             }
+            const auto tools = tool_config(active_printer.config);
+            if (Slic3r::has_fiber_tool(tools)) {
+                filament_names.resize(tools.nozzle_diameter.size());
+                for (size_t physical = 0; physical < filament_names.size(); ++physical) {
+                    const auto accepts = [&](const Slic3r::Preset& preset) {
+                        return preset.is_visible && preset.is_compatible &&
+                            Slic3r::tool_accepts_process(tools, unsigned(physical), preset_process(preset));
+                    };
+                    const auto* preferred = selected.filaments.find_preset(filament_names[physical], false);
+                    if (!preferred || !accepts(*preferred)) {
+                        const auto replacement = std::find_if(selected.filaments.begin(), selected.filaments.end(), accepts);
+                        if (replacement == selected.filaments.end())
+                            throw std::invalid_argument("No compatible material for physical tool " + std::to_string(physical));
+                        filament_names[physical] = replacement->name;
+                    }
+                }
+            }
             const bool defaults_valid = !filament_names.empty() &&
                 std::all_of(filament_names.begin(), filament_names.end(), [&selected](const std::string& name) {
                     const Slic3r::Preset* preset = selected.filaments.find_preset(name, false);
@@ -2456,7 +2504,44 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
                                                          result.selection.filament_preset_ids.empty() ? std::string{} :
                                                                                                         result.selection.filament_preset_ids.front());
 
-        result.config = std::unique_ptr<Config>(new Config(serialized_values(selected.full_config())));
+        auto full_config = selected.full_config();
+        auto physical_tools = selection.filament_physical_tools;
+        const auto tools = tool_config(full_config);
+        if (physical_tools.empty() && same_active_machine && impl_->active_config &&
+            result.selection.filament_preset_ids.size() == impl_->active_selection.filament_preset_ids.size()) {
+            const auto previous = dynamic_config(impl_->active_config->snapshot());
+            const auto previous_tools = filament_tool_map(&previous, result.selection.filament_preset_ids.size());
+            physical_tools.assign(previous_tools.begin(), previous_tools.end());
+        }
+        if (physical_tools.empty() && !tools.toolhead_filament_capacity.values.empty()) {
+            // A new machine starts with one slot for each physical tool, in
+            // machine-declared order. Additional slots require an explicit owner.
+            if (result.selection.filament_preset_ids.size() != tools.nozzle_diameter.size())
+                throw std::invalid_argument("Specify a physical tool for each material slot");
+            for (size_t physical = 0; physical < tools.nozzle_diameter.size(); ++physical)
+                physical_tools.push_back(unsigned(physical));
+        }
+        if (!physical_tools.empty()) {
+            if (physical_tools.size() != result.selection.filament_preset_ids.size())
+                throw std::invalid_argument("Physical tool count must match material slot count");
+            std::vector<int> mapping;
+            for (unsigned physical : physical_tools) {
+                const auto& physical_map = tools.physical_extruder_map.values;
+                const auto logical = std::find(physical_map.begin(), physical_map.end(), int(physical));
+                if (physical >= tools.nozzle_diameter.size() || logical == physical_map.end() ||
+                    std::count(physical_map.begin(), physical_map.end(), int(physical)) != 1)
+                    throw std::invalid_argument("Invalid physical tool owner: " + std::to_string(physical));
+                mapping.push_back(int(logical - physical_map.begin()) + 1);
+            }
+            // Construct variant-dependent material values with the requested
+            // owners, rather than changing the map after preset resolution.
+            full_config = selected.full_config(true, mapping);
+        }
+        if (!tools.toolhead_filament_capacity.values.empty())
+            Slic3r::validate_material_tool_bindings(tool_config(full_config));
+        const auto resolved_tools = filament_tool_map(&full_config, result.selection.filament_preset_ids.size());
+        result.selection.filament_physical_tools.assign(resolved_tools.begin(), resolved_tools.end());
+        result.config = std::unique_ptr<Config>(new Config(serialized_values(full_config)));
         result.success = true;
     } catch (const std::exception& error) {
         result.diagnostics.push_back({"selection", error.what()});
@@ -2478,11 +2563,38 @@ ConfigActivationResult Library::activate_config(
         return result;
     }
 
+    if (impl_->active_config && selection.machine_model_id == impl_->active_selection.machine_model_id &&
+        selection.machine_variant_id == impl_->active_selection.machine_variant_id &&
+        selection.process_preset_id == impl_->active_selection.process_preset_id) {
+        const auto previous = dynamic_config(impl_->active_config->snapshot());
+        auto candidate = dynamic_config(created.config->snapshot());
+        for (const auto* keys : {&Slic3r::Preset::print_options(), &Slic3r::Preset::printer_options()})
+            for (const auto& key : *keys)
+                if (const auto* value = previous.option(key)) candidate.set_key_value(key, value->clone());
+        const auto& old_ids = impl_->active_selection.filament_preset_ids;
+        const auto& new_ids = created.selection.filament_preset_ids;
+        for (const auto& key : Slic3r::Preset::filament_options()) {
+            const auto* old_value = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(previous.option(key));
+            auto* new_value = dynamic_cast<Slic3r::ConfigOptionVectorBase*>(candidate.option(key));
+            if (!old_value || !new_value || old_value->size() != old_ids.size() || new_value->size() != new_ids.size()) continue;
+            for (size_t slot = 0; slot < std::min(old_ids.size(), new_ids.size()); ++slot)
+                if (old_ids[slot] == new_ids[slot]) new_value->set_at(old_value, slot, slot);
+        }
+        created.config = std::unique_ptr<Config>(new Config(serialized_values(candidate)));
+    }
+
     const bool patch_supplies_colors = std::any_of(
         patch.begin(), patch.end(), [](const auto& entry) {
             return entry.first == "filament_colour";
         });
     if (!patch.empty()) {
+        const auto tools = tool_config(dynamic_config(created.config->snapshot()));
+        if (!tools.toolhead_filament_capacity.values.empty()) {
+            for (const auto& entry : patch) if (tool_owned_setting(entry.first)) {
+                result.diagnostics.push_back({entry.first, "Material ownership and tool capabilities are managed by the machine and material selection"});
+                return result;
+            }
+        }
         const SettingsResult patched = created.config->apply_patch(patch);
         if (!patched) {
             result.diagnostics = patched.diagnostics;
@@ -2527,6 +2639,7 @@ std::optional<ActiveConfigView> Library::active_config() const
     view.compatible_processes = impl_->compatible_processes;
     view.compatible_filaments = impl_->compatible_filaments;
     view.settings = impl_->active_config->settings();
+    view.selection.filament_physical_tools.clear();
 
     const Slic3r::DynamicPrintConfig config = dynamic_config(impl_->active_config->snapshot());
     view.filament_slots.reserve(view.selection.filament_preset_ids.size());
@@ -2549,7 +2662,8 @@ std::optional<ActiveConfigView> Library::active_config() const
         }
         const auto tool_map = filament_tool_map(&config, view.selection.filament_preset_ids.size());
         slot.physical_tool_index = static_cast<std::size_t>(tool_map[index]);
-        slot.physical_tool_name = "Nozzle " + std::to_string(slot.physical_tool_index + 1);
+        view.selection.filament_physical_tools.push_back(unsigned(slot.physical_tool_index));
+        slot.physical_tool_name = "Nozzle " + std::to_string(slot.physical_tool_index);
         if (const auto* roles = config.option<Slic3r::ConfigOptionStrings>("toolhead_process_capabilities");
             roles != nullptr && slot.physical_tool_index < roles->values.size()) {
             slot.physical_tool_role = roles->values[slot.physical_tool_index];
@@ -2561,6 +2675,17 @@ std::optional<ActiveConfigView> Library::active_config() const
         if (const auto* nozzles = config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter");
             nozzles != nullptr && slot.physical_tool_index < nozzles->values.size()) {
             slot.nozzle_diameter_mm = nozzles->values[slot.physical_tool_index];
+        }
+        const auto tools = tool_config(config);
+        for (const auto& option : view.compatible_filaments) {
+            for (const auto& bundle : impl_->vendor_presets) {
+                if (!bundle->printers.find_system_preset_by_model_and_variant(
+                        view.selection.machine_model_id, view.selection.machine_variant_id)) continue;
+                const auto* preset = bundle->filaments.find_preset(option.id, false);
+                if (preset && Slic3r::tool_accepts_process(tools, unsigned(slot.physical_tool_index), preset_process(*preset)))
+                    slot.compatible_presets.push_back({option.id, option.name, option.id == slot.preset_id});
+                break;
+            }
         }
         view.filament_slots.push_back(std::move(slot));
     }
@@ -2579,6 +2704,10 @@ SettingsResult Library::apply_active_config_patch(
 {
     if (!impl_->active_config) {
         return settings_failure("configuration", "No slicing configuration is active");
+    }
+    if (!tool_config(dynamic_config(impl_->active_config->snapshot())).toolhead_filament_capacity.values.empty()) {
+        for (const auto& entry : patch) if (tool_owned_setting(entry.first))
+            return settings_failure(entry.first, "Use material selection to change a material; physical tool ownership is preserved");
     }
     if (fixed_physical_filament_slots(dynamic_config(impl_->active_config->snapshot()))) {
         const auto mapping_edit = std::find_if(patch.begin(), patch.end(), [](const auto& entry) {
@@ -2623,6 +2752,9 @@ SettingsResult Library::reset_active_config_value(std::string_view key)
     if (!impl_->active_config) {
         return settings_failure("configuration", "No slicing configuration is active");
     }
+    if (tool_owned_setting(key) &&
+        !tool_config(dynamic_config(impl_->active_config->snapshot())).toolhead_filament_capacity.values.empty())
+        return settings_failure(std::string(key), "Cannot reset material ownership or physical tool capabilities");
     if ((key == "filament_map" || key == "filament_map_mode") &&
         fixed_physical_filament_slots(dynamic_config(impl_->active_config->snapshot()))) {
         return settings_failure(std::string(key),
@@ -2665,6 +2797,13 @@ ConfigActivationResult Library::set_active_filament_preset(
         result.diagnostics.push_back({"filament", "Filament slot index is out of range"});
         return result;
     }
+    const auto current = active_config();
+    const auto& allowed = current->filament_slots[slot_index].compatible_presets;
+    if (std::none_of(allowed.begin(), allowed.end(), [preset_id](const PresetOption& option) { return option.id == preset_id; })) {
+        ConfigActivationResult result;
+        result.diagnostics.push_back({"filament", "Material is incompatible with this physical tool"});
+        return result;
+    }
     if (impl_->active_selection.filament_preset_ids[slot_index] == preset_id) {
         ConfigActivationResult result;
         result.success = true;
@@ -2703,6 +2842,10 @@ ConfigActivationResult Library::resize_active_filament_slots(std::size_t slot_co
         result.diagnostics.push_back({"machine", "The active machine variant is unavailable"});
         return result;
     }
+    if (!variant->toolhead_filament_capacity.empty()) {
+        result.diagnostics.push_back({"filament", "Add materials to an explicit physical tool; total slot count does not identify a tool"});
+        return result;
+    }
     if (slot_count == 0 || slot_count > variant->max_filament_slots) {
         result.diagnostics.push_back({
             "filament",
@@ -2725,8 +2868,53 @@ ConfigActivationResult Library::resize_active_filament_slots(std::size_t slot_co
         result.diagnostics.push_back({"filament", "The active configuration has no filament preset"});
         return result;
     }
-    selection.filament_preset_ids.resize(slot_count,
-                                         selection.filament_preset_ids.back());
+    selection.filament_preset_ids.resize(slot_count, selection.filament_preset_ids.back());
+    return activate_config(selection);
+}
+
+ConfigActivationResult Library::add_active_filament(std::size_t physical_tool, std::string_view preset_id)
+{
+    ConfigActivationResult result;
+    const auto view = active_config();
+    if (!view) {
+        result.diagnostics.push_back({"configuration", "No slicing configuration is active"});
+        return result;
+    }
+    const auto config = dynamic_config(impl_->active_config->snapshot());
+    const auto tools = tool_config(config);
+    const auto& capacities = tools.toolhead_filament_capacity.values;
+    if (physical_tool >= capacities.size()) {
+        result.diagnostics.push_back({"filament", "No material capacity declared for this physical tool"});
+        return result;
+    }
+    const auto count = std::count_if(view->filament_slots.begin(), view->filament_slots.end(),
+        [physical_tool](const FilamentSlotInfo& slot) { return slot.physical_tool_index == physical_tool; });
+    if (count >= capacities[physical_tool]) {
+        result.diagnostics.push_back({"filament", "Material capacity exceeded for physical tool " + std::to_string(physical_tool)});
+        return result;
+    }
+    const auto existing = std::find_if(view->filament_slots.begin(), view->filament_slots.end(),
+        [physical_tool](const FilamentSlotInfo& slot) { return slot.physical_tool_index == physical_tool; });
+    // Each tool has an initial slot. Adding another defaults to its selected
+    // material; the operation's target tool, not the material, owns the slot.
+    if (existing == view->filament_slots.end()) {
+        result.diagnostics.push_back({"filament", "Physical tool has no initialized material slot"});
+        return result;
+    }
+    const std::string requested = preset_id.empty() ? existing->preset_id : std::string(preset_id);
+    if (std::none_of(existing->compatible_presets.begin(), existing->compatible_presets.end(),
+        [&requested](const PresetOption& option) { return option.id == requested; })) {
+        result.diagnostics.push_back({"filament", "Material is incompatible with this physical tool"});
+        return result;
+    }
+    ConfigSelection selection;
+    selection.machine_model_id = view->selection.machine_model_id;
+    selection.machine_variant_id = view->selection.machine_variant_id;
+    selection.process_preset_id = view->selection.process_preset_id;
+    selection.filament_preset_ids = view->selection.filament_preset_ids;
+    for (const auto& slot : view->filament_slots) selection.filament_physical_tools.push_back(unsigned(slot.physical_tool_index));
+    selection.filament_preset_ids.push_back(requested);
+    selection.filament_physical_tools.push_back(unsigned(physical_tool));
     return activate_config(selection);
 }
 
@@ -2782,6 +2970,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         }
         Slic3r::DynamicPrintConfig config = dynamic_config(request.config);
         normalize_filament_identity(config);
+        Slic3r::validate_material_tool_bindings(tool_config(config));
         const auto filament_diagnostics = slice_filament_diagnostics(config);
         if (!filament_diagnostics.empty()) {
             for (const auto& diagnostic : filament_diagnostics) {
@@ -3577,27 +3766,32 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                     true});
             } else {
                 try {
+                    auto candidate_bundle = *preset_bundle;
                     Slic3r::DynamicPrintConfig resolved_config;
                     resolved_config.apply(Slic3r::FullPrintConfig::defaults());
                     resolved_config.apply(config);
                     Slic3r::Preset::normalize(resolved_config);
 
                     if (!project_presets.empty()) {
-                        preset_bundle->load_project_embedded_presets(
+                        candidate_bundle.load_project_embedded_presets(
                             project_presets,
                             Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
                     }
 
-                    preset_bundle->load_config_model(
+                    candidate_bundle.load_config_model(
                         request.path, std::move(resolved_config), file_version);
 
                     auto active = std::unique_ptr<Config>(
-                        new Config(serialized_values(preset_bundle->full_config())));
+                        new Config(serialized_values(candidate_bundle.full_config())));
+                    // Ownership is loaded from the project, not inferred from
+                    // materials. Reject invalid assignments before any commit.
+                    Slic3r::validate_material_tool_bindings(tool_config(candidate_bundle.full_config()));
                     for (const auto& diagnostic : active->validate()) {
                         result.diagnostics.push_back({
                             diagnostic.key, diagnostic.message, true});
                     }
 
+                    *preset_bundle = std::move(candidate_bundle);
                     impl_->active_config = std::move(active);
                     impl_->active_selection.machine_model_id = machine->id;
                     impl_->active_selection.machine_variant_id = variant->id;
@@ -3607,6 +3801,9 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                         preset_bundle->prints.get_selected_preset_name();
                     impl_->active_selection.filament_preset_ids =
                         preset_bundle->filament_presets;
+                    const auto imported = preset_bundle->full_config();
+                    const auto imported_tools = filament_tool_map(&imported, preset_bundle->filament_presets.size());
+                    impl_->active_selection.filament_physical_tools.assign(imported_tools.begin(), imported_tools.end());
                     impl_->compatible_processes = compatible_presets(
                         preset_bundle->prints,
                         impl_->active_selection.process_preset_id);

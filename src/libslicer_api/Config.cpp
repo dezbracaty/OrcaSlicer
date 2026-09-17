@@ -3,6 +3,7 @@
 #include <libslic3r/Config.hpp>
 #include <libslic3r/Preset.hpp>
 #include <libslic3r/PrintConfig.hpp>
+#include <libslic3r/ContinuousFiber/ContinuousFiberConfig.hpp>
 
 #include <algorithm>
 #include <cfloat>
@@ -476,6 +477,9 @@ std::vector<ConfigDiagnostic> Config::validate() const
         for (const auto& [key, message] : errors) {
             diagnostics.push_back({key, message});
         }
+        Slic3r::GCodeConfig tools;
+        tools.apply(impl_->current, true);
+        Slic3r::validate_material_tool_bindings(tools);
     } catch (const std::exception& error) {
         diagnostics.push_back({{}, error.what()});
     }

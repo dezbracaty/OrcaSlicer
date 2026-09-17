@@ -66,6 +66,10 @@ struct ContinuousFiberConfig {
 
 bool continuous_fiber_enabled(const PrintRegionConfig& config);
 bool is_fiber_filament(const GCodeConfig& config, unsigned filament);
+// Material indices, logical extruders and physical tool IDs are distinct.
+bool has_fiber_tool(const GCodeConfig& config);
+bool tool_accepts_process(const GCodeConfig& config, unsigned physical, const std::string& process);
+void validate_material_tool_bindings(const GCodeConfig& config);
 
 struct ResolvedFiberTool {
     unsigned logical_filament_id;

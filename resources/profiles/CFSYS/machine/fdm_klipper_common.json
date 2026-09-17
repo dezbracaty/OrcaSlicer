@@ -7,6 +7,7 @@
   "gcode_flavor": "klipper",
   "physical_extruder_map": ["0", "1"],
   "toolhead_process_capabilities": ["thermoplastic", "continuous_fiber"],
+  "toolhead_filament_capacity": ["4", "1"],
   "toolhead_fiber_e_units_per_mm": ["1", "1"],
   "toolhead_fiber_protocol_id": ["", "cfsys-v1"],
   "fiber_cut_gcode": "M400\nS0\nM400\n",
@@ -67,7 +68,7 @@
   "435x-1",
   "0x-1"
 ],
-  "machine_start_gcode": "CF1004 left_filament={filament_type[1]} right_filament={filament_type[0]}\nCF1005\nCF1006\nCF1008\nG28\nM104 S{nozzle_temperature_initial_layer[initial_extruder]-30} T1\nM104 S{nozzle_temperature_initial_layer[initial_extruder]-30} T0\nCF1009\nT1\nCF1010\nCF1011\nM109 S{nozzle_temperature_initial_layer[initial_extruder]+30} T1\nCF1012\nWipe_the_nozzle\nCF1013\nT0\nCF1015\nM109 S{nozzle_temperature_initial_layer[initial_extruder]+40} T0\nCF1016\nM104 S{nozzle_temperature_initial_layer[initial_extruder]-30} T0\nWipe_the_nozzle\nCF1013\nM190 S[bed_temperature_initial_layer_single]\nT1\nCF1018 mesh_min={adaptive_bed_mesh_min[0]},{adaptive_bed_mesh_min[1]} mesh_max={adaptive_bed_mesh_max[0]},{adaptive_bed_mesh_max[1]} ALGORITHM=[bed_mesh_algo] PROBE_COUNT={bed_mesh_probe_count[0]},{bed_mesh_probe_count[1]} ADAPTIVE=0 ADAPTIVE_MARGIN=0\nCF1019\nM191 S[chamber_temperature]\nT0\nM109 S[nozzle_temperature_initial_layer] T0",
+  "machine_start_gcode": "CF1004 left_filament={filament_type[initial_filament_per_tool[1]]} right_filament={filament_type[initial_filament_per_tool[0]]}\nCF1005\nCF1006\nCF1008\nG28\nM104 S{nozzle_temperature_initial_layer[initial_filament_per_tool[1]]-30} T1\nM104 S{nozzle_temperature_initial_layer[initial_filament_per_tool[0]]-30} T0\nCF1009\nT1\nCF1010\nCF1011\nM109 S{nozzle_temperature_initial_layer[initial_filament_per_tool[1]]+30} T1\nCF1012\nWipe_the_nozzle\nCF1013\nT0\nCF1015\nM109 S{nozzle_temperature_initial_layer[initial_filament_per_tool[0]]+40} T0\nCF1016\nM104 S{nozzle_temperature_initial_layer[initial_filament_per_tool[0]]-30} T0\nWipe_the_nozzle\nCF1013\nM190 S[bed_temperature_initial_layer_single]\nT1\nCF1018 mesh_min={adaptive_bed_mesh_min[0]},{adaptive_bed_mesh_min[1]} mesh_max={adaptive_bed_mesh_max[0]},{adaptive_bed_mesh_max[1]} ALGORITHM=[bed_mesh_algo] PROBE_COUNT={bed_mesh_probe_count[0]},{bed_mesh_probe_count[1]} ADAPTIVE=0 ADAPTIVE_MARGIN=0\nCF1019\nM191 S[chamber_temperature]\nT0\nM109 S{nozzle_temperature_initial_layer[initial_filament_per_tool[0]]} T0",
   "machine_end_gcode": "PRINT_END",
   "layer_change_gcode": ";AFTER_LAYER_CHANGE\n;[layer_z]",
   "before_layer_change_gcode": ";BEFORE_LAYER_CHANGE\n;[layer_z]\nG92 E0\n",

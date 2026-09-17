@@ -35,6 +35,7 @@ struct MachineVariantOption
     bool variable_filament_slots{false};
     bool filament_slots_bound_to_physical_tools{false};
     std::size_t max_filament_slots{1};
+    std::vector<int> toolhead_filament_capacity;
     std::vector<PrintableAreaPoint> printable_area;
     std::string printer_preset_id;
 };
@@ -71,6 +72,8 @@ struct ConfigSelection
     std::string machine_variant_id;
     std::string process_preset_id;
     std::vector<std::string> filament_preset_ids;
+    // Optional physical tool IDs, one per material. Never inferred from material type.
+    std::vector<unsigned> filament_physical_tools;
 };
 
 struct ResolvedSelection
@@ -80,6 +83,7 @@ struct ResolvedSelection
     std::string printer_preset_id;
     std::string process_preset_id;
     std::vector<std::string> filament_preset_ids;
+    std::vector<unsigned> filament_physical_tools;
 };
 
 struct LibraryOptions
@@ -124,6 +128,7 @@ struct FilamentSlotInfo
     std::string physical_tool_role;
     std::string physical_tool_side;
     double nozzle_diameter_mm{0.0};
+    std::vector<PresetOption> compatible_presets;
 };
 
 struct ActiveConfigView
@@ -469,6 +474,7 @@ public:
     ConfigActivationResult set_active_filament_preset(
         std::size_t slot_index, std::string_view preset_id);
     ConfigActivationResult resize_active_filament_slots(std::size_t slot_count);
+    ConfigActivationResult add_active_filament(std::size_t physical_tool, std::string_view preset_id = {});
     SettingsResult set_active_filament_color(std::size_t slot_index, Rgba8 color);
     std::vector<ConfigDiagnostic> validate_active_config() const;
     SliceResult slice(const SliceRequest& request, const SliceCallbacks& callbacks = {}) const;

@@ -2949,6 +2949,18 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     match_physical_extruder_for_each_filament(first_filaments, m_config);
     this->placeholder_parser().set("first_tools", new ConfigOptionInts(first_filaments));
     this->placeholder_parser().set("first_filaments", new ConfigOptionInts(first_filaments));
+    // Startup may initialize an unused physical tool. Keep first_filaments' -1
+    // scheduling semantics, but resolve an actual configured material for the
+    // device template without assuming material index == physical tool ID.
+    auto initial_filament_per_tool = first_filaments;
+    for (size_t filament = 0; filament < m_config.filament_map.size(); ++filament) {
+        const int logical = m_config.filament_map.values[filament] - 1;
+        if (logical < 0 || size_t(logical) >= m_config.physical_extruder_map.size()) continue;
+        const int physical = m_config.physical_extruder_map.values[logical];
+        if (physical >= 0 && size_t(physical) < initial_filament_per_tool.size() && initial_filament_per_tool[physical] < 0)
+            initial_filament_per_tool[physical] = int(filament);
+    }
+    this->placeholder_parser().set("initial_filament_per_tool", new ConfigOptionInts(initial_filament_per_tool));
     this->placeholder_parser().set("initial_tool", initial_extruder_id);
     this->placeholder_parser().set("initial_extruder", initial_extruder_id);
     //BBS
@@ -6615,6 +6627,8 @@ std::string GCode::_extrude(
 {
     if (path.role() == erContinuousFiberContour || path.role() == erContinuousFiberInfill)
         throw Slic3r::RuntimeError("Fiber motion must use its bound execution plan, not plastic extrusion");
+    if (m_writer.filament() && is_fiber_filament(m_config, m_writer.filament()->id()))
+        throw Slic3r::RuntimeError("A thermoplastic path cannot use a continuous-fiber material/tool");
     std::string gcode;
     bool first_deposition_pending = bool(before_first_deposition);
     const auto emit_before_first_deposition = [&]() {
@@ -8270,15 +8284,17 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
     // Process the custom change_filament_gcode.
     std::string change_filament_gcode = m_config.change_filament_gcode.value;
 
-    // Move the lift gcode here which is in the change_filament_gcode originally
-    change_filament_gcode = this->retract(false, false, LiftType::SpiralLift, true) + change_filament_gcode;
+    // Native plastic retraction/lift is writer-owned motion, not custom script
+    // text. Keep it outside template validation (Fiber transitions returned
+    // above), while retaining validation of the actual user template.
+    const std::string toolchange_lift = this->retract(false, false, LiftType::SpiralLift, true);
 
     std::string toolchange_gcode_parsed;
     //Orca: Ignore change_filament_gcode if is the first call for a tool change and manual_filament_change is enabled
-    if (!change_filament_gcode.empty() && !(m_config.manual_filament_change.value && m_toolchange_count == 1)) {
+    if ((!change_filament_gcode.empty() || !toolchange_lift.empty()) && !(m_config.manual_filament_change.value && m_toolchange_count == 1)) {
         dyn_config.set_key_value("toolchange_z", new ConfigOptionFloat(print_z));
 
-        toolchange_gcode_parsed = placeholder_parser_process("change_filament_gcode", change_filament_gcode, new_filament_id, &dyn_config);
+        toolchange_gcode_parsed = toolchange_lift + placeholder_parser_process("change_filament_gcode", change_filament_gcode, new_filament_id, &dyn_config);
         check_add_eol(toolchange_gcode_parsed);
         gcode += toolchange_gcode_parsed;
 

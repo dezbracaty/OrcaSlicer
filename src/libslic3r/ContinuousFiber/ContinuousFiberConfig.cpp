@@ -25,6 +25,58 @@ bool is_fiber_filament(const GCodeConfig& config, unsigned filament)
            config.filament_process_type.values[filament] == "continuous_fiber";
 }
 
+bool has_fiber_tool(const GCodeConfig& config)
+{
+    return std::find(config.toolhead_process_capabilities.values.begin(),
+                     config.toolhead_process_capabilities.values.end(), "continuous_fiber") !=
+           config.toolhead_process_capabilities.values.end();
+}
+
+bool tool_accepts_process(const GCodeConfig& config, unsigned physical, const std::string& process)
+{
+    if (physical >= config.physical_extruder_map.size()) return false;
+    // Older thermoplastic profiles have a single default capability entry.
+    const auto& capabilities = config.toolhead_process_capabilities.values;
+    const std::string capability = physical < capabilities.size() ? capabilities[physical] :
+        (has_fiber_tool(config) ? "" : "thermoplastic");
+    return (process == "thermoplastic" || process == "continuous_fiber") && capability == process;
+}
+
+void validate_material_tool_bindings(const GCodeConfig& config)
+{
+    const bool cfsys = std::find(config.toolhead_fiber_protocol_id.values.begin(),
+        config.toolhead_fiber_protocol_id.values.end(), "cfsys-v1") != config.toolhead_fiber_protocol_id.values.end();
+    // Other machines may still have provisional auto-mapping and broadcast
+    // material vectors here; their final fiber paths use resolve_fiber_tool.
+    if (!cfsys && config.toolhead_filament_capacity.values.empty()) return;
+    if (!has_fiber_tool(config) && !cfsys &&
+        std::find(config.filament_process_type.values.begin(), config.filament_process_type.values.end(),
+                  "continuous_fiber") == config.filament_process_type.values.end()) return;
+    if (cfsys && (config.physical_extruder_map.size() != 2 ||
+        config.toolhead_process_capabilities.values != std::vector<std::string>{"thermoplastic", "continuous_fiber"}))
+        throw std::invalid_argument("CFSYS requires thermoplastic T0 and continuous-fiber T1");
+    if (config.filament_map.size() != config.filament_diameter.size() ||
+        config.filament_process_type.size() != config.filament_diameter.size())
+        throw std::invalid_argument("Every material must have a process type and tool mapping");
+    std::vector<size_t> counts(config.physical_extruder_map.size(), 0);
+    const auto& capacities = config.toolhead_filament_capacity.values;
+    if (!capacities.empty() && capacities.size() != counts.size())
+        throw std::invalid_argument("Material capacities must match the physical tool count");
+    for (size_t filament = 0; filament < config.filament_map.size(); ++filament) {
+        const int logical = config.filament_map.values[filament] - 1;
+        if (logical < 0 || size_t(logical) >= config.physical_extruder_map.size())
+            throw std::invalid_argument("Invalid tool mapping for material " + std::to_string(filament));
+        const int physical = config.physical_extruder_map.values[logical];
+        if (physical < 0 || !tool_accepts_process(config, unsigned(physical), config.filament_process_type.values[filament]))
+            throw std::invalid_argument("Material " + std::to_string(filament) + " is incompatible with physical tool " + std::to_string(physical));
+        if (is_fiber_filament(config, unsigned(filament))) resolve_fiber_tool(config, unsigned(filament));
+        if (!capacities.empty() && (capacities[physical] < 1 || ++counts[physical] > size_t(capacities[physical])))
+            throw std::invalid_argument("Material capacity exceeded for physical tool " + std::to_string(physical));
+    }
+    if (!capacities.empty() && std::find(counts.begin(), counts.end(), 0) != counts.end())
+        throw std::invalid_argument("Each configured physical tool requires an initial material slot");
+}
+
 ResolvedFiberTool resolve_fiber_tool(const GCodeConfig& config, unsigned filament)
 {
     if (!is_fiber_filament(config, filament))
@@ -50,12 +102,10 @@ ResolvedFiberTool resolve_fiber_tool(const GCodeConfig& config, unsigned filamen
     const double units = config.toolhead_fiber_e_units_per_mm.values[physical];
     if (!std::isfinite(units) || units <= 0)
         throw std::invalid_argument("Invalid physical fiber E units/mm");
-    // Existing CFSYS startup macros explicitly address the two material slots
-    // and T0/T1. Do not silently reinterpret that device interface as a remap.
+    // The device contract fixes physical T1, not the material's list position.
     if (protocol == "cfsys-v1" && (config.gcode_flavor != gcfKlipper || units != 1.0 ||
-        filament != 1 || logical != 1 || physical != 1 || config.filament_map.values.front() != 1 ||
-        config.physical_extruder_map.values.front() != 0))
-        throw std::invalid_argument("CFSYS requires resin slot/T0 and fiber slot/T1 with linear millimeter E");
+        physical != 1))
+        throw std::invalid_argument("CFSYS requires physical fiber T1 with linear millimeter E");
     if (config.filament_slots_bound_to_physical_tools.value && filament != unsigned(physical))
         throw std::invalid_argument("Fiber mapping conflicts with physical slot binding");
     return {filament, unsigned(logical), unsigned(physical), units};

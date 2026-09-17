@@ -1270,6 +1270,11 @@ StringObjectException Print::check_multi_filament_valid(const Print& print)
 //BBS: refine seq-print validation logic.....FIXME:StringObjectException *warning can only contain one warning, but there might be many warnings, need a vector<StringObjectException>
 StringObjectException Print::validate(StringObjectException *warning, Polygons* collison_polygons, std::vector<std::pair<Polygon, float>>* height_polygons) const
 {
+    try {
+        validate_material_tool_bindings(m_config);
+    } catch (const std::exception& error) {
+        return {error.what()};
+    }
     std::vector<unsigned int> extruders = this->extruders();
     unsigned int nozzles = m_config.nozzle_diameter.size();
 
@@ -3341,8 +3346,7 @@ std::vector<std::set<int>> Print::get_physical_unprintable_filaments(const std::
     std::vector<std::set<int>>physical_unprintables(extruder_num);
     // Material/capability constraints participate in the search itself. These
     // sets use logical extruder indices; capability arrays use physical IDs.
-    const bool fiber_machine = std::find(m_config.filament_process_type.values.begin(),
-        m_config.filament_process_type.values.end(), "continuous_fiber") != m_config.filament_process_type.values.end();
+    const bool fiber_machine = has_fiber_tool(m_config);
     if (fiber_machine) {
         for (int logical = 0; logical < extruder_num; ++logical) {
             const int physical = size_t(logical) < m_config.physical_extruder_map.values.size() ?

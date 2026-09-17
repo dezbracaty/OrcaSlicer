@@ -352,8 +352,70 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     CHECK_FALSE(config->value("fiber_perimeter_acceleration").has_value());
 }
 
+TEST_CASE("CFSYS material slots are explicitly owned by physical tools", "[libslicer_api][cfsys][tool-materials]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS PLA", "CFSYS CCF"};
+    const auto activated = library->activate_config(selection);
+    for (const auto& diagnostic : activated.diagnostics) INFO(diagnostic.message);
+    REQUIRE(activated.success);
+    REQUIRE(activated.view.filament_slots.size() == 2);
+    const auto contains = [](const auto& options, const std::string& id) {
+        return std::any_of(options.begin(), options.end(), [&id](const auto& value) { return value.id == id; });
+    };
+    CHECK(contains(activated.view.filament_slots[0].compatible_presets, "CFSYS PLA"));
+    CHECK_FALSE(contains(activated.view.filament_slots[0].compatible_presets, "CFSYS CCF"));
+    CHECK(contains(activated.view.filament_slots[1].compatible_presets, "CFSYS CCF"));
+    CHECK_FALSE(contains(activated.view.filament_slots[1].compatible_presets, "CFSYS PLA"));
+    const auto initial_revision = activated.view.revision;
+    CHECK_FALSE(library->set_active_filament_preset(0, "CFSYS CCF").success);
+    CHECK_FALSE(library->set_active_filament_preset(1, "CFSYS PLA").success);
+    CHECK_FALSE(library->add_active_filament(1).success);
+    CHECK_FALSE(library->add_active_filament(0, "CFSYS CCF").success);
+    CHECK_FALSE(library->resize_active_filament_slots(3).success);
+    CHECK(library->active_config()->revision == initial_revision);
+    REQUIRE(library->set_active_config_value("layer_height", "0.15").success);
+    REQUIRE(library->set_active_filament_color(0, {20, 40, 60, 255}).success);
+    for (size_t count = 3; count <= 5; ++count) {
+        const auto added = library->add_active_filament(0, "CFSYS PLA");
+        for (const auto& diagnostic : added.diagnostics) INFO(diagnostic.message);
+        REQUIRE(added.success);
+        REQUIRE(added.view.filament_slots.size() == count);
+        CHECK(added.view.filament_slots.back().physical_tool_index == 0);
+        CHECK(added.view.filament_slots[1].physical_tool_index == 1);
+        CHECK(added.view.filament_slots[0].color.red == 20);
+        CHECK(library->active_config_snapshot()->value("layer_height") == "0.15");
+    }
+    CHECK_FALSE(library->add_active_filament(0).success);
+    CHECK(library->active_config_snapshot()->value("filament_map") == "1,2,1,1,1");
+    CHECK(library->validate_active_config().empty());
+
+    SECTION("arbitrary explicit material order is retained") {
+        auto second = libslicer::Library::open(options);
+        selection.filament_preset_ids = {"CFSYS PLA", "CFSYS PLA", "CFSYS CCF"};
+        selection.filament_physical_tools = {0, 0, 1};
+        const auto reordered = second->activate_config(selection, {
+            {"reinforced_perimeters_filament", "3"}, {"reinforced_infill_filament", "3"}});
+        for (const auto& diagnostic : reordered.diagnostics) INFO(diagnostic.message);
+        REQUIRE(reordered.success);
+        CHECK(second->active_config_snapshot()->value("filament_map") == "1,1,2");
+        CHECK(reordered.view.filament_slots[2].physical_tool_index == 1);
+        CHECK_FALSE(second->set_active_filament_preset(2, "CFSYS PLA").success);
+    }
+}
+
 TEST_CASE("CFSYS original machine scripts produce real fiber G-code and reimport", "[libslicer_api][fiber][cfsys][slice]")
 {
+    const unsigned fiber_slot = GENERATE(0u, 1u, 2u, 4u);
+    INFO("fiber material index=" << fiber_slot);
     // Alpha500 is the machine registered by the current CFSYS vendor catalog.
     const std::string machine = "CFSYS Alpha500 Printer";
     INFO(machine);
@@ -366,7 +428,24 @@ TEST_CASE("CFSYS original machine scripts produce real fiber G-code and reimport
     selection.machine_model_id = machine;
     selection.machine_variant_id = "0.4";
     selection.process_preset_id = "CCF&CIRON @CFSYS";
-    REQUIRE(library->activate_config(selection).success);
+    const unsigned material_count = std::max(2u, fiber_slot + 1);
+    selection.filament_preset_ids.assign(material_count, "CFSYS PLA");
+    selection.filament_preset_ids[fiber_slot] = "CFSYS CCF";
+    selection.filament_physical_tools.assign(material_count, 0);
+    selection.filament_physical_tools[fiber_slot] = 1;
+    const auto activated = library->activate_config(selection, {
+        {"reinforced_perimeters_filament", std::to_string(fiber_slot + 1)},
+        {"reinforced_infill_filament", std::to_string(fiber_slot + 1)},
+        {"outer_wall_filament_id", fiber_slot == 0 ? "2" : "1"},
+        {"inner_wall_filament_id", fiber_slot == 0 ? "2" : "1"},
+        {"sparse_infill_filament_id", fiber_slot != 1 ? "2" : "1"},
+        {"internal_solid_filament_id", fiber_slot != 1 ? "2" : "1"},
+        {"top_surface_filament_id", fiber_slot != 1 ? "2" : "1"},
+        {"bottom_surface_filament_id", fiber_slot != 1 ? "2" : "1"}});
+    std::string activation_diagnostics;
+    for (const auto& issue : activated.diagnostics) activation_diagnostics += issue.key + ": " + issue.message + "\n";
+    INFO(activation_diagnostics);
+    REQUIRE(activated.success);
     std::optional<double> reference_feed;
     for (bool relative_e : {false, true}) {
         INFO("relative_e=" << relative_e);
@@ -384,11 +463,16 @@ TEST_CASE("CFSYS original machine scripts produce real fiber G-code and reimport
         REQUIRE(result.preview);
         REQUIRE(result.preview->statistics.total_fiber_feed_mm > 0);
         std::size_t powered = 0, passive = 0, finish = 0;
+        std::set<unsigned> resin_materials;
         for (const auto& segment : result.preview->segments) {
+            if (segment.deposition == libslicer::ToolpathDepositionKind::Thermoplastic) {
+                CHECK(segment.tool_id == 0);
+                resin_materials.insert(segment.filament_id);
+            }
             if (segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPowered) {
                 ++powered;
                 REQUIRE(segment.tool_id == 1);
-                REQUIRE(segment.filament_id == 1);
+                REQUIRE(segment.filament_id == fiber_slot);
                 REQUIRE(segment.fiber_feed_delta_mm > 0);
                 REQUIRE(segment.end_mm.z > 0);
             }
@@ -404,6 +488,7 @@ TEST_CASE("CFSYS original machine scripts produce real fiber G-code and reimport
             }
         }
         REQUIRE(powered > 0);
+        if (fiber_slot > 1) CHECK(resin_materials.count(1) > 0);
         REQUIRE(passive > 0);
         REQUIRE(finish > 0);
         std::ifstream input(result.output.path);

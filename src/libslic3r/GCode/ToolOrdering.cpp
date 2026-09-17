@@ -1132,6 +1132,18 @@ std::vector<int> ToolOrdering::get_recommended_filament_maps(const std::vector<s
         return std::vector<int>();
 
     const auto& print_config = print->config();
+    if (!print_config.toolhead_filament_capacity.values.empty()) {
+        // Slots added under a physical tool already have an explicit owner.
+        // In particular, non-Bambu's material-index == extruder-index fallback
+        // is invalid for a four-feed T0 plus a one-feed T1 machine.
+        auto mapping = print_config.filament_map.values;
+        for (int& logical : mapping) {
+            if (logical < 1 || size_t(logical) > print_config.physical_extruder_map.size())
+                throw std::invalid_argument("Invalid explicit material tool owner");
+            --logical;
+        }
+        return mapping;
+    }
     const unsigned int filament_nums = (unsigned int)(print_config.filament_colour.values.size() + EPSILON);
 
     // get flush matrix

@@ -5531,6 +5531,14 @@ void PrintConfigDef::init_fff_params()
     def->mode = comDevelop;
     def->set_default_value(new ConfigOptionStrings{"thermoplastic"});
 
+    def = this->add("toolhead_filament_capacity", coInts);
+    def->label = "Material capacity per physical tool";
+    def->tooltip = "Number of material feed slots per physical tool; empty uses the existing machine slot policy.";
+    def->mode = comDevelop;
+    def->readonly = true;
+    def->min = 1;
+    def->set_default_value(new ConfigOptionInts{});
+
     def = this->add("physical_tool_sides", coStrings);
     def->label = "Physical tool sides";
     def->tooltip = "Physical position of each tool: unknown, left, or right.";
