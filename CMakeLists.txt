@@ -46,28 +46,8 @@ message(STATUS "Fetch cache directory: ${CMAKE_FETCH_CACHE}")
 set(ORCA_DEPS_INSTALL_PATHS "" CACHE INTERNAL "Per-dep install roots")
 include("${CMAKE_CURRENT_SOURCE_DIR}/deps/fetch_deps.cmake")
 
-find_package(Git)
-if(DEFINED ENV{git_commit_hash} AND NOT "$ENV{git_commit_hash}" STREQUAL "")
-    if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} rev-parse --short "$ENV{git_commit_hash}"
-            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-            OUTPUT_VARIABLE GIT_COMMIT_HASH
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-    else()
-        string(SUBSTRING "$ENV{git_commit_hash}" 0 7 GIT_COMMIT_HASH)
-    endif()
-    add_compile_definitions("GIT_COMMIT_HASH=\"${GIT_COMMIT_HASH}\"")
-elseif(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} log -1 --format=%h
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        OUTPUT_VARIABLE GIT_COMMIT_HASH
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-    add_compile_definitions("GIT_COMMIT_HASH=\"${GIT_COMMIT_HASH}\"")
-endif()
+# No compiled source consumes GIT_COMMIT_HASH. Keep its fixed fallback in
+# libslic3r_version.h instead of invalidating every target after each commit.
 
 if (DEFINED BBL_RELEASE_TO_PUBLIC)
     add_compile_definitions("BBL_RELEASE_TO_PUBLIC=${BBL_RELEASE_TO_PUBLIC}")
@@ -286,8 +266,18 @@ write_basic_package_version_file(
     COMPATIBILITY SameMajorVersion
 )
 
+set(_libslicer_runtime_dependencies)
+if(WIN32)
+    # Private DLL dependencies are not propagated by the public API target.
+    set(_libslicer_runtime_dependencies
+        RUNTIME_DEPENDENCIES
+        DIRECTORIES "$<TARGET_FILE_DIR:TKernel>" "${GMP_ROOT}/bin"
+        PRE_EXCLUDE_REGEXES "api-ms-.*" "ext-ms-.*"
+        POST_EXCLUDE_REGEXES ".*[/\\\\][Ww][Ii][Nn][Dd][Oo][Ww][Ss][/\\\\].*")
+endif()
 install(TARGETS libslicer_api
     EXPORT libslicerTargets
+    ${_libslicer_runtime_dependencies}
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"

@@ -171,7 +171,7 @@ if(N_CORES EQUAL 0)
     set(N_CORES 4)
 endif()
 
-if(WIN32)
+if(WIN32 AND (OPENSSL_STATUS STREQUAL "SOURCE_ONLY" OR OPENSSL_STATUS STREQUAL "BUILT_COMPLETE"))
     if(NOT DEFINED OPENSSL_ARCH)
         set(OPENSSL_ARCH "VC-WIN64A")
     endif()
@@ -182,101 +182,108 @@ if(WIN32)
 
     # 内部辅助函数：判断给定 perl 是否为 Windows 原生 perl
     # 使用 function 而非 macro，避免宏文本替换时反斜杠路径被 CMake 解析为转义字符
-    function(_orca_is_native_perl _perl_path _result_var)
-        file(TO_CMAKE_PATH "${_perl_path}" _perl_path_normalized)
-        set(${_result_var} FALSE PARENT_SCOPE)
-        if(EXISTS "${_perl_path_normalized}")
-            execute_process(
-                COMMAND "${_perl_path_normalized}" -V
-                OUTPUT_VARIABLE _pv_out
-                ERROR_QUIET
-            )
-            # Strawberry/ActivePerl 的 -V 输出含 "MSWin32" 且不含 msys/cygwin
-            if(_pv_out MATCHES "MSWin32" AND NOT _pv_out MATCHES "msys|cygwin")
-                set(${_result_var} TRUE PARENT_SCOPE)
+    if(OPENSSL_STATUS STREQUAL "SOURCE_ONLY")
+        function(_orca_is_native_perl _perl_path _result_var)
+            file(TO_CMAKE_PATH "${_perl_path}" _perl_path_normalized)
+            set(${_result_var} FALSE PARENT_SCOPE)
+            if(EXISTS "${_perl_path_normalized}")
+                execute_process(
+                    COMMAND "${_perl_path_normalized}" -V
+                    OUTPUT_VARIABLE _pv_out
+                    ERROR_QUIET
+                )
+                # Strawberry/ActivePerl 的 -V 输出含 "MSWin32" 且不含 msys/cygwin
+                if(_pv_out MATCHES "MSWin32" AND NOT _pv_out MATCHES "msys|cygwin")
+                    set(${_result_var} TRUE PARENT_SCOPE)
+                endif()
             endif()
+        endfunction()
+
+        set(_selected_perl "${PERL_EXECUTABLE}")
+        set(PERL_EXECUTABLE "")
+
+        # 1. 优先尊重用户通过环境变量或 CMake 变量指定的 perl
+        if(OPENSSL_PERL)
+            set(_selected_perl "${OPENSSL_PERL}")
+        elseif(DEFINED ENV{OPENSSL_PERL} AND NOT "$ENV{OPENSSL_PERL}" STREQUAL "")
+            set(_selected_perl "$ENV{OPENSSL_PERL}")
         endif()
-    endfunction()
-
-    set(PERL_EXECUTABLE "")
-
-    # 1. 优先尊重用户通过环境变量或 CMake 变量指定的 perl
-    if(DEFINED ENV{OPENSSL_PERL} AND EXISTS "$ENV{OPENSSL_PERL}")
-        set(PERL_EXECUTABLE "$ENV{OPENSSL_PERL}")
-        message(STATUS "   使用环境变量 OPENSSL_PERL 指定的 perl: ${PERL_EXECUTABLE}")
-    elseif(DEFINED OPENSSL_PERL AND EXISTS "${OPENSSL_PERL}")
-        set(PERL_EXECUTABLE "${OPENSSL_PERL}")
-        message(STATUS "   使用 CMake 变量 OPENSSL_PERL 指定的 perl: ${PERL_EXECUTABLE}")
-    endif()
-
-    # 2. 若 CMake 本身来自 Strawberry 安装目录，尝试从同一目录树定位 perl
-    #    Strawberry 结构: <root>/c/bin/cmake.exe  <root>/perl/bin/perl.exe
-    if(NOT PERL_EXECUTABLE)
-        get_filename_component(_cmake_bin_dir "${CMAKE_COMMAND}" DIRECTORY)   # <root>/c/bin
-        get_filename_component(_cmake_c_dir   "${_cmake_bin_dir}" DIRECTORY)  # <root>/c
-        get_filename_component(_strawberry_root "${_cmake_c_dir}" DIRECTORY)  # <root>
-        set(_cmake_sibling_perl "${_strawberry_root}/perl/bin/perl.exe")
-        _orca_is_native_perl("${_cmake_sibling_perl}" _is_native)
-        if(_is_native)
-            set(PERL_EXECUTABLE "${_cmake_sibling_perl}")
-            message(STATUS "   从 CMAKE_COMMAND 同级目录自动定位到 Strawberry Perl: ${PERL_EXECUTABLE}")
+        if(_selected_perl)
+            _orca_is_native_perl("${_selected_perl}" _is_native)
+            if(NOT _is_native)
+                message(FATAL_ERROR "OpenSSL source build requires native Windows Perl. Invalid explicit Perl: ${_selected_perl}. Set PERL_EXECUTABLE or OPENSSL_PERL to Strawberry/ActivePerl.")
+            endif()
+            set(PERL_EXECUTABLE "${_selected_perl}")
         endif()
-    endif()
 
-    # 3. 检查常见固定安装路径
-    if(NOT PERL_EXECUTABLE)
-        set(_perl_candidates
-            "C:/Strawberry/perl/bin/perl.exe"
-            "C:/Perl64/bin/perl.exe"
-            "C:/Perl/bin/perl.exe"
-        )
-        foreach(_p IN LISTS _perl_candidates)
-            _orca_is_native_perl("${_p}" _is_native)
+        if(NOT PERL_EXECUTABLE)
+            get_filename_component(_cmake_bin_dir "${CMAKE_COMMAND}" DIRECTORY)   # <root>/c/bin
+            get_filename_component(_cmake_c_dir   "${_cmake_bin_dir}" DIRECTORY)  # <root>/c
+            get_filename_component(_strawberry_root "${_cmake_c_dir}" DIRECTORY)  # <root>
+            set(_cmake_sibling_perl "${_strawberry_root}/perl/bin/perl.exe")
+            _orca_is_native_perl("${_cmake_sibling_perl}" _is_native)
             if(_is_native)
-                set(PERL_EXECUTABLE "${_p}")
-                break()
+                set(PERL_EXECUTABLE "${_cmake_sibling_perl}")
+                message(STATUS "   从 CMAKE_COMMAND 同级目录自动定位到 Strawberry Perl: ${PERL_EXECUTABLE}")
             endif()
-        endforeach()
-    endif()
+        endif()
 
-    # 4. 遍历 PATH 中所有 perl，取第一个 Windows 原生 perl
-    if(NOT PERL_EXECUTABLE)
-        execute_process(
-            COMMAND cmd /c where perl
-            OUTPUT_VARIABLE _where_perl_out
-            ERROR_QUIET
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-        string(REPLACE "\r\n" "\n" _where_perl_out "${_where_perl_out}")
-        string(REPLACE "\r"   "\n" _where_perl_out "${_where_perl_out}")
-        string(REPLACE "\n"   ";"  _all_perls      "${_where_perl_out}")
-        foreach(_p IN LISTS _all_perls)
-            if(NOT _p STREQUAL "")
+        # 3. 检查常见固定安装路径
+        if(NOT PERL_EXECUTABLE)
+            set(_perl_candidates
+                "C:/Strawberry/perl/bin/perl.exe"
+                "C:/Perl64/bin/perl.exe"
+                "C:/Perl/bin/perl.exe"
+            )
+            foreach(_p IN LISTS _perl_candidates)
                 _orca_is_native_perl("${_p}" _is_native)
                 if(_is_native)
                     set(PERL_EXECUTABLE "${_p}")
-                    message(STATUS "   从 PATH 中找到 Windows 原生 perl: ${PERL_EXECUTABLE}")
                     break()
                 endif()
-            endif()
-        endforeach()
+            endforeach()
+        endif()
+
+        # 4. 遍历 PATH 中所有 perl，取第一个 Windows 原生 perl
+        if(NOT PERL_EXECUTABLE)
+            execute_process(
+                COMMAND cmd /c where perl
+                OUTPUT_VARIABLE _where_perl_out
+                ERROR_QUIET
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+            )
+            string(REPLACE "\r\n" "\n" _where_perl_out "${_where_perl_out}")
+            string(REPLACE "\r"   "\n" _where_perl_out "${_where_perl_out}")
+            string(REPLACE "\n"   ";"  _all_perls      "${_where_perl_out}")
+            foreach(_p IN LISTS _all_perls)
+                if(NOT _p STREQUAL "")
+                    _orca_is_native_perl("${_p}" _is_native)
+                    if(_is_native)
+                        set(PERL_EXECUTABLE "${_p}")
+                        message(STATUS "   从 PATH 中找到 Windows 原生 perl: ${PERL_EXECUTABLE}")
+                        break()
+                    endif()
+                endif()
+            endforeach()
+        endif()
+
+        if(NOT PERL_EXECUTABLE)
+            message(FATAL_ERROR
+                "❌ 未找到适用于 OpenSSL 的 Windows 原生 perl。\n"
+                "   OpenSSL Configure 不接受 msys/Git/cygwin 自带的 perl。\n"
+                "   请安装 Strawberry Perl: https://strawberryperl.com/\n"
+                "   默认安装到 C:/Strawberry/perl/bin/perl.exe\n"
+                "   若已安装于非标准路径，可通过以下方式指定:\n"
+                "     环境变量: set OPENSSL_PERL=C:/your/path/perl.exe\n"
+                "     CMake 参数: -DOPENSSL_PERL=C:/your/path/perl.exe")
+        endif()
+        message(STATUS "   Perl: ${PERL_EXECUTABLE}")
+
+        # 通过 vswhere 定位 VS 安装路径，进而拼出 vcvarsall.bat
+        # vswhere 是 VS 2017+ 自带的官方定位工具，路径固定
+        # 注意：CMake 里 $ENV{ProgramFiles(x86)} 的括号需要绕开
     endif()
 
-    if(NOT PERL_EXECUTABLE)
-        message(FATAL_ERROR
-            "❌ 未找到适用于 OpenSSL 的 Windows 原生 perl。\n"
-            "   OpenSSL Configure 不接受 msys/Git/cygwin 自带的 perl。\n"
-            "   请安装 Strawberry Perl: https://strawberryperl.com/\n"
-            "   默认安装到 C:/Strawberry/perl/bin/perl.exe\n"
-            "   若已安装于非标准路径，可通过以下方式指定:\n"
-            "     环境变量: set OPENSSL_PERL=C:/your/path/perl.exe\n"
-            "     CMake 参数: -DOPENSSL_PERL=C:/your/path/perl.exe")
-    endif()
-    message(STATUS "   Perl: ${PERL_EXECUTABLE}")
-
-    # 通过 vswhere 定位 VS 安装路径，进而拼出 vcvarsall.bat
-    # vswhere 是 VS 2017+ 自带的官方定位工具，路径固定
-    # 注意：CMake 里 $ENV{ProgramFiles(x86)} 的括号需要绕开
     set(_pf86 "")
     if(DEFINED ENV{ProgramFiles\(x86\)})
         set(_pf86 "$ENV{ProgramFiles\(x86\)}")

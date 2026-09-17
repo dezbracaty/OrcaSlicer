@@ -571,19 +571,30 @@ target_include_directories(libslic3r
 target_include_directories(libslic3r SYSTEM PUBLIC ${EXPAT_INCLUDE_DIRS})
 
 # Find the OCCT and related libraries
-set(OpenCASCADE_DIR "${CMAKE_PREFIX_PATH}/lib/cmake/occt")
-find_package(OpenCASCADE REQUIRED)
+# The dependency setup supplies OpenCASCADE_DIR. CMAKE_PREFIX_PATH is a list,
+# so appending a directory to it produces an invalid package path.
+find_package(OpenCASCADE REQUIRED CONFIG)
+if(WIN32)
+    # Make imported DLL locations visible to the API package's runtime install.
+    foreach(_occt_target IN LISTS OpenCASCADE_LIBRARIES)
+        if(TARGET "${_occt_target}")
+            set_property(TARGET "${_occt_target}" PROPERTY IMPORTED_GLOBAL TRUE)
+        endif()
+    endforeach()
+endif()
 target_include_directories(libslic3r SYSTEM PUBLIC ${OpenCASCADE_INCLUDE_DIR})
 
 find_package(JPEG REQUIRED)
 find_package(draco REQUIRED)
 
+if(TARGET TKDESTEP)
+    # OCCT 7.8 consolidated the STEP toolkits into TKDESTEP.
+    set(_occt_step_libs TKDESTEP)
+else()
+    set(_occt_step_libs TKXDESTEP TKSTEP TKSTEP209 TKSTEPAttr TKSTEPBase)
+endif()
 set(OCCT_LIBS
-    TKXDESTEP
-    TKSTEP
-    TKSTEP209
-    TKSTEPAttr
-    TKSTEPBase
+    ${_occt_step_libs}
     TKXCAF
     TKXSBase
     TKVCAF
