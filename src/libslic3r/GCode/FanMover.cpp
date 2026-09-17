@@ -32,17 +32,24 @@ const std::string& FanMover::process_gcode(const std::string& gcode, bool flush)
             [this](GCodeReader& reader, const GCodeReader::GCodeLine& line) { /*m_process_output += line.raw() + "\n";*/ this->_process_gcode_line(reader, line); });
 
     if (flush) {
-        while (!m_buffer.empty()) {
-            BufferData &front = m_buffer.front();
-            m_process_output += front.raw + "\n";
-            // Orca: Keep the emitted fan state in sync when flushing buffered fan commands.
-            if (front.fan_speed >= 0)
-                m_front_buffer_fan_speed = front.fan_speed;
-            remove_from_buffer(m_buffer.begin());
-        }
+        _flush_buffer_to_output();
+        if (m_fiber_block_parser.inside_block())
+            throw Slic3r::RuntimeError("Unclosed FIBER_BEGIN marker in FanMover input");
     }
 
     return m_process_output;
+}
+
+void FanMover::_flush_buffer_to_output()
+{
+    while (!m_buffer.empty()) {
+        BufferData& front = m_buffer.front();
+        m_process_output += front.raw + "\n";
+        // Orca: Keep the emitted fan state in sync when flushing buffered fan commands.
+        if (front.fan_speed >= 0)
+            m_front_buffer_fan_speed = front.fan_speed;
+        remove_from_buffer(m_buffer.begin());
+    }
 }
 
 bool is_end_of_word(char c) {
@@ -278,6 +285,16 @@ void FanMover::_process_T(const std::string_view command)
 
 void FanMover::_process_gcode_line(GCodeReader& reader, const GCodeReader::GCodeLine& line)
 {
+    const FiberGCodeBlockLine fiber_block_line = m_fiber_block_parser.consume(line.raw());
+    if (fiber_block_line.protected_line) {
+        if (fiber_block_line.begins_block)
+            _flush_buffer_to_output();
+        if (line.has_f())
+            m_current_speed = line.f() / 60.0f;
+        m_process_output += line.raw() + "\n";
+        return;
+    }
+
     // processes 'normal' gcode lines
     bool need_flush = false;
     std::string cmd(line.cmd());
@@ -518,4 +535,3 @@ void FanMover::_process_gcode_line(GCodeReader& reader, const GCodeReader::GCode
 }
 
 } // namespace Slic3r
-

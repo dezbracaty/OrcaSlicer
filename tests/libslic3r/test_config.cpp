@@ -3,6 +3,7 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/PrintConfigConstants.hpp"
 #include "libslic3r/LocalesUtils.hpp"
+#include "libslic3r/ClipperUtils.hpp"
 
 #include <cereal/types/polymorphic.hpp>
 #include <cereal/types/string.hpp> 
@@ -10,6 +11,91 @@
 #include <cereal/archives/binary.hpp>
 
 using namespace Slic3r;
+
+namespace {
+
+Pointfs points_mm(std::initializer_list<Vec2d> points)
+{
+    return Pointfs(points);
+}
+
+Polygon polygon_mm(std::initializer_list<Vec2d> points)
+{
+    Polygon polygon;
+    polygon.points.reserve(points.size());
+    for (const Vec2d& point : points)
+        polygon.points.emplace_back(scale_(point.x()), scale_(point.y()));
+    polygon.make_counter_clockwise();
+    return polygon;
+}
+
+void require_same_area(const ExPolygons& lhs, const ExPolygons& rhs)
+{
+    CHECK(diff_ex(lhs, rhs).empty());
+    CHECK(diff_ex(rhs, lhs).empty());
+}
+
+} // namespace
+
+TEST_CASE("bed exclude area preserves Orca single polygon semantics", "[Config][BedExcludeArea]")
+{
+    FullPrintConfig config;
+
+    SECTION("eight points remain one polygon") {
+        config.bed_exclude_area.values = points_mm({
+            {0.0, 0.0}, {40.0, 0.0}, {40.0, 10.0}, {30.0, 10.0},
+            {30.0, 30.0}, {10.0, 30.0}, {10.0, 10.0}, {0.0, 10.0}
+        });
+
+        const Polygons excluded = get_bed_excluded_area(config);
+        REQUIRE(excluded.size() == 1);
+        CHECK(excluded.front().points.size() == 8);
+    }
+
+    SECTION("sixteen points remain one polygon") {
+        config.bed_exclude_area.values = points_mm({
+            {0.0, 0.0}, {80.0, 0.0}, {80.0, 10.0}, {70.0, 10.0},
+            {70.0, 20.0}, {60.0, 20.0}, {60.0, 30.0}, {50.0, 30.0},
+            {50.0, 40.0}, {30.0, 40.0}, {30.0, 30.0}, {20.0, 30.0},
+            {20.0, 20.0}, {10.0, 20.0}, {10.0, 10.0}, {0.0, 10.0}
+        });
+
+        const Polygons excluded = get_bed_excluded_area(config);
+        REQUIRE(excluded.size() == 1);
+        CHECK(excluded.front().points.size() == 16);
+    }
+}
+
+TEST_CASE("CFSYS U-shaped bed exclusion matches two side exclusion zones", "[Config][BedExcludeArea][CFSYS]")
+{
+    const auto require_cfsys_exclusion = [](double right_edge) {
+        FullPrintConfig config;
+        config.printable_area.values = points_mm({
+            {0.0, 0.0}, {435.0, 0.0}, {435.0, 355.0}, {0.0, 355.0}
+        });
+        config.bed_exclude_area.values = points_mm({
+            {0.0, 350.0}, {27.0, 350.0}, {27.0, 0.0}, {392.0, 0.0},
+            {392.0, 350.0}, {right_edge, 350.0}, {right_edge, -1.0}, {0.0, -1.0}
+        });
+
+        const Polygon bed = polygon_mm({{0.0, 0.0}, {435.0, 0.0}, {435.0, 355.0}, {0.0, 355.0}});
+        const Polygons expected_side_zones {
+            polygon_mm({{0.0, 0.0}, {27.0, 0.0}, {27.0, 350.0}, {0.0, 350.0}}),
+            polygon_mm({{392.0, 0.0}, {right_edge, 0.0}, {right_edge, 350.0}, {392.0, 350.0}})
+        };
+
+        const ExPolygons actual = intersection_ex(get_bed_excluded_area(config), Polygons {bed});
+        const ExPolygons expected = union_ex(expected_side_zones);
+        require_same_area(actual, expected);
+
+        const ExPolygons actual_printable = union_ex(Polygons {get_bed_shape_with_excluded_area(config)});
+        const ExPolygons expected_printable = diff_ex(Polygons {bed}, expected_side_zones);
+        require_same_area(actual_printable, expected_printable);
+    };
+
+    SECTION("Alpha500 and common profile") { require_cfsys_exclusion(435.0); }
+    SECTION("CF1 profile") { require_cfsys_exclusion(430.0); }
+}
 
 SCENARIO("Generic config validation performs as expected.", "[Config]") {
     GIVEN("A config generated from default options") {

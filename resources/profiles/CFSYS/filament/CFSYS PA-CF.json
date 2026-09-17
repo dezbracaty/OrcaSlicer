@@ -1,0 +1,67 @@
+{
+    "type": "filament",
+    "filament_id": "GFN98",
+    "setting_id": "GFSA04",
+    "name": "CFSYS PA-CF",
+    "from": "system",
+    "instantiation": "true",
+    "inherits": "fdm_filament_pa",
+    "filament_type": [
+        "PA-CF"
+    ],
+    "activate_chamber_temp_control": [
+        "0"
+    ],
+    "chamber_temperature": [
+        "0"
+    ],
+    "default_filament_colour": [
+        "#77FF77"
+    ],
+    "fan_cooling_layer_time": [
+        "4"
+    ],
+    "fan_max_speed": [
+        "60"
+    ],
+    "fan_min_speed": [
+        "0"
+    ],
+    "filament_max_volumetric_speed": [
+        "8"
+    ],
+    "nozzle_temperature_initial_layer": [
+        "280"
+    ],
+    "nozzle_temperature": [
+        "270"
+    ],
+    "enable_pressure_advance": [
+        "1"
+    ],
+    "pressure_advance": [
+        "0.026"
+    ],
+    "reduce_fan_stop_start_freq": [
+        "0"
+    ],
+    "slow_down_layer_time": [
+        "2"
+    ],
+    "slow_down_min_speed": [
+        "10"
+    ],
+    "support_material_interface_fan_speed": [
+        "100"
+    ],
+    "temperature_vitrification": [
+        "108"
+    ],
+    "compatible_printers": [
+      "CFSYS Alpha500 0.4 nozzle",
+	  "CFSYS Alpha500 Printer 0.2 nozzle",
+	  "CFSYS Alpha500 Printer 0.4 nozzle",
+	  "CFSYS Alpha500 Printer 0.6 nozzle",
+	  "CFSYS Alpha500 Printer 0.8 nozzle"
+    ]
+}

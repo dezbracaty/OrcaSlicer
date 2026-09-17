@@ -16,6 +16,7 @@
 #include "GCode/WipeTower2.hpp"
 #include "Utils.hpp"
 #include "PrintConfig.hpp"
+#include "ContinuousFiber/ContinuousFiberConfig.hpp"
 #include "MaterialType.hpp"
 #include "Model.hpp"
 #include "format.hpp"
@@ -250,7 +251,15 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
     bool invalidated = false;
 
     for (const t_config_option_key &opt_key : opt_keys) {
-        if (steps_gcode.find(opt_key) != steps_gcode.end()) {
+        if (opt_key.rfind("fiber_", 0) == 0 || opt_key == "filament_fiber_feed_correction" ||
+            opt_key == "filament_process_type" || opt_key == "toolhead_process_capabilities") {
+            osteps.emplace_back(posInfill);
+            osteps.emplace_back(posSimplifyInfill);
+            steps.emplace_back(psWipeTower);
+            steps.emplace_back(psGCodeExport);
+        } else if (opt_key.rfind("toolhead_fiber_", 0) == 0) {
+            steps.emplace_back(psGCodeExport);
+        } else if (steps_gcode.find(opt_key) != steps_gcode.end()) {
             // These options only affect G-code export or they are just notes without influence on the generated G-code,
             // so there is nothing to invalidate.
             steps.emplace_back(psGCodeExport);
@@ -1801,8 +1810,17 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
                       "prevent loss of floating point accuracy. Add \"G92 E0\" to layer_gcode."),
                     nullptr, "before_layer_change_gcode"};
     } else {
-        // Absolute mode: any occurrence of "G92 E0" is incompatible.
-        if (before_has_g92_any)
+        // The CFSYS before-layer hook is validated and synchronized with the
+        // writer by placeholder_parser_process, including resin-only layers.
+        bool synchronized_cfsys_hook = false;
+        if (fiber_machine_protocol(m_config) == FiberMachineProtocol::Cfsys) {
+            try {
+                require_fiber_safe_script(m_config.before_layer_change_gcode.value,
+                    "before_layer_change_gcode", FiberMachineProtocol::Cfsys);
+                synchronized_cfsys_hook = true;
+            } catch (const std::runtime_error&) {}
+        }
+        if (before_has_g92_any && !synchronized_cfsys_hook)
             return {L("\"G92 E0\" was found in before_layer_change_gcode, which is incompatible with absolute extruder "
                       "addressing."),
                     nullptr, "before_layer_change_gcode"};
@@ -3321,6 +3339,30 @@ std::vector<std::set<int>> Print::get_physical_unprintable_filaments(const std::
 {
     int extruder_num = m_config.nozzle_diameter.size();
     std::vector<std::set<int>>physical_unprintables(extruder_num);
+    // Material/capability constraints participate in the search itself. These
+    // sets use logical extruder indices; capability arrays use physical IDs.
+    const bool fiber_machine = std::find(m_config.filament_process_type.values.begin(),
+        m_config.filament_process_type.values.end(), "continuous_fiber") != m_config.filament_process_type.values.end();
+    if (fiber_machine) {
+        for (int logical = 0; logical < extruder_num; ++logical) {
+            const int physical = size_t(logical) < m_config.physical_extruder_map.values.size() ?
+                m_config.physical_extruder_map.values[logical] : -1;
+            const std::string capability = physical >= 0 && size_t(physical) < m_config.toolhead_process_capabilities.values.size() ?
+                m_config.toolhead_process_capabilities.values[physical] : "";
+            for (unsigned filament : used_filaments) {
+                const bool fiber = is_fiber_filament(m_config, filament);
+                bool compatible = capability == (fiber ? "continuous_fiber" : "thermoplastic");
+                if (fiber && filament < m_config.filament_map.values.size()) {
+                    const int original = m_config.filament_map.values[filament]-1;
+                    // No upstream geometric replan in a mapping pass: nozzle
+                    // geometry must remain identical to the planned contract.
+                    compatible = compatible && original >= 0 && original < extruder_num &&
+                        m_config.nozzle_diameter.values[original] == m_config.nozzle_diameter.values[logical];
+                }
+                if (!compatible) physical_unprintables[logical].insert(int(filament));
+            }
+        }
+    }
     if (extruder_num < 2)
         return physical_unprintables;
 
@@ -3506,6 +3548,13 @@ void Print::_make_wipe_tower()
     if (!m_wipe_tower_data.tool_ordering.has_wipe_tower())
         // Don't generate any wipe tower.
         return;
+
+    // Check actual participating layers, not merely enable_prime_tower.
+    for (const auto& layer : m_wipe_tower_data.tool_ordering.layer_tools())
+        if (layer.has_wipe_tower)
+            for (unsigned filament : layer.extruders)
+                if (is_fiber_filament(m_config, filament))
+                    throw std::runtime_error("Continuous fiber cannot participate in wipe tower extrusion");
 
     // Check whether there are any layers in m_tool_ordering, which are marked with has_wipe_tower,
     // they print neither object, nor support. These layers are above the raft and below the object, and they

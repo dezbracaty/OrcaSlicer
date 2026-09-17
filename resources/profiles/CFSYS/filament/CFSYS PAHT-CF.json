@@ -1,0 +1,146 @@
+{
+    "compatible_printers": [],
+    "complete_print_exhaust_fan_speed": [
+        "0"
+    ],
+    "default_filament_colour": [
+        "#808080"
+    ],
+    "filament_cost": [
+        "1000"
+    ],
+    "filament_deretraction_speed": [
+        "0"
+    ],
+    "filament_loading_speed_start": [
+        "10"
+    ],
+    "filament_max_volumetric_speed": [
+        "20"
+    ],
+    "filament_retract_before_wipe": [
+        "100%"
+    ],
+    "filament_retract_lift_above": [
+        "0"
+    ],
+    "filament_retract_lift_below": [
+        "0"
+    ],
+    "filament_retract_lift_enforce": [
+        "All Surfaces"
+    ],
+    "filament_retract_restart_extra": [
+        "0"
+    ],
+    "filament_retract_when_changing_layer": [
+        "0"
+    ],
+    "filament_retraction_length": [
+        "2.1"
+    ],
+    "filament_retraction_minimum_travel": [
+        "2"
+    ],
+    "filament_retraction_speed": [
+        "30"
+    ],
+    "enable_pressure_advance": [
+        "1"
+    ],
+    "fan_max_speed": [
+        "100"
+    ],
+    "fan_min_speed": [
+        "5"
+    ],
+    "filament_loading_speed": [
+        "60"
+    ],
+    "during_print_exhaust_fan_speed": [
+        "0"
+    ],
+    "filament_settings_id": [
+        "PAHT-CF"
+    ],
+    "filament_vendor": [
+        "CFSYS"
+    ],
+    "filament_wipe": [
+        "0"
+    ],
+    "filament_wipe_distance": [
+        "1"
+    ],
+    "filament_z_hop": [
+        "0.8"
+    ],
+    "filament_shrink": [
+        "99.6%"
+    ],
+    "filament_z_hop_types": [
+        "Normal Lift"
+    ],
+    "type": "filament",
+    "filament_id": "GFN98",
+    "setting_id": "GFSA04",
+    "name": "CFSYS PAHT-CF",
+    "from": "system",
+    "instantiation": "true",
+    "inherits": "fdm_filament_pa",
+    "filament_type": [
+        "PAHT-CF"
+    ],
+    "nozzle_temperature_range_high": [
+        "330"
+    ],
+    "activate_chamber_temp_control": [
+        "0"
+    ],
+    "additional_cooling_fan_speed": [
+        "0"
+    ],
+    "chamber_temperature": [
+        "0"
+    ],
+    "nozzle_temperature": [
+        "310"
+    ],
+    "nozzle_temperature_initial_layer": [
+        "310"
+    ],
+    "reduce_fan_stop_start_freq": [
+        "0"
+    ],
+    "hot_plate_temp": [
+        "80"
+    ],
+    "hot_plate_temp_initial_layer": [
+        "80"
+    ],
+    "nozzle_temperature_range_low": [
+        "250"
+    ],
+    "overhang_fan_speed": [
+        "60"
+    ],
+    "pressure_advance": [
+        "0.032"
+    ],
+    "slow_down_layer_time": [
+        "3"
+    ],
+    "slow_down_min_speed": [
+        "20"
+    ],
+    "support_material_interface_fan_speed": [
+        "80"
+    ],
+    "temperature_vitrification": [
+        "120"
+    ],
+    "filament_density": [
+        "1.2"
+    ],
+    "version": "2.0.2.0"
+}

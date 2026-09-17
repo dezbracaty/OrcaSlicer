@@ -105,6 +105,22 @@ set(lisbslic3r_sources
     Config.cpp
     Config.hpp
     ContourZ.cpp
+    ContinuousFiber/ContinuousFiberConfig.cpp
+    ContinuousFiber/ContinuousFiberConfig.hpp
+    ContinuousFiber/ContinuousFiberFillStrategy.cpp
+    ContinuousFiber/ContinuousFiberFillStrategy.hpp
+    ContinuousFiber/FiberCoverageLedger.cpp
+    ContinuousFiber/FiberCoverageLedger.hpp
+    ContinuousFiber/FiberPolicyKey.hpp
+    ContinuousFiber/FiberIsland.cpp
+    ContinuousFiber/FiberIsland.hpp
+    ContinuousFiber/FiberSource.hpp
+    ContinuousFiber/PreparedFiberPath.cpp
+    ContinuousFiber/PreparedFiberPath.hpp
+    ContinuousFiber/FiberPathFinalizer.cpp
+    ContinuousFiber/FiberPathFinalizer.hpp
+    ContinuousFiber/FiberPathValidator.cpp
+    ContinuousFiber/FiberPathValidator.hpp
     CustomGCode.cpp
     CustomGCode.hpp
     CutUtils.cpp
@@ -217,6 +233,7 @@ set(lisbslic3r_sources
     GCode/ConflictChecker.hpp
     GCode/CoolingBuffer.cpp
     GCode/CoolingBuffer.hpp
+    GCode/FiberGCodeBlockParser.hpp
     GCode/TimelapsePosPicker.cpp
     GCode/TimelapsePosPicker.hpp
     GCode.cpp

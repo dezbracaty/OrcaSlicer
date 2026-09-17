@@ -33,6 +33,7 @@ struct MachineVariantOption
     double printable_height{0.0};
     std::size_t physical_tool_count{1};
     bool variable_filament_slots{false};
+    bool filament_slots_bound_to_physical_tools{false};
     std::size_t max_filament_slots{1};
     std::vector<PrintableAreaPoint> printable_area;
     std::string printer_preset_id;
@@ -118,6 +119,11 @@ struct FilamentSlotInfo
     std::string material_type;
     Rgba8 color;
     double diameter_mm{1.75};
+    std::size_t physical_tool_index{0};
+    std::string physical_tool_name;
+    std::string physical_tool_role;
+    std::string physical_tool_side;
+    double nozzle_diameter_mm{0.0};
 };
 
 struct ActiveConfigView

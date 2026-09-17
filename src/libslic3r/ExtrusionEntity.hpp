@@ -4,10 +4,12 @@
 #include "libslic3r.h"
 #include "Polygon.hpp"
 #include "Polyline.hpp"
+#include "ContinuousFiber/PreparedFiberPath.hpp"
 
 #include <assert.h>
 #include <string_view>
 #include <numeric>
+#include <memory>
 
 namespace Slic3r {
 
@@ -39,6 +41,10 @@ enum ExtrusionRole : uint8_t {
     erCustom,
     // Extrusion role for a collection with multiple extrusion roles.
     erMixed,
+    // Keep new roles after all historical values so serialized / preview role
+    // numbers retain their original meaning.
+    erContinuousFiberContour,
+    erContinuousFiberInfill,
     erCount
 };
 
@@ -78,7 +84,9 @@ inline bool is_infill(ExtrusionRole role)
         || role == erSolidInfill
         || role == erTopSolidInfill
         || role == erBottomSurface
-        || role == erIroning;
+        || role == erIroning
+        || role == erContinuousFiberContour
+        || role == erContinuousFiberInfill;
 }
 
 inline bool is_top_surface(ExtrusionRole role)
@@ -264,11 +272,11 @@ public:
     bool is_closed() const { return ! this->empty() && this->polyline.points.front() == this->polyline.points.back(); }
     // Produce a list of extrusion paths into retval by clipping this path by ExPolygons.
     // Currently not used.
-    void intersect_expolygons(const ExPolygons &collection, ExtrusionEntityCollection* retval) const;
+    virtual void intersect_expolygons(const ExPolygons &collection, ExtrusionEntityCollection* retval) const;
     // Produce a list of extrusion paths into retval by removing parts of this path by ExPolygons.
     // Currently not used.
-    void subtract_expolygons(const ExPolygons &collection, ExtrusionEntityCollection* retval) const;
-    void clip_end(double distance);
+    virtual void subtract_expolygons(const ExPolygons &collection, ExtrusionEntityCollection* retval) const;
+    virtual void clip_end(double distance);
     virtual void simplify(double tolerance);
     double length() const override;
     ExtrusionRole role() const override { return m_role; }
@@ -292,7 +300,7 @@ public:
     double total_volume() const override { return mm3_per_mm * unscale<double>(length()); }
 
     //BBS: add new simplifing method by fitting arc
-    void simplify_by_fitting_arc(double tolerance);
+    virtual void simplify_by_fitting_arc(double tolerance);
     //BBS:
     bool is_force_no_extrusion() const { return m_no_extrusion; }
     void set_force_no_extrusion(bool no_extrusion) { m_no_extrusion = no_extrusion; }
@@ -308,6 +316,37 @@ private:
     bool m_no_extrusion = false;
 };
 
+// A finalized continuous-fiber path. Its direction is part of the physical
+// start/cut/tail process and therefore must not be changed by path chaining.
+class ExtrusionFiberPath final : public ExtrusionPath
+{
+public:
+    ExtrusionFiberPath() = delete;
+    ExtrusionFiberPath(const ExtrusionPath& source, ExtrusionRole role, std::shared_ptr<const PreparedFiberPath> prepared);
+
+    ExtrusionEntity* clone() const override { return new ExtrusionFiberPath(*this); }
+    ExtrusionEntity* clone_move() override { return new ExtrusionFiberPath(std::move(*this)); }
+    bool can_reverse() const override { return false; }
+    void reverse() override;
+
+    const FiberFragmentId& fragment_id() const { return m_prepared->id; }
+    void simplify(double) override { throw std::logic_error("Cannot simplify finalized fiber geometry"); }
+    void simplify_by_fitting_arc(double) override { throw std::logic_error("Cannot arc-fit finalized fiber geometry"); }
+    void clip_end(double) override { throw std::logic_error("Cannot clip finalized fiber geometry"); }
+    void intersect_expolygons(const ExPolygons&, ExtrusionEntityCollection*) const override { throw std::logic_error("Cannot split finalized fiber geometry"); }
+    void subtract_expolygons(const ExPolygons&, ExtrusionEntityCollection*) const override { throw std::logic_error("Cannot split finalized fiber geometry"); }
+    FiberPathPurpose fiber_purpose() const { return m_prepared->id.parent.purpose; }
+    const std::shared_ptr<const PreparedFiberPath>& prepared_path() const { return m_prepared; }
+    Point first_point() const override { return first_point3().to_point(); }
+    Point last_point() const override { return last_point3().to_point(); }
+    const Point3& first_point3() const override { return m_prepared->spans.front().geometry.points.front(); }
+    const Point3& last_point3() const override { return m_prepared->spans.back().geometry.points.back(); }
+    // Detect direct writes through legacy ExtrusionPath's public derived view.
+    void validate_derived_view() const;
+private:
+    std::shared_ptr<const PreparedFiberPath> m_prepared;
+};
+
 class ExtrusionPathContoured : public ExtrusionPath {
 public:
     std::vector<double> z_diffs;
@@ -320,7 +359,7 @@ public:
     virtual ExtrusionEntity *clone_move() override;
 
     void simplify(double tolerance) override;
-    virtual void simplify_by_fitting_arc(double tolerance);
+    void simplify_by_fitting_arc(double tolerance) override;
 
     void reverse() override;
 };

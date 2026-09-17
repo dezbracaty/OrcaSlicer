@@ -6,6 +6,7 @@
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/CustomGCode.hpp"
+#include "FiberGCodeBlockParser.hpp"
 
 #include <cstdint>
 #include <array>
@@ -212,6 +213,10 @@ class Print;
             //BBS
             int  object_label_id{-1};
             float print_z{0.0f};
+            ToolpathDeposition deposition {ToolpathDeposition::None};
+            FiberProcessPhase fiber_phase {FiberProcessPhase::None};
+            uint64_t fiber_occurrence {0};
+            float fiber_feed_delta_mm {0.0f};
 
             float volumetric_rate() const { return feedrate * mm3_per_mm; }
             float actual_volumetric_rate() const { return actual_feedrate * mm3_per_mm; }
@@ -806,6 +811,9 @@ class Print;
 // ORCA: Add Pressure Advance visualization support
         float m_pressure_advance;
         ExtrusionRole m_extrusion_role;
+        FiberGCodeSemanticParser m_fiber_process;
+        std::optional<unsigned> m_bound_filament;
+        unsigned m_bound_physical {0};
         std::vector<int> m_filament_maps;
         std::vector<unsigned char> m_last_filament_id;
         std::vector<unsigned char> m_filament_id;
@@ -884,6 +892,15 @@ class Print;
         void reset();
 
         const GCodeProcessorResult& get_result() const { return m_result; }
+        std::vector<int> physical_tool_by_filament() const {
+            std::vector<int> result(m_result.filaments_count);
+            for (size_t f = 0; f < result.size(); ++f) {
+                const int logical = f < m_filament_maps.size() ? m_filament_maps[f] : int(f);
+                result[f] = logical >= 0 && size_t(logical) < m_physical_extruder_map.size() ?
+                    m_physical_extruder_map[logical] : int(f);
+            }
+            return result;
+        }
         GCodeProcessorResult& result() { return m_result; }
         GCodeProcessorResult&& extract_result() { return std::move(m_result); }
 
@@ -1140,4 +1157,3 @@ class Print;
 } /* namespace Slic3r */
 
 #endif /* slic3r_GCodeProcessor_hpp_ */
-

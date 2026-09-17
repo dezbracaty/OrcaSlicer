@@ -1,0 +1,61 @@
+{
+    "close_fan_the_first_x_layers": [
+        "3"
+    ],
+    "enable_pressure_advance": [
+        "1"
+    ],
+    "fan_cooling_layer_time": [
+        "8"
+    ],
+    "fan_max_speed": [
+        "30"
+    ],
+    "fan_min_speed": [
+        "10"
+    ],
+    "filament_is_support": [
+        "1"
+    ],
+    "filament_max_volumetric_speed": [
+        "17"
+    ],
+    "filament_settings_id": [
+        "S-PAHT"
+    ],
+    "filament_shrink": [
+        "92%"
+    ],
+    "filament_type": [
+        "S-PAHT"
+    ],
+    "from": "User",
+    "hot_plate_temp": [
+        "80"
+    ],
+    "hot_plate_temp_initial_layer": [
+        "80"
+    ],
+    "inherits": "CFSYS PLA",
+    "is_custom_defined": "0",
+    "name": "S-PAHT",
+    "nozzle_temperature": [
+        "300"
+    ],
+    "nozzle_temperature_initial_layer": [
+        "300"
+    ],
+    "overhang_fan_threshold": [
+        "0%"
+    ],
+    "reduce_fan_stop_start_freq": [
+        "0"
+    ],
+    "slow_down_layer_time": [
+        "5"
+    ],
+    "slow_down_min_speed": [
+        "20"
+    ],
+    "version": "2.0.2.0"
+}

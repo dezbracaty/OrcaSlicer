@@ -1,5 +1,6 @@
 #include "Extruder.hpp"
 #include "PrintConfig.hpp"
+#include "ContinuousFiber/ContinuousFiberConfig.hpp"
 
 namespace Slic3r {
 
@@ -136,6 +137,11 @@ double Extruder::extruded_volume() const
 // Used filament length in mm.
 double Extruder::used_filament() const
 {
+    if (is_fiber_filament(*m_config, m_id)) {
+        if (effective_retracted() != 0 || m_restart_extra != 0)
+            throw std::runtime_error("Fiber consumption has nonzero generic retract state");
+        return m_absolute_E / resolve_fiber_tool(*m_config, m_id).e_units_per_mm;
+    }
     // BBS
     if (m_share_extruder) {
         // FIXME: need to count retracted length for share-extruder machine

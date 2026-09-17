@@ -1,4 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <libslicer/Config.hpp>
 #include <libslicer/Library.hpp>
@@ -10,15 +12,55 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
+#include <map>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string_view>
 #include <vector>
 
 namespace {
+// Real-model validation must use the same explicit mesh placement as the App.
+// Compatibility file input does not apply SliceObjectInput::transform.
+libslicer::SliceObjectInput binary_stl_on_bed(const std::string& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    REQUIRE(input.good());
+    char header[80]; input.read(header, sizeof(header));
+    std::uint32_t triangles = 0;
+    input.read(reinterpret_cast<char*>(&triangles), sizeof(triangles));
+    REQUIRE(std::filesystem::file_size(path) == 84ull + 50ull*triangles);
+    REQUIRE(triangles > 0);
+    libslicer::SliceObjectInput result;
+    result.name = std::filesystem::path(path).stem().string();
+    libslicer::SliceVolumeInput volume;
+    std::map<std::array<float,3>,std::uint32_t> indices;
+    double bottom = std::numeric_limits<double>::max();
+    for (std::uint32_t i = 0; i < triangles; ++i) {
+        char facet[50]; input.read(facet, sizeof(facet));
+        REQUIRE(input.good());
+        std::array<std::uint32_t,3> ids;
+        for (size_t j = 0; j < 3; ++j) {
+            std::array<float,3> xyz;
+            std::memcpy(xyz.data(), facet+12+j*12, 12);
+            for (float value : xyz) REQUIRE(std::isfinite(value));
+            bottom = std::min(bottom, double(xyz[2]));
+            auto entry = indices.emplace(xyz, static_cast<std::uint32_t>(volume.vertices.size()));
+            if (entry.second) volume.vertices.push_back({xyz[0],xyz[1],xyz[2]});
+            ids[j] = entry.first->second;
+        }
+        volume.triangles.push_back({ids[0],ids[1],ids[2]});
+    }
+    result.transform[11] = -bottom;
+    result.volumes.push_back(std::move(volume));
+    return result;
+}
+
 const libslicer::SettingItem* find_item(const std::vector<libslicer::SettingItem>& items, std::string_view key)
 {
     for (const auto& item : items) {
@@ -179,6 +221,655 @@ TEST_CASE("configuration snapshot is independent", "[libslicer_api][config]")
     CHECK(snapshot.value("layer_height") == "0.18");
     CHECK(config.snapshot().value("layer_height") == "0.22");
     CHECK_FALSE(snapshot.value("missing_option").has_value());
+}
+
+TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_api][config][fiber]")
+{
+    auto config = libslicer::Config::defaults();
+    auto items = config.settings();
+
+    const auto* contour_toggle = find_item(items, "generate_reinforced_perimeters");
+    const auto* contour_count = find_item(items, "outer_reinforced_perimeters_counts");
+    const auto* infill_density = find_item(items, "reinforced_infill_density");
+    const auto* layer_interval = find_item(items, "fiber_layer_height_ratio");
+    const auto* minimum_segment = find_item(items, "fiber_minimum_segment_length");
+    const auto* maximum_turn = find_item(items, "fiber_maximum_turn_angle");
+    const auto* contour_infill_clearance = find_item(items, "fiber_contour_infill_clearance");
+    REQUIRE(contour_toggle != nullptr);
+    REQUIRE(contour_count != nullptr);
+    REQUIRE(infill_density != nullptr);
+    REQUIRE(layer_interval != nullptr);
+    REQUIRE(minimum_segment != nullptr);
+    REQUIRE(maximum_turn != nullptr);
+    REQUIRE(contour_infill_clearance != nullptr);
+    CHECK(contour_toggle->enabled);
+    CHECK_FALSE(contour_count->enabled);
+    CHECK_FALSE(infill_density->enabled);
+    CHECK_FALSE(layer_interval->enabled);
+    CHECK_FALSE(minimum_segment->enabled);
+    CHECK_FALSE(maximum_turn->enabled);
+    CHECK_FALSE(contour_infill_clearance->enabled);
+
+    const auto contour_enabled = config.set("generate_reinforced_perimeters", "1");
+    REQUIRE(contour_enabled.success);
+    CHECK(find_item(contour_enabled.changed_items, "generate_reinforced_perimeters") != nullptr);
+    CHECK(find_item(contour_enabled.changed_items, "outer_reinforced_perimeters_counts") != nullptr);
+    CHECK(find_item(contour_enabled.changed_items, "fiber_layer_height_ratio") != nullptr);
+
+    items = config.settings();
+    CHECK(find_item(items, "outer_reinforced_perimeters_counts")->enabled);
+    CHECK(find_item(items, "fiber_layer_height_ratio")->enabled);
+    CHECK(find_item(items, "fiber_minimum_segment_length")->enabled);
+    CHECK(find_item(items, "fiber_maximum_turn_angle")->enabled);
+    CHECK_FALSE(find_item(items, "reinforced_infill_density")->enabled);
+    CHECK_FALSE(find_item(items, "fiber_contour_infill_clearance")->enabled);
+
+    const auto infill_enabled = config.set("generate_reinforced_infills", "1");
+    REQUIRE(infill_enabled.success);
+    CHECK(find_item(infill_enabled.changed_items, "reinforced_infill_density") != nullptr);
+    CHECK(find_item(infill_enabled.changed_items, "fiber_contour_infill_clearance") != nullptr);
+
+    items = config.settings();
+    CHECK(find_item(items, "reinforced_infill_density")->enabled);
+    CHECK(find_item(items, "fiber_contour_infill_clearance")->enabled);
+}
+
+TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[libslicer_api][config][fiber][cfsys]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    const auto activated = library->activate_config(selection);
+    const std::string diagnostic = activated.diagnostics.empty()
+        ? std::string{}
+        : activated.diagnostics.front().message;
+    INFO(diagnostic);
+    REQUIRE(activated.success);
+
+    const auto config = library->active_config_snapshot();
+    REQUIRE(config.has_value());
+    const auto cut_gcode = config->value("fiber_cut_gcode");
+    const auto cut_to_contact = config->value("fiber_cut_to_contact_length");
+    const auto prefeed_extra = config->value("fiber_prefeed_extra_length");
+    const auto z_hop_height = config->value("fiber_z_hop_height");
+    const auto landing_length = config->value("fiber_landing_length");
+    const auto landing_speed = config->value("fiber_landing_speed");
+    const auto start_speed = config->value("fiber_start_speed");
+    const auto minimum_effective = config->value("fiber_minimum_effective_length");
+    const auto minimum_segment = config->value("fiber_minimum_segment_length");
+    const auto maximum_turn = config->value("fiber_maximum_turn_angle");
+    const auto contour_speed = config->value("fiber_contour_max_speed");
+    const auto infill_speed = config->value("fiber_infill_max_speed");
+    const auto contour_acceleration = config->value("fiber_contour_acceleration");
+    const auto infill_acceleration = config->value("fiber_infill_acceleration");
+    REQUIRE(cut_gcode.has_value());
+    REQUIRE(cut_to_contact.has_value());
+    REQUIRE(prefeed_extra.has_value());
+    REQUIRE(z_hop_height.has_value());
+    REQUIRE(landing_length.has_value());
+    REQUIRE(landing_speed.has_value());
+    REQUIRE(start_speed.has_value());
+    REQUIRE(minimum_effective.has_value());
+    REQUIRE(minimum_segment.has_value());
+    REQUIRE(maximum_turn.has_value());
+    REQUIRE(contour_speed.has_value());
+    REQUIRE(infill_speed.has_value());
+    REQUIRE(contour_acceleration.has_value());
+    REQUIRE(infill_acceleration.has_value());
+    // ConfigSnapshot exposes the serialized representation; multiline strings
+    // therefore contain C-style escaped newlines until a slice config is built.
+    CHECK(*cut_gcode == "M400\\nS0\\nM400\\n");
+    CHECK(*cut_to_contact == "23");
+    CHECK(*prefeed_extra == "0.5");
+    CHECK(*z_hop_height == "2");
+    CHECK(*landing_length == "2");
+    CHECK(*landing_speed == "3");
+    CHECK(*start_speed == "10");
+    CHECK(*minimum_effective == "0.5");
+    CHECK(config->value("fiber_minimum_path_length") == std::optional<std::string>{"0"});
+    CHECK(*minimum_segment == "0");
+    CHECK(*maximum_turn == "180");
+    CHECK(*contour_speed == "10");
+    CHECK(*infill_speed == "10");
+    CHECK(*contour_acceleration == "500");
+    CHECK(*infill_acceleration == "500");
+    CHECK(config->value("physical_extruder_map") == std::optional<std::string>{"0,1"});
+    CHECK(config->value("toolhead_fiber_protocol_id") == std::optional<std::string>{";cfsys-v1"});
+
+    // The new algorithm has one canonical configuration contract. Historical
+    // CFSYS names must not survive as runtime aliases.
+    CHECK_FALSE(config->value("fibercut_length").has_value());
+    CHECK_FALSE(config->value("fiber_restart_extra_length").has_value());
+    CHECK_FALSE(config->value("fiber_z_hop").has_value());
+    CHECK_FALSE(config->value("fiber_start_min_length").has_value());
+    CHECK_FALSE(config->value("fiber_normal_max_speed").has_value());
+    CHECK_FALSE(config->value("fiber_perimeter_acceleration").has_value());
+}
+
+TEST_CASE("CFSYS original machine scripts produce real fiber G-code and reimport", "[libslicer_api][fiber][cfsys][slice]")
+{
+    // Alpha500 is the machine registered by the current CFSYS vendor catalog.
+    const std::string machine = "CFSYS Alpha500 Printer";
+    INFO(machine);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = machine;
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    REQUIRE(library->activate_config(selection).success);
+    std::optional<double> reference_feed;
+    for (bool relative_e : {false, true}) {
+        INFO("relative_e=" << relative_e);
+        REQUIRE(library->apply_active_config_patch({{"use_relative_e_distances", relative_e ? "1" : "0"}}).success);
+        libslicer::SliceRequest request;
+        const char* model = std::getenv("LIBSLICER_FIBER_VALIDATION_MODEL");
+        if (model) request.objects.push_back(binary_stl_on_bed(model));
+        else request.objects = {{std::string(LIBSLICER_TEST_DATA_DIR) + "/two_20mm_cubes.obj", {}}};
+        request.config = *library->active_config_snapshot();
+        const auto result = library->slice(request);
+        std::string diagnostics;
+        for (const auto& issue : result.diagnostics) diagnostics += issue.message + "\n";
+        INFO(diagnostics);
+        REQUIRE(result.success);
+        REQUIRE(result.preview);
+        REQUIRE(result.preview->statistics.total_fiber_feed_mm > 0);
+        std::size_t powered = 0, passive = 0, finish = 0;
+        for (const auto& segment : result.preview->segments) {
+            if (segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPowered) {
+                ++powered;
+                REQUIRE(segment.tool_id == 1);
+                REQUIRE(segment.filament_id == 1);
+                REQUIRE(segment.fiber_feed_delta_mm > 0);
+                REQUIRE(segment.end_mm.z > 0);
+            }
+            if (segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPassive) {
+                ++passive;
+                REQUIRE(segment.width_mm > 0);
+                REQUIRE(segment.height_mm > 0);
+                REQUIRE(segment.fiber_feed_delta_mm == 0);
+            }
+            if (segment.fiber_phase == libslicer::ToolpathFiberPhase::Finish) {
+                ++finish;
+                REQUIRE(segment.deposition == libslicer::ToolpathDepositionKind::None);
+            }
+        }
+        REQUIRE(powered > 0);
+        REQUIRE(passive > 0);
+        REQUIRE(finish > 0);
+        std::ifstream input(result.output.path);
+        const std::string gcode((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        const auto first_block = gcode.find(";FIBER_BEGIN");
+        REQUIRE(first_block != std::string::npos);
+        CHECK(gcode.find(machine == "CFSYS Alpha500 Printer" ? "DF1004" : "PRINT_START ") < first_block);
+        CHECK(gcode.find("PRINT_END") > gcode.rfind(";FIBER_END"));
+        std::size_t cursor = 0, cuts = 0;
+        const std::string expected_cut = ";FIBER_CUT\nM400\nS0\nM400\n;FIBER_TAIL_BEGIN\n";
+        while ((cursor = gcode.find(";FIBER_CUT\n", cursor)) != std::string::npos) {
+            REQUIRE(gcode.compare(cursor, expected_cut.size(), expected_cut) == 0);
+            ++cuts;
+            cursor += 11;
+        }
+        REQUIRE(cuts > 0);
+        std::istringstream commands(gcode);
+        std::string line;
+        double acceleration = 0;
+        while (std::getline(commands, line)) {
+            const auto setting = line.find("ACCEL=");
+            if (line.rfind("SET_VELOCITY_LIMIT", 0) == 0 && setting != std::string::npos)
+                acceleration = std::stod(line.substr(setting+6));
+            if (line == ";FIBER_LANDING_BEGIN" || line == ";FIBER_START" || line == ";FIBER_TAIL_BEGIN")
+                REQUIRE(acceleration == Catch::Approx(500.0));
+        }
+        libslicer::GCodePreviewRequest import_request;
+        import_request.gcode_path = result.output.path;
+        const auto imported = library->load_gcode_preview(import_request);
+        REQUIRE(imported.success);
+        REQUIRE(imported.preview);
+        CHECK(imported.preview->statistics.total_fiber_feed_mm ==
+              Catch::Approx(result.preview->statistics.total_fiber_feed_mm).margin(0.02));
+        CHECK(imported.preview->statistics.total_fiber_deposited_path_mm ==
+              Catch::Approx(result.preview->statistics.total_fiber_deposited_path_mm).margin(0.02));
+        if (reference_feed)
+            CHECK(result.preview->statistics.total_fiber_feed_mm == Catch::Approx(*reference_feed).margin(0.05));
+        else reference_feed = result.preview->statistics.total_fiber_feed_mm;
+        std::error_code error;
+        std::filesystem::remove(result.output.path, error);
+    }
+}
+
+TEST_CASE("CFSYS reference model retains reinforced contours on every reference layer", "[libslicer_api][fiber][reference]")
+{
+    const char* model = std::getenv("LIBSLICER_FIBER_VALIDATION_MODEL");
+    const char* reference = std::getenv("LIBSLICER_FIBER_REFERENCE_GCODE");
+    if (!model || !reference) SKIP("Supply the reference STL and G-code to run the stage-one acceptance test");
+    std::ifstream input(reference);
+    REQUIRE(input.good());
+    std::map<size_t,size_t> reference_contours;
+    std::string line, role;
+    size_t layers = 0;
+    while (std::getline(input,line)) {
+        if (line == ";LAYER_CHANGE") ++layers;
+        if (line.rfind(";TYPE:",0) == 0) role = line.substr(6);
+        if (line == "S0" && role == "Fiber wall") ++reference_contours[layers];
+    }
+    REQUIRE_FALSE(reference_contours.empty());
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS PLA", "CFSYS CCF"};
+    REQUIRE(library->activate_config(selection).success);
+    REQUIRE(library->apply_active_config_patch({{"generate_reinforced_infills","1"},
+        {"reinforced_infill_density","100%"},{"curr_bed_type","High Temp Plate"},
+        {"precise_outer_wall","0"},{"wall_direction","auto"}}).success);
+    libslicer::SliceRequest request;
+    request.objects.push_back(binary_stl_on_bed(model));
+    request.config = *library->active_config_snapshot();
+    if (const char* output = std::getenv("LIBSLICER_FIBER_VALIDATION_OUTPUT")) request.output_gcode_path = output;
+    const auto result = library->slice(request);
+    for (const auto& d : result.diagnostics) INFO(d.message);
+    REQUIRE(result.success);
+    REQUIRE(result.summary.layer_count == layers);
+    std::ifstream generated(result.output.path);
+    std::map<size_t,size_t> contours;
+    const std::regex occurrence("^;FIBER_BEGIN .* layer=([0-9]+) .*purpose=contour ");
+    std::smatch match;
+    while (std::getline(generated,line))
+        if (std::regex_search(line,match,occurrence)) ++contours[std::stoul(match[1])+1];
+    for (const auto& expected : reference_contours) {
+        INFO("Reference layer=" << expected.first << ", reference contours=" << expected.second);
+        CHECK(contours[expected.first] >= expected.second);
+    }
+    if (request.output_gcode_path.empty()) {
+        std::error_code error; std::filesystem::remove(result.output.path,error);
+    }
+}
+
+TEST_CASE("continuous fiber rejects a machine without a cut command", "[libslicer_api][fiber-missing-cut][slice]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "Flashforge Creator 5";
+    selection.machine_variant_id = "0.4";
+    const auto activated = library->activate_config(selection, {
+        {"generate_reinforced_perimeters", "1"},
+        {"outer_reinforced_perimeters_counts", "1"},
+        {"reinforced_perimeters_filament", "2"},
+        {"fiber_minimum_path_length", "2"},
+        {"fiber_cut_gcode", ""}
+    });
+    REQUIRE(activated.success);
+    const auto config = library->active_config_snapshot();
+    REQUIRE(config.has_value());
+
+    libslicer::SliceRequest request;
+    request.objects = {{std::string(LIBSLICER_TEST_DATA_DIR) + "/20mm_cube.obj", {}}};
+    request.config = *config;
+    request.generate_preview = false;
+    const auto sliced = library->slice(request);
+
+    CHECK_FALSE(sliced.success);
+    REQUIRE_FALSE(sliced.diagnostics.empty());
+    const bool reported_missing_cut = std::any_of(
+        sliced.diagnostics.begin(), sliced.diagnostics.end(),
+        [](const libslicer::SliceDiagnostic& diagnostic) {
+            return diagnostic.message.find("no fiber cut command") != std::string::npos;
+        });
+    CHECK(reported_missing_cut);
+}
+
+TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libslicer_api][fiber][slice]")
+{
+    const char* validation_model = std::getenv("LIBSLICER_FIBER_VALIDATION_MODEL");
+    const int execution_case = GENERATE(0, 1, 2);
+    const bool swapped_physical_tools = execution_case == 2;
+    INFO("execution_case=" << execution_case);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "Flashforge Creator 5";
+    selection.machine_variant_id = "0.4";
+    const auto activated = library->activate_config(selection, {
+        {"generate_reinforced_perimeters", "1"},
+        {"outer_reinforced_perimeters_counts", "2"},
+        {"generate_reinforced_infills", "1"},
+        {"reinforced_infill_density", "40%"},
+        {"reinforced_infill_pattern", "rectilinear"},
+        {"reinforced_perimeters_filament", "2"},
+        {"reinforced_infill_filament", "2"},
+        {"fiber_layer_height_ratio", "1"},
+        {"fiber_minimum_path_length", "2"},
+        {"fiber_contour_infill_clearance", "0"},
+        {"fiber_resin_overlap", "0.05"},
+        {"fiber_cut_to_contact_length", "5"},
+        {"fiber_prefeed_extra_length", "0.5"},
+        {"fiber_prefeed_speed", "10"},
+        {"fiber_z_hop_height", "2"},
+        {"fiber_landing_length", "2"},
+        {"fiber_landing_speed", "3"},
+        {"fiber_adhesion_dwell_ms", "25"},
+        {"fiber_start_stabilization_length", "2"},
+        {"fiber_start_speed", "10"},
+        {"fiber_cut_gcode", "M400\nM42 P4 S255\nG4 P100\n; TEST_FIBER_CUT"},
+        {"filament_process_type", "thermoplastic;continuous_fiber"},
+        {"filament_fiber_feed_correction", "1,1"},
+        {"toolhead_process_capabilities", swapped_physical_tools ? "continuous_fiber;thermoplastic" : "thermoplastic;continuous_fiber"},
+        {"toolhead_fiber_protocol_id", swapped_physical_tools ? "linear-e-v1;" : ";linear-e-v1"},
+        {"toolhead_fiber_e_units_per_mm", swapped_physical_tools ? "2,1" : "1,2"},
+        {"use_relative_e_distances", execution_case == 0 ? "0" : "1"},
+        {"z_offset", "0.7"},
+        {"fiber_contour_feed_ratio", "1.02"},
+        {"fiber_infill_feed_ratio", "1.05"},
+        {"physical_extruder_map", swapped_physical_tools ? "1,0" : "0,1"},
+        {"fiber_tail_min_speed", "3"},
+        {"fiber_tail_max_speed", "3"},
+        {"enable_prime_tower", "0"},
+        {"wipe", "1"}
+    });
+    std::string activation_diagnostics;
+    for (const auto& issue : activated.diagnostics) activation_diagnostics += issue.key + ": " + issue.message + "\n";
+    INFO(activation_diagnostics);
+    REQUIRE(activated.success);
+    // Synthetic, explicitly command-only machine. Production CFSYS firmware
+    // macros are deliberately not treated as an audited software fixture.
+    std::vector<std::pair<std::string, std::string>> script_patch;
+    const auto before_scripts = library->active_config_snapshot();
+    REQUIRE(before_scripts.has_value());
+    for (const auto& [key, value] : before_scripts->values())
+        if (key.size() >= 6 && key.compare(key.size()-6, 6, "_gcode") == 0 &&
+            key != "fiber_cut_gcode" && key != "emit_machine_limits_to_gcode")
+            script_patch.emplace_back(key, "");
+    const auto cleared_scripts = library->apply_active_config_patch(script_patch);
+    std::string script_diagnostics;
+    for (const auto& issue : cleared_scripts.diagnostics) script_diagnostics += issue.key + ": " + issue.message + "\n";
+    INFO(script_diagnostics);
+    REQUIRE(cleared_scripts.success);
+    const auto config = library->active_config_snapshot();
+    REQUIRE(config.has_value());
+
+    const std::filesystem::path output =
+        std::filesystem::temp_directory_path() / "libslicer_api_continuous_fiber_cube.gcode";
+    std::error_code remove_error;
+    std::filesystem::remove(output, remove_error);
+
+    libslicer::SliceRequest request;
+    if (validation_model) request.objects.push_back(binary_stl_on_bed(validation_model));
+    else request.objects = {{std::string(LIBSLICER_TEST_DATA_DIR) + "/two_20mm_cubes.obj", {}}};
+    request.config = *config;
+    request.output_gcode_path = output.string();
+    const auto sliced = library->slice(request);
+    const std::string diagnostic = sliced.diagnostics.empty()
+        ? std::string{}
+        : sliced.diagnostics.front().message;
+    INFO(diagnostic);
+    REQUIRE(sliced.success);
+    REQUIRE(sliced.preview != nullptr);
+
+    std::size_t contour_segments = 0;
+    std::size_t infill_segments = 0;
+    std::size_t resin_segments = 0;
+    std::size_t passive_segments = 0;
+    for (const auto& segment : sliced.preview->segments) {
+        if (segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPassive) {
+            ++passive_segments;
+            CHECK(segment.motion == libslicer::ToolpathMotionKind::Travel);
+            CHECK(segment.fiber_feed_delta_mm == 0);
+            CHECK(segment.width_mm > 0);
+            CHECK(segment.height_mm > 0);
+        }
+        if (segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPowered) {
+            CHECK(segment.filament_id == 1);
+            REQUIRE(segment.tool_id == (swapped_physical_tools ? 0 : 1));
+            const double ratio = segment.extrusion_role == libslicer::ToolpathExtrusionRole::ContinuousFiberContour ? 1.02 : 1.05;
+            CHECK(segment.fiber_feed_delta_mm == Catch::Approx(segment.deposited_path_length_mm * ratio).margin(0.002));
+            CHECK(segment.end_mm.z > 0);
+            CHECK(segment.start_mm.z == Catch::Approx(segment.end_mm.z));
+            CHECK(segment.extrusion_delta_mm == 0); // not plastic filament millimeters
+        }
+        if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::ContinuousFiberContour)
+            ++contour_segments;
+        else if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::ContinuousFiberInfill)
+            ++infill_segments;
+        else if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::SparseInfill)
+            ++resin_segments;
+    }
+    INFO("contour_segments=" << contour_segments
+         << " infill_segments=" << infill_segments
+         << " resin_segments=" << resin_segments);
+    CHECK(contour_segments > 0);
+    CHECK(infill_segments > 0);
+    CHECK(resin_segments > 0);
+    CHECK(passive_segments > 0);
+    CHECK(sliced.preview->statistics.total_fiber_feed_mm > 0);
+    CHECK(sliced.preview->statistics.total_fiber_prefeed_mm > 0);
+    libslicer::GCodePreviewRequest import_request;
+    import_request.gcode_path = output.string();
+    const auto imported_fiber = library->load_gcode_preview(import_request);
+    for (const auto& issue : imported_fiber.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(imported_fiber.success);
+    REQUIRE(imported_fiber.preview);
+    for (const auto& segment : imported_fiber.preview->segments)
+        if (segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPowered ||
+            segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPassive)
+            REQUIRE(segment.tool_id == (swapped_physical_tools ? 0 : 1));
+    CHECK(imported_fiber.preview->statistics.total_fiber_feed_mm ==
+          Catch::Approx(sliced.preview->statistics.total_fiber_feed_mm).margin(0.02));
+    CHECK(imported_fiber.preview->statistics.total_fiber_deposited_path_mm ==
+          Catch::Approx(sliced.preview->statistics.total_fiber_deposited_path_mm).margin(0.02));
+
+    std::ifstream generated(output);
+    const std::string gcode((std::istreambuf_iterator<char>(generated)),
+                            std::istreambuf_iterator<char>());
+    CHECK(gcode.find(";FIBER_BEGIN") != std::string::npos);
+    CHECK(gcode.find("purpose=contour") != std::string::npos);
+    CHECK(gcode.find("purpose=infill") != std::string::npos);
+    CHECK(gcode.find("component=0") != std::string::npos);
+    if (validation_model == nullptr)
+        CHECK(gcode.find("component=1") != std::string::npos);
+    CHECK(gcode.find(";FIBER_CUT") != std::string::npos);
+    CHECK(gcode.find("; TEST_FIBER_CUT") != std::string::npos);
+
+    std::istringstream gcode_lines(gcode);
+    std::string gcode_line;
+    bool inside_fiber_block = false;
+    bool awaiting_first_motion_after_end = false;
+    bool invalid_block_nesting = false;
+    bool protected_block_rewritten = false;
+    bool post_end_wipe = false;
+    bool block_saw_prefeed = false;
+    bool block_saw_landing = false;
+    bool block_saw_dwell = false;
+    bool block_saw_start = false;
+    bool block_saw_powered_deposition = false;
+    bool invalid_start_sequence = false;
+    std::size_t fiber_begin_count = 0;
+    std::size_t fiber_end_count = 0;
+    std::size_t valid_start_sequence_count = 0;
+    while (std::getline(gcode_lines, gcode_line)) {
+        if (gcode_line.rfind(";FIBER_BEGIN", 0) == 0) {
+            invalid_block_nesting = invalid_block_nesting || inside_fiber_block;
+            inside_fiber_block = true;
+            awaiting_first_motion_after_end = false;
+            block_saw_prefeed = false;
+            block_saw_landing = false;
+            block_saw_dwell = false;
+            block_saw_start = false;
+            block_saw_powered_deposition = false;
+            ++fiber_begin_count;
+        }
+        if (inside_fiber_block) {
+            protected_block_rewritten = protected_block_rewritten ||
+                gcode_line.rfind(";WIPE", 0) == 0 ||
+                gcode_line.find(";_WIPE") != std::string::npos ||
+                gcode_line.rfind("M106", 0) == 0 ||
+                gcode_line.rfind("M107", 0) == 0;
+
+            const bool is_linear_move = gcode_line.rfind("G1 ", 0) == 0;
+            const bool has_x = gcode_line.find(" X") != std::string::npos;
+            const bool has_y = gcode_line.find(" Y") != std::string::npos;
+            const bool has_z = gcode_line.find(" Z") != std::string::npos;
+            const bool has_e = gcode_line.find(" E") != std::string::npos;
+            if (!block_saw_start && is_linear_move && has_e && !has_x && !has_y)
+                block_saw_prefeed = true;
+            if (!block_saw_start && block_saw_prefeed && is_linear_move &&
+                (has_x || has_y) && has_z && !has_e)
+                block_saw_landing = true;
+            if (!block_saw_start && gcode_line.rfind("G4 P25", 0) == 0)
+                block_saw_dwell = true;
+            if (gcode_line.rfind(";FIBER_START", 0) == 0) {
+                invalid_start_sequence = invalid_start_sequence || block_saw_start ||
+                    !block_saw_prefeed || !block_saw_landing || !block_saw_dwell;
+                block_saw_start = true;
+            } else if (block_saw_start && is_linear_move && (has_x || has_y)) {
+                if (!block_saw_powered_deposition) {
+                    invalid_start_sequence = invalid_start_sequence || !has_e;
+                    block_saw_powered_deposition = has_e;
+                }
+            } else if (!block_saw_start && is_linear_move && (has_x || has_y) && has_e) {
+                invalid_start_sequence = true;
+            }
+        }
+        if (gcode_line.rfind(";FIBER_END", 0) == 0) {
+            invalid_block_nesting = invalid_block_nesting || !inside_fiber_block;
+            invalid_start_sequence = invalid_start_sequence || !block_saw_start ||
+                !block_saw_powered_deposition;
+            if (block_saw_start && block_saw_powered_deposition)
+                ++valid_start_sequence_count;
+            inside_fiber_block = false;
+            awaiting_first_motion_after_end = true;
+            ++fiber_end_count;
+            continue;
+        }
+        if (awaiting_first_motion_after_end &&
+            (gcode_line.rfind(";WIPE", 0) == 0 ||
+             gcode_line.find(";_WIPE") != std::string::npos))
+            post_end_wipe = true;
+        if (awaiting_first_motion_after_end &&
+            (gcode_line.rfind("G0 ", 0) == 0 || gcode_line.rfind("G1 ", 0) == 0)) {
+            awaiting_first_motion_after_end = false;
+        }
+    }
+    CHECK_FALSE(inside_fiber_block);
+    CHECK_FALSE(invalid_block_nesting);
+    CHECK_FALSE(protected_block_rewritten);
+    CHECK_FALSE(post_end_wipe);
+    CHECK_FALSE(invalid_start_sequence);
+    CHECK(fiber_begin_count > 0);
+    CHECK(fiber_begin_count == fiber_end_count);
+    CHECK(valid_start_sequence_count == fiber_begin_count);
+
+    const std::size_t tail_begin = gcode.find(";FIBER_TAIL_BEGIN");
+    const std::size_t depleted = tail_begin == std::string::npos ?
+        std::string::npos : gcode.find(";FIBER_DEPLETED", tail_begin);
+    REQUIRE(tail_begin != std::string::npos);
+    REQUIRE(depleted != std::string::npos);
+    const std::string passive_tail = gcode.substr(tail_begin, depleted - tail_begin);
+    std::istringstream passive_tail_lines(passive_tail);
+    std::string passive_line;
+    bool has_passive_xy_motion = false;
+    while (std::getline(passive_tail_lines, passive_line)) {
+        if (passive_line.rfind("G1 ", 0) != 0)
+            continue;
+        has_passive_xy_motion = has_passive_xy_motion ||
+            (passive_line.find(" X") != std::string::npos || passive_line.find(" Y") != std::string::npos);
+        CHECK(passive_line.find(" E") == std::string::npos);
+    }
+    CHECK(has_passive_xy_motion);
+    if (execution_case == 1) {
+        // A rejected machine event must not destroy a previously valid output.
+        REQUIRE(library->apply_active_config_patch({{"fiber_cut_gcode", "UNKNOWN_CUT_MACRO"}}).success);
+        request.config = *library->active_config_snapshot();
+        const auto rejected = library->slice(request);
+        REQUIRE_FALSE(rejected.success);
+        std::ifstream retained(output);
+        const std::string retained_gcode((std::istreambuf_iterator<char>(retained)), std::istreambuf_iterator<char>());
+        CHECK(retained_gcode == gcode);
+        CHECK_FALSE(std::filesystem::exists(output.string() + ".tmp"));
+    }
+    std::filesystem::remove(output, remove_error);
+}
+
+TEST_CASE("disabling continuous fiber preserves the ordinary Orca fill path", "[libslicer_api][fiber-disabled][slice]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library != nullptr);
+
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "Flashforge Creator 5";
+    selection.machine_variant_id = "0.4";
+    const auto activated = library->activate_config(selection, {
+        {"generate_reinforced_perimeters", "0"},
+        {"generate_reinforced_infills", "0"}
+    });
+    REQUIRE(activated.success);
+    const auto config = library->active_config_snapshot();
+    REQUIRE(config.has_value());
+
+    const std::filesystem::path output =
+        std::filesystem::temp_directory_path() / "libslicer_api_fiber_disabled_cube.gcode";
+    std::error_code remove_error;
+    std::filesystem::remove(output, remove_error);
+
+    libslicer::SliceRequest request;
+    request.objects = {{std::string(LIBSLICER_TEST_DATA_DIR) + "/20mm_cube.obj", {}}};
+    request.config = *config;
+    request.output_gcode_path = output.string();
+    const auto sliced = library->slice(request);
+    const std::string diagnostic = sliced.diagnostics.empty()
+        ? std::string{}
+        : sliced.diagnostics.front().message;
+    INFO(diagnostic);
+    REQUIRE(sliced.success);
+    REQUIRE(sliced.preview != nullptr);
+
+    std::size_t contour_segments = 0;
+    std::size_t infill_segments = 0;
+    std::size_t sparse_segments = 0;
+    for (const auto& segment : sliced.preview->segments) {
+        contour_segments += segment.extrusion_role ==
+            libslicer::ToolpathExtrusionRole::ContinuousFiberContour;
+        infill_segments += segment.extrusion_role ==
+            libslicer::ToolpathExtrusionRole::ContinuousFiberInfill;
+        sparse_segments += segment.extrusion_role ==
+            libslicer::ToolpathExtrusionRole::SparseInfill;
+    }
+    CHECK(contour_segments == 0);
+    CHECK(infill_segments == 0);
+    CHECK(sparse_segments > 0);
+
+    std::ifstream generated(output);
+    const std::string gcode((std::istreambuf_iterator<char>(generated)),
+                            std::istreambuf_iterator<char>());
+    CHECK(gcode.find(";FIBER_BEGIN") == std::string::npos);
+    CHECK(gcode.find(";FIBER_END") == std::string::npos);
+    std::filesystem::remove(output, remove_error);
 }
 
 TEST_CASE("library owns machine presets and builds a selected configuration", "[libslicer_api][presets]")

@@ -101,6 +101,12 @@ unsigned int LayerTools::internal_solid_filament_id(const PrintRegion &region) c
 // Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
 unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, const PrintRegion &region) const
 {
+    // A finalized fiber entity owns its material; layer wiping overrides must
+    // not replace it even when the remainder of the layer uses one extruder.
+    if (extrusions.role() == erContinuousFiberContour)
+        return unsigned(region.config().reinforced_perimeters_filament.value - 1);
+    if (extrusions.role() == erContinuousFiberInfill)
+        return unsigned(region.config().reinforced_infill_filament.value - 1);
 	assert(region.config().outer_wall_filament_id.value > 0);
 	assert(region.config().sparse_infill_filament_id.value > 0);
 	assert(region.config().internal_solid_filament_id.value > 0);
@@ -109,7 +115,12 @@ unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, c
 	// 1 based extruder ID.
     unsigned int extruder = 1;
     if (this->extruder_override == 0) {
-        if (extrusions.has_infill()) {
+        const ExtrusionRole collection_role = extrusions.role();
+        if (collection_role == erContinuousFiberContour) {
+            extruder = region.config().reinforced_perimeters_filament;
+        } else if (collection_role == erContinuousFiberInfill) {
+            extruder = region.config().reinforced_infill_filament;
+        } else if (extrusions.has_infill()) {
             if (extrusions.has_solid_infill()) {
                 ExtrusionRole role = extrusions.role();
                 if (role == erTopSolidInfill || role == erIroning)
@@ -711,12 +722,18 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             bool has_internal_solid     = false;
             bool has_top_solid_surface  = false;
             bool has_bottom_surface     = false;
+            bool has_fiber_contour      = false;
+            bool has_fiber_infill       = false;
             bool something_nonoverriddable = false;
             for (const ExtrusionEntity *ee : layerm->fills.entities) {
                 // fill represents infill extrusions of a single island.
                 const auto *fill = dynamic_cast<const ExtrusionEntityCollection*>(ee);
                 ExtrusionRole role = fill->entities.empty() ? erNone : fill->entities.front()->role();
-                if (role == erTopSolidInfill || role == erIroning)
+                if (role == erContinuousFiberContour)
+                    has_fiber_contour = true;
+                else if (role == erContinuousFiberInfill)
+                    has_fiber_infill = true;
+                else if (role == erTopSolidInfill || role == erIroning)
                     has_top_solid_surface = true;
                 else if (role == erBottomSurface)
                     has_bottom_surface = true;
@@ -741,10 +758,14 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                         layer_tools.extruders.emplace_back(region.config().bottom_surface_filament_id);
 	                if (has_infill)
 	                    layer_tools.extruders.emplace_back(region.config().sparse_infill_filament_id);
-                } else if (has_internal_solid || has_top_solid_surface || has_bottom_surface || has_infill)
+                    if (has_fiber_contour)
+                        layer_tools.extruders.emplace_back(region.config().reinforced_perimeters_filament);
+                    if (has_fiber_infill)
+                        layer_tools.extruders.emplace_back(region.config().reinforced_infill_filament);
+                } else if (has_internal_solid || has_top_solid_surface || has_bottom_surface || has_infill || has_fiber_contour || has_fiber_infill)
             		layer_tools.extruders.emplace_back(extruder_override);
             }
-            if (has_internal_solid || has_top_solid_surface || has_bottom_surface || has_infill)
+            if (has_internal_solid || has_top_solid_surface || has_bottom_surface || has_infill || has_fiber_contour || has_fiber_infill)
                 layer_tools.has_object = true;
         }
         layerCount++;
@@ -1584,6 +1605,16 @@ int WipingExtrusions::last_nonsoluble_extruder_on_layer(const PrintConfig& print
 // Decides whether this entity could be overridden
 bool WipingExtrusions::is_overriddable(const ExtrusionEntityCollection& eec, const PrintConfig& print_config, const PrintObject& object, const PrintRegion& region) const
 {
+    // Inspect descendants, including mixed collections; role() alone is insufficient.
+    const auto contains_fiber = [](const auto& self, const ExtrusionEntity& entity) -> bool {
+        if (dynamic_cast<const ExtrusionFiberPath*>(&entity)) return true;
+        if (const auto* collection = dynamic_cast<const ExtrusionEntityCollection*>(&entity))
+            for (const auto* child : collection->entities)
+                if (self(self, *child)) return true;
+        return false;
+    };
+    if (contains_fiber(contains_fiber, eec))
+        return false;
     if (print_config.filament_soluble.get_at(m_layer_tools->extruder(eec, region)))
         return false;
 

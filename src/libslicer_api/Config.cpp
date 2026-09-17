@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <initializer_list>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -174,6 +175,70 @@ const Catalog& catalog()
     return instance;
 }
 
+bool boolean_value(const Slic3r::DynamicPrintConfig& config, const char* key)
+{
+    const auto* value = config.option<Slic3r::ConfigOptionBool>(key);
+    return value != nullptr && value->value;
+}
+
+bool key_is(std::string_view key, std::initializer_list<std::string_view> candidates)
+{
+    return std::find(candidates.begin(), candidates.end(), key) != candidates.end();
+}
+
+void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintConfig& config)
+{
+    const bool contour_enabled = boolean_value(config, "generate_reinforced_perimeters");
+    const bool infill_enabled  = boolean_value(config, "generate_reinforced_infills");
+
+    if (key_is(item.key, {"outer_reinforced_perimeters_counts",
+                          "reinforced_perimeters_filament",
+                          "reinforced_perimeters_extrusion_width"})) {
+        item.enabled = contour_enabled;
+    } else if (key_is(item.key, {"reinforced_infill_density",
+                                 "reinforced_infill_pattern",
+                                 "reinforced_infill_filament",
+                                 "reinforced_infill_extrusion_width"})) {
+        item.enabled = infill_enabled;
+    } else if (item.key == "fiber_contour_boundary_clearance") {
+        item.enabled = contour_enabled;
+    } else if (item.key == "fiber_contour_infill_clearance") {
+        item.enabled = contour_enabled && infill_enabled;
+    } else if (key_is(item.key, {"fiber_layer_height_ratio",
+                                 "fiber_minimum_path_length",
+                                 "fiber_minimum_segment_length",
+                                 "fiber_maximum_turn_angle",
+                                 "fiber_minimum_effective_length",
+                                 "fiber_prefeed_extra_length",
+                                 "fiber_prefeed_speed",
+                                 "fiber_z_hop_height",
+                                 "fiber_landing_length",
+                                 "fiber_landing_speed",
+                                 "fiber_adhesion_dwell_ms",
+                                 "fiber_start_speed",
+                                 "fiber_start_stabilization_length",
+                                 "fiber_finish_extension_length",
+                                 "fiber_outside_tolerance",
+                                 "fiber_contour_max_speed",
+                                 "fiber_infill_max_speed",
+                                 "fiber_contour_feed_ratio",
+                                 "fiber_infill_feed_ratio",
+                                 "fiber_contour_min_speed",
+                                 "fiber_infill_min_speed",
+                                 "fiber_corner_transition_length",
+                                 "fiber_speed_sampling_length",
+                                 "fiber_tail_min_speed",
+                                 "fiber_tail_max_speed",
+                                 "fiber_tail_speed_step_length",
+                                 "fiber_finish_overlap_length",
+                                 "fiber_finish_motion_speed",
+                                 "fiber_contour_acceleration",
+                                 "fiber_infill_acceleration",
+                                 "fiber_resin_overlap"})) {
+        item.enabled = contour_enabled || infill_enabled;
+    }
+}
+
 } // namespace
 
 class ConfigSnapshot::Impl
@@ -270,6 +335,7 @@ std::vector<SettingItem> Config::settings() const
         if (const auto* baseline = impl_->defaults.option(definition.key)) {
             item.default_value = baseline->serialize();
         }
+        apply_dynamic_presentation(item, impl_->current);
         result.push_back(std::move(item));
     }
     return result;
@@ -297,7 +363,24 @@ std::optional<SettingItem> current_item(const Slic3r::DynamicPrintConfig& config
     if (const auto* baseline = defaults.option(definition->key)) {
         item.default_value = baseline->serialize();
     }
+    apply_dynamic_presentation(item, config);
     return item;
+}
+
+void append_presentation_changes(std::vector<std::string>& changed_keys,
+                                 const Slic3r::DynamicPrintConfig& before,
+                                 const Slic3r::DynamicPrintConfig& after)
+{
+    for (const SettingItem& definition : catalog().items) {
+        SettingItem previous = definition;
+        SettingItem current  = definition;
+        apply_dynamic_presentation(previous, before);
+        apply_dynamic_presentation(current, after);
+        if ((previous.enabled != current.enabled || previous.visible != current.visible) &&
+            std::find(changed_keys.begin(), changed_keys.end(), definition.key) == changed_keys.end()) {
+            changed_keys.push_back(definition.key);
+        }
+    }
 }
 } // namespace
 
@@ -308,7 +391,8 @@ SettingsResult Config::set(std::string_view key, std::string_view serialized_val
 
 SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std::string>>& patch)
 {
-    Slic3r::DynamicPrintConfig candidate = impl_->current;
+    const Slic3r::DynamicPrintConfig before = impl_->current;
+    Slic3r::DynamicPrintConfig candidate = before;
     std::string last_key;
     try {
         for (const auto& [key, serialized_value] : patch) {
@@ -342,7 +426,8 @@ SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std:
         return failure(last_key, error.what());
     }
 
-    const auto changed_keys = candidate.diff(impl_->current);
+    auto changed_keys = candidate.diff(before);
+    append_presentation_changes(changed_keys, before, candidate);
     impl_->current          = std::move(candidate);
     SettingsResult result;
     result.success = true;
@@ -365,12 +450,17 @@ SettingsResult Config::reset(std::string_view key)
     if (definition->read_only) {
         return failure(owned_key, "Configuration option is read-only");
     }
-    const bool changed = impl_->current.opt_serialize(owned_key) != impl_->defaults.opt_serialize(owned_key);
+    const Slic3r::DynamicPrintConfig before = impl_->current;
+    const bool changed = before.opt_serialize(owned_key) != impl_->defaults.opt_serialize(owned_key);
     impl_->current.apply_only(impl_->defaults, {owned_key});
     SettingsResult result;
     result.success = true;
-    if (changed) {
-        if (auto item = current_item(impl_->current, impl_->defaults, owned_key)) {
+    std::vector<std::string> changed_keys;
+    if (changed)
+        changed_keys.push_back(owned_key);
+    append_presentation_changes(changed_keys, before, impl_->current);
+    for (const std::string& changed_key : changed_keys) {
+        if (auto item = current_item(impl_->current, impl_->defaults, changed_key)) {
             result.changed_items.push_back(std::move(*item));
         }
     }

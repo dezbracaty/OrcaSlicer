@@ -1,4 +1,5 @@
 #include "GCodeWriter.hpp"
+#include "ContinuousFiber/ContinuousFiberConfig.hpp"
 #include "CustomGCode.hpp"
 #include "I18N.hpp"
 #include "PrintConfig.hpp"
@@ -167,6 +168,16 @@ std::string GCodeWriter::set_temperature(unsigned int temperature, GCodeFlavor f
 
 std::string GCodeWriter::set_temperature(unsigned int temperature, bool wait, int tool) const
 {
+    const bool fiber_machine = std::find(config.filament_process_type.values.begin(),
+        config.filament_process_type.values.end(), "continuous_fiber") != config.filament_process_type.values.end();
+    if (fiber_machine && tool >= 0) {
+        if (size_t(tool) >= config.filament_map.values.size())
+            throw std::runtime_error("Missing heater filament binding");
+        const int logical = config.filament_map.values[tool] - 1;
+        if (logical < 0 || size_t(logical) >= config.physical_extruder_map.values.size())
+            throw std::runtime_error("Missing physical heater binding");
+        tool = config.physical_extruder_map.values[logical];
+    }
     // set tool to -1 to make sure we won't emit T parameter for single extruder or SEMM
     if (!this->multiple_extruders || m_single_extruder_multi_material)
         tool = -1;
@@ -584,7 +595,17 @@ std::string GCodeWriter::toolchange(unsigned int filament_id)
     std::ostringstream gcode;
     if (this->multiple_extruders || (this->config.filament_diameter.values.size() > 1 && !is_bbl_printers())) {
         // Orca: call toolchange_prefix() to get the correct command prefix based on the configuration and flavor.
-        gcode << this->toolchange_prefix() << filament_id;
+        const bool fiber_machine = std::find(config.filament_process_type.values.begin(),
+            config.filament_process_type.values.end(), "continuous_fiber") != config.filament_process_type.values.end();
+        unsigned command_tool = filament_id;
+        if (fiber_machine) {
+            if (size_t(m_curr_extruder_id) >= config.physical_extruder_map.values.size() ||
+                config.physical_extruder_map.values[m_curr_extruder_id] < 0)
+                throw std::runtime_error("Missing physical tool binding for fiber machine");
+            command_tool = unsigned(config.physical_extruder_map.values[m_curr_extruder_id]);
+            gcode << ";TOOL_BINDING filament=" << filament_id << " physical=" << command_tool << "\n";
+        }
+        gcode << this->toolchange_prefix() << command_tool;
         if (GCodeWriter::full_gcode_comment)
             gcode << " ; change extruder";
         gcode << "\n";
@@ -1056,6 +1077,11 @@ std::string GCodeWriter::retract_for_toolchange(bool before_wipe, double retract
 
 std::string GCodeWriter::_retract(double length, double restart_extra, const std::string &comment)
 {
+    if (is_fiber_filament(config, filament()->id())) {
+        if (filament()->effective_retracted() != 0.0 || filament()->restart_extra() != 0.0)
+            throw std::runtime_error("Fiber tool has nonzero generic retraction state");
+        return {};
+    }
     /*  If firmware retraction is enabled, we use a fake value of 1
     since we ignore the actual configured retract_length which
     might be 0, in which case the retraction logic gets skipped. */
@@ -1086,6 +1112,11 @@ std::string GCodeWriter::_retract(double length, double restart_extra, const std
 
 std::string GCodeWriter::unretract()
 {
+    if (filament() && is_fiber_filament(config, filament()->id())) {
+        if (filament()->effective_retracted() != 0.0 || filament()->restart_extra() != 0.0)
+            throw std::runtime_error("Fiber tool has nonzero generic retraction state");
+        return {};
+    }
     std::string gcode;
 
     if (FLAVOR_IS(gcfMakerWare))

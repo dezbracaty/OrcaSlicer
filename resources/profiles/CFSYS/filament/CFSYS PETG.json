@@ -1,0 +1,73 @@
+{
+    "type": "filament",
+    "filament_id": "GFG99",
+    "setting_id": "GFSA04",
+    "name": "CFSYS PETG",
+    "from": "system",
+    "instantiation": "true",
+    "inherits": "fdm_filament_pet",
+    "reduce_fan_stop_start_freq": [
+        "1"
+    ],
+    "slow_down_for_layer_cooling": [
+        "1"
+    ],
+    "overhang_fan_speed": [
+        "60"
+    ],
+    "overhang_fan_threshold": [
+        "0%"
+    ],
+    "slow_down_min_speed": [
+        "10"
+    ],
+    "filament_flow_ratio": [
+        "1"
+    ],
+    "filament_start_gcode": [
+        "; filament start gcode\n"
+    ],
+    "default_filament_colour": [
+        "#ACFFAC"
+    ],
+    "fan_cooling_layer_time": [
+        "20"
+    ],
+    "fan_max_speed": [
+        "100"
+    ],
+    "fan_min_speed": [
+        "20"
+    ],
+    "filament_max_volumetric_speed": [
+        "10"
+    ],
+    "enable_pressure_advance": [
+        "1"
+    ],
+    "pressure_advance": [
+        "0.052"
+    ],
+    "hot_plate_temp": [
+        "80"
+    ],
+    "hot_plate_temp_initial_layer": [
+        "80"
+    ],
+    "nozzle_temperature_range_low": [
+        "220"
+    ],
+    "slow_down_layer_time": [
+        "8"
+    ],
+    "support_material_interface_fan_speed": [
+        "100"
+    ],
+    "compatible_printers": [
+      "CFSYS Alpha500 0.4 nozzle",
+	  "CFSYS Alpha500 Printer 0.2 nozzle",
+	  "CFSYS Alpha500 Printer 0.4 nozzle",
+	  "CFSYS Alpha500 Printer 0.6 nozzle",
+	  "CFSYS Alpha500 Printer 0.8 nozzle"
+    ]
+}

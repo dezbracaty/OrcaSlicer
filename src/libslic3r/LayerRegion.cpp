@@ -1070,6 +1070,8 @@ void LayerRegion::simplify_entity_collection(ExtrusionEntityCollection* entity_c
 
 void LayerRegion::simplify_path(ExtrusionPath* path)
 {
+    if (dynamic_cast<const ExtrusionFiberPath*>(path))
+        return; // Prepared geometry and edge processes have already been frozen.
     const auto print_config = this->layer()->object()->print()->config();
     const bool spiral_mode = print_config.spiral_mode;
     const bool enable_arc_fitting = print_config.enable_arc_fitting;

@@ -1,0 +1,154 @@
+{
+    "close_fan_the_first_x_layers": [
+        "3"
+    ],
+    "enable_pressure_advance": [
+        "1"
+    ],
+    "fan_cooling_layer_time": [
+        "8"
+    ],
+    "additional_cooling_fan_speed": [
+        "100"
+    ],
+    "complete_print_exhaust_fan_speed": [
+        "0"
+    ],
+    "default_filament_colour": [
+        "#F0F0F0"
+    ],
+    "during_print_exhaust_fan_speed": [
+        "0"
+    ],
+    "fan_max_speed": [
+        "100"
+    ],
+    "fan_min_speed": [
+        "5"
+    ],
+    "filament_deretraction_speed": [
+        "0"
+    ],
+    "filament_flow_ratio": [
+        "0.96"
+    ],
+    "filament_loading_speed": [
+        "60"
+    ],
+    "filament_loading_speed_start": [
+        "10"
+    ],
+    "filament_is_support": [
+        "1"
+    ],
+    "filament_max_volumetric_speed": [
+        "6"
+    ],
+    "filament_retract_before_wipe": [
+        "100%"
+    ],
+    "filament_retract_lift_above": [
+        "0"
+    ],
+    "filament_retract_lift_below": [
+        "0"
+    ],
+    "filament_retract_lift_enforce": [
+        "All Surfaces"
+    ],
+    "filament_retract_restart_extra": [
+        "0"
+    ],
+    "filament_retract_when_changing_layer": [
+        "0"
+    ],
+    "filament_retraction_length": [
+        "3.2"
+    ],
+    "filament_retraction_minimum_travel": [
+        "2"
+    ],
+    "filament_retraction_speed": [
+        "30"
+    ],
+    "filament_settings_id": [
+        "S-PAHT"
+    ],
+    "filament_vendor": [
+        "CFSYS"
+    ],
+    "filament_wipe": [
+        "0"
+    ],
+    "filament_wipe_distance": [
+        "1"
+    ],
+    "filament_shrink": [
+        "96%"
+    ],
+    "filament_type": [
+        "S-PAHT"
+    ],
+    "filament_z_hop": [
+        "0.8"
+    ],
+    "temperature_vitrification": [
+        "80"
+    ],
+    "filament_z_hop_types": [
+        "Normal Lift"
+    ],
+    "from": "system",
+    "hot_plate_temp": [
+        "80"
+    ],
+    "hot_plate_temp_initial_layer": [
+        "80"
+    ],
+    "inherits": "CFSYS PLA",
+    "is_custom_defined": "0",
+    "name": "CFSYS S-PAHT",
+    "nozzle_temperature": [
+        "320"
+    ],
+    "nozzle_temperature_initial_layer": [
+        "320"
+    ],
+    "nozzle_temperature_range_high": [
+        "340"
+    ],
+    "nozzle_temperature_range_low": [
+        "260"
+    ],
+    "overhang_fan_speed": [
+        "60"
+    ],
+    "overhang_fan_threshold": [
+        "0%"
+    ],
+    "reduce_fan_stop_start_freq": [
+        "1"
+    ],
+    "pressure_advance": [
+        "0.04"
+    ],
+    "slow_down_layer_time": [
+        "1"
+    ],
+    "slow_down_min_speed": [
+        "20"
+    ],
+    "support_material_interface_fan_speed": [
+        "80"
+    ],
+    "filament_density": [
+        "1.24"
+    ],
+    "filament_cost": [
+        "1000"
+    ],
+    "dont_slow_down_outer_wall": [
+        "1"
+    ],
+    "version": "2.0.2.0"
+}

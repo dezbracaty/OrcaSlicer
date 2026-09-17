@@ -1,0 +1,173 @@
+{
+    "additional_cooling_fan_speed": [
+        "100"
+    ],
+    "dont_slow_down_outer_wall": [
+        "1"
+    ],
+    "enable_pressure_advance": [
+        "1"
+    ],
+    "fan_max_speed": [
+        "100"
+    ],
+    "fan_min_speed": [
+        "100"
+    ],
+    "filament_flow_ratio": [
+        "1"
+    ],
+    "filament_max_volumetric_speed": [
+        "1"
+    ],
+    "filament_retract_when_changing_layer": [
+        "0"
+    ],
+    "chamber_temperature": [
+        "0"
+    ],
+    "complete_print_exhaust_fan_speed": [
+        "0"
+    ],
+    "default_filament_colour": [
+        "#FF0080"
+    ],
+    "during_print_exhaust_fan_speed": [
+        "0"
+    ],
+    "activate_air_filtration": [
+        "1"
+    ],
+    "fan_cooling_layer_time": [
+        "5"
+    ],
+    "filament_cost": [
+        "10000"
+    ],
+    "filament_density": [
+        "1.3"
+    ],
+    "filament_deretraction_speed": [
+        "0"
+    ],
+    "filament_diameter": [
+        "0.35"
+    ],
+    "filament_loading_speed": [
+        "30"
+    ],
+    "filament_loading_speed_start": [
+        "5"
+    ],
+    "filament_retract_before_wipe": [
+        "0"
+    ],
+    "filament_retract_lift_above": [
+        "0"
+    ],
+    "filament_retract_lift_below": [
+        "0"
+    ],
+    "filament_retract_lift_enforce": [
+        "All Surfaces"
+    ],
+    "filament_retract_restart_extra": [
+        "0"
+    ],
+    "filament_retraction_length": [
+        "0"
+    ],
+    "filament_retraction_minimum_travel": [
+        "0"
+    ],
+    "filament_retraction_speed": [
+        "0"
+    ],
+    "filament_settings_id": [
+        "CCF"
+    ],
+    "filament_unloading_speed_start": [
+        "5"
+    ],
+    "filament_vendor": [
+        "CFSYS"
+    ],
+    "filament_wipe_distance": [
+        "0"
+    ],
+    "filament_shrink": [
+        "100%"
+    ],
+    "filament_wipe": [
+        "0"
+    ],
+    "filament_z_hop": [
+        "2"
+    ],
+    "filament_z_hop_types": [
+        "Normal Lift"
+    ],
+    "type": "filament",
+    "filament_id": "GFN98",
+    "setting_id": "GFSA05",
+    "name": "CFSYS CCF",
+    "from": "system",
+    "instantiation": "true",
+    "inherits": "fdm_filament_ccf",
+    "filament_type": [
+        "CCF"
+    ],
+    "nozzle_temperature_range_low": [
+        "230"
+    ],
+    "slow_down_layer_time": [
+        "3"
+    ],
+    "temperature_vitrification": [
+        "100"
+    ],
+    "compatible_printers": [
+      "CFSYS Alpha500 0.4 nozzle",
+	  "CFSYS Alpha500 Printer 0.2 nozzle",
+	  "CFSYS Alpha500 Printer 0.4 nozzle",
+	  "CFSYS Alpha500 Printer 0.6 nozzle",
+	  "CFSYS Alpha500 Printer 0.8 nozzle"
+    ],
+    "overhang_fan_speed": [
+        "60"
+    ],
+    "activate_chamber_temp_control": [
+        "0"
+    ],
+    "hot_plate_temp": [
+        "100"
+    ],
+    "hot_plate_temp_initial_layer": [
+        "100"
+    ],
+    "nozzle_temperature": [
+        "235"
+    ],
+    "nozzle_temperature_initial_layer": [
+        "235"
+    ],
+    "nozzle_temperature_range_high": [
+        "260"
+    ],
+    "pressure_advance": [
+        "0"
+    ],
+    "reduce_fan_stop_start_freq": [
+        "1"
+    ],
+    "slow_down_for_layer_cooling": [
+        "0"
+    ],
+    "slow_down_min_speed": [
+        "5"
+    ],
+    "support_material_interface_fan_speed": [
+        "100"
+    ],
+    "version": "2.0.2.0"
+}

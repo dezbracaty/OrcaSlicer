@@ -1,5 +1,6 @@
 #include "../GCode.hpp"
 #include "CoolingBuffer.hpp"
+#include "FiberGCodeBlockParser.hpp"
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/log/trivial.hpp>
@@ -71,6 +72,7 @@ struct CoolingLine
         // ORCA: Add support for ironing fan speed control
         TYPE_IRONING_FAN_START         = 1 << 19,
         TYPE_IRONING_FAN_END           = 1 << 20,
+        TYPE_FIBER_PROTECTED           = 1 << 21,
     };
 
     CoolingLine(unsigned int type, size_t  line_start, size_t  line_end) :
@@ -362,6 +364,7 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
     // Orca: Whether we had our first extrusion in this layer.
     // Time of any other movements before the first extrusion will be excluded from the layer time.
     bool layer_had_extrusion = false;
+    FiberGCodeBlockParser fiber_block_parser;
 
     for (; *line_start != 0; line_start = line_end)
     {
@@ -372,6 +375,9 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
         // CoolingLine will contain the trailing '\n'.
         if (*line_end == '\n')
             ++ line_end;
+        const FiberGCodeBlockLine fiber_block_line = fiber_block_parser.consume(sline);
+        if (fiber_block_line.protected_line)
+            active_speed_modifier = size_t(-1);
         CoolingLine line(0, line_start - gcode.c_str(), line_end - gcode.c_str());
         if (boost::starts_with(sline, "G0 "))
             line.type = CoolingLine::TYPE_G0;
@@ -433,7 +439,8 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
             
             // ORCA: Dont slowdown external perimeters for layer time works by not marking the external perimeter as adjustable, 
             // hence the slowdown algorithm ignores it.
-            if (boost::contains(sline, ";_EXTRUDE_SET_SPEED") && ! wipe && adjust_external) {
+            if (!fiber_block_line.protected_line &&
+                boost::contains(sline, ";_EXTRUDE_SET_SPEED") && !wipe && adjust_external) {
                 line.type |= CoolingLine::TYPE_ADJUSTABLE;
                 active_speed_modifier = adjustment->lines.size();
             }
@@ -470,10 +477,12 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
                 if (line.length > 0)
                     line.time = line.length / line.feedrate;
                 line.time_max = line.time;
-                if ((line.type & CoolingLine::TYPE_ADJUSTABLE) || active_speed_modifier != size_t(-1))
+                if (!fiber_block_line.protected_line &&
+                    ((line.type & CoolingLine::TYPE_ADJUSTABLE) || active_speed_modifier != size_t(-1)))
                     line.time_max = (adjustment->slow_down_min_speed == 0.f) ? FLT_MAX : std::max(line.time, line.length / adjustment->slow_down_min_speed);
                 // BBS: add G2 and G3 support
-                if (active_speed_modifier < adjustment->lines.size() && ((line.type & CoolingLine::TYPE_G1) ||
+                if (!fiber_block_line.protected_line &&
+                    active_speed_modifier < adjustment->lines.size() && ((line.type & CoolingLine::TYPE_G1) ||
                                                                          (line.type & CoolingLine::TYPE_G2) ||
                                                                          (line.type & CoolingLine::TYPE_G3))) {
                     // Inside the ";_EXTRUDE_SET_SPEED" blocks, there must not be a G1 Fxx entry.
@@ -493,6 +502,10 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
                 }
             }
             current_pos = std::move(new_pos);
+            if (fiber_block_line.protected_line)
+                line.type |= CoolingLine::TYPE_FIBER_PROTECTED;
+        } else if (fiber_block_line.protected_line) {
+            line.type = CoolingLine::TYPE_FIBER_PROTECTED;
         } else if (boost::starts_with(sline, ";_EXTRUDE_END")) {
             line.type = CoolingLine::TYPE_EXTRUDE_END;
             active_speed_modifier = size_t(-1);
@@ -553,6 +566,9 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
         if (line.type != 0)
             adjustment->lines.emplace_back(std::move(line));
     }
+
+    if (fiber_block_parser.inside_block())
+        throw std::runtime_error("Unclosed FIBER_BEGIN marker in CoolingBuffer input");
 
     return per_extruder_adjustments;
 }
@@ -837,7 +853,9 @@ std::string CoolingBuffer::apply_layer_cooldown(
         const char *line_end    = gcode.c_str() + line->line_end;
         if (line_start > pos)
             new_gcode.append(pos, line_start - pos);
-        if (line->type & CoolingLine::TYPE_SET_TOOL) {
+        if (line->type & CoolingLine::TYPE_FIBER_PROTECTED) {
+            new_gcode.append(line_start, line_end - line_start);
+        } else if (line->type & CoolingLine::TYPE_SET_TOOL) {
             unsigned int new_extruder = 0;
             auto ret = std::from_chars(line_start + m_toolchange_prefix.size(), line_end, new_extruder);
             if (std::errc::invalid_argument != ret.ec) {

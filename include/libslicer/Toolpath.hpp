@@ -10,7 +10,7 @@ namespace libslicer {
 
 inline constexpr std::uint32_t invalid_toolpath_id = 0xffffffffu;
 inline constexpr std::uint16_t invalid_toolpath_small_id = 0xffffu;
-inline constexpr std::uint32_t toolpath_schema_version = 2u;
+inline constexpr std::uint32_t toolpath_schema_version = 3u;
 
 struct ToolpathPoint
 {
@@ -55,7 +55,9 @@ enum class ToolpathExtrusionRole : std::uint8_t
     SupportTransition,
     WipeTower,
     Custom,
-    Mixed
+    Mixed,
+    ContinuousFiberContour,
+    ContinuousFiberInfill
 };
 
 enum class ToolpathEventKind : std::uint8_t
@@ -132,6 +134,9 @@ struct ToolpathColor
 // A normalized, directly drawable segment. Processor-only vertices such as
 // actual-speed and arc subdivisions are absorbed by libslicer and never exposed
 // as a special public state.
+enum class ToolpathDepositionKind : std::uint8_t { None, Thermoplastic, ContinuousFiberPowered, ContinuousFiberPassive };
+enum class ToolpathFiberPhase : std::uint8_t { None, Approach, Prefeed, Ready, Landing, Powered, Cut, Tail, Depleted, Finish, Complete };
+
 struct ToolpathSegment
 {
     std::uint64_t id{0};
@@ -144,7 +149,12 @@ struct ToolpathSegment
     std::uint16_t filament_id{invalid_toolpath_small_id};
     std::uint16_t color_id{invalid_toolpath_small_id};
     ToolpathMotionKind motion{ToolpathMotionKind::Travel};
-    // Valid only for Extrusion. Travel and Wipe are guaranteed to use None.
+    ToolpathDepositionKind deposition{ToolpathDepositionKind::None};
+    ToolpathFiberPhase fiber_phase{ToolpathFiberPhase::None};
+    std::uint64_t fiber_occurrence{0};
+    float fiber_feed_delta_mm{0.0f};
+    float deposited_path_length_mm{0.0f};
+    // Deposition role is also valid for passive continuous-fiber Travel.
     ToolpathExtrusionRole extrusion_role{ToolpathExtrusionRole::None};
     ToolpathPoint start_mm;
     ToolpathPoint end_mm;
@@ -234,6 +244,9 @@ struct ToolpathStatistics
     std::size_t render_segment_count{0};
     double total_time_seconds{0.0};
     double total_extrusion_mm{0.0};
+    double total_fiber_feed_mm{0.0}; // powered + prefeed, never passive geometry twice
+    double total_fiber_prefeed_mm{0.0};
+    double total_fiber_deposited_path_mm{0.0};
     double total_extrusion_volume_mm3{0.0};
     double total_print_distance_mm{0.0};
     double total_travel_distance_mm{0.0};

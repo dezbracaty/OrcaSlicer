@@ -9,6 +9,7 @@
 #include "../Point.hpp"
 #include "../GCodeReader.hpp"
 #include "../GCodeWriter.hpp"
+#include "FiberGCodeBlockParser.hpp"
 #include <regex>
 
 namespace Slic3r {
@@ -58,6 +59,7 @@ private:
 
     // The output of process_layer()
     std::string m_process_output;
+    FiberGCodeBlockParser m_fiber_block_parser;
 
 public:
     FanMover(const GCodeWriter& writer, const float nb_seconds_delay, const bool with_D_option, const bool relative_e,
@@ -89,6 +91,7 @@ private:
     void _print_in_middle_G1(BufferData& line_to_split, float nb_sec, const std::string& line_to_write);
     void _remove_slow_fan(int16_t min_speed, float past_sec);
     std::string _set_fan(int16_t speed);
+    void _flush_buffer_to_output();
 };
 
 } // namespace Slic3r

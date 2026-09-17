@@ -107,6 +107,8 @@ void PressureEqualizer::process_layer(const std::string &gcode)
                 ++gcode_begin;
         }
         assert(!this->opened_extrude_set_speed_block);
+        if (m_fiber_block_parser.inside_block())
+            throw Slic3r::RuntimeError("Unclosed FIBER_BEGIN marker in PressureEqualizer input");
     }
     
     // at this point, we have an entire layer of gcode lines loaded into m_gcode_lines
@@ -156,6 +158,9 @@ long PressureEqualizer::advance_segment_beyond_small_gap(const long idx_orig)
     double distance_traveled = 0.0;
     // start at beginning of gap, advance till extrusion found or gap too big
     for (auto idx_cur_pos = idx_orig + 1; idx_cur_pos < m_gcode_lines.size(); idx_cur_pos++) {
+        if (m_gcode_lines[idx_cur_pos].fiber_protected) {
+            return idx_orig;
+        }
         // started extruding again! return segment extension
         if (m_gcode_lines[idx_cur_pos].extruding()) {
             return idx_cur_pos;
@@ -254,7 +259,10 @@ static inline float parse_float(const char *&line, const size_t line_length)
 bool PressureEqualizer::process_line(const char *line, const char *line_end, GCodeLine &buf)
 {
     const size_t len = line_end - line;
-    if (strncmp(line, EXTRUSION_ROLE_TAG.data(), EXTRUSION_ROLE_TAG.length()) == 0) {
+    const FiberGCodeBlockLine fiber_block_line = m_fiber_block_parser.consume(
+        std::string_view(line, len));
+    if (!fiber_block_line.protected_line &&
+        strncmp(line, EXTRUSION_ROLE_TAG.data(), EXTRUSION_ROLE_TAG.length()) == 0) {
         line += EXTRUSION_ROLE_TAG.length();
         int role = atoi(line);
         m_current_extrusion_role = ExtrusionRole(role);
@@ -284,6 +292,7 @@ bool PressureEqualizer::process_line(const char *line, const char *line_end, GCo
     buf.max_volumetric_extrusion_rate_slope_positive = 0.f;
     buf.max_volumetric_extrusion_rate_slope_negative = 0.f;
 	buf.extrusion_role = m_current_extrusion_role;
+    buf.fiber_protected = fiber_block_line.protected_line;
 
     std::string str_line(line, line_end);
     const bool found_extrude_set_speed_tag = boost::contains(str_line, EXTRUDE_SET_SPEED_TAG);
@@ -314,7 +323,7 @@ bool PressureEqualizer::process_line(const char *line, const char *line_end, GCo
         case 1:
         {
             // G0, G1: A FFF 3D printer does not make a difference between the two.
-            buf.adjustable_flow = this->opened_extrude_set_speed_block;
+            buf.adjustable_flow = this->opened_extrude_set_speed_block && !buf.fiber_protected;
             buf.extrude_set_speed_tag = found_extrude_set_speed_tag;
             buf.extrude_end_tag = found_extrude_end_tag;
             float new_pos[5];

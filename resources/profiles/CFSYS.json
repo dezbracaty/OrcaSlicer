@@ -1,0 +1,155 @@
+{
+    "name": "CFSYS Printer",
+    "version": "02.00.02.03",
+    "force_update": "0",
+    "description": "CFSYS configurations",
+    "machine_model_list": [
+        {
+            "name": "CFSYS Alpha500 Printer",
+            "sub_path": "machine/CFSYS Alpha500.json"
+        }
+    ],
+    "process_list": [
+        {
+            "name": "fdm_process_common",
+            "sub_path": "process/fdm_process_common.json"
+        },
+        {
+            "name": "fdm_process_klipper_common",
+            "sub_path": "process/fdm_process_klipper_common.json"
+        },
+        {
+            "name": "0.20mm Standard @CFSYS",
+            "sub_path": "process/0.20mm Standard @CFSYS.json"
+        },
+        {
+            "name": "CCF&CIRON @CFSYS",
+            "sub_path": "process/CCF&CIRON @CFSYS.json"
+        }
+
+    ],
+    "filament_list": [
+        {
+            "name": "fdm_filament_common",
+            "sub_path": "filament/fdm_filament_common.json"
+        },
+        {
+            "name": "fdm_filament_pla",
+            "sub_path": "filament/fdm_filament_pla.json"
+        },
+        {
+            "name": "fdm_filament_pet",
+            "sub_path": "filament/fdm_filament_pet.json"
+        },
+        {
+            "name": "fdm_filament_abs",
+            "sub_path": "filament/fdm_filament_abs.json"
+        },
+        {
+            "name": "fdm_filament_asa",
+            "sub_path": "filament/fdm_filament_asa.json"
+        },
+        {
+            "name": "fdm_filament_pva",
+            "sub_path": "filament/fdm_filament_pva.json"
+        },
+        {
+            "name": "fdm_filament_pa",
+            "sub_path": "filament/fdm_filament_pa.json"
+        },
+        {
+            "name": "fdm_filament_pc",
+            "sub_path": "filament/fdm_filament_pc.json"
+        },
+		{
+            "name": "fdm_filament_ccf",
+            "sub_path": "filament/fdm_filament_ccf.json"
+        },
+        {
+            "name": "fdm_filament_tpu",
+            "sub_path": "filament/fdm_filament_tpu.json"
+        },
+        {
+            "name": "CFSYS ASA",
+            "sub_path": "filament/CFSYS ASA.json"
+        },
+        {
+            "name": "CFSYS ASA-CF",
+            "sub_path": "filament/CFSYS ASA-CF.json"
+        },
+        {
+            "name": "CFSYS ASA-GF",
+            "sub_path": "filament/CFSYS ASA-GF.json"
+        },
+        {
+            "name": "CFSYS PLA",
+            "sub_path": "filament/CFSYS PLA.json"
+        },
+        {
+            "name": "CFSYS PETG",
+            "sub_path": "filament/CFSYS PETG.json"
+        },
+        {
+            "name": "CFSYS ABS",
+            "sub_path": "filament/CFSYS ABS.json"
+        },
+        {
+            "name": "CFSYS ABS-CF",
+            "sub_path": "filament/CFSYS ABS-CF.json"
+        },
+        {
+            "name": "CFSYS ABS-GF",
+            "sub_path": "filament/CFSYS ABS-GF.json"
+        },
+        {
+            "name": "CFSYS PA",
+            "sub_path": "filament/CFSYS PA.json"
+        },
+        {
+            "name": "CFSYS PA-CF",
+            "sub_path": "filament/CFSYS PA-CF.json"
+        },
+        {
+            "name": "CFSYS CCF",
+            "sub_path": "filament/CFSYS CCF.json"
+        },
+        {
+            "name": "CFSYS TPU 95A",
+            "sub_path": "filament/CFSYS TPU 95A.json"
+        },
+        {
+            "name": "CFSYS PET-CF",
+            "sub_path": "filament/CFSYS PET-CF.json"
+        },
+        {
+            "name": "CFSYS PET-GF",
+            "sub_path": "filament/CFSYS PET-GF.json"
+        },
+        {
+            "name": "CFSYS PPS-CF",
+            "sub_path": "filament/CFSYS PPS-CF.json"
+        },
+        {
+            "name": "CFSYS S-Multi",
+            "sub_path": "filament/CFSYS S-Multi.json"
+        },
+        {
+            "name": "CFSYS CIRON",
+            "sub_path": "filament/CFSYS CIRON.json"
+        }
+    ],
+    "machine_list": [
+        {
+            "name": "fdm_machine_common",
+            "sub_path": "machine/fdm_machine_common.json"
+        },
+        {
+            "name": "fdm_klipper_common",
+            "sub_path": "machine/fdm_klipper_common.json"
+        },
+        {
+            "name": "CFSYS Alpha500 0.4 nozzle",
+            "sub_path": "machine/CFSYS Alpha500 0.4 nozzle.json"
+        }
+    ]
+}

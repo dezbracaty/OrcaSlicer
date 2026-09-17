@@ -1,0 +1,12 @@
+{
+    "type": "machine_model",
+    "name": "CFSYS Alpha500 Printer",
+    "model_id": "CFSYS-Alpha500",
+    "nozzle_diameter": "0.2;0.4;0.6;0.8",
+    "machine_tech": "FFF",
+    "family": "CFSYS",
+    "bed_model": "CF1-bed.stl",
+    "bed_texture": "CF1-textture.svg",
+    "hotend_model": "",
+    "default_materials": "CFSYS ABS;CFSYS ABS-CF;CFSYS ABS-GF;CFSYS ASA;CFSYS ASA-CF;CFSYS ASA-GF;CFSYS CCF;CFSYS CIRON;CFSYS PA;CFSYS PA-CF;CFSYS PET-CF;CFSYS PET-GF;CFSYS PETG;CFSYS PLA;CFSYS PPS-CF;CFSYS S-Multi;CFSYS TPU 95A"
+}

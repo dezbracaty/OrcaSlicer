@@ -939,6 +939,334 @@ void PrintConfigDef::init_fff_params()
     // Maximum extruder temperature, bumped to 1500 to support printing of glass.
     const int max_temp = 1500;
 
+    def = this->add("generate_reinforced_perimeters", coBool);
+    def->label = L("Continuous fiber contours");
+    def->category = L("Continuous fiber");
+    def->tooltip = L("Generate continuous fiber contour paths inside eligible internal fill surfaces.");
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("outer_reinforced_perimeters_counts", coInt);
+    def->label = L("Continuous fiber contour count");
+    def->category = L("Continuous fiber");
+    def->tooltip = L("Maximum concentric offset depth used for continuous fiber contours.");
+    def->min = 0;
+    def->max = 100;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("generate_reinforced_infills", coBool);
+    def->label = L("Continuous fiber infill");
+    def->category = L("Continuous fiber");
+    def->tooltip = L("Generate continuous fiber infill inside eligible internal fill surfaces.");
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("reinforced_infill_density", coPercent);
+    def->label = L("Continuous fiber infill density");
+    def->category = L("Continuous fiber");
+    def->sidetext = "%";
+    def->min = 0;
+    def->max = 100;
+    def->set_default_value(new ConfigOptionPercent(40));
+
+    def = this->add("reinforced_infill_pattern", coEnum);
+    def->label = L("Continuous fiber infill pattern");
+    def->category = L("Continuous fiber");
+    def->enum_keys_map = &ConfigOptionEnum<InfillPattern>::get_enum_values();
+    def->enum_values = {"rectilinear", "concentric"};
+    def->enum_labels = {L("Rectilinear"), L("Concentric")};
+    def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
+
+    def = this->add("reinforced_infill_filament", coInt);
+    def->label = L("Continuous fiber infill filament");
+    def->category = L("Continuous fiber");
+    def->min = 1;
+    def->set_default_value(new ConfigOptionInt(2));
+
+    def = this->add("reinforced_perimeters_filament", coInt);
+    def->label = L("Continuous fiber contour filament");
+    def->category = L("Continuous fiber");
+    def->min = 1;
+    def->set_default_value(new ConfigOptionInt(2));
+
+    def = this->add("reinforced_perimeters_extrusion_width", coFloatOrPercent);
+    def->label = L("Continuous fiber contour width");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloatOrPercent(0.8, false));
+
+    def = this->add("reinforced_infill_extrusion_width", coFloatOrPercent);
+    def->label = L("Continuous fiber infill width");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm or %");
+    def->ratio_over = "nozzle_diameter";
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloatOrPercent(0.8, false));
+
+    def = this->add("fiber_layer_height_ratio", coInt);
+    def->label = L("Continuous fiber layer interval");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("layers");
+    def->min = 1;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("fiber_minimum_path_length", coFloat);
+    def->label = L("Minimum continuous fiber path length");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(10.0));
+
+    def = this->add("fiber_minimum_segment_length", coFloat);
+    def->label = L("Minimum continuous fiber segment length");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_maximum_turn_angle", coFloat);
+    def->label = L("Maximum continuous fiber turn angle");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("°");
+    def->min = 0;
+    def->max = 180;
+    def->set_default_value(new ConfigOptionFloat(180.0));
+
+    def = this->add("fiber_contour_boundary_clearance", coFloat);
+    def->label = L("Fiber contour boundary clearance");
+    def->tooltip = L("Additional resin clearance between the fiber footprint and the internal core boundary.");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_contour_infill_clearance", coFloat);
+    def->label = L("Fiber contour to infill clearance");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_resin_overlap", coFloat);
+    def->label = L("Fiber to resin overlap");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.05));
+
+    def = this->add("fiber_cut_to_contact_length", coFloat);
+    def->label = L("Fiber cutter to contact distance");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_prefeed_extra_length", coFloat);
+    def->label = L("Fiber prefeed extra length");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_prefeed_speed", coFloat);
+    def->label = L("Fiber prefeed speed");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(10.0));
+
+    def = this->add("fiber_z_hop_height", coFloat);
+    def->label = L("Fiber Z-hop height");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_landing_length", coFloat);
+    def->label = L("Fiber landing length");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_landing_speed", coFloat);
+    def->label = L("Fiber landing speed");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(3.0));
+
+    def = this->add("fiber_adhesion_dwell_ms", coInt);
+    def->label = L("Fiber adhesion dwell");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("ms");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("fiber_start_speed", coFloat);
+    def->label = L("Fiber start speed");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(10.0));
+
+    def = this->add("fiber_start_stabilization_length", coFloat);
+    def->label = L("Fiber start stabilization length");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_minimum_effective_length", coFloat);
+    def->label = L("Minimum effective fiber length");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_finish_extension_length", coFloat);
+    def->label = L("Fiber finish extension length");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_outside_tolerance", coFloat);
+    def->label = L("Fiber outside-domain tolerance");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm²");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.01));
+
+    def = this->add("fiber_contour_max_speed", coFloat);
+    def->label = L("Fiber contour maximum speed");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(10.0));
+
+    def = this->add("fiber_infill_max_speed", coFloat);
+    def->label = L("Fiber infill maximum speed");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(10.0));
+
+    def = this->add("fiber_contour_acceleration", coFloat);
+    def->label = L("Fiber contour acceleration");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm/s²");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(300.0));
+
+    def = this->add("fiber_infill_acceleration", coFloat);
+    def->label = L("Fiber infill acceleration");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm/s²");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(300.0));
+
+    def = this->add("fiber_contour_feed_ratio", coFloat);
+    def->label = L("Fiber contour feed ratio");
+    def->category = L("Continuous fiber");
+    def->sidetext = "";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("fiber_infill_feed_ratio", coFloat);
+    def->label = L("Fiber infill feed ratio");
+    def->category = L("Continuous fiber");
+    def->sidetext = "";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("fiber_contour_min_speed", coFloat);
+    def->label = L("Fiber contour minimum speed");
+    def->category = L("Continuous fiber");
+    def->sidetext = "mm/s";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(3.0));
+
+    def = this->add("fiber_infill_min_speed", coFloat);
+    def->label = L("Fiber infill minimum speed");
+    def->category = L("Continuous fiber");
+    def->sidetext = "mm/s";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(3.0));
+
+    def = this->add("fiber_corner_transition_length", coFloat);
+    def->label = L("Fiber corner transition length");
+    def->category = L("Continuous fiber");
+    def->sidetext = "mm";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(5.0));
+
+    def = this->add("fiber_speed_sampling_length", coFloat);
+    def->label = L("Fiber speed sampling length");
+    def->category = L("Continuous fiber");
+    def->sidetext = "mm";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(2.0));
+
+    def = this->add("fiber_tail_min_speed", coFloat);
+    def->label = L("Fiber tail minimum speed");
+    def->category = L("Continuous fiber");
+    def->sidetext = "mm/s";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(3.0));
+
+    def = this->add("fiber_tail_max_speed", coFloat);
+    def->label = L("Fiber tail maximum speed");
+    def->category = L("Continuous fiber");
+    def->sidetext = "mm/s";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(10.0));
+
+    def = this->add("fiber_tail_speed_step_length", coFloat);
+    def->label = L("Fiber tail speed step length");
+    def->category = L("Continuous fiber");
+    def->sidetext = "mm";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(2.0));
+
+    def = this->add("fiber_finish_overlap_length", coFloat);
+    def->label = L("Fiber finish overlap length");
+    def->category = L("Continuous fiber");
+    def->sidetext = "mm";
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_finish_motion_speed", coFloat);
+    def->label = L("Fiber finish motion speed");
+    def->category = L("Continuous fiber");
+    def->sidetext = "mm/s";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(3.0));
+
+    def = this->add("filament_process_type", coStrings);
+    def->label = L("Filament process type");
+    def->set_default_value(new ConfigOptionStrings{"thermoplastic"});
+
+    def = this->add("filament_fiber_feed_correction", coFloats);
+    def->label = L("Fiber feed correction");
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloats{1.0});
+
+    def = this->add("toolhead_fiber_e_units_per_mm", coFloats);
+    def->label = L("Fiber E units per millimeter");
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloats{1.0});
+
+    def = this->add("toolhead_fiber_protocol_id", coStrings);
+    def->label = L("Fiber machine protocol");
+    // Empty means unverified: never silently certify firmware macros.
+    def->set_default_value(new ConfigOptionStrings{""});
+
+    def = this->add("fiber_cut_gcode", coString);
+    def->label = L("Fiber cut G-code");
+    def->category = L("Continuous fiber");
+    def->set_default_value(new ConfigOptionString(""));
+
     def = this->add("reduce_crossing_wall", coBool);
     def->label = L("Avoid crossing walls");
     def->category = L("Quality");
@@ -5190,6 +5518,26 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.01));
 
+    def = this->add("filament_slots_bound_to_physical_tools", coBool);
+    def->label = "Bind filament slots to physical tools";
+    def->tooltip = "Keep every filament slot attached to the physical tool with the same index.";
+    def->mode = comDevelop;
+    def->readonly = true;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("toolhead_process_capabilities", coStrings);
+    def->label = "Toolhead process capabilities";
+    def->tooltip = "Process accepted by each physical tool: thermoplastic or continuous_fiber.";
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionStrings{"thermoplastic"});
+
+    def = this->add("physical_tool_sides", coStrings);
+    def->label = "Physical tool sides";
+    def->tooltip = "Physical position of each tool: unknown, left, or right.";
+    def->mode = comDevelop;
+    def->readonly = true;
+    def->set_default_value(new ConfigOptionStrings{"unknown"});
+
     def = this->add("retraction_minimum_travel", coFloats);
     def->label = L("Travel distance threshold");
     def->tooltip = L("Only trigger retraction when the travel distance is longer than this threshold.");
@@ -7343,7 +7691,7 @@ void PrintConfigDef::init_extruder_option_keys()
 {
     // ConfigOptionFloats, ConfigOptionPercents, ConfigOptionBools, ConfigOptionStrings
     m_extruder_option_keys = {
-        "extruder_type", "nozzle_diameter", "default_nozzle_volume_type", "min_layer_height", "max_layer_height", "extruder_offset",
+        "extruder_type", "nozzle_diameter", "toolhead_process_capabilities", "physical_tool_sides", "default_nozzle_volume_type", "min_layer_height", "max_layer_height", "extruder_offset",
         "extruder_printable_height", "nozzle_volume", "nozzle_type", "nozzle_flush_dataset",
         "retraction_length", "z_hop", "z_hop_types", "travel_slope", "retract_lift_above", "retract_lift_below", "retract_lift_enforce", "retraction_speed", "deretraction_speed",
         "retract_before_wipe", "retract_restart_extra", "retraction_minimum_travel", "wipe", "wipe_distance",
@@ -10364,7 +10712,7 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
 
     // --filament-diameter
     for (double fd : cfg.filament_diameter.values)
-        if (fd < 1) {
+        if (fd < 0.1) {
             error_message.emplace("filament_diameter", L("invalid value ") + cfg.filament_diameter.serialize());
             break;
         }

@@ -1,0 +1,12 @@
+{
+    "type": "machine_model",
+    "name": "CFSYS CF1 Printer",
+    "model_id": "CFSYS-CF1",
+    "nozzle_diameter": "0.2;0.4;0.6;0.8",
+    "machine_tech": "FFF",
+    "family": "CFSYS",
+    "bed_model": "CF1-bed.stl",
+    "bed_texture": "CF1-textture.svg",
+    "hotend_model": "",
+    "default_materials": "CFSYS ABS;CFSYS PLA;CFSYS PETG;CFSYS PA;CFSYS PA-CF;CFSYS CCF"
+}

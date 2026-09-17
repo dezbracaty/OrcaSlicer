@@ -90,6 +90,10 @@ void PrintRegion::collect_object_printing_extruders(const PrintConfig &print_con
     	emplace_extruder(region_config.top_surface_filament_id);
     if (region_config.bottom_shell_layers.value > 0)
     	emplace_extruder(region_config.bottom_surface_filament_id);
+    if (region_config.generate_reinforced_perimeters.value)
+        emplace_extruder(region_config.reinforced_perimeters_filament);
+    if (region_config.generate_reinforced_infills.value)
+        emplace_extruder(region_config.reinforced_infill_filament);
 }
 
 void PrintRegion::collect_object_printing_extruders(const Print &print, std::vector<unsigned int> &object_extruders) const

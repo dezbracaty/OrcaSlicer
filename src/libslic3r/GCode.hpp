@@ -33,6 +33,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <functional>
 #include <cfloat>
 
 namespace Slic3r {
@@ -253,6 +254,8 @@ public:
     bool            needs_retraction(const Polyline& travel, ExtrusionRole role, LiftType& lift_type);
     std::string     retract(bool toolchange = false, bool is_last_retraction = false, LiftType lift_type = LiftType::NormalLift, bool apply_instantly = false, ExtrusionRole role = erNone);
     std::string     unretract() { return m_writer.unlift() + m_writer.unretract(); }
+    uint64_t       m_fiber_path_occurrence { 0 };
+    bool           m_has_fiber_execution { false };
     std::string     set_extruder(unsigned int extruder_id, double print_z, bool by_object=false, int toolchange_temp_override = -1);
     bool is_BBL_Printer();
     WipeTowerType wipe_tower_type();
@@ -416,6 +419,7 @@ private:
                              const Point*                start_point       = nullptr);
     std::string extrude_multi_path(const ExtrusionMultiPath& multipath, const std::string& description = "", double speed = -1.);
     std::string extrude_path(const ExtrusionPath& path, const std::string& description = "", double speed = -1.);
+    std::string extrude_fiber(const ExtrusionFiberPath& path, const std::string& description = "", double speed = -1.);
 
     // Orca: Adaptive PA variables
     // Used for adaptive PA when extruding paths with multiple, varying flow segments.
@@ -660,7 +664,11 @@ private:
     int get_highest_bed_temperature(const bool is_first_layer,const Print &print) const;
 
     double      calc_max_volumetric_speed(const double layer_height, const double line_width, const std::string co_str);
-    std::string _extrude(const ExtrusionPath &path, std::string description = "", double speed = -1);
+    std::string _extrude(
+        const ExtrusionPath &path,
+        std::string description = "",
+        double speed = -1,
+        const std::function<std::string()>& before_first_deposition = {});
     bool _needSAFC(const ExtrusionPath &path);
     void print_machine_envelope(GCodeOutputStream& file, Print& print);
     void _print_first_layer_bed_temperature(GCodeOutputStream &file, Print &print, const std::string &gcode, unsigned int first_printing_extruder_id, bool wait);

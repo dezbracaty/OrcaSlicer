@@ -1,0 +1,28 @@
+{
+    "default_filament_colour": [
+        "#ECECEC"
+    ],
+    "fan_min_speed": [
+        "60"
+    ],
+    "filament_max_volumetric_speed": [
+        "12"
+    ],
+    "overhang_fan_speed": [
+        "0"
+    ],
+    "filament_settings_id": [
+        "CFSYS ABS-GF"
+    ],
+    "from": "system",
+    "inherits": "CFSYS ABS",
+    "is_custom_defined": "0",
+    "name": "CFSYS ABS-GF",
+    "reduce_fan_stop_start_freq": [
+        "0"
+    ],
+    "support_material_interface_fan_speed": [
+        "100"
+    ],
+    "version": "2.0.2.0"
+}

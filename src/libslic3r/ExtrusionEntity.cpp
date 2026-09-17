@@ -12,6 +12,44 @@
 #define L(s) (s)
 
 namespace Slic3r {
+
+ExtrusionFiberPath::ExtrusionFiberPath(
+    const ExtrusionPath& source,
+    ExtrusionRole role,
+    std::shared_ptr<const PreparedFiberPath> prepared)
+    : ExtrusionPath(source)
+    , m_prepared(std::move(prepared))
+{
+    if (!m_prepared)
+        throw Slic3r::RuntimeError("Continuous fiber path requires finalized process data");
+    m_prepared->validate();
+    polyline.points.clear();
+    for (const auto& span : m_prepared->spans)
+        polyline.points.insert(polyline.points.end(), span.geometry.points.begin() + (polyline.points.empty() ? 0 : 1), span.geometry.points.end());
+    mm3_per_mm = m_prepared->geometric_mm3_per_mm;
+    width = m_prepared->width_mm;
+    height = m_prepared->height_mm;
+    this->set_extrusion_role(role);
+    this->set_reverse();
+}
+
+void ExtrusionFiberPath::reverse()
+{
+    throw Slic3r::RuntimeError("Continuous fiber paths cannot be reversed");
+}
+
+void ExtrusionFiberPath::validate_derived_view() const
+{
+    size_t position = 0;
+    for (const auto& span : m_prepared->spans)
+        for (size_t i = position == 0 ? 0 : 1; i < span.geometry.points.size(); ++i, ++position)
+            if (position >= polyline.points.size() || polyline.points[position] != span.geometry.points[i])
+                throw Slic3r::RuntimeError("Finalized fiber geometry was mutated through a legacy path API");
+    const auto expected_role = fiber_purpose() == FiberPathPurpose::Contour ? erContinuousFiberContour : erContinuousFiberInfill;
+    if (position != polyline.points.size() || mm3_per_mm != m_prepared->geometric_mm3_per_mm ||
+        width != m_prepared->width_mm || height != m_prepared->height_mm || role() != expected_role)
+        throw Slic3r::RuntimeError("Finalized fiber metadata was mutated through a legacy path API");
+}
     
 static const double slope_inner_outer_wall_gap = 0.4;
 
@@ -601,6 +639,8 @@ std::string ExtrusionEntity::role_to_string(ExtrusionRole role)
         case erSupportMaterialInterface     : return L("Support interface");
         case erSupportTransition            : return L("Support transition");
         case erWipeTower                    : return L("Prime tower");
+        case erContinuousFiberContour       : return L("Continuous fiber contour");
+        case erContinuousFiberInfill        : return L("Continuous fiber infill");
         case erCustom                       : return L("Custom");
         case erMixed                        : return L("Multiple");
         default                             : assert(false);
@@ -644,6 +684,10 @@ ExtrusionRole ExtrusionEntity::string_to_role(const std::string_view role)
         return erSupportTransition;
     else if (role == L("Prime tower"))
         return erWipeTower;
+    else if (role == L("Continuous fiber contour"))
+        return erContinuousFiberContour;
+    else if (role == L("Continuous fiber infill"))
+        return erContinuousFiberInfill;
     else if (role == L("Custom"))
         return erCustom;
     else if (role == L("Multiple"))

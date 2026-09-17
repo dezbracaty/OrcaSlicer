@@ -1,0 +1,90 @@
+{
+    "type": "filament",
+    "name": "fdm_filament_ccf",
+    "from": "system",
+    "instantiation": "false",
+    "inherits": "fdm_filament_common",
+    "cool_plate_temp" : [
+        "0"
+    ],
+    "eng_plate_temp" : [
+        "100"
+    ],
+    "hot_plate_temp" : [
+        "80"
+    ],
+    "textured_plate_temp" : [
+        "100"
+    ],
+    "cool_plate_temp_initial_layer" : [
+        "0"
+    ],
+    "eng_plate_temp_initial_layer" : [
+        "100"
+    ],
+    "hot_plate_temp_initial_layer" : [
+        "80"
+    ],
+    "textured_plate_temp_initial_layer" : [
+        "100"
+    ],
+    "slow_down_for_layer_cooling": [
+        "1"
+    ],
+    "close_fan_the_first_x_layers": [
+        "3"
+    ],
+    "fan_cooling_layer_time": [
+        "100"
+    ],
+    "filament_max_volumetric_speed": [
+        "3"
+    ],
+    "filament_process_type": ["continuous_fiber"],
+    "filament_fiber_feed_correction": ["1"],
+    "filament_type": [
+        "CCF"
+    ],
+	"filament_diameter": [
+        "0.4"
+    ],
+    "filament_density": [
+        "1.8"
+    ],
+    "filament_cost": [
+        "20"
+    ],
+    "nozzle_temperature_initial_layer": [
+        "255"
+    ],
+    "reduce_fan_stop_start_freq": [
+        "1"
+    ],
+    "fan_max_speed": [
+        "100"
+    ],
+    "fan_min_speed": [
+        "100"
+    ],
+    "overhang_fan_speed": [
+        "45"
+    ],
+    "nozzle_temperature": [
+        "255"
+    ],
+    "temperature_vitrification": [
+        "108"
+    ],
+    "nozzle_temperature_range_low": [
+        "270"
+    ],
+    "nozzle_temperature_range_high": [
+        "300"
+    ],
+    "slow_down_min_speed": [
+        "10"
+    ],
+    "slow_down_layer_time": [
+        "8"
+    ]
+}

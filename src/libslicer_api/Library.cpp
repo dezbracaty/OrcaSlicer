@@ -369,6 +369,13 @@ std::vector<std::string> config_vector_values(const Config& config, const std::s
     return serialized_option_values(dynamic_config(config.snapshot()), key);
 }
 
+bool fixed_physical_filament_slots(const Slic3r::DynamicPrintConfig& config)
+{
+    const auto* fixed = config.option<Slic3r::ConfigOptionBool>(
+        "filament_slots_bound_to_physical_tools");
+    return fixed != nullptr && fixed->value;
+}
+
 std::string serialize_strings(const std::vector<std::string>& values)
 {
     return Slic3r::ConfigOptionStrings(values).serialize();
@@ -1437,6 +1444,8 @@ ToolpathExtrusionRole to_extrusion_role(Slic3r::ExtrusionRole role)
     case Slic3r::erWipeTower:                return ToolpathExtrusionRole::WipeTower;
     case Slic3r::erCustom:                   return ToolpathExtrusionRole::Custom;
     case Slic3r::erMixed:                    return ToolpathExtrusionRole::Mixed;
+    case Slic3r::erContinuousFiberContour:   return ToolpathExtrusionRole::ContinuousFiberContour;
+    case Slic3r::erContinuousFiberInfill:    return ToolpathExtrusionRole::ContinuousFiberInfill;
     default:                                 return ToolpathExtrusionRole::None;
     }
 }
@@ -1456,6 +1465,10 @@ std::vector<int> filament_tool_map(const Slic3r::DynamicPrintConfig* config,
             result[index] = std::max(0, option->values[index] - 1);
         }
     }
+    if (const auto* physical = config->option<Slic3r::ConfigOptionInts>("physical_extruder_map"))
+        for (auto& tool : result)
+            if (tool >= 0 && size_t(tool) < physical->values.size())
+                tool = physical->values[tool];
     return result;
 }
 
@@ -1511,7 +1524,8 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
     const Slic3r::GCodeProcessorResult& source,
     const Slic3r::DynamicPrintConfig* config,
     const std::string& source_path,
-    const Slic3r::BeltCoordinateSystem* belt_coordinates = nullptr)
+    const Slic3r::BeltCoordinateSystem* belt_coordinates = nullptr,
+    const std::vector<int>* resolved_tools = nullptr)
 {
     auto preview = std::make_shared<ToolpathPreview>();
     preview->source_path = source_path;
@@ -1545,7 +1559,10 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
         filament_count = std::max(filament_count, static_cast<std::size_t>(move.extruder_id) + 1);
     }
     filament_count = std::max<std::size_t>(filament_count, 1);
-    const auto tool_by_filament = filament_tool_map(config, filament_count);
+    auto tool_by_filament = filament_tool_map(config, filament_count);
+    if (resolved_tools != nullptr)
+        for (std::size_t i = 0; i < std::min(filament_count, resolved_tools->size()); ++i)
+            tool_by_filament[i] = resolved_tools->at(i);
 
     std::size_t tool_count = 1;
     for (const int tool : tool_by_filament) {
@@ -1567,8 +1584,16 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
                 break;
             }
         }
-        if (nozzle_diameters != nullptr && index < nozzle_diameters->values.size()) {
-            tool.nozzle_diameter_mm = static_cast<float>(nozzle_diameters->values[index]);
+        std::size_t logical_index = index;
+        if (config != nullptr) {
+            if (const auto* physical_map = config->option<Slic3r::ConfigOptionInts>("physical_extruder_map")) {
+                const auto found = std::find(physical_map->values.begin(), physical_map->values.end(), int(index));
+                if (found != physical_map->values.end())
+                    logical_index = std::size_t(found - physical_map->values.begin());
+            }
+        }
+        if (nozzle_diameters != nullptr && logical_index < nozzle_diameters->values.size()) {
+            tool.nozzle_diameter_mm = static_cast<float>(nozzle_diameters->values[logical_index]);
         }
         preview->tools.push_back(tool);
     }
@@ -1642,6 +1667,9 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
     std::uint64_t next_run_id = 0;
     bool previous_was_motion = false;
     ToolpathMotionKind previous_motion = ToolpathMotionKind::Travel;
+    Slic3r::ToolpathDeposition previous_deposition = Slic3r::ToolpathDeposition::None;
+    Slic3r::FiberProcessPhase previous_phase = Slic3r::FiberProcessPhase::None;
+    uint64_t previous_occurrence = 0;
     ToolpathExtrusionRole previous_role = ToolpathExtrusionRole::None;
     std::uint32_t previous_layer = invalid_toolpath_id;
     std::uint32_t previous_object = invalid_toolpath_id;
@@ -1649,6 +1677,11 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
     std::uint16_t previous_color = invalid_toolpath_small_id;
 
     for (const auto& input : source.moves) {
+        if (!input.internal_only && input.fiber_phase != Slic3r::FiberProcessPhase::None) {
+            preview->statistics.total_fiber_feed_mm += std::max(0.0f, input.fiber_feed_delta_mm);
+            if (input.fiber_phase == Slic3r::FiberProcessPhase::Prefeed)
+                preview->statistics.total_fiber_prefeed_mm += std::max(0.0f, input.fiber_feed_delta_mm);
+        }
         const std::uint32_t source_layer = input.layer_id;
         auto& layer = layer_builders[source_layer];
         layer.duration_seconds += input.time[static_cast<std::size_t>(
@@ -1682,11 +1715,13 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
 
         if (motion && previous_position && has_end &&
             point_distance(*previous_position, end) > 0.000001) {
-            const ToolpathExtrusionRole role = *motion == ToolpathMotionKind::Extrusion
+            const ToolpathExtrusionRole role = input.deposition != Slic3r::ToolpathDeposition::None
                 ? to_extrusion_role(input.extrusion_role)
                 : ToolpathExtrusionRole::None;
             const bool continues_run = previous_was_motion &&
                 previous_motion == *motion &&
+                previous_deposition == input.deposition && previous_phase == input.fiber_phase &&
+                previous_occurrence == input.fiber_occurrence &&
                 previous_role == role &&
                 previous_layer == source_layer &&
                 previous_object == object_id &&
@@ -1704,6 +1739,27 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
             segment.filament_id = filament_id;
             segment.color_id = input.cp_color_id;
             segment.motion = *motion;
+            switch (input.deposition) {
+            case Slic3r::ToolpathDeposition::None: segment.deposition = ToolpathDepositionKind::None; break;
+            case Slic3r::ToolpathDeposition::Thermoplastic: segment.deposition = ToolpathDepositionKind::Thermoplastic; break;
+            case Slic3r::ToolpathDeposition::ContinuousFiberPowered: segment.deposition = ToolpathDepositionKind::ContinuousFiberPowered; break;
+            case Slic3r::ToolpathDeposition::ContinuousFiberPassive: segment.deposition = ToolpathDepositionKind::ContinuousFiberPassive; break;
+            }
+            switch (input.fiber_phase) {
+            case Slic3r::FiberProcessPhase::None: segment.fiber_phase = ToolpathFiberPhase::None; break;
+            case Slic3r::FiberProcessPhase::Approach: segment.fiber_phase = ToolpathFiberPhase::Approach; break;
+            case Slic3r::FiberProcessPhase::Prefeed: segment.fiber_phase = ToolpathFiberPhase::Prefeed; break;
+            case Slic3r::FiberProcessPhase::Ready: segment.fiber_phase = ToolpathFiberPhase::Ready; break;
+            case Slic3r::FiberProcessPhase::Landing: segment.fiber_phase = ToolpathFiberPhase::Landing; break;
+            case Slic3r::FiberProcessPhase::Powered: segment.fiber_phase = ToolpathFiberPhase::Powered; break;
+            case Slic3r::FiberProcessPhase::Cut: segment.fiber_phase = ToolpathFiberPhase::Cut; break;
+            case Slic3r::FiberProcessPhase::Tail: segment.fiber_phase = ToolpathFiberPhase::Tail; break;
+            case Slic3r::FiberProcessPhase::Depleted: segment.fiber_phase = ToolpathFiberPhase::Depleted; break;
+            case Slic3r::FiberProcessPhase::Finish: segment.fiber_phase = ToolpathFiberPhase::Finish; break;
+            case Slic3r::FiberProcessPhase::Complete: segment.fiber_phase = ToolpathFiberPhase::Complete; break;
+            }
+            segment.fiber_occurrence = input.fiber_occurrence;
+            segment.fiber_feed_delta_mm = input.fiber_feed_delta_mm;
             segment.extrusion_role = role;
             segment.start_mm = *previous_position;
             segment.end_mm = end;
@@ -1722,7 +1778,12 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
             segment.jerk_mm_s = input.jerk;
 
             const double distance = point_distance(segment.start_mm, segment.end_mm);
-            if (*motion == ToolpathMotionKind::Extrusion) {
+            if (input.travel_dist > 0)
+                segment.fiber_feed_delta_mm *= float(distance / input.travel_dist);
+            if (segment.deposition != ToolpathDepositionKind::None) {
+                segment.deposited_path_length_mm = float(std::hypot(end.x-previous_position->x, end.y-previous_position->y));
+                if (segment.deposition != ToolpathDepositionKind::Thermoplastic)
+                    preview->statistics.total_fiber_deposited_path_mm += segment.deposited_path_length_mm;
                 segment.width_mm = std::max(0.0f, input.width);
                 segment.height_mm = std::max(0.0f, input.height);
                 segment.mm3_per_mm = std::max(0.0f, input.mm3_per_mm);
@@ -1733,7 +1794,7 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
                     : 1.75f;
                 const double filament_area =
                     0.25 * 3.14159265358979323846 * diameter * diameter;
-                segment.extrusion_delta_mm = filament_area > 0.0
+                segment.extrusion_delta_mm = segment.deposition == ToolpathDepositionKind::Thermoplastic && filament_area > 0.0
                     ? static_cast<float>(volume / filament_area)
                     : 0.0f;
 
@@ -1816,6 +1877,9 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
 
             previous_was_motion = true;
             previous_motion = *motion;
+            previous_deposition = input.deposition;
+            previous_phase = input.fiber_phase;
+            previous_occurrence = input.fiber_occurrence;
             previous_role = role;
             previous_layer = source_layer;
             previous_object = object_id;
@@ -1883,7 +1947,7 @@ std::shared_ptr<ToolpathPreview> make_toolpath_preview(
     std::map<ToolpathExtrusionRole, ToolpathFeatureStatistics> feature_stats;
     std::map<ToolpathExtrusionRole, std::uint64_t> last_feature_run;
     for (const auto& segment : preview->segments) {
-        if (segment.motion != ToolpathMotionKind::Extrusion ||
+        if (segment.deposition == ToolpathDepositionKind::None ||
             segment.extrusion_role == ToolpathExtrusionRole::None) {
             continue;
         }
@@ -2204,6 +2268,10 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
                                 preset->config.option<Slic3r::ConfigOptionBool>("single_extruder_multi_material")) {
                             option.variable_filament_slots = multi_material->value;
                         }
+                        if (const auto* fixed = preset->config.option<Slic3r::ConfigOptionBool>(
+                                "filament_slots_bound_to_physical_tools")) {
+                            option.filament_slots_bound_to_physical_tools = fixed->value;
+                        }
                         // Current supported single-nozzle material systems expose
                         // four feed slots. Fixed multi-tool machines use exactly
                         // their physical tool count.
@@ -2479,6 +2547,21 @@ std::optional<ActiveConfigView> Library::active_config() const
             diameters != nullptr && index < diameters->values.size()) {
             slot.diameter_mm = diameters->values[index];
         }
+        const auto tool_map = filament_tool_map(&config, view.selection.filament_preset_ids.size());
+        slot.physical_tool_index = static_cast<std::size_t>(tool_map[index]);
+        slot.physical_tool_name = "Nozzle " + std::to_string(slot.physical_tool_index + 1);
+        if (const auto* roles = config.option<Slic3r::ConfigOptionStrings>("toolhead_process_capabilities");
+            roles != nullptr && slot.physical_tool_index < roles->values.size()) {
+            slot.physical_tool_role = roles->values[slot.physical_tool_index];
+        }
+        if (const auto* sides = config.option<Slic3r::ConfigOptionStrings>("physical_tool_sides");
+            sides != nullptr && slot.physical_tool_index < sides->values.size()) {
+            slot.physical_tool_side = sides->values[slot.physical_tool_index];
+        }
+        if (const auto* nozzles = config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter");
+            nozzles != nullptr && slot.physical_tool_index < nozzles->values.size()) {
+            slot.nozzle_diameter_mm = nozzles->values[slot.physical_tool_index];
+        }
         view.filament_slots.push_back(std::move(slot));
     }
     return view;
@@ -2496,6 +2579,15 @@ SettingsResult Library::apply_active_config_patch(
 {
     if (!impl_->active_config) {
         return settings_failure("configuration", "No slicing configuration is active");
+    }
+    if (fixed_physical_filament_slots(dynamic_config(impl_->active_config->snapshot()))) {
+        const auto mapping_edit = std::find_if(patch.begin(), patch.end(), [](const auto& entry) {
+            return entry.first == "filament_map" || entry.first == "filament_map_mode";
+        });
+        if (mapping_edit != patch.end()) {
+            return settings_failure(mapping_edit->first,
+                                    "Filament-to-tool mapping is fixed by the selected machine");
+        }
     }
     Config candidate = *impl_->active_config;
     SettingsResult result = candidate.apply_patch(patch);
@@ -2530,6 +2622,11 @@ SettingsResult Library::reset_active_config_value(std::string_view key)
 {
     if (!impl_->active_config) {
         return settings_failure("configuration", "No slicing configuration is active");
+    }
+    if ((key == "filament_map" || key == "filament_map_mode") &&
+        fixed_physical_filament_slots(dynamic_config(impl_->active_config->snapshot()))) {
+        return settings_failure(std::string(key),
+                                "Filament-to-tool mapping is fixed by the selected machine");
     }
     Config candidate = *impl_->active_config;
     SettingsResult result = candidate.reset(key);
@@ -3021,6 +3118,10 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             return render_model_thumbnails(thumbnail_scene, params);
         };
         result.output.path = print.export_gcode(output_path, &processor_result, thumbnail_callback);
+        // Tool ordering may resolve a different filament assignment than the request.
+        // Package and preview the actual execution mapping, not the input proposal.
+        config.set_key_value("filament_map", print.config().filament_map.clone());
+        config.set_key_value("physical_extruder_map", print.config().physical_extruder_map.clone());
         result.output.ownership = library_temporary
             ? OutputArtifactOwnership::LibraryTemporary
             : OutputArtifactOwnership::CallerOwned;
@@ -3173,8 +3274,9 @@ GCodePreviewResult Library::load_gcode_preview(const GCodePreviewRequest& reques
 
         report_progress(callbacks, 0.9f, "Preparing toolpath preview");
         const auto belt_coordinates = belt_coordinates_from_gcode(request.gcode_path);
+        const auto resolved_tools = processor.physical_tool_by_filament();
         result.preview = make_toolpath_preview(processor.get_result(), nullptr, request.gcode_path,
-                                               belt_coordinates ? &*belt_coordinates : nullptr);
+                                               belt_coordinates ? &*belt_coordinates : nullptr, &resolved_tools);
         if (!result.preview || result.preview->layers.empty() ||
             result.preview->segments.empty()) {
             result.diagnostics.push_back({"preview", "G-code contains no drawable toolpath", false});

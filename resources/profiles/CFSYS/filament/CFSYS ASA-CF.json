@@ -1,0 +1,22 @@
+{
+    "default_filament_colour": [
+        "#FF9F9F"
+    ],
+    "filament_max_volumetric_speed": [
+        "12"
+    ],
+    "filament_settings_id": [
+        "CFSYS ASA-CF"
+    ],
+    "overhang_fan_speed": [
+        "0"
+    ],
+    "from": "system",
+    "inherits": "CFSYS ASA",
+    "is_custom_defined": "0",
+    "name": "CFSYS ASA-CF",
+    "slow_down_layer_time": [
+        "8"
+    ],
+    "version": "2.0.2.0"
+}

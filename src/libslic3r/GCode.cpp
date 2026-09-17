@@ -6,6 +6,7 @@
 #include "libslic3r.h"
 #include "I18N.hpp"
 #include "GCode.hpp"
+#include "ContinuousFiber/ContinuousFiberConfig.hpp"
 #include "Exception.hpp"
 #include "ExtrusionEntity.hpp"
 #include "EdgeGrid.hpp"
@@ -2034,6 +2035,67 @@ WipeTowerType GCode::wipe_tower_type()
 
 void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
 {
+    m_has_fiber_execution = false;
+    m_fiber_path_occurrence = 0;
+    // Whole-plan validation before export/writer state is touched. Rejected
+    // geometry was already returned to ResinRemaining by the layer planner.
+    bool has_fiber = false;
+    const auto validate_entity = [&](const auto& self, const ExtrusionEntity& entity) -> void {
+        if (const auto* fiber = dynamic_cast<const ExtrusionFiberPath*>(&entity)) {
+            fiber->validate_derived_view();
+            const auto tool = resolve_fiber_tool(print->config(), fiber->prepared_path()->logical_filament_id);
+            const auto bound = bind_fiber_execution(fiber->prepared_path(), tool.logical_filament_id,
+                tool.logical_extruder_id, tool.physical_tool_id, tool.e_units_per_mm,
+                print->config().fiber_cut_gcode.value);
+            const auto& limits = print->config();
+            const auto check_limit = [](double value, const ConfigOptionFloats& option, const char* name) {
+                if (!option.values.empty() && option.values.front() > 0 && value > option.values.front() + EPSILON)
+                    throw std::runtime_error(std::string("Prepared Fiber motion exceeds ") + name + "; replan required");
+            };
+            const double acceleration = bound.prepared->acceleration_mm_s2;
+            check_limit(acceleration, limits.machine_max_acceleration_extruding, "print acceleration limit");
+            check_limit(acceleration, limits.machine_max_acceleration_travel, "travel acceleration limit");
+            check_limit(acceleration, limits.machine_max_acceleration_x, "X acceleration limit");
+            check_limit(acceleration, limits.machine_max_acceleration_y, "Y acceleration limit");
+            check_limit(bound.prefeed_F / 60.0, limits.machine_max_speed_e, "E feedrate limit");
+            for (const auto& span : bound.prepared->spans) {
+                const double landing_length = span.kind == FiberMotionKind::PrefedLanding ?
+                    unscale<double>(span.geometry.length()) : 0.0;
+                const double z_per_xy = landing_length > 0 ? bound.prepared->start_procedure.z_hop_height_mm / landing_length : 0.0;
+                for (size_t edge = 0; edge < span.edges.size(); ++edge) {
+                    const Vec3d delta = (span.geometry.points[edge+1] - span.geometry.points[edge]).cast<double>();
+                    const double xy_speed = span.edges[edge].speed_mm_s / std::sqrt(1.0 + z_per_xy*z_per_xy);
+                    check_limit(xy_speed * std::abs(delta.x()) / delta.norm(), limits.machine_max_speed_x, "X feedrate limit");
+                    check_limit(xy_speed * std::abs(delta.y()) / delta.norm(), limits.machine_max_speed_y, "Y feedrate limit");
+                    check_limit(xy_speed * z_per_xy, limits.machine_max_speed_z, "Z feedrate limit");
+                    check_limit(xy_speed * span.edges[edge].feed_mm_per_xy_mm * bound.e_units_per_mm,
+                                limits.machine_max_speed_e, "E feedrate limit");
+                }
+            }
+            has_fiber = true;
+        } else if (const auto* collection = dynamic_cast<const ExtrusionEntityCollection*>(&entity)) {
+            for (const auto* child : collection->entities) self(self, *child);
+        }
+    };
+    for (const auto* object : print->objects())
+        for (const auto* layer : object->layers())
+            for (const auto* region : layer->regions())
+                validate_entity(validate_entity, region->fills);
+    m_has_fiber_execution = has_fiber;
+    if (has_fiber) {
+        const auto protocol = fiber_machine_protocol(print->config());
+        validate_fiber_cut_event(print->config().fiber_cut_gcode.value, protocol);
+        if (print->config().single_extruder_multi_material.value)
+            throw std::runtime_error("Fiber requires independent tool inventory, not shared-extruder multimaterial");
+        for (const auto& key : print->config().keys()) {
+            if (key.find("gcode") == std::string::npos || key == "fiber_cut_gcode") continue;
+            const auto* option = print->config().option(key);
+            if (const auto* value = dynamic_cast<const ConfigOptionString*>(option))
+                require_fiber_safe_script(value->value, key.c_str(), protocol);
+            else if (const auto* values = dynamic_cast<const ConfigOptionStrings*>(option))
+                for (const auto& value : values->values) require_fiber_safe_script(value, key.c_str(), protocol);
+        }
+    }
     PROFILE_CLEAR();
 
     // BBS
@@ -2071,8 +2133,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
     BOOST_LOG_TRIVIAL(info) << "Exporting G-code..." << log_memory_info();
 
-    // Remove the old g-code if it exists.
-    boost::nowide::remove(path);
+    // Keep the last successful artifact until atomic replacement below.
 
     fs::path file_path(path);
     fs::path folder = file_path.parent_path();
@@ -2083,6 +2144,10 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
     std::string path_tmp(path);
     path_tmp += ".tmp";
+    struct TemporaryExportCleanup {
+        std::string path;
+        ~TemporaryExportCleanup() { boost::nowide::remove(path.c_str()); }
+    } temporary_export_cleanup{path_tmp};
 
     m_processor.initialize(path_tmp);
     m_processor.set_print(print);
@@ -2177,6 +2242,35 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
                                                  m_print->get_physical_unprintable_filaments(m_print->get_slice_used_filaments(false)));
 
     m_processor.finalize(true);
+    if (has_fiber) {
+        // Audit the actual postprocessed file, not only the pre-emission plan.
+        // Every material switch carries its frozen binding; no ambient Fiber E.
+        FiberGCodeSemanticParser process;
+        GCodeReader reader;
+        bool fiber_tool = false;
+        const bool parsed = reader.parse_file(path_tmp, [&](GCodeReader&, const GCodeReader::GCodeLine& line) {
+            const auto comment = line.comment();
+            if (comment.substr(0, 13) == "TOOL_BINDING ") {
+                unsigned filament = 0, physical = 0;
+                if (std::sscanf(std::string(comment).c_str(), "TOOL_BINDING filament=%u physical=%u", &filament, &physical) != 2)
+                    throw std::runtime_error("Invalid final tool binding");
+                fiber_tool = is_fiber_filament(m_config, filament);
+            }
+            process.consume(comment);
+            if (process.inside()) fiber_tool = true;
+            const bool feed_move = line.has_e() &&
+                (line.cmd_is("G0") || line.cmd_is("G1") || line.cmd_is("G2") || line.cmd_is("G3"));
+            const bool firmware_retract = line.cmd_is("G10") || line.cmd_is("G11") || line.cmd_is("G22") || line.cmd_is("G23");
+            if (fiber_tool && firmware_retract)
+                throw std::runtime_error("Final G-code contains Fiber firmware retraction");
+            if (fiber_tool && feed_move) {
+                if (process.phase != FiberProcessPhase::Powered && process.phase != FiberProcessPhase::Prefeed)
+                    throw std::runtime_error("Final G-code contains unowned Fiber feed or retraction");
+            }
+        });
+        if (!parsed) throw std::runtime_error("Cannot audit final Fiber G-code file");
+        process.finish();
+    }
 //    DoExport::update_print_estimated_times_stats(m_processor, print->m_print_statistics);
     DoExport::update_print_estimated_stats(m_processor, m_writer.extruders(), print->m_print_statistics, print->config());
     if (result != nullptr) {
@@ -3868,6 +3962,10 @@ void GCode::process_layers(
 
 std::string GCode::placeholder_parser_process(const std::string &name, const std::string &templ, unsigned int current_filament_id, const DynamicConfig *config_override)
 {
+    const bool synchronized_cfsys_hook = name == "before_layer_change_gcode" &&
+        fiber_machine_protocol(m_config) == FiberMachineProtocol::Cfsys;
+    if (m_has_fiber_execution || synchronized_cfsys_hook)
+        require_fiber_safe_script(templ, name.c_str(), fiber_machine_protocol(m_config));
     // Orca: Added CMake config option since debug is rarely used in current workflow.
     // Also changed from throwing error immediately to storing messages till slicing is completed
     // to raise all errors at the same time.
@@ -3908,6 +4006,8 @@ PlaceholderParserIntegration &ppi = m_placeholder_parser_integration;
     try {
         ppi.update_from_gcodewriter(m_writer);
         std::string output = ppi.parser.process(templ, current_filament_id, config_override, &ppi.output_config, &ppi.context);
+        if (m_has_fiber_execution || synchronized_cfsys_hook)
+            require_fiber_safe_script(output, name.c_str(), fiber_machine_protocol(m_config), true);
         ppi.validate_output_vector_variables();
 
         if (const std::vector<double> &pos = ppi.opt_position->values; ppi.position != pos) {
@@ -3928,6 +4028,14 @@ PlaceholderParserIntegration &ppi = m_placeholder_parser_integration;
             }
         }
 
+        if (synchronized_cfsys_hook) {
+            // The approved CFSYS layer hook resets E coordinates, not inventory.
+            // Synchronize after template output-state handling in absolute E mode.
+            GCodeReader reader;
+            reader.parse_buffer(output, [&](GCodeReader&, const GCodeReader::GCodeLine& line) {
+                if (line.cmd_is("G92") && line.has_e()) (void)m_writer.reset_e(true);
+            });
+        }
         return output;
     } 
     catch (std::runtime_error &err) 
@@ -6105,7 +6213,9 @@ std::string GCode::extrude_entity(const ExtrusionEntity&      entity,
                                   double                      speed,
                                   const ExtrusionEntitiesPtr& region_perimeters)
 {
-    if (const ExtrusionPath* path = dynamic_cast<const ExtrusionPath*>(&entity))
+    if (const ExtrusionFiberPath* fiber_path = dynamic_cast<const ExtrusionFiberPath*>(&entity))
+        return this->extrude_fiber(*fiber_path, description, speed);
+    else if (const ExtrusionPath* path = dynamic_cast<const ExtrusionPath*>(&entity))
         return this->extrude_path(*path, description, speed);
     else if (const ExtrusionMultiPath* multipath = dynamic_cast<const ExtrusionMultiPath*>(&entity))
         return this->extrude_multi_path(*multipath, description, speed);
@@ -6140,6 +6250,145 @@ std::string GCode::extrude_path(const ExtrusionPath& path, const std::string& de
             m_wipe.path.reverse();
     }
 
+    return gcode;
+}
+
+std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::string& description, double /*speed*/)
+{
+    if (!m_writer.filament())
+        throw Slic3r::RuntimeError("Fiber execution has no selected tool");
+    const auto tool = resolve_fiber_tool(m_config, m_writer.filament()->id());
+    validate_fiber_cut_event(m_config.fiber_cut_gcode.value, fiber_machine_protocol(m_config));
+    path.validate_derived_view();
+    const auto bound = bind_fiber_execution(path.prepared_path(), tool.logical_filament_id,
+        tool.logical_extruder_id, tool.physical_tool_id, tool.e_units_per_mm, m_config.fiber_cut_gcode.value);
+    const PreparedFiberPath& prepared = *bound.prepared;
+    if (m_writer.filament()->effective_retracted() != 0.0 || m_writer.filament()->restart_extra() != 0.0)
+        throw Slic3r::RuntimeError("Fiber execution found nonzero generic retraction state");
+    // Quantization must not erase a motion or a process boundary.
+    for (const auto& span : prepared.spans)
+        for (size_t i = 1; i < span.geometry.points.size(); ++i) {
+            const Vec2d a = point_to_gcode(span.geometry.points[i-1].to_point());
+            const Vec2d b = point_to_gcode(span.geometry.points[i].to_point());
+            if (GCodeFormatter::quantize_xyzf(a.x()) == GCodeFormatter::quantize_xyzf(b.x()) &&
+                GCodeFormatter::quantize_xyzf(a.y()) == GCodeFormatter::quantize_xyzf(b.y()))
+                throw Slic3r::RuntimeError("Fiber edge disappears after G-code coordinate quantization");
+        }
+
+    m_wipe.reset_path();
+    m_multi_flow_segment_path_pa_set = false;
+    m_multi_flow_segment_path_average_mm3_per_mm = 0;
+    std::string gcode = ";FIBER_BEGIN v=3 occurrence=" + std::to_string(++m_fiber_path_occurrence) +
+        " object=" + std::to_string(prepared.id.parent.domain.object_id) +
+        " layer=" + std::to_string(prepared.id.parent.domain.layer_id) +
+        " component=" + std::to_string(prepared.id.parent.domain.component_id) +
+        " purpose=" + (prepared.id.parent.purpose == FiberPathPurpose::Contour ? std::string("contour") : std::string("infill")) +
+        " filament=" + std::to_string(bound.logical_filament_id) +
+        " extruder=" + std::to_string(bound.logical_extruder_id) +
+        " physical=" + std::to_string(bound.physical_tool_id) +
+        " width=" + std::to_string(path.width) + " height=" + std::to_string(path.height) +
+        " e_units_per_mm=" + std::to_string(bound.e_units_per_mm) + "\n";
+    // BEGIN metadata is authoritative even before the first powered move.
+    gcode += ";TYPE:" + std::string(prepared.id.parent.purpose == FiberPathPurpose::Contour ?
+        "Continuous fiber contour" : "Continuous fiber infill") + "\n";
+    const FiberStartProcedure& start = prepared.start_procedure;
+    gcode += m_writer.set_print_acceleration(unsigned(std::lround(prepared.acceleration_mm_s2)));
+    gcode += m_writer.set_travel_acceleration(unsigned(std::lround(prepared.acceleration_mm_s2)));
+    for (const auto& action : prepared.actions) {
+        switch (action.type) {
+        case FiberActionType::Begin:
+            break; // occurrence metadata emitted above; validated first action
+        case FiberActionType::Approach: {
+            gcode += m_writer.unlift();
+            const Point first = prepared.spans.front().geometry.points.front().to_point();
+            if (!m_last_pos_defined || m_last_pos.to_point() != first || m_need_change_layer_lift_z)
+                gcode += travel_to(first, path.role(), "move to first continuous fiber point");
+            gcode += m_writer.unlift();
+            if (GCodeFormatter::quantize_xyzf(m_writer.get_position().z()) != GCodeFormatter::quantize_xyzf(m_nominal_z))
+                gcode += m_writer.travel_to_z(m_nominal_z, "continuous fiber layer Z", true);
+            m_need_change_layer_lift_z = false;
+            m_writer.add_object_change_labels(gcode);
+            // travel_to() sets the machine's travel acceleration, including
+            // Klipper's shared ACCEL modal state. Restore the process limit
+            // after approach, before Z-hop/landing/powered/tail/finish.
+            gcode += m_writer.set_print_acceleration(unsigned(std::lround(prepared.acceleration_mm_s2)));
+            gcode += m_writer.set_travel_acceleration(unsigned(std::lround(prepared.acceleration_mm_s2)));
+            break;
+        }
+        case FiberActionType::ZHop:
+            gcode += m_writer.travel_to_z(m_nominal_z + start.z_hop_height_mm, "continuous fiber Z-hop", true);
+            break;
+        case FiberActionType::Prefeed: {
+            gcode += ";FIBER_PREFEED_BEGIN\n";
+            GCodeG1Formatter command;
+            m_writer.filament()->extrude(bound.prefeed_dE);
+            command.emit_e(m_writer.filament()->E());
+            command.emit_f(bound.prefeed_F);
+            gcode += command.string();
+            gcode += ";FIBER_PREFEED_END\n";
+            break;
+        }
+        case FiberActionType::LandingSpan: {
+            const auto& landing = prepared.spans[action.span_index];
+            gcode += ";FIBER_LANDING_BEGIN\n";
+            double distance = 0.0;
+            const double total = landing.geometry.length();
+            const double z = m_writer.get_position().z();
+            for (size_t i = 0; i < landing.edges.size(); ++i) {
+                distance += (landing.geometry.points[i+1]-landing.geometry.points[i]).cast<double>().norm();
+                const Vec2d xy = point_to_gcode(landing.geometry.points[i+1].to_point());
+                gcode += m_writer.set_speed(landing.edges[i].speed_mm_s*60.0);
+                gcode += m_writer.extrude_to_xyz(Vec3d(xy.x(), xy.y(), lerp(z, m_nominal_z, distance/total)),
+                                               0.0, "continuous fiber landing", true);
+            }
+            set_last_pos(landing.geometry.points.back());
+            gcode += ";FIBER_LANDING_END\n";
+            break;
+        }
+        case FiberActionType::LowerToLayer: {
+            const Vec3d current = m_writer.get_position();
+            gcode += m_writer.set_speed(start.landing_speed_mm_s * 60.0);
+            gcode += m_writer.extrude_to_xyz(Vec3d(current.x(), current.y(), m_nominal_z),
+                                           0.0, "fiber lowering without deposition", true);
+            break;
+        }
+        case FiberActionType::AdhesionDwell:
+            gcode += "G4 P" + std::to_string(start.adhesion_dwell_ms) + "\n";
+            break;
+        case FiberActionType::Start:
+            gcode += ";FIBER_START\n";
+            break;
+        case FiberActionType::MotionSpan: {
+            const auto& span = prepared.spans[action.span_index];
+            for (size_t edge = 0; edge < span.edges.size(); ++edge) {
+                gcode += m_writer.set_speed(span.edges[edge].speed_mm_s*60.0);
+                gcode += m_writer.extrude_to_xy(point_to_gcode(span.geometry.points[edge+1].to_point()),
+                    bound.edge_dE[action.span_index][edge], description, !span.actively_feeds_fiber());
+                set_last_pos(span.geometry.points[edge+1]);
+            }
+            break;
+        }
+        case FiberActionType::Cut:
+            gcode += ";FIBER_CUT\n" + bound.cut_gcode;
+            if (gcode.back() != '\n') gcode += '\n';
+            gcode += ";FIBER_TAIL_BEGIN\n";
+            break;
+        case FiberActionType::FiberDepleted:
+            gcode += ";FIBER_DEPLETED\n;FIBER_FINISH_BEGIN\n";
+            break;
+        case FiberActionType::Finish:
+            gcode += ";FIBER_FINISH\n";
+            break;
+        case FiberActionType::End:
+            gcode += ";FIBER_END\n";
+            break;
+        }
+    }
+    // Force the next ordinary path to refresh its role and geometric metadata.
+    m_last_extrusion_role = erNone;
+    m_last_width = 0;
+    m_last_height = 0;
+    m_wipe.reset_path();
     return gcode;
 }
 
@@ -6358,9 +6607,22 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double 
     return res;
 }
 
-std::string GCode::_extrude(const ExtrusionPath &path, std::string description, double speed)
+std::string GCode::_extrude(
+    const ExtrusionPath &path,
+    std::string description,
+    double speed,
+    const std::function<std::string()>& before_first_deposition)
 {
+    if (path.role() == erContinuousFiberContour || path.role() == erContinuousFiberInfill)
+        throw Slic3r::RuntimeError("Fiber motion must use its bound execution plan, not plastic extrusion");
     std::string gcode;
+    bool first_deposition_pending = bool(before_first_deposition);
+    const auto emit_before_first_deposition = [&]() {
+        if (!first_deposition_pending)
+            return;
+        gcode += before_first_deposition();
+        first_deposition_pending = false;
+    };
 
     if (is_bridge(path.role()))
         description += " (bridge)";
@@ -6438,7 +6700,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 #endif
         } else if (m_config.get_abs_value("bridge_acceleration") > 0 && is_bridge(path.role())) {
             acceleration = m_config.get_abs_value("bridge_acceleration");
-        } else if (m_config.get_abs_value("sparse_infill_acceleration") > 0 && (path.role() == erInternalInfill)) {
+        } else if (m_config.get_abs_value("sparse_infill_acceleration") > 0 && path.role() == erInternalInfill) {
             acceleration = m_config.get_abs_value("sparse_infill_acceleration");
         } else if (m_config.get_abs_value("internal_solid_infill_acceleration") > 0 && (path.role() == erSolidInfill)) {
             acceleration = m_config.get_abs_value("internal_solid_infill_acceleration");
@@ -6505,7 +6767,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             _mm3_per_mm *= m_config.inner_wall_flow_ratio;
         } else if (path.role() == erOverhangPerimeter) {
             _mm3_per_mm *= m_config.overhang_flow_ratio;
-        } else if (path.role() == erInternalInfill) {
+        } else if (path.role() == erInternalInfill || path.role() == erContinuousFiberContour || path.role() == erContinuousFiberInfill) {
             _mm3_per_mm *= m_config.sparse_infill_flow_ratio;
         } else if (path.role() == erSolidInfill) {
             _mm3_per_mm *= m_config.internal_solid_infill_flow_ratio;
@@ -7041,11 +7303,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         if (z < 0.1) {
                             throw RuntimeError("GCode: very low z");
                         }
+                        emit_before_first_deposition();
                         gcode += m_writer.extrude_to_xyz(Vec3d(dest2d.x(), dest2d.y(), z), e,
                                                          GCodeWriter::full_gcode_comment ? tempDescription : "");
 
                     } else if (sloped == nullptr) {
                         // Normal extrusion
+                        emit_before_first_deposition();
                         gcode += m_writer.extrude_to_xy(
                             this->point_to_gcode(line.b.to_point()),
                             dE,
@@ -7055,6 +7319,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
                         Vec2d dest2d = this->point_to_gcode(line.b.to_point());
                         Vec3d dest3d(dest2d(0), dest2d(1), get_sloped_z(z_ratio));
+                        emit_before_first_deposition();
                         gcode += m_writer.extrude_to_xyz(
                             dest3d,
                             dE * e_ratio,
@@ -7085,6 +7350,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     tempDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, line_length);
                                 }
                             }
+                            emit_before_first_deposition();
                             gcode += m_writer.extrude_to_xy(
                                 this->point_to_gcode(line.b),
                                 dE,
@@ -7108,6 +7374,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 tempDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, arc_length);
                             }
                         }
+                        emit_before_first_deposition();
                         gcode += m_writer.extrude_arc_to_xy(
                             this->point_to_gcode(arc.end_point),
                             center_offset,
@@ -7248,15 +7515,18 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 if (z < 0.1) {
                     throw RuntimeError("GCode: very low z");
                 }
+                emit_before_first_deposition();
                 gcode += m_writer.extrude_to_xyz(Vec3d(dest2d.x(), dest2d.y(), z), e,
                                                  GCodeWriter::full_gcode_comment ? tempDescription : "");
             } else if (sloped == nullptr) {
                 // Normal extrusion
+                emit_before_first_deposition();
                 gcode += m_writer.extrude_to_xy(p.head<2>(), dE, GCodeWriter::full_gcode_comment ? tempDescription : "");
             } else {
                 // Sloped extrusion
                 const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
                 Vec3d dest3d(p(0), p(1), get_sloped_z(z_ratio));
+                emit_before_first_deposition();
                 gcode += m_writer.extrude_to_xyz(dest3d, dE * e_ratio, GCodeWriter::full_gcode_comment ? tempDescription : "");
             }
 
@@ -7297,6 +7567,8 @@ std::string GCode::extrusion_role_to_string_for_parser(const ExtrusionRole & rol
         case erSupportMaterialInterface: return "SupportMaterialInterface";
         case erSupportTransition: return "SupportTransition";
         case erWipeTower: return "WipeTower";
+        case erContinuousFiberContour: return "ContinuousFiberContour";
+        case erContinuousFiberInfill: return "ContinuousFiberInfill";
         case erCustom:
         case erMixed:
         case erCount:
@@ -7673,7 +7945,8 @@ std::string GCode::retract(bool toolchange, bool is_last_retraction, LiftType li
         return gcode;
 
     // wipe (if it's enabled for this extruder and we have a stored wipe path and no-zero wipe distance)
-    if (FILAMENT_CONFIG(wipe) && m_wipe.has_path() && scale_(FILAMENT_CONFIG(wipe_distance)) > SCALED_EPSILON) {
+    if (!is_fiber_filament(m_config, m_writer.filament()->id()) &&
+        FILAMENT_CONFIG(wipe) && m_wipe.has_path() && scale_(FILAMENT_CONFIG(wipe_distance)) > SCALED_EPSILON) {
         Wipe::RetractionValues wipeRetractions = m_wipe.calculateWipeRetractionLengths(*this, toolchange);
         gcode += toolchange ? m_writer.retract_for_toolchange(true,wipeRetractions.retractLengthBeforeWipe) : m_writer.retract(true, wipeRetractions.retractLengthBeforeWipe);
         gcode += m_wipe.wipe(*this,wipeRetractions.retractLengthDuringWipe, toolchange, is_last_retraction);
@@ -7728,6 +8001,35 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
     int new_extruder_id = get_extruder_id(new_filament_id);
     if (!m_writer.need_toolchange(new_filament_id))
         return "";
+
+    const bool destination_fiber = is_fiber_filament(m_config, new_filament_id);
+    const bool source_fiber = m_writer.filament() && is_fiber_filament(m_config, m_writer.filament()->id());
+    if (source_fiber || destination_fiber) {
+        // Ordinary transitions only; tower participants are checked before tower generation.
+        if (destination_fiber) resolve_fiber_tool(m_config, new_filament_id);
+        if (source_fiber && m_writer.filament()->extruder_id() == new_extruder_id)
+            throw std::runtime_error("Fiber inventory cannot be changed by a logical filament alias");
+        const auto protocol = fiber_machine_protocol(m_config);
+        require_fiber_safe_script(m_config.change_filament_gcode.value, "change_filament_gcode", protocol);
+        require_fiber_safe_script(m_config.filament_start_gcode.get_at(new_filament_id), "filament_start_gcode", protocol);
+        if (m_writer.filament())
+            require_fiber_safe_script(m_config.filament_end_gcode.get_at(m_writer.filament()->id()), "filament_end_gcode", protocol);
+        std::string gcode = retract(true, false);
+        m_wipe.reset_path();
+        if (m_ooze_prevention.enable && m_writer.filament())
+            gcode += m_ooze_prevention.pre_toolchange(*this);
+        if (by_object) m_writer.add_object_change_labels(gcode);
+        gcode += m_writer.toolchange(new_filament_id);
+        placeholder_parser().set("current_extruder", new_filament_id);
+        placeholder_parser().set("current_hotend", hotend_id_for_gcode_placeholder(m_config, new_extruder_id));
+        if (m_ooze_prevention.enable) gcode += m_ooze_prevention.post_toolchange(*this);
+        if (!destination_fiber && m_config.enable_pressure_advance.get_at(new_filament_id)) {
+            gcode += m_writer.set_pressure_advance(m_config.pressure_advance.get_at(new_filament_id));
+            m_pa_processor->resetPreviousPA(m_config.pressure_advance.get_at(new_filament_id));
+        }
+        ++m_toolchange_count;
+        return gcode;
+    }
 
     // if we are running a single-extruder setup, just set the extruder and return nothing
     if (!m_writer.multiple_extruders) {

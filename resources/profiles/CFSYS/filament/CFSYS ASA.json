@@ -1,0 +1,26 @@
+{
+    "type": "filament",
+    "filament_id": "GFB98",
+    "setting_id": "GFSA05",
+    "name": "CFSYS ASA",
+    "from": "system",
+    "instantiation": "true",
+    "inherits": "fdm_filament_asa",
+    "is_custom_defined": "0",
+    "version": "2.0.2.0",
+    "default_filament_colour": [
+        "#D0D0D0"
+    ],
+    "filament_max_volumetric_speed": [
+        "12"
+    ],
+    "slow_down_layer_time": [
+        "3"
+    ],
+    "overhang_fan_speed": [
+        "0"
+    ],
+    "filament_flow_ratio": [
+        "0.98"
+    ]
+}

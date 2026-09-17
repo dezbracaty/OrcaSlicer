@@ -1825,7 +1825,8 @@ bool GCodeProcessor::check_multi_extruder_gcode_valid(const int                 
     std::map<int, std::map<int, GCodePosInfo>> gcode_path_pos; // object_id, filament_id, pos
     for (const GCodeProcessorResult::MoveVertex &move : m_result.moves) {
         // sometimes, the start line extrude was outside the edge of plate a little, this is allowed, so do not include into the gcode_path_pos
-        if (move.type == EMoveType::Extrude /* && move.extrusion_role != ExtrusionRole::erFlush || move.type == EMoveType::Travel*/)
+        if (move.type == EMoveType::Extrude || move.deposition != ToolpathDeposition::None ||
+            move.fiber_phase == FiberProcessPhase::Finish)
             if (move.extrusion_role == ExtrusionRole::erCustom) {
                 /*if (move.is_arc_move_with_interpolation_points()) {
                     for (int i = 0; i < move.interpolation_points.size(); i++) {
@@ -2424,6 +2425,8 @@ void GCodeProcessor::enable_stealth_time_estimator(bool enabled)
 
 void GCodeProcessor::reset()
 {
+    m_fiber_process = {};
+    m_bound_filament.reset();
     m_units = EUnits::Millimeters;
     m_global_positioning_type = EPositioningType::Absolute;
     m_e_local_positioning_type = EPositioningType::Absolute;
@@ -2616,6 +2619,7 @@ void GCodeProcessor::process_buffer(const std::string &buffer)
 
 void GCodeProcessor::finalize(bool post_process)
 {
+    m_fiber_process.finish();
     m_result.z_offset = m_z_offset;
 
     // update width/height of wipe moves
@@ -3042,6 +3046,26 @@ bool GCodeProcessor::get_last_position_from_gcode(const std::string &gcode_str, 
 
 void GCodeProcessor::process_tags(const std::string_view comment, bool producers_enabled)
 {
+    if (comment.substr(0, 13) == "TOOL_BINDING ") {
+        unsigned filament = 0, physical = 0;
+        if (m_fiber_process.inside() || m_bound_filament ||
+            std::sscanf(std::string(comment).c_str(), "TOOL_BINDING filament=%u physical=%u", &filament, &physical) != 2)
+            throw std::runtime_error("Invalid tool binding metadata");
+        m_bound_filament = filament;
+        m_bound_physical = physical;
+        return;
+    }
+    if (m_fiber_process.consume(comment)) {
+        if (m_fiber_process.inside()) {
+            set_extrusion_role(m_fiber_process.contour ? erContinuousFiberContour : erContinuousFiberInfill);
+            m_width = float(m_fiber_process.width);
+            m_height = float(m_fiber_process.height);
+        } else {
+            set_extrusion_role(erNone);
+            m_width = m_height = m_mm3_per_mm = 0.0f;
+        }
+        return;
+    }
     // producers tags
     if (producers_enabled && process_producers_tags(comment))
         return;
@@ -3882,10 +3906,29 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         return;
 
     EMoveType type = move_type(delta_pos);
+    if (m_fiber_process.inside()) {
+        const auto phase = m_fiber_process.phase;
+        const bool xy = delta_pos[X] != 0 || delta_pos[Y] != 0;
+        if (delta_pos[E] != 0 && phase != FiberProcessPhase::Powered && phase != FiberProcessPhase::Prefeed)
+            throw std::runtime_error("E motion outside owned Fiber feed phase");
+        if (delta_pos[E] < 0 || (phase == FiberProcessPhase::Powered && xy && delta_pos[E] <= 0))
+            throw std::runtime_error("Invalid active Fiber E motion");
+        if (phase == FiberProcessPhase::Prefeed && (xy || delta_pos[Z] != 0))
+            throw std::runtime_error("Fiber prefeed must be extrusion-only");
+        m_width = float(m_fiber_process.width);
+        m_height = float(m_fiber_process.height);
+        m_mm3_per_mm = m_fiber_process.deposition() == ToolpathDeposition::None ? 0.0f :
+            m_height * (m_width - m_height * float(1.0 - 0.25 * PI));
+        if (m_fiber_process.deposition() != ToolpathDeposition::None)
+            m_extruded_last_z = m_end_position[Z];
+        if (delta_pos[E] > 0)
+            m_used_filaments.increase_model_caches(area_filament_cross_section * delta_pos[E] /
+                                                   float(m_fiber_process.e_units_per_mm));
+    }
     const float delta_xyz = std::sqrt(sqr(delta_pos[X]) + sqr(delta_pos[Y]) + sqr(delta_pos[Z]));
     m_travel_dist = delta_xyz;
 
-    if (type == EMoveType::Extrude) {
+    if (type == EMoveType::Extrude && !m_fiber_process.inside()) {
         float volume_extruded_filament = area_filament_cross_section * delta_pos[E];
         float area_toolpath_cross_section = volume_extruded_filament / delta_xyz;
 
@@ -3988,7 +4031,8 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         TimeBlock block;
         block.move_type = type;
         //BBS: don't calculate travel time into extrusion path, except travel inside start and end gcode.
-        block.role = (type != EMoveType::Travel || m_extrusion_role == erCustom) ? m_extrusion_role : erNone;
+        block.role = (type != EMoveType::Travel || m_extrusion_role == erCustom ||
+                      m_fiber_process.deposition() != ToolpathDeposition::None) ? m_extrusion_role : erNone;
         block.distance = distance;
         block.g1_line_id = m_g1_line_id;
         block.move_id = static_cast<unsigned int>(m_result.moves.size());
@@ -4048,7 +4092,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
 
         // calculates block acceleration
         float acceleration =
-            (type == EMoveType::Travel) ? get_travel_acceleration(static_cast<PrintEstimatedStatistics::ETimeMode>(i)) :
+            (type == EMoveType::Travel && m_fiber_process.deposition() == ToolpathDeposition::None) ? get_travel_acceleration(static_cast<PrintEstimatedStatistics::ETimeMode>(i)) :
             (is_extrusion_only_move(delta_pos) ?
                 get_retract_acceleration(static_cast<PrintEstimatedStatistics::ETimeMode>(i)) :
                 get_acceleration(static_cast<PrintEstimatedStatistics::ETimeMode>(i)));
@@ -4991,8 +5035,30 @@ void GCodeProcessor::process_M83(const GCodeReader::GCodeLine& line)
     m_e_local_positioning_type = EPositioningType::Relative;
 }
 
+// Explicit heater targets in the Fiber protocol are physical tool IDs, while
+// preview temperatures are indexed by logical material. Preserve Resin-only parsing.
+static bool apply_fiber_heater_target(const GCodeReader::GCodeLine& line,
+    const GCodeConfig& config, std::vector<float>& temperatures)
+{
+    if (std::find(config.filament_process_type.values.begin(), config.filament_process_type.values.end(),
+                  "continuous_fiber") == config.filament_process_type.values.end()) return false;
+    float physical, temperature;
+    if (!line.has_value('T', physical)) return false;
+    if (!line.has_value('S', temperature) && !line.has_value('R', temperature)) return false;
+    if (!std::isfinite(physical) || physical < 0 || physical != std::floor(physical))
+        throw std::runtime_error("Invalid physical heater target");
+    for (size_t filament = 0; filament < std::min(temperatures.size(), config.filament_map.values.size()); ++filament) {
+        const int logical = config.filament_map.values[filament] - 1;
+        if (logical >= 0 && size_t(logical) < config.physical_extruder_map.values.size() &&
+            config.physical_extruder_map.values[logical] == physical)
+            temperatures[filament] = temperature;
+    }
+    return true;
+}
+
 void GCodeProcessor::process_M104(const GCodeReader::GCodeLine& line)
 {
+    if (apply_fiber_heater_target(line, m_parser.config(), m_extruder_temps)) return;
     int filament_id = get_filament_id();
     float new_temp;
     if (line.has_value('S', new_temp))
@@ -5070,6 +5136,7 @@ void GCodeProcessor::process_M108(const GCodeReader::GCodeLine& line)
 
 void GCodeProcessor::process_M109(const GCodeReader::GCodeLine& line)
 {
+    if (apply_fiber_heater_target(line, m_parser.config(), m_extruder_temps)) return;
     int filament_id = get_filament_id();
     float new_temp;
     if (line.has_value('R', new_temp)) {
@@ -5459,10 +5526,19 @@ void GCodeProcessor::process_M1020(const GCodeReader::GCodeLine &line)
 
 void GCodeProcessor::process_T(const std::string_view command)
 {
+    if (m_fiber_process.inside()) throw std::runtime_error("Tool change inside a Fiber process block");
     unsigned int eid = 0;
     auto         ret          = std::from_chars(command.data() + 1, command.data()+command.size(), eid);
     if (std::errc::invalid_argument == ret.ec)
         return;
+
+    if (m_bound_filament) {
+        if (eid != m_bound_physical || *m_bound_filament >= m_result.filaments_count)
+            throw std::runtime_error("Tool command disagrees with frozen material binding");
+        process_filament_change(int(*m_bound_filament));
+        m_bound_filament.reset();
+        return;
+    }
 
     int curr_filament_id = get_filament_id(false);
     int curr_extruder_id = get_extruder_id(false);
@@ -5629,7 +5705,7 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         m_line_id + 1 :
         ((type == EMoveType::Seam) ? m_last_line_id : m_line_id);
 
-    if (type == EMoveType::Travel) {
+    if (type == EMoveType::Travel && m_fiber_process.deposition() == ToolpathDeposition::None) {
         m_result.print_statistics.total_travel_moves++;
         m_result.print_statistics.total_travel_distance += m_travel_dist;
     }
@@ -5664,6 +5740,17 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         m_object_label_id,
         m_print_z
     });
+
+    auto& stored = m_result.moves.back();
+    stored.fiber_phase = m_fiber_process.phase;
+    stored.fiber_occurrence = m_fiber_process.occurrence;
+    stored.deposition = m_fiber_process.inside() ? m_fiber_process.deposition() :
+        (type == EMoveType::Extrude ? ToolpathDeposition::Thermoplastic : ToolpathDeposition::None);
+    if (m_fiber_process.inside()) {
+        stored.fiber_feed_delta_mm = stored.delta_extruder / float(m_fiber_process.e_units_per_mm);
+        if (stored.deposition == ToolpathDeposition::None)
+            stored.extrusion_role = erNone;
+    }
 
     if (type == EMoveType::Seam) {
         m_seams_count++;

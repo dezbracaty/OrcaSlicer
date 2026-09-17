@@ -33,9 +33,14 @@ void FillConcentric::_fill_surface_single(
     Polygons loops = to_polygons(contracted);
 
     ExPolygons last { std::move(contracted) };
+    // `loops` already contains the outermost concentric level.
+    size_t generated_depth = 1;
     while (! last.empty()) {
+        if (params.max_concentric_loops > 0 && generated_depth >= params.max_concentric_loops)
+            break;
         last = offset2_ex(last, -(distance + min_spacing/2), +min_spacing/2);
         append(loops, to_polygons(last));
+        ++generated_depth;
     }
 
     // generate paths from the outermost to the innermost, to avoid
