@@ -6,6 +6,7 @@
 #include "Flow.hpp"
 #include "SurfaceCollection.hpp"
 #include "ExtrusionEntityCollection.hpp"
+#include <map>
 #include "BoundingBox.hpp"
 namespace Slic3r {
 
@@ -123,6 +124,13 @@ private:
 class Layer
 {
 public:
+    struct FiberInfillStatistics {
+        size_t candidates {0};
+        size_t accepted_fragments {0};
+        size_t split_candidates {0};
+        std::map<std::string, size_t> rejected_fragments;
+    };
+    FiberInfillStatistics fiber_infill_statistics;
     // Sequential index of this layer in PrintObject::m_layers, offsetted by the number of raft layers.
     size_t              id() const          { return m_id; }
     void                set_id(size_t id)   { m_id = id; }

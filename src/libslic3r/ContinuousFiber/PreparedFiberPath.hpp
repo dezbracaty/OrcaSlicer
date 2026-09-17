@@ -113,6 +113,16 @@ struct BoundFiberExecutionPlan {
     std::string cut_gcode;
 };
 
+// Available machine limits, not a model/deposition domain or a full collision
+// envelope. Positions are emitted G-code coordinates; XY limits describe the
+// tool tip, hence command_to_tip_offset is applied before the check.
+struct FiberMachineMotionLimits {
+    ExPolygons tip_xy;
+    Vec2d command_to_tip_offset {Vec2d::Zero()};
+    double maximum_z_mm {0};
+    void validate_move(const Vec3d& from, const Vec3d& to) const;
+};
+
 BoundFiberExecutionPlan bind_fiber_execution(
     std::shared_ptr<const PreparedFiberPath> prepared,
     unsigned filament_id, unsigned extruder_id, unsigned physical_tool_id,

@@ -187,11 +187,11 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
     }
 }
 
-// Conservative first implementation: require the requested finish to be fully
-// safe. Never connect the disjoint pieces returned by polygon intersection.
-// Shortening needs a calibrated minimum/permission and is not silently enabled.
+// Finish is a tool motion after the depositing tail, not another material path.
+// Its machine-space limits are checked at execution binding, never against the
+// deposition domain (or its contour keepouts) and never using fiber line width.
 bool plan_finish(PreparedFiberPath& prepared, const ExtrusionPath& candidate,
-                 const ExPolygons& domain, const ContinuousFiberConfig& config)
+                 const ContinuousFiberConfig& config)
 {
     const bool tangent = prepared.id.parent.purpose == FiberPathPurpose::Infill ||
         (config.infill_enabled && config.infill_pattern == ipConcentric);
@@ -214,19 +214,6 @@ bool plan_finish(PreparedFiberPath& prepared, const ExtrusionPath& candidate,
         finish = candidate.polyline;
         finish.clip_end(candidate.length()-scale_(length));
         prepared.finish_strategy = FiberFinishStrategy::LoopOverlap;
-    }
-    // The complete geometric footprint must stay inside the conservative domain.
-    // Production toolhead contact envelopes require a separately calibrated contract.
-    ExtrusionPath motion(finish, candidate);
-    // Loop overlap retraces an already depositing path. Apply the same area
-    // tolerance as its coverage audit; a microscopic offset sliver must not
-    // discard an otherwise valid closed contour.
-    const double outside = area_mm2(diff_ex(union_ex(motion.polygons_covered_by_width()), domain,
-                        ApplySafetyOffset::Yes));
-    if (outside > config.outside_tolerance_mm2) {
-        BOOST_LOG_TRIVIAL(debug) << "[FiberFinishRejected] layer=" << prepared.id.parent.domain.layer_id
-            << " outside_mm2=" << outside << " strategy=" << (tangent ? "tangent" : "overlap");
-        return false;
     }
     prepared.spans.push_back({std::move(finish), FiberMotionKind::NonDepositingFinish});
     return true;
@@ -376,10 +363,9 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     if (!passive.empty())
         prepared->spans.push_back({std::move(passive), FiberMotionKind::PassiveDepositingAfterCut});
 
-    if (!plan_finish(*prepared, candidate, allowed_domain, config)) {
-        result.failure = FiberFinalizationFailure::OutsideDomain;
-        return result;
-    }
+    if (!plan_finish(*prepared, candidate, config))
+        throw std::runtime_error("Invalid fiber finish geometry at layer " + std::to_string(id.parent.domain.layer_id) +
+            ": loop overlap requires a closed path at least as long as its configured finish");
     try {
         plan_edges(*prepared, candidate.polyline, config);
     } catch (const std::invalid_argument&) {

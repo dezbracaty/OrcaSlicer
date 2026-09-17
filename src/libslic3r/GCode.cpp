@@ -6277,6 +6277,39 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     const PreparedFiberPath& prepared = *bound.prepared;
     if (m_writer.filament()->effective_retracted() != 0.0 || m_writer.filament()->restart_extra() != 0.0)
         throw Slic3r::RuntimeError("Fiber execution found nonzero generic retraction state");
+    // Printable/tool areas are the conservative limits available in the machine
+    // profile, NOT the fiber deposition domain. Do not invent a contact envelope.
+    FiberMachineMotionLimits limits;
+    Polygon bed = Polygon::new_scale(m_config.printable_area.values);
+    bed.make_counter_clockwise();
+    limits.tip_xy = {ExPolygon(std::move(bed))};
+    if (m_config.bed_exclude_area.values.size() >= 3) {
+        Polygon excluded = Polygon::new_scale(m_config.bed_exclude_area.values);
+        excluded.make_counter_clockwise();
+        limits.tip_xy = diff_ex(limits.tip_xy, ExPolygons{ExPolygon(std::move(excluded))});
+    }
+    const auto& tool_areas = m_config.extruder_printable_area.values;
+    if (bound.logical_extruder_id < tool_areas.size() && tool_areas[bound.logical_extruder_id].size() >= 3) {
+        Polygon area = Polygon::new_scale(tool_areas[bound.logical_extruder_id]);
+        area.make_counter_clockwise();
+        limits.tip_xy = intersection_ex(limits.tip_xy, ExPolygons{ExPolygon(std::move(area))});
+    }
+    limits.command_to_tip_offset = m_config.extruder_offset.get_at(bound.logical_extruder_id);
+    limits.maximum_z_mm = m_config.printable_height.value;
+    const auto& tool_heights = m_config.extruder_printable_height.values;
+    if (bound.logical_extruder_id < tool_heights.size() && tool_heights[bound.logical_extruder_id] > 0)
+        limits.maximum_z_mm = std::min(limits.maximum_z_mm, tool_heights[bound.logical_extruder_id]);
+    const auto validate_motion = [&](const Vec3d& from, const Vec3d& to) {
+        try { limits.validate_move(from, to); }
+        catch (const std::exception& error) {
+            throw Slic3r::RuntimeError(std::string(error.what()) + ": object=" +
+                std::to_string(prepared.id.parent.domain.object_id) + " layer=" +
+                std::to_string(prepared.id.parent.domain.layer_id) + " physical_tool=" +
+                std::to_string(bound.physical_tool_id) + " destination=" +
+                std::to_string(to.x()) + "," + std::to_string(to.y()) + "," + std::to_string(to.z()));
+        }
+    };
+    const Vec3d approach_from = m_writer.get_position();
     // Quantization must not erase a motion or a process boundary.
     for (const auto& span : prepared.spans)
         for (size_t i = 1; i < span.geometry.points.size(); ++i) {
@@ -6285,7 +6318,11 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             if (GCodeFormatter::quantize_xyzf(a.x()) == GCodeFormatter::quantize_xyzf(b.x()) &&
                 GCodeFormatter::quantize_xyzf(a.y()) == GCodeFormatter::quantize_xyzf(b.y()))
                 throw Slic3r::RuntimeError("Fiber edge disappears after G-code coordinate quantization");
+            validate_motion(Vec3d(a.x(), a.y(), m_nominal_z), Vec3d(b.x(), b.y(), m_nominal_z));
         }
+    const Vec2d first_xy = point_to_gcode(prepared.spans.front().geometry.points.front().to_point());
+    validate_motion(Vec3d(first_xy.x(), first_xy.y(), m_nominal_z),
+                    Vec3d(first_xy.x(), first_xy.y(), m_nominal_z + prepared.start_procedure.z_hop_height_mm));
 
     m_wipe.reset_path();
     m_multi_flow_segment_path_pa_set = false;
@@ -6396,6 +6433,18 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             break;
         }
     }
+    // Also check the actual absolute-XYZ commands, including approach routing,
+    // Z-hop, and quantization. A failed export is discarded atomically; no
+    // partial fiber file is delivered. No firmware/custom motion is invented here.
+    GCodeReader motion_reader;
+    motion_reader.x() = float(approach_from.x());
+    motion_reader.y() = float(approach_from.y());
+    motion_reader.z() = float(approach_from.z());
+    motion_reader.parse_buffer(gcode, [&](GCodeReader& reader, const GCodeReader::GCodeLine& line) {
+        if ((line.cmd_is("G0") || line.cmd_is("G1")) && (line.has_x() || line.has_y() || line.has_z()))
+            validate_motion(Vec3d(reader.x(), reader.y(), reader.z()),
+                            Vec3d(line.new_X(reader), line.new_Y(reader), line.new_Z(reader)));
+    });
     // Force the next ordinary path to refresh its role and geometric metadata.
     m_last_extrusion_role = erNone;
     m_last_width = 0;

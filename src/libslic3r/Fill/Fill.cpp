@@ -1831,6 +1831,14 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
 
     const size_t contour_accepted = contour_result.accepted_count();
     const size_t infill_accepted = infill_result.accepted_count();
+    auto& statistics = context.layer.fiber_infill_statistics;
+    statistics.candidates += infill_result.candidates.size();
+    statistics.accepted_fragments += infill_accepted;
+    for (const auto& assignment : infill_result.assignments) {
+        if (assignment.id.fragment_ordinal == 1) ++statistics.split_candidates;
+        if (assignment.kind == FiberAssignmentKind::Rejected)
+            ++statistics.rejected_fragments[fiber_rejection_reason_name(assignment.reason)];
+    }
     const auto log_rejections = [&](const FiberValidationResult& validation) {
         for (const FiberFragmentAssignment& assignment : validation.assignments) {
             if (assignment.kind != FiberAssignmentKind::Rejected)
@@ -1845,6 +1853,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 << " fragment=" << assignment.id.fragment_ordinal
                 << " source_begin_mm=" << assignment.source_begin_mm
                 << " source_end_mm=" << assignment.source_end_mm
+                << " source_length_mm=" << validation.candidates.at(assignment.id.parent.path_ordinal).length_mm
                 << " reason=" << fiber_rejection_reason_name(assignment.reason);
         }
     };
@@ -1898,7 +1907,7 @@ FillSurfaceView build_resin_surface_view(
 // friend to Layer
 void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
 {
-
+    fiber_infill_statistics = {};
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");

@@ -1,8 +1,32 @@
 #include "PreparedFiberPath.hpp"
+#include "../ClipperUtils.hpp"
 #include <cmath>
 #include <stdexcept>
 
 namespace Slic3r {
+
+void FiberMachineMotionLimits::validate_move(const Vec3d& from, const Vec3d& to) const
+{
+    if (tip_xy.empty() || !command_to_tip_offset.allFinite() ||
+        !std::isfinite(maximum_z_mm) || maximum_z_mm <= 0)
+        throw std::runtime_error("Fiber machine motion limits are unavailable");
+    Points xy;
+    for (const Vec3d& p : {from, to}) {
+        if (!p.allFinite() || p.z() < 0 || p.z() > maximum_z_mm ||
+            p.head<2>().cwiseAbs().maxCoeff() > 1000000.0)
+            throw std::runtime_error("Fiber motion exceeds machine Z/coordinate limits");
+        const Vec2d tip = p.head<2>() + command_to_tip_offset;
+        const Point point = Point::new_scale(tip.x(), tip.y());
+        if (!std::any_of(tip_xy.begin(), tip_xy.end(), [&](const ExPolygon& area) { return area.contains(point); }))
+            throw std::runtime_error("Fiber motion exceeds the configured tool working area");
+        xy.push_back(point);
+    }
+    // Clipper treats an open line coincident with a polygon boundary as outside.
+    // Include that boundary using one integer coordinate unit, not a user margin.
+    if (xy.front() != xy.back() &&
+        total_length(diff_pl(Polylines{Polyline(std::move(xy))}, offset_ex(tip_xy, 1.0f))) > scale_(0.00001))
+        throw std::runtime_error("Fiber motion crosses a configured machine exclusion area");
+}
 
 double PreparedFiberPath::total_depositing_length_mm() const
 {

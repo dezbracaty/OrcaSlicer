@@ -6,6 +6,7 @@
 #include <libslic3r/PresetBundle.hpp>
 #include <libslic3r/Model.hpp>
 #include <libslic3r/Print.hpp>
+#include <libslic3r/Layer.hpp>
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/ContinuousFiber/ContinuousFiberConfig.hpp>
 #include <libslic3r/GCode/GCodeProcessor.hpp>
@@ -3227,6 +3228,28 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         {
             Slic3r::ScopedBeltSupportDebugRecorder debug_scope(belt_support_debug.get());
             print.process();
+        }
+        // Keep planner statistics internal; diagnostics are the existing public
+        // channel. Candidates and accepted/rejected fragments are distinct units.
+        size_t fiber_candidates = 0, fiber_accepted = 0, fiber_split = 0;
+        std::map<std::string, size_t> fiber_rejections;
+        for (const auto* object : print.objects())
+            for (const auto* layer : object->layers()) {
+                const auto& stats = layer->fiber_infill_statistics;
+                fiber_candidates += stats.candidates;
+                fiber_accepted += stats.accepted_fragments;
+                fiber_split += stats.split_candidates;
+                for (const auto& entry : stats.rejected_fragments)
+                    fiber_rejections[entry.first] += entry.second;
+            }
+        if (fiber_candidates > 0) {
+            std::string message = "Continuous fiber infill: candidates=" + std::to_string(fiber_candidates) +
+                ", accepted_fragments=" + std::to_string(fiber_accepted) +
+                ", split_candidates=" + std::to_string(fiber_split) + ". Rejected fragments:";
+            for (const auto& entry : fiber_rejections)
+                message += " " + entry.first + "=" + std::to_string(entry.second);
+            result.diagnostics.push_back({fiber_accepted == 0 ? "fiber_infill_empty" : "fiber_infill_summary",
+                std::move(message), fiber_accepted == 0, "generate_reinforced_infills"});
         }
         if (cancellation_requested(callbacks)) {
             result.cancelled = true;

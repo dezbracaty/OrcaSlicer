@@ -630,18 +630,74 @@ TEST_CASE("fiber finish is selected by purpose not closed topology", "[Continuou
     REQUIRE(contour.prepared);
     CHECK(contour.prepared->finish_strategy == FiberFinishStrategy::LoopOverlap);
     CHECK(contour.prepared->spans.back().geometry.points.back() == Point3::new_scale(8,5,0));
-    const auto open = FiberPathFinalizer::finalize(straight_path(5,5,25,5), domain, config, contour_id);
-    CHECK_FALSE(open.prepared);
+    CHECK_THROWS(FiberPathFinalizer::finalize(straight_path(5,5,25,5), domain, config, contour_id));
 }
 
-TEST_CASE("fiber finish never jumps through a hole to a remote intersection", "[ContinuousFiber][finish]")
+TEST_CASE("fiber finish is continuous motion not material clipped by a model hole", "[ContinuousFiber][finish]")
 {
     ContinuousFiberConfig config;
     config.finish_extension_length_mm = 15;
     const auto result = FiberPathFinalizer::finalize(straight_path(2,5,10,5),
         {rectangle_with_hole(0,0,30,10,15,2,20,8)}, config, test_id());
-    CHECK_FALSE(result.prepared);
-    CHECK(result.failure == FiberFinalizationFailure::OutsideDomain);
+    REQUIRE(result.prepared);
+    const auto& finish = result.prepared->spans.back();
+    CHECK(finish.kind == FiberMotionKind::NonDepositingFinish);
+    CHECK(finish.geometry.points.front() == Point3::new_scale(10,5,0));
+    CHECK(finish.geometry.points.back() == Point3::new_scale(25,5,0));
+    CHECK(finish.edges.front().feed_mm_per_xy_mm == 0);
+    CHECK(result.prepared->total_depositing_length_mm() == Catch::Approx(8));
+}
+
+TEST_CASE("fiber finish leaves the deposition domain without changing feed tail or coverage", "[ContinuousFiber][finish]")
+{
+    ContinuousFiberConfig config;
+    config.landing_length_mm = 2;
+    config.minimum_effective_length_mm = 0.5;
+    config.cut_to_contact_length_mm = 23;
+    const ExPolygons domain {rectangle(0,0,60,10)};
+    const auto source = straight_path(5,5,55,5);
+    const auto baseline = FiberPathFinalizer::finalize(source, domain, config, test_id());
+    REQUIRE(baseline.prepared);
+    config.finish_extension_length_mm = 23;
+    const auto result = FiberPathFinalizer::finalize(source, domain, config, test_id());
+    REQUIRE(result.prepared);
+    CHECK(result.prepared->passive_tail_length_mm() == Catch::Approx(23));
+    CHECK(result.prepared->total_depositing_length_mm() == Catch::Approx(50));
+    CHECK(area(result.prepared->physical_coverage) == Catch::Approx(area(baseline.prepared->physical_coverage)));
+    CHECK(area(result.prepared->resin_exclusion) == Catch::Approx(area(baseline.prepared->resin_exclusion)));
+    const auto& finish = result.prepared->spans.back();
+    CHECK(finish.geometry.points.back() == Point3::new_scale(78,5,0));
+    CHECK(unscale<double>(finish.geometry.length()) == Catch::Approx(23));
+    CHECK(finish.edges.front().feed_mm_per_xy_mm == 0);
+    for (size_t i = 0; i < baseline.prepared->spans.size(); ++i) {
+        CHECK(result.prepared->spans[i].geometry.points == baseline.prepared->spans[i].geometry.points);
+        for (size_t e = 0; e < baseline.prepared->spans[i].edges.size(); ++e)
+            CHECK(result.prepared->spans[i].edges[e].feed_mm_per_xy_mm ==
+                  baseline.prepared->spans[i].edges[e].feed_mm_per_xy_mm);
+    }
+    auto sampled = source;
+    sampled.polyline.points.insert(sampled.polyline.points.end()-1, Point3::new_scale(54,5,0));
+    const auto same = FiberPathFinalizer::finalize(sampled, domain, config, test_id());
+    REQUIRE(same.prepared);
+    CHECK(same.prepared->spans.back().geometry.points == finish.geometry.points);
+    CHECK_FALSE(FiberPathFinalizer::finalize(straight_path(5,5,65,5), domain, config, test_id()).prepared);
+}
+
+TEST_CASE("fiber motion checks real tool coordinates exclusions and height", "[ContinuousFiber][machine-motion]")
+{
+    FiberMachineMotionLimits limits;
+    limits.tip_xy = {rectangle_with_hole(0,0,100,100,40,40,60,60)};
+    limits.maximum_z_mm = 100;
+    limits.command_to_tip_offset = Vec2d(-19,0);
+    CHECK_NOTHROW(limits.validate_move(Vec3d(24,5,1), Vec3d(97,5,1)));
+    CHECK_THROWS(limits.validate_move(Vec3d(24,5,1), Vec3d(120,5,1)));
+    CHECK_THROWS(limits.validate_move(Vec3d(49,50,1), Vec3d(89,50,1)));
+    CHECK_THROWS(limits.validate_move(Vec3d(24,5,99), Vec3d(24,5,101)));
+    CHECK_THROWS(limits.validate_move(Vec3d(24,5,1), Vec3d(24,5,-1)));
+    CHECK_THROWS(limits.validate_move(Vec3d(24,5,1), Vec3d(std::numeric_limits<double>::infinity(),5,1)));
+    // A translated instance must be validated again in its new machine position.
+    CHECK_THROWS(limits.validate_move(Vec3d(74,5,1), Vec3d(147,5,1)));
+    CHECK_NOTHROW(limits.validate_move(Vec3d(19,0,0), Vec3d(119,0,0)));
 }
 
 TEST_CASE("fiber numerical knots and speed sampling do not discard a closed contour", "[ContinuousFiber][geometry]")
@@ -667,7 +723,7 @@ TEST_CASE("fiber numerical knots and speed sampling do not discard a closed cont
             CHECK(unscale<double>((span.geometry.points[i]-span.geometry.points[i-1]).cast<double>().norm()) > 0.0014143);
 }
 
-TEST_CASE("fiber loop overlap uses the same boundary tolerance as deposition", "[ContinuousFiber][finish]")
+TEST_CASE("fiber loop overlap does not weaken depositing boundary validation", "[ContinuousFiber][finish]")
 {
     const auto candidate = path_from_points({{0.49999,1},{20,1},{20,10},{0.49999,10},{0.49999,1}}, 1.0);
     ContinuousFiberConfig config;
