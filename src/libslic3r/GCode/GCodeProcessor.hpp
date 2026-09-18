@@ -806,6 +806,7 @@ class Print;
         float m_forced_height; // mm
         float m_mm3_per_mm;
         float m_travel_dist; // mm
+        int m_part_cooling_fan_index = -1;
         float m_fan_speed; // percentage
         float m_z_offset; // mm
 // ORCA: Add Pressure Advance visualization support

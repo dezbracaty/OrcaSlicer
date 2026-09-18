@@ -617,6 +617,241 @@ libslicer::SliceObjectInput fiber_infill_block()
 }
 }
 
+TEST_CASE("ordinary multi-tool printing uses configured clearance without fiber", "[libslicer_api][machine-gcode][slice]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "Flashforge Creator 5";
+    selection.machine_variant_id = "0.4";
+    auto created = library->create_config(selection);
+    REQUIRE(created.success);
+    REQUIRE(created.config->snapshot().value("toolchange_z_lift") == "0");
+    REQUIRE(created.config->snapshot().value("part_cooling_fan_index") == "-1");
+    REQUIRE(created.config->apply_patch({
+        {"toolchange_z_lift", "7.5"}, {"part_cooling_fan_index", "4"},
+        {"filament_colour", "#FFFFFF;#000000;#FF0000;#0000FF"},
+        {"enable_prime_tower", "0"}, {"change_filament_gcode", ""},
+        {"filament_start_gcode", ";;;"}, {"filament_end_gcode", ";;;"},
+        {"outer_wall_filament_id", "1"}, {"inner_wall_filament_id", "1"},
+        {"sparse_infill_filament_id", "2"}, {"internal_solid_filament_id", "2"}, {"gcode_comments", "1"}}).success);
+    libslicer::SliceRequest request;
+    request.config = created.config->snapshot();
+    request.objects.push_back(fiber_infill_block());
+    const auto sliced = library->slice(request);
+    std::ostringstream diagnostics;
+    for (const auto &d : sliced.diagnostics) diagnostics << d.message << "\n";
+    INFO(diagnostics.str());
+    REQUIRE(sliced.success);
+    std::ifstream input(sliced.output.path);
+    std::string line;
+    double z = 0, layer_z = 0;
+    std::optional<double> restore;
+    size_t protected_changes = 0;
+    while (std::getline(input, line)) {
+        if (line.rfind(";Z:", 0) == 0) layer_z = std::stod(line.substr(3));
+        REQUIRE(line.rfind(";FIBER_BEGIN", 0) != 0);
+        if (line.rfind("G1 Z", 0) == 0) {
+            const double next_z = std::stod(line.substr(4));
+            if (line.find("toolchange clearance") != std::string::npos) {
+                REQUIRE_FALSE(restore.has_value());
+                restore = std::max(z, layer_z);
+                CHECK(next_z - *restore == Catch::Approx(7.5).margin(0.001));
+                ++protected_changes;
+            } else if (line.find("restore Z after toolchange") != std::string::npos) {
+                REQUIRE(restore.has_value());
+                CHECK(next_z == Catch::Approx(*restore).margin(0.001));
+                restore.reset();
+            }
+            z = next_z;
+        }
+    }
+    CHECK(protected_changes > 1);
+    CHECK_FALSE(restore.has_value());
+    std::filesystem::remove(sliced.output.path);
+}
+
+TEST_CASE("machine output settings migrate only missing known preset values", "[libslicer_api][machine-gcode][3mf]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection).success);
+    const auto snapshot = *library->active_config_snapshot();
+    REQUIRE(snapshot.value("toolchange_z_lift") == "10");
+    REQUIRE(snapshot.value("part_cooling_fan_index") == "1");
+
+    const int mode = GENERATE(0, 1, 2, 3);
+    // 0: missing official fields; 1: explicit off; 2: unknown lineage;
+    // 3: explicit customized values survive project serialization.
+    const auto json_string = [](const std::string &value) {
+        std::string result = "\"";
+        for (const unsigned char c : value) {
+            if (c == '\\' || c == '\"') { result += '\\'; result += c; }
+            else if (c < 32) { result += "\\u00"; result += "0123456789abcdef"[c >> 4]; result += "0123456789abcdef"[c & 15]; }
+            else result += c;
+        }
+        return result + "\"";
+    };
+    std::string settings = "{\"name\":\"project_settings\"";
+    for (const auto &[key, value] : snapshot.values()) {
+        std::string saved = value;
+        if (key == "toolchange_z_lift" || key == "part_cooling_fan_index") {
+            if (mode == 0 || mode == 2) continue;
+            saved = key == "toolchange_z_lift" ? (mode == 1 ? "0" : "7.5") : (mode == 1 ? "-1" : "4");
+        } else if (mode == 2 && (key == "printer_settings_id" || key == "inherits_group"))
+            saved = "Unknown custom preset";
+        settings += "," + json_string(key) + ":" + json_string(saved);
+    }
+    settings += "}";
+    const std::string model = R"xml(<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+<metadata name="Application">BambuStudio-2.0.0</metadata>
+<metadata name="BambuStudio:3mfVersion">1</metadata>
+<resources><object id="1" type="model"><mesh><vertices>
+<vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/>
+<vertex x="0" y="10" z="0"/><vertex x="0" y="0" z="10"/>
+</vertices><triangles><triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="1" v3="3"/>
+<triangle v1="0" v2="3" v3="2"/><triangle v1="1" v2="2" v3="3"/>
+</triangles></mesh></object></resources><build><item objectid="1"/></build></model>)xml";
+    const auto path = std::filesystem::temp_directory_path() / ("libslicer-machine-settings-" + std::to_string(mode) + ".3mf");
+    mz_zip_archive archive{};
+    REQUIRE(mz_zip_writer_init_file(&archive, path.string().c_str(), 0));
+    const std::string relationships = R"xml(<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>)xml";
+    const std::string content_types = R"xml(<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>)xml";
+    REQUIRE(mz_zip_writer_add_mem(&archive, "_rels/.rels", relationships.data(), relationships.size(), MZ_DEFAULT_COMPRESSION));
+    REQUIRE(mz_zip_writer_add_mem(&archive, "[Content_Types].xml", content_types.data(), content_types.size(), MZ_DEFAULT_COMPRESSION));
+    REQUIRE(mz_zip_writer_add_mem(&archive, "3D/3dmodel.model", model.data(), model.size(), MZ_DEFAULT_COMPRESSION));
+    REQUIRE(mz_zip_writer_add_mem(&archive, "Metadata/project_settings.config", settings.data(), settings.size(), MZ_DEFAULT_COMPRESSION));
+    REQUIRE(mz_zip_writer_finalize_archive(&archive));
+    REQUIRE(mz_zip_writer_end(&archive));
+    libslicer::ProjectImportRequest request;
+    request.path = path.string();
+    const auto imported = library->import_project(request);
+    std::ostringstream import_diagnostics;
+    for (const auto &diagnostic : imported.diagnostics) import_diagnostics << diagnostic.message << "\n";
+    INFO(import_diagnostics.str());
+    REQUIRE(imported);
+    REQUIRE(library->active_config_snapshot());
+    const auto loaded = *library->active_config_snapshot();
+    CAPTURE(mode, loaded.value("toolchange_z_lift").value_or("missing"), loaded.value("part_cooling_fan_index").value_or("missing"));
+    CHECK(loaded.value("toolchange_z_lift") == (mode == 0 ? "10" : mode == 3 ? "7.5" : "0"));
+    CHECK(loaded.value("part_cooling_fan_index") == (mode == 0 ? "1" : mode == 3 ? "4" : "-1"));
+    const auto patch = library->apply_active_config_patch({{"toolchange_z_lift", "6"}, {"part_cooling_fan_index", "5"}});
+    REQUIRE(patch.success);
+    CHECK(library->active_config_snapshot()->value("toolchange_z_lift") == "6");
+    CHECK(library->active_config_snapshot()->value("part_cooling_fan_index") == "5");
+    // A previous snapshot remains immutable when UI values change.
+    CHECK(snapshot.value("toolchange_z_lift") == "10");
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("CFSYS export restores legacy toolchange clearance and fan channels", "[libslicer_api][fiber][cfsys-output]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"curr_bed_type", "Engineering Plate"},
+        {"generate_reinforced_infills", "0"}}).success);
+    const char* model = std::getenv("LIBSLICER_FIBER_VALIDATION_MODEL");
+    const double clearance = model ? 10.0 : GENERATE(0.0, 7.5, 10.0);
+    const int fan_channel = clearance == 7.5 ? 4 : 1;
+    if (clearance != 10.0)
+        REQUIRE(library->apply_active_config_patch({{"toolchange_z_lift", std::to_string(clearance)},
+            {"part_cooling_fan_index", std::to_string(fan_channel)}}).success);
+    libslicer::SliceRequest request;
+    request.config = *library->active_config_snapshot();
+    request.center_on_build_plate = model != nullptr;
+    request.objects.push_back(model ? binary_stl_on_bed(model) : fiber_infill_block());
+    const char* output = std::getenv("LIBSLICER_CFSYS_REVIEW_OUTPUT");
+    if (output) request.output_gcode_path = output;
+    const auto result = library->slice(request);
+    for (const auto& diagnostic : result.diagnostics) INFO(diagnostic.message);
+    REQUIRE(result.success);
+    std::ifstream input(result.output.path);
+    const std::string gcode((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    REQUIRE(gcode.find(";FIBER_BEGIN") != std::string::npos);
+    CHECK(gcode.find("M190 S100") != std::string::npos);
+    CHECK(gcode.find("M109 S300 T0") != std::string::npos);
+    CHECK(gcode.find("M109 S235 T1") != std::string::npos);
+    CHECK(gcode.find("M106 P" + std::to_string(fan_channel) + " S255") != std::string::npos);
+    CHECK(gcode.find("M106 P2 S255") != std::string::npos);
+
+    std::istringstream stream(gcode);
+    std::string line;
+    bool body = false, last_move_only_z = false;
+    double z = 0, before_last_move_z = 0, layer_z = 0;
+    std::optional<double> restore_z;
+    size_t changes = 0, restored = 0;
+    while (std::getline(stream, line)) {
+        if (line == ";LAYER_CHANGE") body = true;
+        if (line.rfind(";Z:", 0) == 0) layer_z = std::stod(line.substr(3));
+        const auto comment = line.find(';');
+        if (comment != std::string::npos) line.resize(comment);
+        std::istringstream command(line);
+        std::string code;
+        command >> code;
+        if (code == "M106") {
+            CHECK((line.find(" P" + std::to_string(fan_channel) + " ") != std::string::npos ||
+                   line.find(" P2") != std::string::npos || line.find(" P3") != std::string::npos));
+        }
+        if (body && (code == "T0" || code == "T1")) {
+            ++changes;
+            if (clearance == 0) continue;
+            REQUIRE_FALSE(restore_z.has_value());
+            REQUIRE(last_move_only_z);
+            // A deferred layer transition may be combined with the upward
+            // move. Clearance is above the current layer (or an existing hop).
+            restore_z = std::max(before_last_move_z, layer_z);
+            CHECK(z - *restore_z == Catch::Approx(clearance).margin(0.001));
+        }
+        if (code == "G0" || code == "G1") {
+            bool has_z = false, has_xy_or_e = false;
+            double next_z = z;
+            for (std::string parameter; command >> parameter;) {
+                if (parameter[0] == 'Z') { has_z = true; next_z = std::stod(parameter.substr(1)); }
+                if (parameter[0] == 'X' || parameter[0] == 'Y' || parameter[0] == 'E') has_xy_or_e = true;
+            }
+            if (has_z || has_xy_or_e) {
+                if (restore_z) {
+                    CHECK(has_z);
+                    CHECK_FALSE(has_xy_or_e);
+                    CHECK(next_z == Catch::Approx(*restore_z).margin(0.001));
+                    restore_z.reset();
+                    ++restored;
+                }
+                before_last_move_z = z;
+                z = next_z;
+                last_move_only_z = has_z && !has_xy_or_e;
+            }
+        }
+    }
+    REQUIRE(changes > 1);
+    CHECK(restored == (clearance > 0 ? changes : 0));
+    CHECK_FALSE(restore_z.has_value());
+    if (!output) std::filesystem::remove(result.output.path);
+}
+
 TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libslicer_api][fiber-fill-debug]")
 {
     libslicer::LibraryOptions options;
@@ -1484,6 +1719,10 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     REQUIRE(original_relative.has_value());
     REQUIRE(original_before_layer.has_value());
     REQUIRE(original_layer.has_value());
+    // Missing per-layer E resets are invalid for Marlin, not this preset's Klipper flavor.
+    const auto original_flavor = created.config->snapshot().value("gcode_flavor");
+    REQUIRE(original_flavor.has_value());
+    REQUIRE(created.config->set("gcode_flavor", "marlin").success);
     REQUIRE(created.config->set("use_relative_e_distances", "1").success);
     REQUIRE(created.config->set("before_layer_change_gcode", "").success);
     REQUIRE(created.config->set("layer_change_gcode", "").success);
@@ -1498,6 +1737,7 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     REQUIRE(validation != invalid.diagnostics.end());
     CHECK(validation->option_key == "before_layer_change_gcode");
 
+    REQUIRE(created.config->set("gcode_flavor", *original_flavor).success);
     REQUIRE(created.config->set("use_relative_e_distances", *original_relative).success);
     REQUIRE(created.config->set("before_layer_change_gcode", *original_before_layer).success);
     REQUIRE(created.config->set("layer_change_gcode", *original_layer).success);

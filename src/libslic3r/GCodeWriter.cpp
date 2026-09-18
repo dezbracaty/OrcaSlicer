@@ -712,6 +712,33 @@ std::string GCodeWriter::eager_lift(const LiftType type) {
     return lift_move;
 }
 
+bool GCodeWriter::toolchange_requires_z_lift(unsigned int filament_id) const
+{
+    if (config.toolchange_z_lift.value <= 0 || !filament() || !need_toolchange(filament_id))
+        return false;
+    const auto physical_tool = [this](int logical) {
+        const auto &mapping = config.physical_extruder_map.values;
+        return logical >= 0 && size_t(logical) < mapping.size() ? mapping[logical] : logical;
+    };
+    const auto next = Slic3r::lower_bound_by_predicate(m_filament_extruders.begin(), m_filament_extruders.end(),
+        [filament_id](const Extruder &e) { return e.id() < filament_id; });
+    if (next == m_filament_extruders.end() || next->id() != filament_id)
+        throw std::invalid_argument("Missing target filament for tool change clearance");
+    return physical_tool(filament()->extruder_id()) != physical_tool(next->extruder_id());
+}
+
+std::string GCodeWriter::travel_to_z_for_toolchange(double target_z, double maximum_z)
+{
+    if (m_belt_coordinates)
+        throw std::invalid_argument("Tool change clearance lift does not support belt coordinates");
+    if (!std::isfinite(target_z) || !std::isfinite(maximum_z) || maximum_z <= 0 ||
+        target_z < 0 || target_z > maximum_z)
+        throw std::runtime_error("Tool change clearance exceeds the printable height or has an invalid Z position");
+    // Unlike travel_to_z(), keep both the applied and pending retraction lift.
+    // The caller restores this temporary offset after tool selection/heating.
+    return _travel_to_z(target_z, target_z > m_pos.z() ? "toolchange clearance" : "restore Z after toolchange");
+}
+
 std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &comment, bool force_z)
 {
     // FIXME: This function was not being used when travel_speed_z was separated (bd6badf).
@@ -1192,12 +1219,21 @@ std::string GCodeWriter::set_fan(const GCodeFlavor gcode_flavor, unsigned int sp
     return gcode.str();
 }
 
+std::string GCodeWriter::set_fan(const GCodeConfig &config, unsigned int speed)
+{
+    std::string gcode = set_fan(config.gcode_flavor, speed,
+        static_cast<unsigned int>(std::max(0, config.part_cooling_fan_min_pwm.value)));
+    const int channel = config.part_cooling_fan_index.value;
+    if (channel < -1 || (channel >= 0 && config.gcode_flavor != gcfKlipper))
+        throw std::invalid_argument("Explicit part cooling fan channels require Klipper");
+    if (channel >= 0)
+        gcode.insert(4, " P" + std::to_string(channel));
+    return gcode;
+}
+
 std::string GCodeWriter::set_fan(unsigned int speed) const
 {
-    //BBS
-    // ORCA: pick up the per-printer PWM floor from the active config.
-    return GCodeWriter::set_fan(this->config.gcode_flavor, speed,
-                                static_cast<unsigned int>(std::max(0, this->config.part_cooling_fan_min_pwm.value)));
+    return GCodeWriter::set_fan(this->config, speed);
 }
 
 //BBS: set additional fan speed for BBS machine only

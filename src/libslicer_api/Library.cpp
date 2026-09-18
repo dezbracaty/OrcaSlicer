@@ -3826,6 +3826,27 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
             } else {
                 try {
                     auto candidate_bundle = *preset_bundle;
+                    // Migrate only absent machine-output options, before defaults erase
+                    // the distinction between missing and explicitly disabled values.
+                    const auto *official = candidate_bundle.printers.find_system_preset_by_model_and_variant(
+                        machine->id, variant->id);
+                    const bool known_lineage = official && official->is_system &&
+                        (printer_preset == official->name ||
+                         std::find(inherited_presets.begin(), inherited_presets.end(), official->name) != inherited_presets.end()) &&
+                        (printer_model.empty() || printer_model == machine->id) &&
+                        (printer_variant.empty() || printer_variant == variant->id);
+                    for (const char *key : {"toolchange_z_lift", "part_cooling_fan_index"}) {
+                        if (config.has(key)) continue;
+                        if (known_lineage) {
+                            if (const auto *value = official->config.option(key)) {
+                                config.set_key_value(key, value->clone());
+                                result.diagnostics.push_back({"config", std::string("Inherited missing machine setting from installed preset: ") + key, true});
+                            }
+                        } else {
+                            result.diagnostics.push_back({"config", std::string("Machine preset origin is unknown; keeping the legacy default for ") + key +
+                                ". Select an updated machine preset to enable its configured behavior.", true});
+                        }
+                    }
                     Slic3r::DynamicPrintConfig resolved_config;
                     resolved_config.apply(Slic3r::FullPrintConfig::defaults());
                     resolved_config.apply(config);
@@ -3837,8 +3858,15 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                             Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
                     }
 
+                    // The preset loader may refresh non-dirty values from a newer
+                    // system preset. These resolved machine options are authoritative,
+                    // including an explicitly disabled value in the project.
+                    Slic3r::DynamicPrintConfig machine_output_options;
+                    machine_output_options.apply_only(resolved_config,
+                        {"toolchange_z_lift", "part_cooling_fan_index"}, true);
                     candidate_bundle.load_config_model(
                         request.path, std::move(resolved_config), file_version);
+                    candidate_bundle.printers.get_edited_preset().config.apply(machine_output_options);
 
                     auto active = std::unique_ptr<Config>(
                         new Config(serialized_values(candidate_bundle.full_config())));

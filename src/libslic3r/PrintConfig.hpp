@@ -1375,6 +1375,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     // Used to overcome the PWM start-up threshold on fans that cannot spool below a certain duty cycle.
     // A value of 0 (the default) leaves behaviour unchanged. A fan command of 0 (off) is always honoured.
     ((ConfigOptionInt,                 part_cooling_fan_min_pwm))
+    ((ConfigOptionInt,                 part_cooling_fan_index))
+    ((ConfigOptionFloat,               toolchange_z_lift))
     ((ConfigOptionFloats,              filament_diameter))
     ((ConfigOptionBoolsNullable,       filament_adaptive_volumetric_speed))
     ((ConfigOptionStrings,             volumetric_speed_coefficients))
@@ -1728,6 +1730,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE0(
 
 // Validate the FullPrintConfig. Returns an empty string on success, otherwise an error message is returned.
 std::map<std::string, std::string> validate(const FullPrintConfig &config, bool under_cli = false);
+std::map<std::string, std::string> validate_machine_gcode_config(const PrintConfig &config);
 
 PRINT_CONFIG_CLASS_DEFINE(
     SLAPrintConfig,

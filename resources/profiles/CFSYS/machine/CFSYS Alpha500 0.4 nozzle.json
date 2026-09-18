@@ -1,4 +1,6 @@
 {
+"toolchange_z_lift": "10",
+"part_cooling_fan_index": "1",
   "type": "machine",
   "setting_id": "GM001",
   "name": "CFSYS Alpha500 Printer 0.4 nozzle",

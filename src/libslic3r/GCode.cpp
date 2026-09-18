@@ -5689,6 +5689,9 @@ LayerResult GCode::process_layer(
 
 void GCode::apply_print_config(const PrintConfig &print_config)
 {
+    const auto machine_errors = validate_machine_gcode_config(print_config);
+    if (!machine_errors.empty())
+        throw std::invalid_argument(machine_errors.begin()->second);
     m_writer.apply_print_config(print_config);
     m_config.apply(print_config);
     m_scaled_resolution = scaled<double>(print_config.resolution.value);
@@ -8081,6 +8084,10 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
         m_wipe.reset_path();
         if (m_ooze_prevention.enable && m_writer.filament())
             gcode += m_ooze_prevention.pre_toolchange(*this);
+        const bool toolchange_clearance = m_writer.toolchange_requires_z_lift(new_filament_id);
+        const double original_z = m_writer.get_position().z();
+        if (toolchange_clearance)
+            gcode += m_writer.travel_to_z_for_toolchange(original_z + m_config.toolchange_z_lift.value, m_config.printable_height.value);
         if (by_object) m_writer.add_object_change_labels(gcode);
         gcode += m_writer.toolchange(new_filament_id);
         placeholder_parser().set("current_extruder", new_filament_id);
@@ -8090,6 +8097,8 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
             gcode += m_writer.set_pressure_advance(m_config.pressure_advance.get_at(new_filament_id));
             m_pa_processor->resetPreviousPA(m_config.pressure_advance.get_at(new_filament_id));
         }
+        if (toolchange_clearance)
+            gcode += m_writer.travel_to_z_for_toolchange(original_z, m_config.printable_height.value);
         ++m_toolchange_count;
         return gcode;
     }
@@ -8336,7 +8345,9 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
     // Native plastic retraction/lift is writer-owned motion, not custom script
     // text. Keep it outside template validation (Fiber transitions returned
     // above), while retaining validation of the actual user template.
-    const std::string toolchange_lift = this->retract(false, false, LiftType::SpiralLift, true);
+    const bool toolchange_clearance = m_writer.toolchange_requires_z_lift(new_filament_id);
+    const std::string toolchange_lift = toolchange_clearance ? std::string() :
+        this->retract(false, false, LiftType::SpiralLift, true);
 
     std::string toolchange_gcode_parsed;
     //Orca: Ignore change_filament_gcode if is the first call for a tool change and manual_filament_change is enabled
@@ -8371,6 +8382,9 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
 
     //BBS: don't add T[next extruder] if there is no T cmd on filament change
      //We inform the writer about what is happening, but we may not use the resulting gcode.
+    const double original_z = m_writer.get_position().z();
+    if (toolchange_clearance)
+        gcode += m_writer.travel_to_z_for_toolchange(original_z + m_config.toolchange_z_lift.value, m_config.printable_height.value);
     std::string toolchange_command = m_writer.toolchange(new_filament_id);
     if (!custom_gcode_changes_tool(toolchange_gcode_parsed, m_writer.toolchange_prefix(), new_filament_id))
         gcode += toolchange_command;
@@ -8433,6 +8447,8 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
         // Reset Adaptive PA processor last PA value
         m_pa_processor->resetPreviousPA(m_config.pressure_advance.get_at(new_filament_id));
     }
+    if (toolchange_clearance)
+        gcode += m_writer.travel_to_z_for_toolchange(original_z, m_config.printable_height.value);
     //Orca: tool changer or IDEX's firmware may change Z position, so we set it to unknown/undefined
     m_last_pos_defined = false;
 

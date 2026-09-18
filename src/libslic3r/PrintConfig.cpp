@@ -4204,6 +4204,25 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0));
 
+    def = this->add("toolchange_z_lift", coFloat);
+    def->label = L("Tool change clearance lift");
+    def->tooltip = L("Additional Z clearance during a physical tool change. Zero preserves existing behavior. "
+                     "Not supported with prime towers, belt printers, manual tool changes or custom filament-change scripts.");
+    def->category = L("Machine G-code");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("part_cooling_fan_index", coInt);
+    def->label = L("Part cooling fan channel");
+    def->tooltip = L("Explicit M106 P channel for the part cooling fan on Klipper machines with indexed fan commands. "
+                     "Use -1 to preserve the firmware's existing output format.");
+    def->category = L("Machine G-code");
+    def->min = -1;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(-1));
+
     // ORCA: minimum non-zero part cooling fan speed.
     def = this->add("part_cooling_fan_min_pwm", coInt);
     def->label = L("Minimum non-zero part cooling fan speed");
@@ -10709,9 +10728,39 @@ void compute_filament_override_value(const std::string& opt_key, const ConfigOpt
 
 //BBS: pass map to recording all invalid valies
 //FIXME localize this function.
+std::map<std::string, std::string> validate_machine_gcode_config(const PrintConfig &cfg)
+{
+    std::map<std::string, std::string> errors;
+    const int channel = cfg.part_cooling_fan_index.value;
+    if (channel < -1 || (channel >= 0 && cfg.gcode_flavor != gcfKlipper))
+        errors.emplace("part_cooling_fan_index", "Explicit part cooling fan channels require Klipper; use -1 for the legacy format.");
+    else if ((channel == 2 && cfg.auxiliary_fan.value) || (channel == 3 && cfg.support_air_filtration.value))
+        errors.emplace("part_cooling_fan_index", "Part cooling fan channel conflicts with an enabled auxiliary or exhaust fan.");
+    const double lift = cfg.toolchange_z_lift.value;
+    if (!std::isfinite(lift) || lift < 0)
+        errors.emplace("toolchange_z_lift", "Tool change clearance lift must be finite and non-negative.");
+    else if (lift > 0) {
+        if (cfg.enable_prime_tower || cfg.printer_structure == psBelt || cfg.manual_filament_change)
+            errors.emplace("toolchange_z_lift", "Tool change clearance lift does not support prime towers, belt printers or manual tool changes.");
+        const auto has_commands = [](const std::string &script) {
+            std::istringstream stream(script);
+            for (std::string line; std::getline(stream, line);) {
+                line = line.substr(0, line.find(';'));
+                if (line.find_first_not_of(" \t\r") != std::string::npos) return true;
+            }
+            return false;
+        };
+        if (has_commands(cfg.change_filament_gcode.value) ||
+            std::any_of(cfg.filament_start_gcode.values.begin(), cfg.filament_start_gcode.values.end(), has_commands) ||
+            std::any_of(cfg.filament_end_gcode.values.begin(), cfg.filament_end_gcode.values.end(), has_commands))
+            errors.emplace("toolchange_z_lift", "Tool change clearance lift cannot be combined with custom filament start, end or change commands.");
+    }
+    return errors;
+}
+
 std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool under_cli)
 {
-    std::map<std::string, std::string> error_message;
+    std::map<std::string, std::string> error_message = validate_machine_gcode_config(cfg);
     // --layer-height
     if (cfg.get_abs_value("layer_height") <= 0) {
         error_message.emplace("layer_height", L("invalid value ") + std::to_string(cfg.get_abs_value("layer_height")));

@@ -194,6 +194,8 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "machine_start_gcode",
         "filament_start_gcode",
         "change_filament_gcode",
+        "toolchange_z_lift",
+        "part_cooling_fan_index",
         "wipe",
         // BBS
         "wipe_distance",
@@ -1270,6 +1272,9 @@ StringObjectException Print::check_multi_filament_valid(const Print& print)
 //BBS: refine seq-print validation logic.....FIXME:StringObjectException *warning can only contain one warning, but there might be many warnings, need a vector<StringObjectException>
 StringObjectException Print::validate(StringObjectException *warning, Polygons* collison_polygons, std::vector<std::pair<Polygon, float>>* height_polygons) const
 {
+    const auto machine_errors = validate_machine_gcode_config(m_config);
+    if (!machine_errors.empty())
+        return {machine_errors.begin()->second, nullptr, machine_errors.begin()->first};
     try {
         validate_material_tool_bindings(m_config);
     } catch (const std::exception& error) {

@@ -1959,6 +1959,7 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
     m_parser.apply_config(config);
 
     m_flavor = config.gcode_flavor;
+    m_part_cooling_fan_index = config.part_cooling_fan_index.value;
 
     m_single_extruder_multi_material = config.single_extruder_multi_material;
 
@@ -2090,6 +2091,8 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
 
 void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
 {
+    const auto *fan_index = config.option<ConfigOptionInt>("part_cooling_fan_index");
+    m_part_cooling_fan_index = fan_index ? fan_index->value : -1;
     m_parser.apply_config(config);
 
     //BBS
@@ -2432,6 +2435,7 @@ void GCodeProcessor::reset()
     m_e_local_positioning_type = EPositioningType::Absolute;
     m_extruder_offsets = std::vector<Vec3f>(MIN_EXTRUDERS_COUNT, Vec3f::Zero());
     m_flavor = gcfRepRapSprinter;
+    m_part_cooling_fan_index = -1;
     m_nozzle_volume = std::vector<float>(MAXIMUM_EXTRUDER_NUMBER, 0.f);
 
     m_start_position = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -5076,7 +5080,9 @@ void GCodeProcessor::process_M106(const GCodeReader::GCodeLine& line)
 {
     //BBS: for Bambu machine ,we both use M106 P1 and M106 to indicate the part cooling fan
     //So we must not ignore M106 P1
-    if (!line.has('P') || (line.has('P') && line.p() == 1.0f)) {
+    if (m_part_cooling_fan_index >= 0
+            ? line.has('P') && line.p() == m_part_cooling_fan_index
+            : !line.has('P') || line.p() == 1.0f) {
         // The absence of P means the print cooling fan, so ignore anything else.
         float new_fan_speed;
         if (line.has_value('S', new_fan_speed))
@@ -5119,7 +5125,8 @@ void GCodeProcessor::process_SET_PRESSURE_ADVANCE(const GCodeReader::GCodeLine& 
 
 void GCodeProcessor::process_M107(const GCodeReader::GCodeLine& line)
 {
-    m_fan_speed = 0.0f;
+    if (m_part_cooling_fan_index < 0 || (line.has('P') && line.p() == m_part_cooling_fan_index))
+        m_fan_speed = 0.0f;
 }
 
 void GCodeProcessor::process_M108(const GCodeReader::GCodeLine& line)

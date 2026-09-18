@@ -93,7 +93,15 @@ void change_axis_value(std::string& line, char axis, const float new_value, cons
     line = line.replace(pos, end - pos, ss.str());
 }
 
-int16_t get_fan_speed(const std::string &line, GCodeFlavor flavor) {
+int16_t get_fan_speed(const std::string &line, GCodeFlavor flavor, int channel) {
+    // Explicit channels are opt-in. Other fans must never be delayed or kick-started.
+    if (channel >= 0 && (line.compare(0, 4, "M106") == 0 || line.compare(0, 4, "M107") == 0)) {
+        const auto index = get_axis_value(line, 'P');
+        if (std::isnan(index) || index != channel) return -1;
+        if (line.compare(0, 4, "M107") == 0) return 0;
+        const auto speed = get_axis_value(line, 'S');
+        return std::isnan(speed) ? 255 : int16_t(speed);
+    }
     if (line.compare(0, 4, "M106") == 0) {
         if (flavor == (gcfMach3) || flavor == (gcfMachinekit)) {
             return (int16_t)get_axis_value(line, 'P');
@@ -236,11 +244,7 @@ void FanMover::_remove_slow_fan(int16_t min_speed, float past_sec) {
 }
 
 std::string FanMover::_set_fan(int16_t speed) {
-    //const Tool* tool = m_writer.get_tool(m_currrent_extruder < 20 ? m_currrent_extruder : 0);
-    // ORCA: apply the per-printer non-zero fan PWM floor so reposted fan commands respect the clamp too.
-    const int floor_pct = m_writer.config.part_cooling_fan_min_pwm.value;
-    const unsigned int part_cooling_fan_min_pwm = floor_pct > 0 ? static_cast<unsigned int>(floor_pct) : 0u;
-    return GCodeWriter::set_fan(m_writer.config.gcode_flavor.value, speed, part_cooling_fan_min_pwm);
+    return GCodeWriter::set_fan(m_writer.config, speed);
 }
 
 
@@ -324,7 +328,7 @@ void FanMover::_process_gcode_line(GCodeReader& reader, const GCodeReader::GCode
         }
         case 'M':
         {
-            fan_speed = get_fan_speed(line.raw(), m_writer.config.gcode_flavor);
+            fan_speed = get_fan_speed(line.raw(), m_writer.config.gcode_flavor, m_writer.config.part_cooling_fan_index.value);
             if (fan_speed >= 0) {
                 const auto fan_baseline = 255.0;
                 fan_speed = 100 * fan_speed / fan_baseline;

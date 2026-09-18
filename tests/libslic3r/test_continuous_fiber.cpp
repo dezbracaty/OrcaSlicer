@@ -8,6 +8,8 @@
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/GCode/FiberGCodeBlockParser.hpp"
 #include "libslic3r/GCodeWriter.hpp"
+#include "libslic3r/GCode.hpp"
+#include "libslic3r/GCode/FanMover.hpp"
 
 #include <set>
 #include <limits>
@@ -854,6 +856,217 @@ TEST_CASE("fiber writer owns linear feed and rejects generic retract repair", "[
     CHECK_THROWS(writer.unretract());
     CHECK(writer.filament()->effective_retracted() == 1);
     CHECK(writer.filament()->restart_extra() == Catch::Approx(0.2));
+}
+
+TEST_CASE("CFSYS toolchange clearance preserves existing and pending travel lifts", "[ContinuousFiber][cfsys][writer]")
+{
+    PrintConfig config;
+    config.z_hop.values = {0.8};
+    GCodeWriter writer;
+    writer.apply_print_config(config);
+    writer.set_extruders({0});
+    writer.toolchange(0);
+    writer.set_position(Vec3d(100, 100, 5));
+    const bool already_lifted = GENERATE(false, true);
+    if (already_lifted) writer.eager_lift(LiftType::NormalLift);
+    else writer.lazy_lift();
+    const double original_z = writer.get_position().z();
+    const double original_hop = writer.get_zhop();
+    CHECK(writer.travel_to_z_for_toolchange(original_z + 10, 508).find(" E") == std::string::npos);
+    CHECK(writer.get_position().z() == Catch::Approx(original_z + 10));
+    CHECK(writer.get_zhop() == Catch::Approx(original_hop));
+    writer.travel_to_z_for_toolchange(original_z, 508);
+    CHECK(writer.get_position().z() == Catch::Approx(original_z));
+    CHECK(writer.get_zhop() == Catch::Approx(original_hop));
+    // A pending ordinary hop must still happen on the next travel.
+    writer.travel_to_xyz(Vec3d(110, 100, 5));
+    CHECK(writer.get_position().z() == Catch::Approx(5.8));
+    writer.unlift();
+    CHECK(writer.get_position().z() == Catch::Approx(5));
+    writer.set_position(Vec3d(100, 100, 500));
+    CHECK_THROWS(writer.travel_to_z_for_toolchange(510, 508));
+    CHECK(writer.get_position().z() == 500);
+}
+
+TEST_CASE("default fan configuration preserves all legacy firmware formats", "[ContinuousFiber][cooling][compatibility]")
+{
+    for (const auto flavor : {gcfMarlinLegacy, gcfKlipper, gcfRepRapFirmware, gcfRepetier,
+             gcfMarlinFirmware, gcfRepRapSprinter, gcfTeacup, gcfMakerWare,
+             gcfSailfish, gcfMach3, gcfMachinekit, gcfSmoothie, gcfNoExtrusion}) {
+        for (const std::string protocol : {"", "linear-e-v1", "cfsys-v1"}) {
+
+            for (const int floor : {-1, 0, 20, 100}) {
+                for (const unsigned speed : {0u, 5u, 60u, 100u}) {
+                    CAPTURE(flavor, protocol, floor, speed);
+                    PrintConfig config;
+                    config.gcode_flavor.value = flavor;
+                    config.toolhead_fiber_protocol_id.values = {"", protocol};
+                    config.part_cooling_fan_min_pwm.value = floor;
+                    // This is the unchanged formatter used before the CFSYS fix.
+                    const std::string previous = GCodeWriter::set_fan(flavor, speed, unsigned(std::max(0, floor)));
+                    CHECK(GCodeWriter::set_fan(config, speed) == previous);
+                    GCodeWriter writer;
+                    writer.apply_print_config(config);
+                    CHECK(writer.set_fan(speed) == previous);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("CFSYS cooling keeps explicit fan channels and material-specific speeds", "[ContinuousFiber][cfsys][cooling]")
+{
+    PrintConfig config;
+    config.gcode_flavor.value = gcfKlipper;
+    CHECK(GCodeWriter::set_fan(config, 60).find("M106 S153") == 0);
+    config.toolhead_fiber_protocol_id.values = {"", "cfsys-v1"};
+    config.part_cooling_fan_index.value = 1;
+    config.part_cooling_fan_min_pwm.value = 20;
+    CHECK(GCodeWriter::set_fan(config, 0).find("M106 P1 S0") == 0);
+    CHECK(GCodeWriter::set_fan(config, 5).find("M106 P1 S51") == 0);
+    CHECK(GCodeWriter::set_fan(config, 60).find("M106 P1 S153") == 0);
+    CHECK(GCodeWriter::set_additional_fan(100).find("M106 P2 S255") == 0);
+    CHECK(GCodeWriter::set_exhaust_fan(100).find("M106 P3 S255") == 0);
+
+    config.part_cooling_fan_min_pwm.value = 0;
+    config.filament_diameter.values = {1.75, 0.35};
+    config.filament_map.values = {1, 2};
+    config.physical_extruder_map.values = {0, 1};
+    config.filament_process_type.values = {"thermoplastic", "continuous_fiber"};
+    config.toolhead_process_capabilities.values = {"thermoplastic", "continuous_fiber"};
+    config.toolhead_fiber_e_units_per_mm.values = {1, 1};
+    config.fan_min_speed.values = {5, 100};
+    config.fan_max_speed.values = {100, 100};
+    config.reduce_fan_stop_start_freq.values = {false, true};
+    config.close_fan_the_first_x_layers.values = {3, 3};
+    config.full_fan_speed_layer.values = {0, 0};
+    config.fan_cooling_layer_time.values = {5, 5};
+    config.slow_down_layer_time.values = {3, 3};
+    config.additional_cooling_fan_speed.values = {0, 100};
+    config.auxiliary_fan.value = true;
+    GCode generator;
+    generator.apply_print_config(config);
+    generator.writer().set_extruders({0, 1});
+    generator.writer().toolchange(0);
+    generator.writer().set_position(Vec3d(100, 100, 1));
+    CoolingBuffer cooling(generator);
+    const std::string first_layer = cooling.process_layer("G4 S10\n", 0, true);
+    CHECK(first_layer.find("M106 P1 S0") != std::string::npos);
+    const std::string switches = cooling.process_layer(
+        "G1 F600 ;_EXTRUDE_SET_SPEED\nG1 X101 E1\n;_EXTRUDE_END\nG4 S10\nT1\nG4 S10\nT0\nG4 S10\n", 4, true);
+    INFO(switches);
+    const auto fiber_fan = switches.find("M106 P1 S255");
+    REQUIRE(fiber_fan != std::string::npos);
+    CHECK(switches.find("M106 P2 S255") != std::string::npos);
+    CHECK(switches.find("M106 P1 S0", fiber_fan) != std::string::npos);
+    CHECK(switches.find("M106 P2 S0", fiber_fan) != std::string::npos);
+    CHECK(switches.find("M106 S") == std::string::npos);
+
+    // Kick-start regeneration must not drop P1 or rewrite P2/P3 commands.
+    FanMover mover(generator.writer(), 0, false, true, false, 0.2f);
+    const std::string moved = mover.process_gcode(
+        "M106 P1 S0\nG1 X10 F600\nM106 P1 S128\nG1 X20 F600\nM106 P2 S255\nM106 P3 S0\n", true);
+    INFO(moved);
+    CHECK(moved.find("M106 P1 S255") != std::string::npos);
+    CHECK(moved.find("M106 P2 S255") != std::string::npos);
+    CHECK(moved.find("M106 P3 S0") != std::string::npos);
+    CHECK(moved.find("M106 S") == std::string::npos);
+}
+
+TEST_CASE("configured clearance follows physical tools without a fiber protocol", "[machine-gcode][writer]")
+{
+    PrintConfig config;
+    config.filament_diameter.values = {1.75, 1.75, 1.75};
+    config.filament_map.values = {1, 1, 2};
+    config.physical_extruder_map.values = {0, 1};
+    config.toolchange_z_lift.value = 7.5;
+    GCodeWriter writer;
+    writer.apply_print_config(config);
+    writer.set_extruders({0, 1, 2});
+    CHECK_FALSE(writer.toolchange_requires_z_lift(0));
+    writer.toolchange(0);
+    CHECK_FALSE(writer.toolchange_requires_z_lift(0));
+    CHECK_FALSE(writer.toolchange_requires_z_lift(1));
+    CHECK(writer.toolchange_requires_z_lift(2));
+    writer.toolchange(2);
+    CHECK(writer.toolchange_requires_z_lift(0));
+    writer.config.toolchange_z_lift.value = 0;
+    CHECK_FALSE(writer.toolchange_requires_z_lift(0));
+}
+
+TEST_CASE("machine output configuration rejects unsupported combinations", "[machine-gcode][config]")
+{
+    PrintConfig config;
+    config.gcode_flavor.value = gcfKlipper;
+    config.part_cooling_fan_index.value = 4;
+    config.enable_prime_tower.value = false;
+    CHECK(validate_machine_gcode_config(config).empty());
+    SECTION("firmware") {
+        config.gcode_flavor.value = gcfMach3;
+        CHECK_FALSE(validate_machine_gcode_config(config).empty());
+        CHECK_THROWS(GCodeWriter::set_fan(config, 50));
+    }
+    SECTION("channels") {
+        config.auxiliary_fan.value = true;
+        config.part_cooling_fan_index.value = 2;
+        CHECK_FALSE(validate_machine_gcode_config(config).empty());
+        config.part_cooling_fan_index.value = 3;
+        config.support_air_filtration.value = true;
+        CHECK_FALSE(validate_machine_gcode_config(config).empty());
+    }
+    SECTION("lift and custom scripts") {
+        config.toolchange_z_lift.value = 7.5;
+        CHECK(validate_machine_gcode_config(config).empty());
+        config.change_filament_gcode.value = "; comment only\n";
+        CHECK(validate_machine_gcode_config(config).empty());
+        config.change_filament_gcode.value += "G1 Z10\n";
+        CHECK_FALSE(validate_machine_gcode_config(config).empty());
+    }
+    SECTION("lift limits") {
+        config.toolchange_z_lift.value = std::numeric_limits<double>::infinity();
+        CHECK_FALSE(validate_machine_gcode_config(config).empty());
+        config.toolchange_z_lift.value = -1;
+        CHECK_FALSE(validate_machine_gcode_config(config).empty());
+        config.toolchange_z_lift.value = 10;
+        config.enable_prime_tower.value = true;
+        CHECK_FALSE(validate_machine_gcode_config(config).empty());
+        config.enable_prime_tower.value = false;
+        config.printer_structure.value = psBelt;
+        CHECK_FALSE(validate_machine_gcode_config(config).empty());
+    }
+}
+
+TEST_CASE("explicit fan channels survive postprocessing and preview", "[machine-gcode][cooling]")
+{
+    const int channel = GENERATE(0, 1, 4);
+    PrintConfig config;
+    config.gcode_flavor.value = gcfKlipper;
+    config.part_cooling_fan_index.value = channel;
+    const std::string prefix = "M106 P" + std::to_string(channel);
+    CHECK(GCodeWriter::set_fan(config, 0).find(prefix + " S0") == 0);
+    CHECK(GCodeWriter::set_fan(config, 50).find(prefix + " S127") == 0);
+    GCodeWriter writer;
+    writer.apply_print_config(config);
+    FanMover mover(writer, 0, false, true, false, 0.2f);
+    const std::string moved = mover.process_gcode(prefix + " S0\nG1 X10 F600\n" + prefix +
+        " S128\nG1 X20 F600\nM106 P2 S255\nM107 P2\nM107 P" + std::to_string(channel) + "\n", true);
+    CHECK(moved.find(prefix + " S255") != std::string::npos);
+    CHECK(moved.find("M106 P2 S255") != std::string::npos);
+    CHECK(moved.find("M107 P2") != std::string::npos);
+    CHECK(moved.find("M106 S") == std::string::npos);
+
+    GCodeProcessor processor;
+    processor.apply_config(config);
+    processor.initialize_result_moves();
+    const auto move_at_fan = [&](const std::string &commands, int x, double expected) {
+        processor.process_buffer(commands + "G1 X" + std::to_string(x) + " E" + std::to_string(x) + " F600\n");
+        REQUIRE_FALSE(processor.get_result().moves.empty());
+        CHECK(processor.get_result().moves.back().fan_speed == Catch::Approx(expected).margin(0.001));
+    };
+    move_at_fan(prefix + " S153\n", 10, 60);
+    move_at_fan("M106 P2 S255\nM107 P2\n", 20, 60);
+    move_at_fan("M107 P" + std::to_string(channel) + "\n", 30, 0);
+    move_at_fan(prefix + "\n", 40, 100);
 }
 
 TEST_CASE("CFSYS device commands are scoped to their established process stages", "[ContinuousFiber][cfsys][scripts]")

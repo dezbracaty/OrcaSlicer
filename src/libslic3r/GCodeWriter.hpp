@@ -94,6 +94,10 @@ public:
     std::string unretract();
     // do lift instantly
     std::string eager_lift(const LiftType type);
+    // Temporary toolchange move; the caller restores the exact original Z
+    // without consuming an existing or pending travel lift.
+    std::string travel_to_z_for_toolchange(double target_z, double maximum_z);
+    bool toolchange_requires_z_lift(unsigned int filament_id) const;
     // record a lift request, do realy lift in next travel
     std::string lazy_lift(LiftType lift_type = LiftType::NormalLift, bool spiral_vase = false);
     std::string unlift();
@@ -109,6 +113,7 @@ public:
     // ORCA: `part_cooling_fan_min_pwm` (0-100, default 0) is a floor applied only when `speed` is non-zero, used to overcome
     // PWM start-up thresholds on fans that won't spool below a certain duty cycle. A `speed` of 0 is always honoured.
     static std::string set_fan(const GCodeFlavor gcode_flavor, unsigned int speed, unsigned int part_cooling_fan_min_pwm = 0);
+    static std::string set_fan(const GCodeConfig &config, unsigned int speed);
     // To be called by the main thread. It always emits the G-code, it does not remember the previous state.
     // Keeping the state is left to the CoolingBuffer, which runs asynchronously on another thread.
     std::string set_fan(unsigned int speed) const;
