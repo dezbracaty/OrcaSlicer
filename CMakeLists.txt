@@ -6,6 +6,8 @@ cmake_minimum_required(VERSION 3.13)
 
 project(libslicer LANGUAGES C CXX)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/MSVCNinjaDependencies.cmake")
+
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 set(LIBSLICER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
