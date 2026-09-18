@@ -352,6 +352,7 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     CHECK(config->value("fiber_minimum_path_length") == std::optional<std::string>{"0"});
     CHECK(*minimum_segment == "0");
     CHECK(*maximum_turn == "180");
+    CHECK(config->value("fiber_contour_boundary_clearance") == "0.2");
     CHECK(*contour_speed == "10");
     CHECK(*infill_speed == "10");
     CHECK(*contour_acceleration == "500");
