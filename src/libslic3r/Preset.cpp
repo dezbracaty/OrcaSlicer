@@ -1015,8 +1015,6 @@ static std::vector<std::string> s_Preset_print_options{
     "fiber_layer_height_ratio",
     "fiber_fill_debug",
     "fiber_minimum_path_length",
-    "fiber_minimum_segment_length",
-    "fiber_maximum_turn_angle",
     "fiber_minimum_effective_length",
     "fiber_contour_boundary_clearance",
     "fiber_contour_infill_clearance",

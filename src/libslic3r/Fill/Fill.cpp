@@ -1861,7 +1861,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 << " source_begin_mm=" << assignment.source_begin_mm
                 << " source_end_mm=" << assignment.source_end_mm
                 << " source_length_mm=" << validation.candidates.at(assignment.id.parent.path_ordinal).length_mm
-                << " reason=" << fiber_rejection_reason_name(assignment.reason);
+                << " reason=" << fiber_rejection_reason_name(assignment.reason) << " detail=" << assignment.detail;
         }
     };
     log_rejections(contour_result);

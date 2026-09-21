@@ -1089,8 +1089,6 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloatOrPercent,       reinforced_infill_extrusion_width))
     ((ConfigOptionInt,                  fiber_layer_height_ratio))
     ((ConfigOptionFloat,                fiber_minimum_path_length))
-    ((ConfigOptionFloat,                fiber_minimum_segment_length))
-    ((ConfigOptionFloat,                fiber_maximum_turn_angle))
     ((ConfigOptionFloat,                fiber_minimum_effective_length))
     ((ConfigOptionFloat,                fiber_contour_infill_clearance))
     ((ConfigOptionFloat,                fiber_contour_boundary_clearance))

@@ -2,6 +2,7 @@
 #define slic3r_ContinuousFiberConfig_hpp_
 
 #include "../Flow.hpp"
+#include "FiberSource.hpp"
 #include "../PrintConfig.hpp"
 
 namespace Slic3r {
@@ -21,8 +22,6 @@ struct ContinuousFiberConfig {
     unsigned contour_material { 0 };
     unsigned infill_material { 0 };
     double minimum_path_length_mm { 0.0 };
-    double minimum_segment_length_mm { 0.0 };
-    double maximum_turn_angle_degrees { 180.0 };
     double cut_to_contact_length_mm { 0.0 };
     double prefeed_extra_length_mm { 0.0 };
     double prefeed_speed_mm_s { 10.0 };
@@ -87,6 +86,8 @@ void require_fiber_safe_script(const std::string& script, const char* name,
     FiberMachineProtocol protocol = FiberMachineProtocol::LinearE, bool expanded = false);
 void validate_fiber_cut_event(const std::string& script,
     FiberMachineProtocol protocol = FiberMachineProtocol::LinearE);
+// Validates common process values and only the requested path family.
+void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose);
 ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region);
 
 } // namespace Slic3r

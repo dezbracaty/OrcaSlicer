@@ -243,22 +243,18 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
     CHECK(fill_debug->visible);
     CHECK(fill_debug->default_value == "0");
     CHECK_FALSE(fill_debug->enabled);
-    const auto* minimum_segment = find_item(items, "fiber_minimum_segment_length");
-    const auto* maximum_turn = find_item(items, "fiber_maximum_turn_angle");
+    CHECK(find_item(items, "fiber_minimum_segment_length") == nullptr);
+    CHECK(find_item(items, "fiber_maximum_turn_angle") == nullptr);
     const auto* contour_infill_clearance = find_item(items, "fiber_contour_infill_clearance");
     REQUIRE(contour_toggle != nullptr);
     REQUIRE(contour_count != nullptr);
     REQUIRE(infill_density != nullptr);
     REQUIRE(layer_interval != nullptr);
-    REQUIRE(minimum_segment != nullptr);
-    REQUIRE(maximum_turn != nullptr);
     REQUIRE(contour_infill_clearance != nullptr);
     CHECK(contour_toggle->enabled);
     CHECK_FALSE(contour_count->enabled);
     CHECK_FALSE(infill_density->enabled);
     CHECK_FALSE(layer_interval->enabled);
-    CHECK_FALSE(minimum_segment->enabled);
-    CHECK_FALSE(maximum_turn->enabled);
     CHECK_FALSE(contour_infill_clearance->enabled);
 
     const auto contour_enabled = config.set("generate_reinforced_perimeters", "1");
@@ -276,8 +272,6 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
     REQUIRE(config.reset("fiber_fill_debug").success);
     CHECK(debug_snapshot.value("fiber_fill_debug") == "1");
     CHECK(config.snapshot().value("fiber_fill_debug") == "0");
-    CHECK(find_item(items, "fiber_minimum_segment_length")->enabled);
-    CHECK(find_item(items, "fiber_maximum_turn_angle")->enabled);
     CHECK_FALSE(find_item(items, "reinforced_infill_density")->enabled);
     CHECK_FALSE(find_item(items, "fiber_contour_infill_clearance")->enabled);
 
@@ -319,8 +313,6 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     const auto landing_speed = config->value("fiber_landing_speed");
     const auto start_speed = config->value("fiber_start_speed");
     const auto minimum_effective = config->value("fiber_minimum_effective_length");
-    const auto minimum_segment = config->value("fiber_minimum_segment_length");
-    const auto maximum_turn = config->value("fiber_maximum_turn_angle");
     const auto contour_speed = config->value("fiber_contour_max_speed");
     const auto infill_speed = config->value("fiber_infill_max_speed");
     const auto contour_acceleration = config->value("fiber_contour_acceleration");
@@ -333,8 +325,6 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     REQUIRE(landing_speed.has_value());
     REQUIRE(start_speed.has_value());
     REQUIRE(minimum_effective.has_value());
-    REQUIRE(minimum_segment.has_value());
-    REQUIRE(maximum_turn.has_value());
     REQUIRE(contour_speed.has_value());
     REQUIRE(infill_speed.has_value());
     REQUIRE(contour_acceleration.has_value());
@@ -350,8 +340,6 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     CHECK(*start_speed == "10");
     CHECK(*minimum_effective == "0.5");
     CHECK(config->value("fiber_minimum_path_length") == std::optional<std::string>{"0"});
-    CHECK(*minimum_segment == "0");
-    CHECK(*maximum_turn == "180");
     CHECK(config->value("fiber_contour_boundary_clearance") == "0.2");
     CHECK(*contour_speed == "10");
     CHECK(*infill_speed == "10");
@@ -2242,4 +2230,38 @@ TEST_CASE("painted model thumbnails preserve filament colors", "[libslicer_api][
 
     std::filesystem::remove(output, remove_error);
     std::filesystem::remove(packaged_output, remove_error);
+}
+
+TEST_CASE("inactive fiber infill settings do not prevent contour slicing", "[libslicer_api][cleanup]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"generate_reinforced_infills", "0"},
+        {"fiber_infill_max_speed", "0"},
+        {"reinforced_infill_extrusion_width", "0.05"},
+        {"fiber_resin_overlap", "0.05"}}).success);
+    libslicer::SliceRequest request;
+    request.config = *library->active_config_snapshot();
+    request.objects.push_back(fiber_infill_block());
+    const auto result = library->slice(request);
+    for (const auto& diagnostic : result.diagnostics) INFO(diagnostic.message);
+    REQUIRE(result.success);
+    std::ifstream input(result.output.path);
+    const std::string gcode((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    CHECK(gcode.find(";FIBER_BEGIN") != std::string::npos);
+    CHECK(gcode.find("purpose=contour") != std::string::npos);
+    CHECK(gcode.find("fiber_minimum_segment_length =") == std::string::npos);
+    CHECK(gcode.find("fiber_maximum_turn_angle =") == std::string::npos);
+    std::filesystem::remove(result.output.path);
+    if (!result.gcode_3mf.path.empty()) std::filesystem::remove(result.gcode_3mf.path);
 }

@@ -232,85 +232,101 @@ bool continuous_fiber_enabled(const PrintRegionConfig& config)
     return config.generate_reinforced_perimeters.value || config.generate_reinforced_infills.value;
 }
 
+void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose)
+{
+    const auto check = [](double value, const char* name, bool positive = false) {
+        if (!std::isfinite(value) || (positive ? value <= 0 : value < 0))
+            throw std::invalid_argument(std::string(name) + (positive ? " must be finite and positive" : " must be finite and non-negative"));
+    };
+    const std::pair<const char*, double> common[] = {
+        {"fiber_minimum_path_length", config.minimum_path_length_mm},
+        {"fiber_minimum_effective_length", config.minimum_effective_length_mm},
+        {"fiber_cut_to_contact_length", config.cut_to_contact_length_mm},
+        {"fiber_prefeed_extra_length", config.prefeed_extra_length_mm},
+        {"fiber_prefeed_speed", config.prefeed_speed_mm_s},
+        {"fiber_z_hop_height", config.z_hop_height_mm},
+        {"fiber_landing_length", config.landing_length_mm},
+        {"fiber_landing_speed", config.landing_speed_mm_s},
+        {"fiber_start_speed", config.start_speed_mm_s},
+        {"fiber_start_stabilization_length", config.start_stabilization_length_mm},
+        {"fiber_outside_tolerance", config.outside_tolerance_mm2},
+        {"fiber_resin_overlap", config.resin_overlap_mm}
+    };
+    for (const auto& [name, value] : common) check(value, name);
+    check(config.corner_transition_length_mm, "fiber_corner_transition_length", true);
+    check(config.speed_sampling_length_mm, "fiber_speed_sampling_length", true);
+    if (config.layer_interval <= 0 || config.adhesion_dwell_ms < 0)
+        throw std::invalid_argument("Invalid continuous fiber layer interval or adhesion dwell");
+    if (config.cut_to_contact_length_mm + config.prefeed_extra_length_mm > 0)
+        check(config.prefeed_speed_mm_s, "fiber_prefeed_speed", true);
+    if (config.z_hop_height_mm > 0 || config.landing_length_mm > 0)
+        check(config.landing_speed_mm_s, "fiber_landing_speed", true);
+    if (config.start_stabilization_length_mm > 0)
+        check(config.start_speed_mm_s, "fiber_start_speed", true);
+    if (config.cut_to_contact_length_mm > 0) {
+        check(config.tail_min_speed_mm_s, "fiber_tail_min_speed", true);
+        check(config.tail_max_speed_mm_s, "fiber_tail_max_speed", true);
+        check(config.tail_speed_step_length_mm, "fiber_tail_speed_step_length", true);
+        if (config.tail_min_speed_mm_s > config.tail_max_speed_mm_s)
+            throw std::invalid_argument("Continuous fiber tail minimum speed exceeds maximum speed");
+    }
+    const bool contour = purpose == FiberPathPurpose::Contour;
+    const double minimum = contour ? config.contour_min_speed_mm_s : config.infill_min_speed_mm_s;
+    const double maximum = contour ? config.contour_max_speed_mm_s : config.infill_max_speed_mm_s;
+    check(minimum, contour ? "fiber_contour_min_speed" : "fiber_infill_min_speed", true);
+    check(maximum, contour ? "fiber_contour_max_speed" : "fiber_infill_max_speed", true);
+    if (minimum > maximum) throw std::invalid_argument("Continuous fiber minimum speed exceeds maximum speed");
+    check(contour ? config.contour_feed_ratio : config.infill_feed_ratio, "fiber feed ratio", true);
+    check(contour ? config.contour_feed_correction : config.infill_feed_correction, "fiber feed correction", true);
+    check(contour ? config.contour_acceleration_mm_s2 : config.infill_acceleration_mm_s2, "fiber acceleration", true);
+    const double finish = contour ? config.finish_overlap_length_mm : config.finish_extension_length_mm;
+    check(finish, contour ? "fiber_finish_overlap_length" : "fiber_finish_extension_length");
+    if (finish > 0) check(config.finish_motion_speed_mm_s, "fiber_finish_motion_speed", true);
+    if (contour) {
+        check(config.contour_boundary_clearance_mm, "fiber_contour_boundary_clearance");
+        if (config.contour_count < 0) throw std::invalid_argument("Invalid fiber contour count");
+    }
+    if (config.contour_enabled && config.infill_enabled)
+        check(config.contour_infill_clearance_mm, "fiber_contour_infill_clearance");
+}
+
 ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region)
 {
     const PrintRegionConfig& source = region.region().config();
-    const auto finite_nonnegative = [](double value, const char* key) {
-        if (!std::isfinite(value) || value < 0.0)
-            throw std::runtime_error(std::string(key) + " must be finite and non-negative");
-        return value;
-    };
-    const auto finite_positive = [](double value, const char* key) {
-        if (!std::isfinite(value) || value <= 0.0)
-            throw std::runtime_error(std::string(key) + " must be finite and positive");
-        return value;
-    };
     ContinuousFiberConfig result;
     result.contour_enabled = source.generate_reinforced_perimeters.value;
     result.infill_enabled = source.generate_reinforced_infills.value;
     result.layer_interval = std::max(1, source.fiber_layer_height_ratio.value);
-    result.contour_count = std::max(0, source.outer_reinforced_perimeters_counts.value);
-    result.infill_pattern = source.reinforced_infill_pattern.value;
-    if (!std::isfinite(source.reinforced_infill_density.value))
-        throw std::runtime_error("reinforced_infill_density must be finite");
-    result.infill_density = std::clamp(source.reinforced_infill_density.value, 0.0, 100.0);
-    result.contour_material = unsigned(std::max(1, source.reinforced_perimeters_filament.value));
-    result.infill_material = unsigned(std::max(1, source.reinforced_infill_filament.value));
-    result.minimum_path_length_mm = finite_nonnegative(source.fiber_minimum_path_length.value, "fiber_minimum_path_length");
-    result.minimum_segment_length_mm = finite_nonnegative(source.fiber_minimum_segment_length.value, "fiber_minimum_segment_length");
-    result.maximum_turn_angle_degrees = finite_nonnegative(source.fiber_maximum_turn_angle.value, "fiber_maximum_turn_angle");
-    if (result.maximum_turn_angle_degrees > 180.0)
-        throw std::runtime_error("fiber_maximum_turn_angle must not exceed 180 degrees");
-    result.minimum_effective_length_mm = finite_nonnegative(source.fiber_minimum_effective_length.value, "fiber_minimum_effective_length");
-    result.contour_infill_clearance_mm = finite_nonnegative(source.fiber_contour_infill_clearance.value, "fiber_contour_infill_clearance");
-    result.contour_boundary_clearance_mm = finite_nonnegative(source.fiber_contour_boundary_clearance.value, "fiber_contour_boundary_clearance");
-    result.resin_overlap_mm = finite_nonnegative(source.fiber_resin_overlap.value, "fiber_resin_overlap");
-    result.prefeed_extra_length_mm = finite_nonnegative(source.fiber_prefeed_extra_length.value, "fiber_prefeed_extra_length");
-    result.prefeed_speed_mm_s = finite_nonnegative(source.fiber_prefeed_speed.value, "fiber_prefeed_speed");
-    result.z_hop_height_mm = finite_nonnegative(source.fiber_z_hop_height.value, "fiber_z_hop_height");
-    result.landing_length_mm = finite_nonnegative(source.fiber_landing_length.value, "fiber_landing_length");
-    result.landing_speed_mm_s = finite_nonnegative(source.fiber_landing_speed.value, "fiber_landing_speed");
+    result.minimum_path_length_mm = source.fiber_minimum_path_length.value;
+    result.minimum_effective_length_mm = source.fiber_minimum_effective_length.value;
+    result.resin_overlap_mm = source.fiber_resin_overlap.value;
+    result.prefeed_extra_length_mm = source.fiber_prefeed_extra_length.value;
+    result.prefeed_speed_mm_s = source.fiber_prefeed_speed.value;
+    result.z_hop_height_mm = source.fiber_z_hop_height.value;
+    result.landing_length_mm = source.fiber_landing_length.value;
+    result.landing_speed_mm_s = source.fiber_landing_speed.value;
     result.adhesion_dwell_ms = std::max(0, source.fiber_adhesion_dwell_ms.value);
-    result.start_speed_mm_s = finite_nonnegative(source.fiber_start_speed.value, "fiber_start_speed");
-    result.start_stabilization_length_mm = finite_nonnegative(source.fiber_start_stabilization_length.value, "fiber_start_stabilization_length");
-    result.finish_extension_length_mm = finite_nonnegative(source.fiber_finish_extension_length.value, "fiber_finish_extension_length");
-    result.outside_tolerance_mm2 = finite_nonnegative(source.fiber_outside_tolerance.value, "fiber_outside_tolerance");
-    result.contour_max_speed_mm_s = finite_nonnegative(source.fiber_contour_max_speed.value, "fiber_contour_max_speed");
-    result.infill_max_speed_mm_s = finite_nonnegative(source.fiber_infill_max_speed.value, "fiber_infill_max_speed");
-    result.contour_acceleration_mm_s2 = finite_nonnegative(source.fiber_contour_acceleration.value, "fiber_contour_acceleration");
-    result.infill_acceleration_mm_s2 = finite_nonnegative(source.fiber_infill_acceleration.value, "fiber_infill_acceleration");
-
-    result.contour_feed_ratio = finite_positive(source.fiber_contour_feed_ratio.value, "fiber_contour_feed_ratio");
-    result.infill_feed_ratio = finite_positive(source.fiber_infill_feed_ratio.value, "fiber_infill_feed_ratio");
-    result.contour_min_speed_mm_s = finite_positive(source.fiber_contour_min_speed.value, "fiber_contour_min_speed");
-    result.infill_min_speed_mm_s = finite_positive(source.fiber_infill_min_speed.value, "fiber_infill_min_speed");
-    result.corner_transition_length_mm = finite_positive(source.fiber_corner_transition_length.value, "fiber_corner_transition_length");
-    result.speed_sampling_length_mm = finite_positive(source.fiber_speed_sampling_length.value, "fiber_speed_sampling_length");
-    result.tail_min_speed_mm_s = finite_positive(source.fiber_tail_min_speed.value, "fiber_tail_min_speed");
-    result.tail_max_speed_mm_s = finite_positive(source.fiber_tail_max_speed.value, "fiber_tail_max_speed");
-    result.tail_speed_step_length_mm = finite_positive(source.fiber_tail_speed_step_length.value, "fiber_tail_speed_step_length");
-    result.finish_overlap_length_mm = finite_nonnegative(source.fiber_finish_overlap_length.value, "fiber_finish_overlap_length");
-    result.finish_motion_speed_mm_s = finite_positive(source.fiber_finish_motion_speed.value, "fiber_finish_motion_speed");
-    if (result.contour_min_speed_mm_s > result.contour_max_speed_mm_s ||
-        result.infill_min_speed_mm_s > result.infill_max_speed_mm_s ||
-        result.tail_min_speed_mm_s > result.tail_max_speed_mm_s)
-        throw std::runtime_error("Continuous fiber minimum speed exceeds maximum speed");
+    result.start_speed_mm_s = source.fiber_start_speed.value;
+    result.start_stabilization_length_mm = source.fiber_start_stabilization_length.value;
+    result.outside_tolerance_mm2 = source.fiber_outside_tolerance.value;
+    result.corner_transition_length_mm = source.fiber_corner_transition_length.value;
+    result.speed_sampling_length_mm = source.fiber_speed_sampling_length.value;
+    result.tail_min_speed_mm_s = source.fiber_tail_min_speed.value;
+    result.tail_max_speed_mm_s = source.fiber_tail_max_speed.value;
+    result.tail_speed_step_length_mm = source.fiber_tail_speed_step_length.value;
+    result.finish_motion_speed_mm_s = source.fiber_finish_motion_speed.value;
+    if (result.contour_enabled && result.infill_enabled)
+        result.contour_infill_clearance_mm = source.fiber_contour_infill_clearance.value;
 
     const PrintConfig& print_config = layer.object()->print()->config();
     if (print_config.fiber_cut_gcode.value.find_first_not_of(" \t\r\n") == std::string::npos)
-        throw std::runtime_error(
-            "Continuous fiber is enabled, but the selected machine has no fiber cut command");
-    result.cut_to_contact_length_mm = finite_nonnegative(print_config.fiber_cut_to_contact_length.value, "fiber_cut_to_contact_length");
+        throw std::runtime_error("Continuous fiber is enabled, but the selected machine has no fiber cut command");
+    result.cut_to_contact_length_mm = print_config.fiber_cut_to_contact_length.value;
     const auto correction_for = [&](unsigned material) {
         if (material == 0 || material > print_config.filament_fiber_feed_correction.values.size())
             throw std::runtime_error("Missing fiber feed correction for material");
-        return finite_positive(print_config.filament_fiber_feed_correction.values[material - 1],
-                               "filament_fiber_feed_correction");
+        return print_config.filament_fiber_feed_correction.values[material - 1];
     };
-    if (result.contour_enabled)
-        result.contour_feed_correction = correction_for(result.contour_material);
-    if (result.infill_enabled)
-        result.infill_feed_correction = correction_for(result.infill_material);
     const auto flow_for = [&](unsigned material, const ConfigOptionFloatOrPercent& width) {
         if (material == 0 || material > print_config.filament_map.values.size())
             throw std::runtime_error("Continuous fiber material has no extruder mapping");
@@ -318,36 +334,41 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         if (extruder < 0 || size_t(extruder) >= print_config.nozzle_diameter.values.size())
             throw std::runtime_error("Continuous fiber extruder is outside the configured nozzle set");
         const float nozzle = float(print_config.nozzle_diameter.values[extruder]);
-        return Flow::new_from_config_width(frInfill, width, nozzle, float(layer.height));
+        const Flow flow = Flow::new_from_config_width(frInfill, width, nozzle, float(layer.height));
+        if (!std::isfinite(flow.width()) || flow.width() <= 0 || result.resin_overlap_mm >= 0.5 * flow.width())
+            throw std::runtime_error("Fiber width must be positive and fiber_resin_overlap smaller than half its width");
+        return flow;
     };
-    result.contour_flow = flow_for(result.contour_material, source.reinforced_perimeters_extrusion_width);
-    result.infill_flow = flow_for(result.infill_material, source.reinforced_infill_extrusion_width);
-
-    const double minimum_half_width = 0.5 * std::min(result.contour_flow.width(), result.infill_flow.width());
-    if (result.resin_overlap_mm >= minimum_half_width)
-        throw std::runtime_error("fiber_resin_overlap must be smaller than half of the continuous fiber width");
-    if (result.infill_pattern != ipRectilinear && result.infill_pattern != ipConcentric)
-        throw std::runtime_error("Continuous fiber infill supports only rectilinear and concentric patterns");
-    if (result.cut_to_contact_length_mm + result.prefeed_extra_length_mm > 0.0 && result.prefeed_speed_mm_s <= 0.0)
-        throw std::runtime_error("fiber_prefeed_speed must be positive when continuous fiber prefeed is enabled");
-    if ((result.z_hop_height_mm > 0.0 || result.landing_length_mm > 0.0) && result.landing_speed_mm_s <= 0.0)
-        throw std::runtime_error("fiber_landing_speed must be positive when continuous fiber landing is enabled");
-    if (result.start_stabilization_length_mm > 0.0 && result.start_speed_mm_s <= 0.0)
-        throw std::runtime_error("fiber_start_speed must be positive when a start stabilization span is enabled");
-    if (result.contour_enabled && result.contour_max_speed_mm_s <= 0.0)
-        throw std::runtime_error("fiber_contour_max_speed must be positive when continuous fiber contours are enabled");
-    if (result.infill_enabled && result.infill_max_speed_mm_s <= 0.0)
-        throw std::runtime_error("fiber_infill_max_speed must be positive when continuous fiber infill is enabled");
-    if (result.contour_enabled && result.contour_acceleration_mm_s2 <= 0.0)
-        throw std::runtime_error("fiber_contour_acceleration must be positive when continuous fiber contours are enabled");
-    if (result.infill_enabled && result.infill_acceleration_mm_s2 <= 0.0)
-        throw std::runtime_error("fiber_infill_acceleration must be positive when continuous fiber infill is enabled");
-
-    if (result.contour_enabled)
-        finite_positive(result.contour_flow.width(), "continuous fiber contour width");
-    if (result.infill_enabled)
-        finite_positive(result.infill_flow.width(), "continuous fiber infill width");
-
+    if (result.contour_enabled) {
+        result.contour_count = std::max(0, source.outer_reinforced_perimeters_counts.value);
+        result.contour_material = unsigned(std::max(1, source.reinforced_perimeters_filament.value));
+        result.contour_boundary_clearance_mm = source.fiber_contour_boundary_clearance.value;
+        result.contour_min_speed_mm_s = source.fiber_contour_min_speed.value;
+        result.contour_max_speed_mm_s = source.fiber_contour_max_speed.value;
+        result.contour_acceleration_mm_s2 = source.fiber_contour_acceleration.value;
+        result.contour_feed_ratio = source.fiber_contour_feed_ratio.value;
+        result.contour_feed_correction = correction_for(result.contour_material);
+        result.finish_overlap_length_mm = source.fiber_finish_overlap_length.value;
+        validate_fiber_process_config(result, FiberPathPurpose::Contour);
+        result.contour_flow = flow_for(result.contour_material, source.reinforced_perimeters_extrusion_width);
+    }
+    if (result.infill_enabled) {
+        result.infill_pattern = source.reinforced_infill_pattern.value;
+        if (result.infill_pattern != ipRectilinear && result.infill_pattern != ipConcentric)
+            throw std::runtime_error("Continuous fiber infill supports only rectilinear and concentric patterns");
+        if (!std::isfinite(source.reinforced_infill_density.value))
+            throw std::runtime_error("reinforced_infill_density must be finite");
+        result.infill_density = std::clamp(source.reinforced_infill_density.value, 0.0, 100.0);
+        result.infill_material = unsigned(std::max(1, source.reinforced_infill_filament.value));
+        result.infill_min_speed_mm_s = source.fiber_infill_min_speed.value;
+        result.infill_max_speed_mm_s = source.fiber_infill_max_speed.value;
+        result.infill_acceleration_mm_s2 = source.fiber_infill_acceleration.value;
+        result.infill_feed_ratio = source.fiber_infill_feed_ratio.value;
+        result.infill_feed_correction = correction_for(result.infill_material);
+        result.finish_extension_length_mm = source.fiber_finish_extension_length.value;
+        validate_fiber_process_config(result, FiberPathPurpose::Infill);
+        result.infill_flow = flow_for(result.infill_material, source.reinforced_infill_extrusion_width);
+    }
     return result;
 }
 

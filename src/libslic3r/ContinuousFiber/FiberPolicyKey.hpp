@@ -34,8 +34,6 @@ struct FiberPolicyKey {
     unsigned contour_material { 0 };
     unsigned infill_material { 0 };
     double minimum_path_length_mm { 0.0 };
-    double minimum_segment_length_mm { 0.0 };
-    double maximum_turn_angle_degrees { 180.0 };
     double cut_to_contact_length_mm { 0.0 };
     double prefeed_extra_length_mm { 0.0 };
     double prefeed_speed_mm_s { 0.0 };
@@ -78,7 +76,6 @@ struct FiberPolicyKey {
             contour_width, contour_spacing, contour_height, contour_nozzle,
             infill_width, infill_spacing, infill_height, infill_nozzle,
             contour_material, infill_material, minimum_path_length_mm,
-            minimum_segment_length_mm, maximum_turn_angle_degrees,
             cut_to_contact_length_mm, prefeed_extra_length_mm, prefeed_speed_mm_s,
             z_hop_height_mm, landing_length_mm, landing_speed_mm_s, adhesion_dwell_ms,
             start_speed_mm_s, start_stabilization_length_mm,
@@ -120,8 +117,6 @@ inline FiberPolicyKey fiber_policy_key(
         config.contour_material,
         config.infill_material,
         config.minimum_path_length_mm,
-        config.minimum_segment_length_mm,
-        config.maximum_turn_angle_degrees,
         config.cut_to_contact_length_mm,
         config.prefeed_extra_length_mm,
         config.prefeed_speed_mm_s,

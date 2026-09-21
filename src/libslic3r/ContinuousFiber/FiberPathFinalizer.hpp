@@ -5,6 +5,7 @@
 #include "PreparedFiberPath.hpp"
 
 #include <memory>
+#include <string>
 
 namespace Slic3r {
 
@@ -18,17 +19,21 @@ enum class FiberFinalizationFailure : uint8_t {
     TooShort,
     InvalidParameter,
     InvalidGeometry,
-    OutsideDomain
+    OutsideDomain,
+    FinishUnavailable,
+    SamplingLimit
 };
 
 struct FiberFinalizationResult {
     std::shared_ptr<const PreparedFiberPath> prepared;
     FiberFinalizationFailure failure { FiberFinalizationFailure::None };
     double length_mm { 0.0 };
+    std::string detail;
 };
 
 class FiberPathFinalizer {
 public:
+    // Candidate geometry must be normalized before validation and source mapping.
     static FiberFinalizationResult finalize(
         const ExtrusionPath& candidate,
         const ExPolygons& allowed_domain,

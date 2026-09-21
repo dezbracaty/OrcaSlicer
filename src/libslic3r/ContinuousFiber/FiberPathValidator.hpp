@@ -25,14 +25,14 @@ enum class FiberRejectionReason : uint8_t {
     InvalidParameter,
     InvalidGeometry,
     DegenerateSegment,
-    SegmentTooShort,
     SelfIntersection,
     DuplicateSegment,
-    TurnLimitExceeded,
     OutsideDomain,
     ProcessBudgetTooShort,
     FinalizedPathOutsideDomain,
-    IntervalMappingFailure
+    IntervalMappingFailure,
+    FinishUnavailable,
+    SamplingLimit
 };
 
 const char* fiber_rejection_reason_name(FiberRejectionReason reason);
@@ -43,6 +43,7 @@ struct FiberFragmentAssignment {
     double source_end_mm { 0.0 };
     FiberAssignmentKind kind { FiberAssignmentKind::Rejected };
     FiberRejectionReason reason { FiberRejectionReason::None };
+    std::string detail;
     std::optional<ExtrusionPath> centerline;
     std::shared_ptr<const PreparedFiberPath> prepared;
 };

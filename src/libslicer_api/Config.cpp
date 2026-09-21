@@ -208,8 +208,6 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
     } else if (key_is(item.key, {"fiber_layer_height_ratio",
                                  "fiber_fill_debug",
                                  "fiber_minimum_path_length",
-                                 "fiber_minimum_segment_length",
-                                 "fiber_maximum_turn_angle",
                                  "fiber_minimum_effective_length",
                                  "fiber_prefeed_extra_length",
                                  "fiber_prefeed_speed",

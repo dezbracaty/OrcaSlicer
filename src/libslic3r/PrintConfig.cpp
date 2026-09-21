@@ -1024,21 +1024,6 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(10.0));
 
-    def = this->add("fiber_minimum_segment_length", coFloat);
-    def->label = L("Minimum continuous fiber segment length");
-    def->category = L("Continuous fiber");
-    def->sidetext = L("mm");
-    def->min = 0;
-    def->set_default_value(new ConfigOptionFloat(0.0));
-
-    def = this->add("fiber_maximum_turn_angle", coFloat);
-    def->label = L("Maximum continuous fiber turn angle");
-    def->category = L("Continuous fiber");
-    def->sidetext = L("°");
-    def->min = 0;
-    def->max = 180;
-    def->set_default_value(new ConfigOptionFloat(180.0));
-
     def = this->add("fiber_contour_boundary_clearance", coFloat);
     def->label = L("Fiber contour boundary clearance");
     def->tooltip = L("Additional resin clearance between the fiber footprint and the internal core boundary.");
@@ -8650,6 +8635,8 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
 
     // Ignore the following obsolete configuration keys:
     static std::set<std::string> ignore = {
+        // Retired whole-path filters: discretized edges are not bend geometry.
+        "fiber_minimum_segment_length", "fiber_maximum_turn_angle",
         "acceleration", "scale", "rotate", "duplicate", "duplicate_grid",
         "bed_size",
         "print_center", "g0", "wipe_tower_per_color_wipe", 

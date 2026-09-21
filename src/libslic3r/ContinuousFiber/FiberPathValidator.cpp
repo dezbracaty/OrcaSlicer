@@ -25,51 +25,6 @@ struct SourceInterval {
     FiberRejectionReason reason { FiberRejectionReason::None };
 };
 
-bool finite_nonnegative(double value)
-{
-    return std::isfinite(value) && value >= 0.0;
-}
-
-bool config_is_valid(const ContinuousFiberConfig& config)
-{
-    const double nonnegative_values[] = {
-        config.minimum_path_length_mm,
-        config.minimum_segment_length_mm,
-        config.maximum_turn_angle_degrees,
-        config.cut_to_contact_length_mm,
-        config.prefeed_extra_length_mm,
-        config.prefeed_speed_mm_s,
-        config.z_hop_height_mm,
-        config.landing_length_mm,
-        config.landing_speed_mm_s,
-        config.start_speed_mm_s,
-        config.start_stabilization_length_mm,
-        config.minimum_effective_length_mm,
-        config.finish_extension_length_mm,
-        config.outside_tolerance_mm2,
-        config.contour_max_speed_mm_s,
-        config.infill_max_speed_mm_s,
-        config.contour_acceleration_mm_s2,
-        config.infill_acceleration_mm_s2,
-        config.contour_infill_clearance_mm,
-        config.contour_boundary_clearance_mm,
-        config.resin_overlap_mm
-    };
-    if (!std::all_of(std::begin(nonnegative_values), std::end(nonnegative_values), finite_nonnegative))
-        return false;
-    if (config.maximum_turn_angle_degrees > 180.0)
-        return false;
-    if (config.layer_interval <= 0 || config.contour_count < 0 || config.adhesion_dwell_ms < 0)
-        return false;
-    if (config.cut_to_contact_length_mm + config.prefeed_extra_length_mm > 0.0 && config.prefeed_speed_mm_s <= 0.0)
-        return false;
-    if ((config.z_hop_height_mm > 0.0 || config.landing_length_mm > 0.0) && config.landing_speed_mm_s <= 0.0)
-        return false;
-    if (config.start_stabilization_length_mm > 0.0 && config.start_speed_mm_s <= 0.0)
-        return false;
-    return true;
-}
-
 using SegmentKey = std::tuple<coord_t, coord_t, coord_t, coord_t>;
 
 SegmentKey undirected_segment_key(const Point& a, const Point& b)
@@ -80,8 +35,7 @@ SegmentKey undirected_segment_key(const Point& a, const Point& b)
 }
 
 FiberRejectionReason validate_path_geometry(
-    const ExtrusionPath& path,
-    const ContinuousFiberConfig& config)
+    const ExtrusionPath& path)
 {
     const Polyline polyline = path.polyline.to_polyline();
     const Points& points = polyline.points;
@@ -96,15 +50,12 @@ FiberRejectionReason validate_path_geometry(
         return FiberRejectionReason::InvalidGeometry;
 
     std::set<SegmentKey> segments;
-    const double minimum_segment_scaled = scale_(config.minimum_segment_length_mm);
     for (size_t index = 0; index + 1 < points.size(); ++index) {
         const Point& a = points[index];
         const Point& b = points[index + 1];
         const double segment_length = (b - a).cast<double>().norm();
         if (!std::isfinite(segment_length) || segment_length <= SCALED_EPSILON)
             return FiberRejectionReason::DegenerateSegment;
-        if (minimum_segment_scaled > 0.0 && segment_length + SCALED_EPSILON < minimum_segment_scaled)
-            return FiberRejectionReason::SegmentTooShort;
         if (!segments.insert(undirected_segment_key(a, b)).second)
             return FiberRejectionReason::DuplicateSegment;
         if (index > 0) {
@@ -128,24 +79,6 @@ FiberRejectionReason validate_path_geometry(
                     points[second], points[second + 1]))
                 return FiberRejectionReason::SelfIntersection;
         }
-    }
-
-    const size_t unique_point_count = closed ? points.size() - 1 : points.size();
-    const double maximum_turn_radians = config.maximum_turn_angle_degrees * M_PI / 180.0;
-    for (size_t index = 0; index < unique_point_count; ++index) {
-        if (!closed && (index == 0 || index + 1 == unique_point_count))
-            continue;
-        const size_t previous_index = index == 0 ? unique_point_count - 1 : index - 1;
-        const size_t next_index = index + 1 == unique_point_count ? 0 : index + 1;
-        const Vec2d incoming = (points[index] - points[previous_index]).cast<double>();
-        const Vec2d outgoing = (points[next_index] - points[index]).cast<double>();
-        const double denominator = incoming.norm() * outgoing.norm();
-        if (!std::isfinite(denominator) || denominator <= EPSILON)
-            return FiberRejectionReason::DegenerateSegment;
-        const double cosine = std::clamp(incoming.dot(outgoing) / denominator, -1.0, 1.0);
-        const double turn = std::acos(cosine);
-        if (!std::isfinite(turn) || turn > maximum_turn_radians + EPSILON)
-            return FiberRejectionReason::TurnLimitExceeded;
     }
 
     return FiberRejectionReason::None;
@@ -312,6 +245,10 @@ FiberRejectionReason finalization_reason(FiberFinalizationFailure failure)
         return FiberRejectionReason::InvalidParameter;
     case FiberFinalizationFailure::InvalidGeometry:
         return FiberRejectionReason::InvalidGeometry;
+    case FiberFinalizationFailure::FinishUnavailable:
+        return FiberRejectionReason::FinishUnavailable;
+    case FiberFinalizationFailure::SamplingLimit:
+        return FiberRejectionReason::SamplingLimit;
     case FiberFinalizationFailure::None:
         break;
     }
@@ -345,14 +282,14 @@ const char* fiber_rejection_reason_name(FiberRejectionReason reason)
     case FiberRejectionReason::InvalidParameter: return "invalid_parameter";
     case FiberRejectionReason::InvalidGeometry: return "invalid_geometry";
     case FiberRejectionReason::DegenerateSegment: return "degenerate_segment";
-    case FiberRejectionReason::SegmentTooShort: return "segment_too_short";
     case FiberRejectionReason::SelfIntersection: return "self_intersection";
     case FiberRejectionReason::DuplicateSegment: return "duplicate_segment";
-    case FiberRejectionReason::TurnLimitExceeded: return "turn_limit_exceeded";
     case FiberRejectionReason::OutsideDomain: return "outside_domain";
     case FiberRejectionReason::ProcessBudgetTooShort: return "process_budget_too_short";
     case FiberRejectionReason::FinalizedPathOutsideDomain: return "finalized_path_outside_domain";
     case FiberRejectionReason::IntervalMappingFailure: return "interval_mapping_failure";
+    case FiberRejectionReason::FinishUnavailable: return "finish_unavailable";
+    case FiberRejectionReason::SamplingLimit: return "sampling_limit";
     }
     return "unknown";
 }
@@ -456,7 +393,6 @@ FiberValidationResult FiberPathValidator::validate(
 {
     FiberValidationResult result;
     result.output_role = output_role;
-    const bool valid_config = config_is_valid(config);
     size_t path_ordinal = 0;
 
     const auto reject_unsupported = [&](const ExtrusionEntity& entity) {
@@ -480,8 +416,8 @@ FiberValidationResult FiberPathValidator::validate(
         const double source_length_mm = unscale<double>(path.length());
         result.candidates.push_back({candidate_id, std::isfinite(source_length_mm) ? source_length_mm : 0.0});
 
-        FiberRejectionReason whole_path_reason = !planar ? FiberRejectionReason::InvalidGeometry : valid_config ?
-            validate_path_geometry(path, config) : FiberRejectionReason::InvalidParameter;
+        FiberRejectionReason whole_path_reason = !planar ? FiberRejectionReason::InvalidGeometry :
+            validate_path_geometry(path);
         bool mapping_valid = true;
         std::vector<SourceInterval> intervals;
         if (whole_path_reason == FiberRejectionReason::None)
@@ -516,7 +452,12 @@ FiberValidationResult FiberPathValidator::validate(
             assignment.centerline->set_extrusion_role(output_role);
 
             if (assignment.kind == FiberAssignmentKind::AcceptedFiber) {
-                const FiberRejectionReason fragment_reason = validate_path_geometry(*assignment.centerline, config);
+                // Clipping can change geometry; an unchanged full candidate was already checked.
+                const bool whole_candidate = interval.begin_scaled == 0.0 && interval.end_scaled == path.length();
+                if (!whole_candidate)
+                    assignment.centerline->polyline = normalize_fiber_geometry(assignment.centerline->polyline);
+                const FiberRejectionReason fragment_reason = whole_candidate ? FiberRejectionReason::None :
+                    validate_path_geometry(*assignment.centerline);
                 if (fragment_reason != FiberRejectionReason::None) {
                     assignment.kind = FiberAssignmentKind::Rejected;
                     assignment.reason = fragment_reason;
@@ -526,6 +467,7 @@ FiberValidationResult FiberPathValidator::validate(
                     if (!finalized.prepared) {
                         assignment.kind = FiberAssignmentKind::Rejected;
                         assignment.reason = finalization_reason(finalized.failure);
+                        assignment.detail = finalized.detail;
                     } else {
                         assignment.prepared = finalized.prepared;
                         append_coverage(result, *assignment.prepared);

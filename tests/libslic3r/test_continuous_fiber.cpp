@@ -106,14 +106,6 @@ TEST_CASE("continuous fiber grouping separates incompatible process parameters",
     CHECK_FALSE(fiber_policy_key(first, 0.0, true) == fiber_policy_key(second, 0.0, true));
 
     second = first;
-    second.minimum_segment_length_mm = 0.5;
-    CHECK_FALSE(fiber_policy_key(first, 0.0, true) == fiber_policy_key(second, 0.0, true));
-
-    second = first;
-    second.maximum_turn_angle_degrees = 90.0;
-    CHECK_FALSE(fiber_policy_key(first, 0.0, true) == fiber_policy_key(second, 0.0, true));
-
-    second = first;
     second.contour_boundary_clearance_mm = 0.2;
     CHECK_FALSE(fiber_policy_key(first, 0.0, true) == fiber_policy_key(second, 0.0, true));
 }
@@ -404,7 +396,7 @@ TEST_CASE("fiber validator rejects repeated and reversed segments", "[Continuous
     CHECK(result.audit_assignments().valid());
 }
 
-TEST_CASE("fiber validator enforces minimum segment length", "[ContinuousFiber]")
+TEST_CASE("fiber validator retains a path containing a short geometric edge", "[ContinuousFiber]")
 {
     ExtrusionEntityCollection candidate_collection;
     candidate_collection.entities.push_back(new ExtrusionPath(path_from_points({
@@ -412,18 +404,18 @@ TEST_CASE("fiber validator enforces minimum segment length", "[ContinuousFiber]"
     })));
     const ExPolygons domain {rectangle(0, 0, 12, 12)};
     ContinuousFiberConfig config;
-    config.minimum_segment_length_mm = 1.0;
 
     FiberValidationResult result = FiberPathValidator::validate(
         {&candidate_collection}, domain, config, FiberPathPurpose::Infill,
         erContinuousFiberInfill, test_id().parent.domain);
 
     REQUIRE(result.assignments.size() == 1);
-    CHECK(result.assignments.front().reason == FiberRejectionReason::SegmentTooShort);
+    CHECK(result.assignments.front().kind == FiberAssignmentKind::AcceptedFiber);
+    CHECK(result.assignments.front().prepared->total_depositing_length_mm() == Catch::Approx(10.5));
     CHECK(result.audit_assignments().valid());
 }
 
-TEST_CASE("fiber validator enforces the maximum turn angle", "[ContinuousFiber]")
+TEST_CASE("fiber validator does not use a turn threshold to discard a complete path", "[ContinuousFiber]")
 {
     ExtrusionEntityCollection candidate_collection;
     candidate_collection.entities.push_back(new ExtrusionPath(path_from_points({
@@ -431,14 +423,14 @@ TEST_CASE("fiber validator enforces the maximum turn angle", "[ContinuousFiber]"
     })));
     const ExPolygons domain {rectangle(0, 0, 12, 12)};
     ContinuousFiberConfig config;
-    config.maximum_turn_angle_degrees = 45.0;
 
     FiberValidationResult result = FiberPathValidator::validate(
         {&candidate_collection}, domain, config, FiberPathPurpose::Infill,
         erContinuousFiberInfill, test_id().parent.domain);
 
     REQUIRE(result.assignments.size() == 1);
-    CHECK(result.assignments.front().reason == FiberRejectionReason::TurnLimitExceeded);
+    CHECK(result.assignments.front().kind == FiberAssignmentKind::AcceptedFiber);
+    CHECK(result.assignments.front().prepared->total_depositing_length_mm() == Catch::Approx(10));
     CHECK(result.audit_assignments().valid());
 }
 
@@ -574,6 +566,7 @@ TEST_CASE("fiber normal speed is invariant under collinear tessellation", "[Cont
     ContinuousFiberConfig config;
     const ExPolygons domain{rectangle(0, 0, 40, 20)};
     const auto pa = FiberPathFinalizer::finalize(a, domain, config, test_id());
+    b.polyline = normalize_fiber_geometry(b.polyline);
     const auto pb = FiberPathFinalizer::finalize(b, domain, config, test_id());
     REQUIRE(pa.prepared); REQUIRE(pb.prepared);
     const auto& sa = pa.prepared->spans.front();
@@ -632,7 +625,9 @@ TEST_CASE("fiber finish is selected by purpose not closed topology", "[Continuou
     REQUIRE(contour.prepared);
     CHECK(contour.prepared->finish_strategy == FiberFinishStrategy::LoopOverlap);
     CHECK(contour.prepared->spans.back().geometry.points.back() == Point3::new_scale(8,5,0));
-    CHECK_THROWS(FiberPathFinalizer::finalize(straight_path(5,5,25,5), domain, config, contour_id));
+    const auto unavailable = FiberPathFinalizer::finalize(straight_path(5,5,25,5), domain, config, contour_id);
+    CHECK(unavailable.failure == FiberFinalizationFailure::FinishUnavailable);
+    CHECK_FALSE(unavailable.detail.empty());
 }
 
 TEST_CASE("fiber finish is continuous motion not material clipped by a model hole", "[ContinuousFiber][finish]")
@@ -679,6 +674,7 @@ TEST_CASE("fiber finish leaves the deposition domain without changing feed tail 
     }
     auto sampled = source;
     sampled.polyline.points.insert(sampled.polyline.points.end()-1, Point3::new_scale(54,5,0));
+    sampled.polyline = normalize_fiber_geometry(sampled.polyline);
     const auto same = FiberPathFinalizer::finalize(sampled, domain, config, test_id());
     REQUIRE(same.prepared);
     CHECK(same.prepared->spans.back().geometry.points == finish.geometry.points);
@@ -706,8 +702,9 @@ TEST_CASE("fiber numerical knots and speed sampling do not discard a closed cont
 {
     // A near-duplicate from offsetting plus a real corner very close to the
     // 2 mm sampling grid. Neither may invalidate the complete 40 mm loop.
-    const auto candidate = path_from_points({{5,5},{5.00001,5.00001},
+    auto candidate = path_from_points({{5,5},{5.00001,5.00001},
         {15.0001,5},{15.0001,15},{5,15},{5,5.00001},{5,5}});
+    candidate.polyline = normalize_fiber_geometry(candidate.polyline);
     ContinuousFiberConfig config;
     config.landing_length_mm = 2;
     config.cut_to_contact_length_mm = 23;
@@ -1112,4 +1109,84 @@ TEST_CASE("fiber semantic parser separates approach landing feed tail and finish
     CHECK_NOTHROW(parser.finish());
     CHECK_THROWS(parser.consume("FIBER_TAIL_BEGIN"));
     CHECK_THROWS(parser.consume("FIBER_BEGIN v=2"));
+}
+
+TEST_CASE("fiber tail obeys corner limits without rejecting a closed contour", "[ContinuousFiber][cleanup]")
+{
+    const auto candidate = path_from_points({{5,5},{25,5},{25,25},{5,25},{5,5}});
+    ContinuousFiberConfig config;
+    config.cut_to_contact_length_mm = 23;
+    config.tail_min_speed_mm_s = 3;
+    config.tail_max_speed_mm_s = 10;
+    auto id = test_id(); id.parent.purpose = FiberPathPurpose::Contour;
+    const auto result = FiberPathFinalizer::finalize(candidate, {rectangle(0,0,30,30)}, config, id);
+    REQUIRE(result.prepared);
+    CHECK(result.prepared->passive_tail_length_mm() == Catch::Approx(23));
+    CHECK(result.prepared->total_depositing_length_mm() == Catch::Approx(80));
+    const auto& tail = result.prepared->spans.back();
+    CHECK(tail.edges.back().speed_mm_s == Catch::Approx(6.5));
+    for (const auto& edge : tail.edges) {
+        CHECK(edge.speed_mm_s >= 3);
+        CHECK(edge.speed_mm_s <= 10);
+        CHECK(edge.feed_mm_per_xy_mm == 0);
+    }
+}
+
+TEST_CASE("contour finish is independent of enabled concentric infill", "[ContinuousFiber][cleanup]")
+{
+    const auto candidate = path_from_points({{5,5},{25,5},{25,25},{5,25},{5,5}});
+    ContinuousFiberConfig config;
+    config.finish_overlap_length_mm = 3;
+    config.finish_extension_length_mm = 17;
+    config.infill_enabled = true;
+    config.infill_pattern = ipConcentric;
+    auto id = test_id(); id.parent.purpose = FiberPathPurpose::Contour;
+    const auto result = FiberPathFinalizer::finalize(candidate, {rectangle(0,0,30,30)}, config, id);
+    REQUIRE(result.prepared);
+    CHECK(result.prepared->finish_strategy == FiberFinishStrategy::LoopOverlap);
+    CHECK(result.prepared->spans.back().geometry.points.back() == Point3::new_scale(8,5,0));
+}
+
+TEST_CASE("fiber finalization validates only the requested path family", "[ContinuousFiber][cleanup]")
+{
+    ContinuousFiberConfig config;
+    config.infill_max_speed_mm_s = 0;
+    config.infill_feed_ratio = std::numeric_limits<double>::quiet_NaN();
+    config.finish_extension_length_mm = -1;
+    auto id = test_id(); id.parent.purpose = FiberPathPurpose::Contour;
+    const auto path = path_from_points({{5,5},{25,5},{25,25},{5,25},{5,5}});
+    const ExPolygons domain {rectangle(0,0,30,30)};
+    REQUIRE(FiberPathFinalizer::finalize(path, domain, config, id).prepared);
+    const auto invalid = FiberPathFinalizer::finalize(path, domain, config, test_id());
+    CHECK(invalid.failure == FiberFinalizationFailure::InvalidParameter);
+    CHECK_FALSE(invalid.detail.empty());
+}
+
+TEST_CASE("one unavailable contour finish does not abort other candidates", "[ContinuousFiber][cleanup]")
+{
+    ExtrusionEntityCollection candidates;
+    candidates.entities.push_back(new ExtrusionPath(path_from_points({{5,5},{25,5},{25,25},{5,25},{5,5}})));
+    candidates.entities.push_back(new ExtrusionPath(path_from_points({{5,5},{7,5},{7,7},{5,7},{5,5}})));
+    ContinuousFiberConfig config;
+    config.finish_overlap_length_mm = 12;
+    const auto result = FiberPathValidator::validate({&candidates}, {rectangle(0,0,30,30)}, config,
+        FiberPathPurpose::Contour, erContinuousFiberContour, test_id().parent.domain);
+    CHECK(result.accepted_count() == 1);
+    CHECK(result.rejected_count() == 1);
+    CHECK(result.assignments.back().reason == FiberRejectionReason::FinishUnavailable);
+    CHECK_FALSE(result.assignments.back().detail.empty());
+    CHECK(result.audit_assignments().valid());
+}
+
+TEST_CASE("retired fiber edge filters are ignored when reading old configs", "[ContinuousFiber][cleanup]")
+{
+    for (std::string key : {"fiber_minimum_segment_length", "fiber_maximum_turn_angle"}) {
+        CHECK_FALSE(print_config_def.has(key));
+        DynamicPrintConfig restored;
+        CHECK_NOTHROW(restored.set_deserialize_strict(key, "1"));
+        CHECK_FALSE(restored.has(key));
+        std::string value = "1";
+        PrintConfigDef::handle_legacy(key, value);
+        CHECK(key.empty());
+    }
 }

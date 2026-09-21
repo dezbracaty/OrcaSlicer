@@ -130,6 +130,8 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
         contour ? config.contour_min_speed_mm_s : config.infill_min_speed_mm_s,
         contour ? config.contour_max_speed_mm_s : config.infill_max_speed_mm_s,
         config.corner_transition_length_mm);
+    const FiberSpeedPlanner tail_limits(depositing, config.tail_min_speed_mm_s,
+                                       config.tail_max_speed_mm_s, config.corner_transition_length_mm);
     double offset = 0.0;
     for (FiberMotionSpan& span : prepared.spans) {
         span.geometry = normalized_xy(span.geometry);
@@ -139,7 +141,7 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
         const bool tail = span.kind == FiberMotionKind::PassiveDepositingAfterCut;
         const size_t cells = tail ? std::max(size_t(2), size_t(std::ceil(length/config.tail_speed_step_length_mm))) : 0;
         if (cells > 1000000 || length/config.speed_sampling_length_mm > 1000000)
-            throw std::invalid_argument("Fiber command sampling exceeds the supported budget");
+            throw std::length_error("Fiber command sampling exceeds the supported budget");
         const auto add_sample = [&](double s) {
             const auto next = std::lower_bound(arc.positions.begin(), arc.positions.end(), s);
             if (next == arc.positions.end() || next == arc.positions.begin()) return;
@@ -173,11 +175,9 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
             } else if (tail) {
                 const size_t cell = std::min(cells-1, size_t(std::floor((cuts[i-1]+cuts[i])*0.5/length*cells)));
                 speed = config.tail_min_speed_mm_s + (config.tail_max_speed_mm_s-config.tail_min_speed_mm_s)*double(cell)/double(cells-1);
-                // Tail has its own speed range; turns obey the same angular safety model.
-                FiberSpeedPlanner tail_limits(depositing, config.tail_min_speed_mm_s,
-                                             config.tail_max_speed_mm_s, config.corner_transition_length_mm);
-                if (speed > tail_limits.limit(offset+cuts[i-1], offset+cuts[i]) + EPSILON)
-                    throw std::invalid_argument("Fiber tail ramp exceeds the corner speed limit");
+                // The requested ramp is capped by the path's corner limits.
+                // A speed conflict does not invalidate an otherwise printable path.
+                speed = std::min(speed, tail_limits.limit(offset+cuts[i-1], offset+cuts[i]));
             }
             edges.push_back({speed, span.actively_feeds_fiber() ? ratio : 0.0});
         }
@@ -193,8 +193,7 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
 bool plan_finish(PreparedFiberPath& prepared, const ExtrusionPath& candidate,
                  const ContinuousFiberConfig& config)
 {
-    const bool tangent = prepared.id.parent.purpose == FiberPathPurpose::Infill ||
-        (config.infill_enabled && config.infill_pattern == ipConcentric);
+    const bool tangent = prepared.id.parent.purpose == FiberPathPurpose::Infill;
     const double length = tangent ? config.finish_extension_length_mm : config.finish_overlap_length_mm;
     if (length <= 0) return true;
     Polyline3 finish;
@@ -230,58 +229,27 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     const FiberFragmentId& id)
 {
     FiberFinalizationResult result;
-    ExtrusionPath candidate(input);
-    try { candidate.polyline = normalized_xy(input.polyline); }
-    catch (const std::invalid_argument&) {
+    // The validator owns source normalization, before geometry checks and
+    // interval mapping. Splitting below may introduce short end edges, so each
+    // process span still preserves its endpoints when preparing command samples.
+    const ExtrusionPath& candidate = input;
+    if (candidate.polyline.points.size() < 2 || allowed_domain.empty() ||
+        std::any_of(candidate.polyline.points.begin(), candidate.polyline.points.end(),
+                    [](const Point3& point) { return point.z() != 0; })) {
         result.failure = FiberFinalizationFailure::InvalidGeometry;
+        result.detail = "Fiber finalization requires a normalized planar path and nonempty domain";
         return result;
     }
     result.length_mm = unscale<double>(candidate.length());
-
-    const double process_values[] = {
-        result.length_mm,
-        config.minimum_path_length_mm,
-        config.landing_length_mm,
-        config.start_stabilization_length_mm,
-        config.minimum_effective_length_mm,
-        config.cut_to_contact_length_mm,
-        config.prefeed_extra_length_mm,
-        config.prefeed_speed_mm_s,
-        config.z_hop_height_mm,
-        config.landing_speed_mm_s,
-        config.start_speed_mm_s,
-        config.finish_extension_length_mm,
-        config.finish_overlap_length_mm,
-        config.outside_tolerance_mm2,
-        config.resin_overlap_mm,
-        config.contour_infill_clearance_mm
-    };
-    if (!std::all_of(std::begin(process_values), std::end(process_values), [](double value) {
-            return std::isfinite(value) && value >= 0.0;
-        })) {
-        result.failure = FiberFinalizationFailure::InvalidParameter;
+    if (!std::isfinite(result.length_mm)) {
+        result.failure = FiberFinalizationFailure::InvalidGeometry;
+        result.detail = "Non-finite fiber path length";
         return result;
     }
-    if ((config.cut_to_contact_length_mm + config.prefeed_extra_length_mm > 0.0 && config.prefeed_speed_mm_s <= 0.0) ||
-        (config.landing_length_mm > 0.0 && config.landing_speed_mm_s <= 0.0) ||
-        (config.start_stabilization_length_mm > 0.0 && config.start_speed_mm_s <= 0.0)) {
+    try { validate_fiber_process_config(config, id.parent.purpose); }
+    catch (const std::invalid_argument& error) {
         result.failure = FiberFinalizationFailure::InvalidParameter;
-        return result;
-    }
-
-    const double positive_values[] = {
-        config.contour_feed_ratio, config.infill_feed_ratio, config.contour_feed_correction,
-        config.infill_feed_correction, config.contour_min_speed_mm_s, config.contour_max_speed_mm_s,
-        config.infill_min_speed_mm_s, config.infill_max_speed_mm_s, config.corner_transition_length_mm,
-        config.speed_sampling_length_mm, config.tail_min_speed_mm_s, config.tail_max_speed_mm_s,
-        config.tail_speed_step_length_mm, config.finish_motion_speed_mm_s
-    };
-    if (!std::all_of(std::begin(positive_values), std::end(positive_values),
-                    [](double v){return std::isfinite(v) && v > 0;}) ||
-        config.contour_min_speed_mm_s > config.contour_max_speed_mm_s ||
-        config.infill_min_speed_mm_s > config.infill_max_speed_mm_s ||
-        config.tail_min_speed_mm_s > config.tail_max_speed_mm_s) {
-        result.failure = FiberFinalizationFailure::InvalidParameter;
+        result.detail = error.what();
         return result;
     }
     const double required_length = std::max(
@@ -290,10 +258,6 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
             config.minimum_effective_length_mm + config.cut_to_contact_length_mm);
     if (result.length_mm + EPSILON < required_length) {
         result.failure = FiberFinalizationFailure::TooShort;
-        return result;
-    }
-    if (candidate.polyline.points.size() < 2 || allowed_domain.empty()) {
-        result.failure = FiberFinalizationFailure::InvalidGeometry;
         return result;
     }
 
@@ -363,17 +327,21 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     if (!passive.empty())
         prepared->spans.push_back({std::move(passive), FiberMotionKind::PassiveDepositingAfterCut});
 
-    if (!plan_finish(*prepared, candidate, config))
-        throw std::runtime_error("Invalid fiber finish geometry at layer " + std::to_string(id.parent.domain.layer_id) +
-            ": loop overlap requires a closed path at least as long as its configured finish");
+    if (!plan_finish(*prepared, candidate, config)) {
+        result.failure = FiberFinalizationFailure::FinishUnavailable;
+        result.detail = "Loop overlap requires a closed path at least as long as its configured finish";
+        return result;
+    }
     try {
         plan_edges(*prepared, candidate.polyline, config);
-    } catch (const std::invalid_argument&) {
-        result.failure = FiberFinalizationFailure::InvalidParameter;
+    } catch (const std::length_error& error) {
+        result.failure = FiberFinalizationFailure::SamplingLimit;
+        result.detail = error.what();
         return result;
     }
     try { prepared->finalize_actions(); prepared->validate(); }
-    catch (const std::invalid_argument&) {
+    catch (const std::invalid_argument& error) {
+        result.detail = error.what();
         result.failure = FiberFinalizationFailure::InvalidGeometry;
         return result;
     }
