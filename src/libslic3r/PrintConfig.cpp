@@ -1013,7 +1013,7 @@ void PrintConfigDef::init_fff_params()
     def = this->add("fiber_fill_debug", coBool);
     def->label = L("Enable continuous fiber fill debugging");
     def->category = L("Continuous fiber");
-    def->tooltip = L("Collect rejected fiber contour and infill candidate paths for preview diagnostics. Does not change the generated print moves. Regions without candidate paths are not included.");
+    def->tooltip = L("Collect original contour regions, contour candidate coverage not present in the final fiber paths, and rejected candidate paths for preview diagnostics. Does not change print moves. Missing coverage is relative to generated candidates, not the entire resin region.");
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionBool(false));
 

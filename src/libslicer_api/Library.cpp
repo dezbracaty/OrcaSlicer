@@ -7,6 +7,7 @@
 #include <libslic3r/Model.hpp>
 #include <libslic3r/Print.hpp>
 #include <libslic3r/Layer.hpp>
+#include <libslic3r/Tesselate.hpp>
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/ContinuousFiber/ContinuousFiberConfig.hpp>
 #include <libslic3r/GCode/GCodeProcessor.hpp>
@@ -3439,14 +3440,39 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                                 path.layer_index = preview_layer->index;
                                 path.object_index = oi;
                                 path.instance_index = ii;
-                                for (const auto& point : source.geometry.points) {
-                                    Slic3r::Vec3d position(Slic3r::unscale<double>(point.x() + shift.x()),
-                                        Slic3r::unscale<double>(point.y() + shift.y()), layer->print_z);
+                                switch (source.kind) {
+                                case Slic3r::Layer::FiberDiagnosticKind::RejectedPath:
+                                    path.kind = FiberDiagnosticKind::RejectedPath; break;
+                                case Slic3r::Layer::FiberDiagnosticKind::OriginalContourRegion:
+                                    path.kind = FiberDiagnosticKind::OriginalContourRegion; break;
+                                case Slic3r::Layer::FiberDiagnosticKind::MissingContourRegion:
+                                    path.kind = FiberDiagnosticKind::MissingContourRegion; break;
+                                }
+                                path.policy_group_id = source.policy_group_id;
+                                path.component_id = source.component_id;
+                                const auto world_point = [&](double x, double y) {
+                                    Slic3r::Vec3d position(x + Slic3r::unscale<double>(shift.x()),
+                                                         y + Slic3r::unscale<double>(shift.y()), layer->print_z);
                                     if (const auto* belt = print.belt_coordinate_system())
                                         position = belt->oriented_to_world(position);
-                                    path.points.push_back({float(position.x()), float(position.y()), float(position.z())});
-                                }
-                                if (path.points.size() >= 2)
+                                    return ToolpathPoint{float(position.x()), float(position.y()), float(position.z())};
+                                };
+                                for (const auto& point : source.geometry.points)
+                                    path.points.push_back(world_point(Slic3r::unscale<double>(point.x()), Slic3r::unscale<double>(point.y())));
+                                const auto append_loop = [&](const Slic3r::Polygon& polygon) {
+                                    if (polygon.points.size() < 3) return;
+                                    std::vector<ToolpathPoint> loop;
+                                    for (const auto& point : polygon.points)
+                                        loop.push_back(world_point(Slic3r::unscale<double>(point.x()), Slic3r::unscale<double>(point.y())));
+                                    loop.push_back(loop.front());
+                                    path.boundaries.push_back(std::move(loop));
+                                };
+                                append_loop(source.region.contour);
+                                for (const auto& hole : source.region.holes) append_loop(hole);
+                                if (path.kind == FiberDiagnosticKind::MissingContourRegion)
+                                    for (const auto& point : Slic3r::triangulate_expolygon_2d(source.region))
+                                        path.triangles.push_back(world_point(point.x(), point.y()));
+                                if (path.points.size() >= 2 || !path.boundaries.empty())
                                     preview->fiber_fill_diagnostics.push_back(std::move(path));
                             }
                         }

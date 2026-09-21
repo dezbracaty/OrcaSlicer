@@ -841,6 +841,32 @@ TEST_CASE("CFSYS export restores legacy toolchange clearance and fan channels", 
     if (!output) std::filesystem::remove(result.output.path);
 }
 
+namespace {
+libslicer::SliceObjectInput fiber_debug_ring()
+{
+    libslicer::SliceObjectInput object;
+    object.name = "fiber-debug-ring";
+    libslicer::SliceVolumeInput volume;
+    // Extruded rectangular annulus: includes a through hole and non-zero XY placement.
+    volume.vertices = {{100,100,0},{160,100,0},{160,140,0},{100,140,0},
+                       {120,110,0},{140,110,0},{140,130,0},{120,130,0},
+                       {100,100,3},{160,100,3},{160,140,3},{100,140,3},
+                       {120,110,3},{140,110,3},{140,130,3},{120,130,3}};
+    const auto quad = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        volume.triangles.push_back({a,b,c}); volume.triangles.push_back({a,c,d});
+    };
+    for (std::uint32_t i=0;i<4;++i) {
+        const auto j=(i+1)%4;
+        quad(i,j,j+8,i+8); // outer wall
+        quad(i+4,i+12,j+12,j+4); // inner wall
+        quad(i+8,j+8,j+12,i+12); // top
+        quad(i,i+4,j+4,j); // bottom
+    }
+    object.volumes.push_back(std::move(volume));
+    return object;
+}
+}
+
 TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libslicer_api][fiber-fill-debug]")
 {
     libslicer::LibraryOptions options;
@@ -862,7 +888,7 @@ TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libsl
     libslicer::SliceRequest request;
     request.config = *library->active_config_snapshot();
     request.center_on_build_plate = model != nullptr;
-    request.objects.push_back(model ? binary_stl_on_bed(model) : fiber_infill_block());
+    request.objects.push_back(model ? binary_stl_on_bed(model) : fiber_debug_ring());
     const auto normal = library->slice(request);
     for (const auto& d : normal.diagnostics) INFO(d.message);
     REQUIRE(normal.success);
@@ -879,16 +905,77 @@ TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libsl
     REQUIRE(debug.success);
     REQUIRE(debug.preview);
     REQUIRE_FALSE(debug.preview->fiber_fill_diagnostics.empty());
-    size_t contour_count = 0, infill_count = 0;
+    size_t contour_count = 0, infill_count = 0, original_count = 0, missing_count = 0;
+    bool original_has_holes = false, missing_has_holes = false;
+    double original_area = 0, missing_area = 0;
+    const auto loop_area = [](const std::vector<libslicer::ToolpathPoint>& loop) {
+        double result = 0;
+        for (size_t i=1;i<loop.size();++i)
+            result += double(loop[i-1].x)*loop[i].y-double(loop[i].x)*loop[i-1].y;
+        return result*.5;
+    };
     for (const auto& path : debug.preview->fiber_fill_diagnostics) {
-        REQUIRE(path.points.size() >= 2);
+        INFO("diagnostic kind=" << unsigned(path.kind) << " layer=" << path.layer_index
+             << " component=" << path.component_id);
         CHECK_FALSE(path.reason.empty());
-        CHECK(path.source_length_mm > 0);
+        if (path.kind == libslicer::FiberDiagnosticKind::RejectedPath) {
+            REQUIRE(path.points.size() >= 2);
+            CHECK(path.source_length_mm > 0);
+            path.contour ? ++contour_count : ++infill_count;
+        } else {
+            REQUIRE_FALSE(path.boundaries.empty());
+            double area = 0;
+            for (const auto& loop : path.boundaries) {
+                REQUIRE(loop.size() >= 4);
+                CHECK(loop.front().x == loop.back().x);
+                CHECK(loop.front().y == loop.back().y);
+                area += loop_area(loop);
+            }
+            if (path.kind == libslicer::FiberDiagnosticKind::OriginalContourRegion) {
+                // Preserve even sub-resolution original domains. Quantizing their
+                // world coordinates to float can flip their tiny signed area.
+                // Bound the possible area change by coordinate ULP and perimeter.
+                double area_roundoff = 0;
+                for (const auto& loop : path.boundaries) {
+                    double coordinate_scale = 1;
+                    for (const auto& point : loop)
+                        coordinate_scale = std::max({coordinate_scale, std::abs(double(point.x)), std::abs(double(point.y))});
+                    const double ulp = coordinate_scale * std::numeric_limits<float>::epsilon();
+                    for (size_t i=1;i<loop.size();++i)
+                        area_roundoff += ulp*(std::abs(double(loop[i].x)-loop[i-1].x) +
+                                              std::abs(double(loop[i].y)-loop[i-1].y)) + 2*ulp*ulp;
+                }
+                CHECK(area >= -area_roundoff);
+                ++original_count;
+                original_has_holes |= path.boundaries.size() > 1;
+                original_area += area;
+                CHECK(path.triangles.empty());
+            } else {
+                CHECK(area > 0);
+                ++missing_count;
+                missing_has_holes |= path.boundaries.size() > 1;
+                missing_area += area;
+                REQUIRE_FALSE(path.triangles.empty());
+                REQUIRE(path.triangles.size()%3 == 0);
+                double triangle_area = 0;
+                for (size_t i=0;i<path.triangles.size();i+=3) {
+                    const auto a=path.triangles[i], b=path.triangles[i+1], c=path.triangles[i+2];
+                    triangle_area += std::abs((double(b.x)-a.x)*(double(c.y)-a.y)-(double(b.y)-a.y)*(double(c.x)-a.x))*.5;
+                    if (!model) {
+                        const double x=(double(a.x)+b.x+c.x)/3, y=(double(a.y)+b.y+c.y)/3;
+                        CHECK_FALSE((x>120 && x<140 && y>110 && y<130));
+                    }
+                }
+                CHECK(triangle_area == Catch::Approx(area).margin(0.005));
+            }
+        }
         REQUIRE(path.layer_index < debug.preview->layers.size());
         CHECK(path.object_index == 0);
         CHECK(path.instance_index == 0);
-        path.contour ? ++contour_count : ++infill_count;
-        for (const auto& p : path.points) {
+        std::vector<libslicer::ToolpathPoint> all_points = path.points;
+        for (const auto& loop : path.boundaries) all_points.insert(all_points.end(), loop.begin(), loop.end());
+        all_points.insert(all_points.end(), path.triangles.begin(), path.triangles.end());
+        for (const auto& p : all_points) {
             CHECK(std::isfinite(p.x)); CHECK(std::isfinite(p.y));
             CHECK(p.z == Catch::Approx(debug.preview->layers[path.layer_index].print_z_mm));
             if (!model) {
@@ -897,6 +984,12 @@ TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libsl
             }
         }
     }
+    CHECK(original_count > 0);
+    CHECK(missing_count > 0);
+    CHECK(original_has_holes);
+    CHECK(missing_has_holes);
+    // Candidate bands occupy only a fraction of the domain, even when all candidates fail.
+    CHECK(missing_area < original_area*.5);
     CHECK(contour_count > 0);
     CHECK(infill_count > 0);
     CHECK(debug.preview->segments.size() == normal.preview->segments.size());

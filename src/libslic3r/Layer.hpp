@@ -131,11 +131,16 @@ public:
         std::map<std::string, size_t> rejected_fragments;
     };
     FiberInfillStatistics fiber_infill_statistics;
+    enum class FiberDiagnosticKind { RejectedPath, OriginalContourRegion, MissingContourRegion };
     struct FiberFillDiagnostic {
         Polyline geometry;
         std::string reason;
         bool contour {false};
         double source_length_mm {0.0};
+        FiberDiagnosticKind kind {FiberDiagnosticKind::RejectedPath};
+        ExPolygon region; // Outer boundary and holes, diagnostic geometry only.
+        size_t policy_group_id {0};
+        size_t component_id {0};
     };
     std::vector<FiberFillDiagnostic> fiber_fill_diagnostics;
     // Sequential index of this layer in PrintObject::m_layers, offsetted by the number of raft layers.

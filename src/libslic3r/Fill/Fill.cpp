@@ -30,6 +30,7 @@
 
 #include <map>
 #include <optional>
+#include <set>
 #include <tuple>
 
 namespace Slic3r {
@@ -1763,8 +1764,30 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     const ExPolygons original_area = original_job.expolygons;
     const FiberDomainId& domain_id = domain.id;
 
+    const bool collect_debug = context.layer.object()->print()->config().fiber_fill_debug.value;
+    const auto record_regions = [&](const ExPolygons& regions, Layer::FiberDiagnosticKind kind,
+                                    const std::string& reason) {
+        for (const auto& region : regions) {
+            // A residual component thinner than the geometry tolerance cannot
+            // be represented reliably by the float preview coordinates.
+            if (kind == Layer::FiberDiagnosticKind::MissingContourRegion &&
+                offset_ex(ExPolygons{region}, -float(SCALED_EPSILON)).empty())
+                continue;
+            Layer::FiberFillDiagnostic diagnostic;
+            diagnostic.kind = kind;
+            diagnostic.region = region;
+            diagnostic.reason = reason;
+            diagnostic.contour = true;
+            diagnostic.policy_group_id = domain_id.policy_group_id;
+            diagnostic.component_id = domain_id.component_id;
+            context.layer.fiber_fill_diagnostics.push_back(std::move(diagnostic));
+        }
+    };
     FiberValidationResult contour_result;
     if (config.contour_enabled && config.contour_count > 0) {
+        if (collect_debug)
+            record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
+                           "original_contour_domain_before_candidate_generation");
         const FiberFillJobParams contour_params = resolve_fiber_fill_params(
             config, domain.policy, FiberCandidateFamily::Contour);
         SurfaceFill contour_job = original_job;
@@ -1784,9 +1807,29 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         execute_surface_fill_job(context, contour_job, candidates,
             {false, false, true, contour_params.max_concentric_loops, true});
         OwnedCandidateEntities owner(std::move(candidates));
+        ExPolygons candidate_coverage;
+        if (collect_debug)
+            candidate_coverage = intersection_ex(union_ex(owner.root.polygons_covered_by_width()), original_area);
         contour_result = FiberPathValidator::validate(
             owner.root.entities, original_area, config, FiberPathPurpose::Contour,
             erContinuousFiberContour, domain_id);
+        if (collect_debug) {
+            // Only missing coverage of actual contour candidates is highlighted.
+            // Resin-only interior and areas where no candidate existed are not failures.
+            std::set<std::string> reasons;
+            for (const auto& assignment : contour_result.assignments)
+                if (assignment.kind == FiberAssignmentKind::Rejected)
+                    reasons.insert(fiber_rejection_reason_name(assignment.reason));
+            std::string reason = "candidate_coverage_minus_final_contour_coverage";
+            for (const auto& value : reasons) reason += "; " + value;
+            // Process splitting resamples centerlines before their swept widths are
+            // unioned. Ignore differences within the existing geometric EPSILON;
+            // otherwise sub-micron slivers become misleading thick red boundaries.
+            // This tolerance only affects diagnostics, never physical print coverage.
+            const ExPolygons compared_coverage = offset_ex(contour_result.physical_footprint, float(SCALED_EPSILON));
+            record_regions(diff_ex(candidate_coverage, compared_coverage),
+                           Layer::FiberDiagnosticKind::MissingContourRegion, reason);
+        }
     }
 
     FiberValidationResult infill_result;
@@ -1848,7 +1891,9 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                     assignment.centerline->polyline.to_polyline(),
                     fiber_rejection_reason_name(assignment.reason),
                     assignment.id.parent.purpose == FiberPathPurpose::Contour,
-                    assignment.source_end_mm - assignment.source_begin_mm});
+                    assignment.source_end_mm - assignment.source_begin_mm,
+                    Layer::FiberDiagnosticKind::RejectedPath, {},
+                    domain_id.policy_group_id, domain_id.component_id});
             }
             BOOST_LOG_TRIVIAL(debug)
                 << "[FiberRejected] layer=" << context.layer.id()
