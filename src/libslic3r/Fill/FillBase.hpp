@@ -82,6 +82,8 @@ struct FillParams
     // Limit classic concentric generation by offset depth. Zero preserves the
     // ordinary Orca behavior and generates all loops that fit.
     size_t      max_concentric_loops{ 0 };
+    // Select emitted classic concentric loops without removing geometric holes.
+    bool        concentric_include_holes{ true };
     // Layer height for Concentric infill with Arachne.
     coordf_t    layer_height    { 0.f };
 

@@ -273,7 +273,8 @@ double connection_length(const TangentSolution& value)
 struct DomainDistance {
     struct Edge { Vec2d a, delta; double length_squared; };
     std::vector<Edge> edges;
-    AABBTreeLines::LinesDistancer<Linef> index;
+    Linesf lines;
+    AABBTreeIndirect::Tree<2,double> tree;
     explicit DomainDistance(const ExPolygons& domain) {
         const auto append=[&](const Polygon& ring) {
             for (size_t i=0;i<ring.points.size();++i) {
@@ -282,12 +283,27 @@ struct DomainDistance {
             }
         };
         for (const auto& region:domain) { append(region.contour); for (const auto& h:region.holes) append(h); }
-        Linesf lines;lines.reserve(edges.size());
+        lines.reserve(edges.size());
         for (const auto& edge:edges) lines.emplace_back(edge.a,edge.a+edge.delta);
-        index=AABBTreeLines::LinesDistancer<Linef>(std::move(lines));
+        tree=AABBTreeLines::build_aabb_tree_over_indexed_lines(lines);
     }
     double outside_distance(const Vec2d& p) const {
-        return index.distance_from_lines<true>(p);
+        size_t nearest=size_t(-1);Vec2d point=Vec2d::Zero();
+        const double squared=AABBTreeLines::squared_distance_to_indexed_lines(lines,tree,p,nearest,point);
+        return squared<0?HUGE_VAL:std::sqrt(squared)*AABBTreeLines::point_outside_closed_contours(lines,tree,p);
+    }
+    void nearby_edges(const Vec2d& center,double radius,std::vector<size_t>& found) const {
+        // A vertex or perpendicular foot within the radial band must lie in
+        // this box. Expand conservatively for floating-point boundary contacts.
+        const double roundoff=8*std::numeric_limits<double>::epsilon()*(radius+center.cwiseAbs().maxCoeff());
+        const Vec2d extent=Vec2d::Constant(radius+std::max(1e-9,roundoff));
+        const Eigen::AlignedBox<double,2> box(center-extent,center+extent);
+        found.clear();
+        AABBTreeIndirect::traverse(tree,AABBTreeIndirect::intersecting(box),[&](const auto& node) {
+            found.push_back(node.idx);return true;
+        });
+        // Keep the original evaluation order, including ties on the boundary.
+        std::sort(found.begin(),found.end());
     }
 };
 
@@ -417,7 +433,7 @@ void prune_candidates(LocalSolutions& solutions)
     std::vector<TangentSolution> kept;kept.reserve(frontier.size());
     for (size_t i:frontier) kept.push_back(std::move(values[i]));
     values=std::move(kept);
-    solutions.exhausted=true; // A later failure is not a proof of infeasibility.
+    solutions.candidates_pruned=true; // A later failure is not a proof of infeasibility.
 }
 
 LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
@@ -498,10 +514,22 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
         double tolerance;
         const std::vector<Vec2d>* knots;
         std::function<void(TangentSolution)> retain;
+        mutable std::vector<size_t> nearby;
+        mutable std::vector<double> last_parameters;
+        mutable std::optional<TangentSolution> last_connection;
+        mutable double last_violation=0;
+        const std::optional<TangentSolution>& evaluate(const std::vector<double>& x) const {
+            // COBYLA evaluates objective and constraint at the same pose. Share
+            // only that exact pose, within this optimizer run and this thread.
+            if (x!=last_parameters) {
+                last_connection=connection(*problem,family,x,last_violation);
+                last_parameters=x;
+            }
+            return last_connection;
+        }
         double constraint(const std::vector<double>& x) const {
-            double violation;
-            auto value=connection(*problem,family,x,violation);
-            if (!value) return 1+violation/problem->minimum_radius;
+            const auto& value=evaluate(x);
+            if (!value) return 1+last_violation/problem->minimum_radius;
             const double winding_error=turn_violation(*value,problem->turn_radians,problem->heading_min,problem->heading_max);
             if (winding_error>1e-8) return winding_error;
             double outside=-HUGE_VAL;
@@ -519,9 +547,11 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
                     if (angle<=std::abs(arc.sweep_radians) && radial.squaredNorm()>1e-18)
                         outside=std::max(outside,distances->outside_distance(arc.center_mm+arc.radius_mm*radial.normalized()));
                 };
-                for (const auto& edge:distances->edges) {
+                const double band=arc.radius_mm*std::abs(arc.sweep_radians)/count;
+                distances->nearby_edges(arc.center_mm,arc.radius_mm+band,nearby);
+                for (size_t edge_index:nearby) {
+                    const auto& edge=distances->edges[edge_index];
                     const Vec2d radial=edge.a-arc.center_mm;
-                    const double band=arc.radius_mm*std::abs(arc.sweep_radians)/count;
                     if (std::abs(radial.norm()-arc.radius_mm)<=band) inspect_direction(radial);
                     const double t=(-radial).dot(edge.delta)/edge.length_squared;
                     if (t>=0 && t<=1) {
@@ -543,8 +573,8 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
         }
         static double objective(const std::vector<double>& x,std::vector<double>&,void* data) {
             const auto& self=*static_cast<Search*>(data);
-            double violation; auto value=connection(*self.problem,self.family,x,violation);
-            if (!value) return 100+violation/self.problem->minimum_radius;
+            const auto& value=self.evaluate(x);
+            if (!value) return 100+self.last_violation/self.problem->minimum_radius;
             return connection_score(*value,*self.knots,self.problem->minimum_radius,self.problem->incoming_length,self.problem->absolute_turn);
         }
     };
@@ -581,7 +611,7 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
             optimizer.set_initial_step(step);
             optimizer.set_xtol_abs(1e-5); optimizer.set_maxeval(180);
             double score;
-            try { result.exhausted|=optimizer.optimize(x,score)==nlopt::MAXEVAL_REACHED; }
+            try { result.optimizer_limit_reached|=optimizer.optimize(x,score)==nlopt::MAXEVAL_REACHED; }
             catch (const nlopt::roundoff_limited&) { result.numerical_failure=true; }
             double violation;
             if (auto value=connection(problem,family,x,violation)) add(*value);
@@ -841,7 +871,6 @@ ContourRoundingResult validated_cycle(const std::vector<LocalSolutions>& candida
         }
     }
     if (!result.path) {
-        limited|=std::any_of(candidates.begin(),candidates.end(),[](const auto& c){return c.exhausted;});
         if (limited) result.issues.push_back({ContourRoundingFailure::SearchBudgetExceeded,source});
         return result;
     }
@@ -857,15 +886,17 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
     std::optional<DomainDistance> distances;
     std::map<std::pair<size_t,size_t>,LocalSolutions> cache;
     size_t revisions_left=2*p.size(),local_queries_left=2*p.size(),searches_left=128;
-    bool budget_exhausted=false,numerical_failure=false;
+    bool budget_exhausted=false,optimizer_limit=false,numerical_failure=false;
     const auto solve=[&](CornerGroup group,double lo=0.0,double hi=HUGE_VAL) {
         if (local_queries_left==0) {
             budget_exhausted=true;
-            LocalSolutions limited;limited.exhausted=true;return limited;
+            // Cached partitions may still form a valid ring without another
+            // local solve. Do not consume their independent revision budget.
+            return LocalSolutions{};
         }
         --local_queries_left;
         auto local=solve_group(p,group,options,domain,distances,lo,hi);
-        budget_exhausted|=local.exhausted;
+        optimizer_limit|=local.optimizer_limit_reached;
         numerical_failure|=local.values.empty() && local.numerical_failure;
         return local;
     };
@@ -881,6 +912,18 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
         for (size_t i=1;i<span;++i) groups.front().count+=groups[i].count;
         groups.erase(groups.begin()+1,groups.begin()+span);
         return groups;
+    };
+    const auto priority=[&](const Partition& groups) {
+        size_t unresolved=0;double deficit=0;
+        for (const auto& group:groups) if (cached(group).values.empty()) {
+            ++unresolved;
+            if (const auto support=supports(p,group)) {
+                const Vec2d contact=support->base+options.minimum_radius_mm*support->slope;
+                deficit+=std::max({0.0,-contact.x(),contact.x()-support->incoming_length})+
+                    std::max({0.0,-contact.y(),contact.y()-support->outgoing_length});
+            }
+        }
+        return std::make_pair(unresolved,deficit);
     };
     const auto attempt=[&](Partition groups,const auto& enqueue,size_t queued_partitions) {
         ContourRoundingResult result;
@@ -904,37 +947,17 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
             bool unresolved=false;
             for (size_t i=0;i<groups.size();++i) if (candidates[i].values.empty()) {
                 unresolved=true;
-                for (int direction:{-1,1}) {
-                    size_t before=direction<0?(i+groups.size()-1)%groups.size():i;
-                    size_t span=2;
-                    CornerGroup expanded{groups[before].first,
-                        groups[before].count+groups[(before+1)%groups.size()].count};
-                    while (expanded.count<p.size()-1 && span<=groups.size()) {
-                        const auto& expanded_solutions=cached(expanded);
-                        if (!expanded_solutions.values.empty()) {
-                            const double score=std::min_element(expanded_solutions.values.begin(),expanded_solutions.values.end(),
-                                [](const auto& a,const auto& b){return a.score<b.score;})->score;
-                            enqueue(merged_partition(groups,before,span),score);
-                            break;
-                        }
-                        // An analytic contact beyond this window identifies the
-                        // support it still needs. Extend only in that direction;
-                        // optimizer failure by itself never enlarges the window.
-                        const auto support=supports(p,expanded);
-                        if (!support || span==groups.size()) break;
-                        const Vec2d contact=support->base+options.minimum_radius_mm*support->slope;
-                        if (direction<0 && contact.x()<-1e-8) {
-                            before=(before+groups.size()-1)%groups.size();
-                            expanded.first=groups[before].first;
-                            expanded.count+=groups[before].count;
-                        } else if (direction>0 && contact.y()>support->outgoing_length+1e-8) {
-                            expanded.count+=groups[(before+span)%groups.size()].count;
-                        } else break;
-                        ++span;
+                // An unresolved window may need support from BOTH sides. Keep
+                // intermediate partitions even when their local solve fails; a
+                // single-circle contact cannot rule out a later CSC/CCC solution.
+                for (size_t before:{(i+groups.size()-1)%groups.size(),i}) {
+                    const size_t count=groups[before].count+groups[(before+1)%groups.size()].count;
+                    if (count<p.size()-1) {
+                        auto merged=merged_partition(groups,before,2);
+                        const auto order=priority(merged);
+                        enqueue(std::move(merged),order);
                     }
                 }
-                // Search the queued partitions independently. A locally preferred
-                // merge must not erase the other direction before whole-ring checks.
                 break;
             }
             if (unresolved) break;
@@ -973,18 +996,19 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
             auto constrained=solve(group,incoming_min,outgoing_max);
             if (!constrained.values.empty()) {
                 auto& retained=cache.at({group.first,group.count});
-                bool added=false;
                 for (auto& value:constrained.values)
                     if (std::none_of(retained.values.begin(),retained.values.end(),[&](const auto& old){return same_connection(old,value);})) {
-                        retained.values.push_back(std::move(value));added=true;
+                        retained.values.push_back(std::move(value));
                     }
-                retained.exhausted|=constrained.exhausted;
+                retained.optimizer_limit_reached|=constrained.optimizer_limit_reached;
                 retained.numerical_failure|=constrained.numerical_failure;
                 prune_candidates(retained);
-                if (added) continue;
+                if (std::any_of(retained.values.begin(),retained.values.end(),[&](const auto& value) {
+                    return std::none_of(candidates[blocked].values.begin(),candidates[blocked].values.end(),
+                        [&](const auto& old){return same_connection(old,value);});
+                })) continue;
             }
-            // Grow only across an observed overlap of verified connections. Neither
-            // an optimizer failure nor a single-circle deficit can grow a window.
+            // Verified connections identify which shared supports overlap.
             double left_overlap=HUGE_VAL,right_overlap=HUGE_VAL;
             for (const auto& value:candidates[blocked].values) {
                 const double left=incoming_min-value.incoming_remaining;
@@ -993,10 +1017,12 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
                 if (right>1e-8) right_overlap=std::min(right_overlap,right+std::max(0.0,left));
             }
             const size_t previous=(blocked+groups.size()-1)%groups.size();
-            if (std::isfinite(left_overlap) && groups[previous].count+groups[blocked].count<p.size()-1)
-                enqueue(merged_partition(groups,previous,2),left_overlap);
-            if (std::isfinite(right_overlap) && groups[blocked].count+groups[(blocked+1)%groups.size()].count<p.size()-1)
-                enqueue(merged_partition(groups,blocked,2),right_overlap);
+            for (const auto& side:{std::make_pair(previous,left_overlap),std::make_pair(blocked,right_overlap)})
+                if (std::isfinite(side.second) && groups[side.first].count+groups[(side.first+1)%groups.size()].count<p.size()-1) {
+                    auto merged=merged_partition(groups,side.first,2);
+                    const auto order=priority(merged);
+                    enqueue(std::move(merged),order);
+                }
             result.issues.push_back({ContourRoundingFailure::SupportConflict,source});
             return result;
         }
@@ -1005,13 +1031,12 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
             const auto group=groups[k];
             for (size_t i=0;i<group.count+2;++i)
                 issue.points.push_back(scaled_point(p[(group.first+p.size()-1+i)%p.size()]));
-            result.issues.push_back({candidates[k].exhausted?ContourRoundingFailure::SearchBudgetExceeded:
+            result.issues.push_back({candidates[k].optimizer_limit_reached?ContourRoundingFailure::OptimizerLimit:
                 candidates[k].numerical_failure?ContourRoundingFailure::NumericalFailure:ContourRoundingFailure::SearchNotFound,std::move(issue)});
         }
         if (!result.issues.empty()) return result;
         if (choice.indices.empty()) {
-            const bool limited=std::any_of(candidates.begin(),candidates.end(),[](const auto& c){return c.exhausted;});
-            result.issues.push_back({limited?ContourRoundingFailure::SearchBudgetExceeded:ContourRoundingFailure::SupportConflict,source});
+            result.issues.push_back({ContourRoundingFailure::SupportConflict,source});
             return result;
         }
         // Reserve a share for queued partitions instead of letting a failing
@@ -1050,14 +1075,15 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
     result=search_contour_partitions(conflict_windows(p,options,domain),source,
         revisions_left,searches_left,attempt);
     if (!result.path) {
-        const bool limited=budget_exhausted ||
-            std::any_of(cache.begin(),cache.end(),[](const auto& item){return item.second.exhausted;});
-        if (numerical_failure && std::none_of(result.issues.begin(),result.issues.end(),[](const auto& issue){
-            return issue.reason==ContourRoundingFailure::NumericalFailure;
-        })) result.issues.push_back({ContourRoundingFailure::NumericalFailure,source});
-        if (limited && std::none_of(result.issues.begin(),result.issues.end(),[](const auto& issue){
-            return issue.reason==ContourRoundingFailure::SearchBudgetExceeded;
-        })) result.issues.push_back({ContourRoundingFailure::SearchBudgetExceeded,source});
+        const auto report=[&](bool occurred,ContourRoundingFailure reason) {
+            if (occurred && std::none_of(result.issues.begin(),result.issues.end(),[&](const auto& issue){return issue.reason==reason;}))
+                result.issues.push_back({reason,source});
+        };
+        report(numerical_failure,ContourRoundingFailure::NumericalFailure);
+        report(optimizer_limit,ContourRoundingFailure::OptimizerLimit);
+        report(std::any_of(cache.begin(),cache.end(),[](const auto& item){return item.second.candidates_pruned;}),
+            ContourRoundingFailure::CandidateLimit);
+        report(budget_exhausted,ContourRoundingFailure::SearchBudgetExceeded);
         return result;
     }
     Polyline output=result.path->to_polyline();
@@ -1101,6 +1127,8 @@ const char* contour_rounding_failure_name(ContourRoundingFailure reason)
     case ContourRoundingFailure::SupportConflict:return "rounding_support_conflict";
     case ContourRoundingFailure::SearchBudgetExceeded:return "rounding_search_budget_exceeded";
     case ContourRoundingFailure::NumericalFailure:return "rounding_numerical_failure";
+    case ContourRoundingFailure::OptimizerLimit:return "rounding_optimizer_limit";
+    case ContourRoundingFailure::CandidateLimit:return "rounding_candidate_limit";
     case ContourRoundingFailure::SamplingLimit:return "rounding_sampling_limit";
     }
     return "unknown";

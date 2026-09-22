@@ -1080,6 +1080,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     // FiberContour paths; obsolete CFSYS process keys are not runtime aliases.
     ((ConfigOptionBool,                 generate_reinforced_perimeters))
     ((ConfigOptionInt,                  outer_reinforced_perimeters_counts))
+    ((ConfigOptionBool,                 fiber_contour_include_holes))
     ((ConfigOptionBool,                 generate_reinforced_infills))
     ((ConfigOptionPercent,              reinforced_infill_density))
     ((ConfigOptionEnum<InfillPattern>,  reinforced_infill_pattern))

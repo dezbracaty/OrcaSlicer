@@ -1383,6 +1383,7 @@ struct FillExecutionPolicy {
     size_t max_concentric_loops = 0;
     // A planner may supply the already inset, fixed-width centerline domain.
     bool centerline_domain = false;
+    bool concentric_include_holes = true;
 };
 
 struct FillExecutionContext {
@@ -1468,6 +1469,7 @@ static void execute_surface_fill_job(
         (surface_fill.params.pattern == ipConcentric || surface_fill.params.pattern == ipConcentricInternal);
     params.enable_gap_fill = policy.enable_gap_fill;
     params.max_concentric_loops = policy.max_concentric_loops;
+    params.concentric_include_holes = policy.concentric_include_holes;
     params.layer_height = layerm->layer()->height;
     params.lateral_lattice_angle_1 = surface_fill.params.lateral_lattice_angle_1;
     params.lateral_lattice_angle_2 = surface_fill.params.lateral_lattice_angle_2;
@@ -1791,10 +1793,8 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         const FiberFillJobParams contour_params = resolve_fiber_fill_params(
             config, domain.policy, FiberCandidateFamily::Contour);
         SurfaceFill contour_job = original_job;
-        // Open the centerline domain by half a fiber width before the native
-        // concentric generator. A narrow neck that cannot accommodate the
-        // return turn must not join two independently printable contours.
-        // Coverage/exclusion is still derived only from accepted final paths.
+        // Inset only for physical width and boundary clearance. Additional
+        // opening can join hole boundaries to the outer candidate contour.
         const double width = config.contour_flow.width();
         if (collect_debug)
             BOOST_LOG_TRIVIAL(debug) << "[FiberContourRadius] layer=" << context.layer.id()
@@ -1802,16 +1802,13 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 << " effective_mm=" << (config.contour_bend_radius_mm > 0 ?
                     std::max(config.contour_bend_radius_mm, 0.5*width + ContourRoundingOptions{}.geometry_tolerance_mm) : 0.0)
                 << " width_mm=" << width;
-        const ExPolygons centerline_limit = offset_ex(original_area,
+        contour_job.expolygons = offset_ex(original_area,
             -float(scale_(0.5 * width + config.contour_boundary_clearance_mm)));
-        contour_job.expolygons = intersection_ex(offset2_ex(original_area,
-            -float(scale_(width + config.contour_boundary_clearance_mm)), float(scale_(0.5 * width))),
-            centerline_limit);
         apply_fiber_fill_params(contour_job.params, contour_params);
 
         ExtrusionEntitiesPtr candidates;
         execute_surface_fill_job(context, contour_job, candidates,
-            {false, false, true, contour_params.max_concentric_loops, true});
+            {false, false, true, contour_params.max_concentric_loops, true, config.contour_include_holes});
         OwnedCandidateEntities owner(std::move(candidates));
         ExPolygons candidate_coverage;
         if (collect_debug)
@@ -1884,16 +1881,6 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         if (assignment.id.fragment_ordinal == 1) ++statistics.split_candidates;
         if (assignment.kind == FiberAssignmentKind::Rejected)
             ++statistics.rejected_fragments[fiber_rejection_reason_name(assignment.reason)];
-    }
-    for (const auto& assignment : contour_result.assignments) {
-        if (assignment.kind != FiberAssignmentKind::AcceptedFiber) continue;
-        context.layer.fiber_contour_source_overlap_mm2 += assignment.contour_source_overlap_mm2;
-        context.layer.fiber_contour_added_overlap_mm2 += assignment.contour_added_overlap_mm2;
-        if (assignment.contour_added_overlap_mm2 > 0)
-            BOOST_LOG_TRIVIAL(debug) << "[FiberContourCoverageOverlap] layer=" << context.layer.id()
-                << " candidate=" << assignment.id.parent.path_ordinal
-                << " source_mm2=" << assignment.contour_source_overlap_mm2
-                << " added_mm2=" << assignment.contour_added_overlap_mm2;
     }
     const auto log_rejections = [&](const FiberValidationResult& validation) {
         for (const FiberFragmentAssignment& assignment : validation.assignments) {
@@ -1993,7 +1980,6 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     fiber_infill_statistics = {};
     fiber_fill_diagnostics.clear();
     fiber_contour_rounding_failures.clear();
-    fiber_contour_source_overlap_mm2 = fiber_contour_added_overlap_mm2 = 0;
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");

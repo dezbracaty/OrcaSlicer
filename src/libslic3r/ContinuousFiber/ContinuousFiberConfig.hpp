@@ -12,6 +12,7 @@ class LayerRegion;
 
 struct ContinuousFiberConfig {
     bool contour_enabled { false };
+    bool contour_include_holes { true };
     bool infill_enabled { false };
     int layer_interval { 1 };
     int contour_count { 0 };

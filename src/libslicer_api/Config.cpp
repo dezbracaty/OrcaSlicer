@@ -192,7 +192,8 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
     const bool contour_enabled = boolean_value(config, "generate_reinforced_perimeters");
     const bool infill_enabled  = boolean_value(config, "generate_reinforced_infills");
 
-    if (key_is(item.key, {"outer_reinforced_perimeters_counts",
+    if (key_is(item.key, {"fiber_contour_include_holes",
+                          "outer_reinforced_perimeters_counts",
                           "reinforced_perimeters_filament",
                           "reinforced_perimeters_extrusion_width"})) {
         item.enabled = contour_enabled;

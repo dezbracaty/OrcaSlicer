@@ -14,6 +14,7 @@ namespace Slic3r {
 // process output is identical.
 struct FiberPolicyKey {
     bool contour_enabled { false };
+    bool contour_include_holes { true };
     bool infill_enabled { false };
     int layer_interval { 1 };
     int contour_count { 0 };
@@ -72,7 +73,7 @@ struct FiberPolicyKey {
     auto values() const
     {
         return std::tie(
-            contour_enabled, infill_enabled, layer_interval, contour_count,
+            contour_enabled, contour_include_holes, infill_enabled, layer_interval, contour_count,
             infill_pattern, infill_density, infill_direction, fixed_direction,
             contour_width, contour_spacing, contour_height, contour_nozzle,
             infill_width, infill_spacing, infill_height, infill_nozzle,
@@ -100,6 +101,7 @@ inline FiberPolicyKey fiber_policy_key(
         throw std::runtime_error("Continuous fiber infill direction must be finite");
     return {
         config.contour_enabled,
+        config.contour_include_holes,
         config.infill_enabled,
         config.layer_interval,
         config.contour_count,

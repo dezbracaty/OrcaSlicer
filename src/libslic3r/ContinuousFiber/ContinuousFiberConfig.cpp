@@ -341,6 +341,7 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         return flow;
     };
     if (result.contour_enabled) {
+        result.contour_include_holes = source.fiber_contour_include_holes.value;
         result.contour_count = std::max(0, source.outer_reinforced_perimeters_counts.value);
         result.contour_material = unsigned(std::max(1, source.reinforced_perimeters_filament.value));
         result.contour_boundary_clearance_mm = source.fiber_contour_boundary_clearance.value;

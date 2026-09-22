@@ -1005,6 +1005,7 @@ bool Preset::has_cali_lines(PresetBundle* preset_bundle)
 static std::vector<std::string> s_Preset_print_options{
     "generate_reinforced_perimeters",
     "outer_reinforced_perimeters_counts",
+    "fiber_contour_include_holes",
     "generate_reinforced_infills",
     "reinforced_infill_density",
     "reinforced_infill_pattern",

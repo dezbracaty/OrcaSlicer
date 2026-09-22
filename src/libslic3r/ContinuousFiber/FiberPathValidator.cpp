@@ -467,7 +467,6 @@ FiberValidationResult FiberPathValidator::validate(
                     assignment.reason = fragment_reason;
                 } else {
                     std::vector<ContourArc> arcs;
-                    Polyline3 rounding_source;
                     if (rounds_contours) {
                         const ExPolygons& centerline_domain = centerline_domain_for_width(path.width);
                         ContourRoundingOptions rounding{config.contour_bend_radius_mm};
@@ -481,7 +480,6 @@ FiberValidationResult FiberPathValidator::validate(
                             result.assignments.emplace_back(std::move(assignment));
                             continue;
                         }
-                        rounding_source = std::move(assignment.centerline->polyline);
                         assignment.centerline->polyline = std::move(*rounded.path);
                         arcs = std::move(rounded.arcs);
                         // round_contour has checked the complete replacement geometry.
@@ -495,12 +493,6 @@ FiberValidationResult FiberPathValidator::validate(
                         assignment.detail = finalized.detail;
                     } else {
                         assignment.prepared = finalized.prepared;
-                        if (!arcs.empty()) {
-                            const auto overlap = ContinuousFiberFillStrategy::contour_coverage_overlap(
-                                rounding_source, assignment.centerline->polyline, path.width);
-                            assignment.contour_source_overlap_mm2 = overlap.first;
-                            assignment.contour_added_overlap_mm2 = overlap.second;
-                        }
                         append_coverage(result, *assignment.prepared);
                     }
                 }

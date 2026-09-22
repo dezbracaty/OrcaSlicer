@@ -5,6 +5,7 @@
 #include "libslic3r/ContinuousFiber/FiberPathValidator.hpp"
 #include "libslic3r/ContinuousFiber/FiberPolicyKey.hpp"
 #include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/Fill/FillConcentric.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/GCode/FiberGCodeBlockParser.hpp"
 #include "libslic3r/GCodeWriter.hpp"
@@ -1808,7 +1809,7 @@ TEST_CASE("contour cycle selection matches exhaustive constrained search", "[Con
     }
 }
 
-TEST_CASE("rejected short rounded contours do not compute coverage diagnostics", "[ContinuousFiber][ContourRounding]")
+TEST_CASE("coverage diagnostics are explicit and independent of path acceptance", "[ContinuousFiber][ContourRounding]")
 {
     auto candidate=path_from_points({{0,0},{10,0},{10,10},{0,10},{0,0}});
     candidate.set_extrusion_role(erContinuousFiberContour);
@@ -1822,15 +1823,17 @@ TEST_CASE("rejected short rounded contours do not compute coverage diagnostics",
     REQUIRE(rejected.assignments.size()==1);
     const auto& assignment=rejected.assignments.front();
     CHECK(assignment.reason==FiberRejectionReason::ProcessBudgetTooShort);
-    CHECK(assignment.contour_source_overlap_mm2==0);
-    CHECK(assignment.contour_added_overlap_mm2==0);
     config.minimum_path_length_mm=0;
     const auto accepted=FiberPathValidator::validate({&candidate},domain,config,
         FiberPathPurpose::Contour,erContinuousFiberContour,{16,53,0,0});
     REQUIRE(accepted.accepted_count()==1);
-    // A sharp source square has inside-corner overlap. Its accepted assignment
-    // must still report it, so moving diagnostics does not silently disable them.
-    CHECK(accepted.assignments.front().contour_source_overlap_mm2>0);
+    // Computing an optional diagnostic must not mutate the accepted path.
+    const auto& rounded=accepted.assignments.front().centerline->polyline;
+    const auto points=rounded.points;
+    const auto overlap=ContinuousFiberFillStrategy::contour_coverage_overlap(candidate.polyline,rounded,candidate.width);
+    CHECK(overlap.first>0);
+    CHECK(rounded.points==points);
+    CHECK(accepted.accepted_count()==1);
 }
 
 TEST_CASE("optional contour improvement preserves a validated ring on global conflicts", "[ContinuousFiber][ContourRounding][improvement]")
@@ -1935,11 +1938,11 @@ TEST_CASE("partition alternatives survive a preferred partition failing whole-ri
         [&](auto groups,const auto& enqueue,size_t queued) {
             ++attempts;--revisions;--searches;
             if (groups.size()==4) {
-                enqueue({{0,2},{2,1},{3,1}},0.); // Locally preferred, globally crossing.
-                enqueue({{0,1},{1,2},{3,1}},1.); // Worse local score, valid whole ring.
-                enqueue({{2,1},{3,1},{0,2}},0.); // Same partition, different cyclic seam.
+                enqueue({{0,2},{2,1},{3,1}},{0,0.}); // Locally preferred, globally crossing.
+                enqueue({{0,1},{1,2},{3,1}},{0,1.}); // Worse local score, valid whole ring.
+                enqueue({{2,1},{3,1},{0,2}},{0,0.}); // Same partition, different cyclic seam.
                 auto rotated=initial;std::rotate(rotated.begin(),rotated.begin()+1,rotated.end());
-                enqueue(rotated,-1.); // Must not retry the original partition.
+                enqueue(rotated,{0,-1.}); // Must not retry the original partition.
                 return ContourRoundingResult{};
             }
             auto proposed=values;
@@ -1973,4 +1976,127 @@ TEST_CASE("arc sampling exhaustion is distinct from a geometric radius conflict"
     REQUIRE_FALSE(result.path);
     REQUIRE(result.issues.size()==1);
     CHECK(result.issues.front().reason==ContourRoundingFailure::SamplingLimit);
+}
+
+
+TEST_CASE("concentric hole selection preserves excluded geometry at every depth", "[ContinuousFiber][hole-contours]")
+{
+    const size_t depth = GENERATE(1, 3);
+    ExPolygon region = rectangle(0, 0, 100, 80);
+    SECTION("no holes") {}
+    SECTION("one hole") { region = rectangle_with_hole(0, 0, 100, 80, 15, 15, 30, 30); }
+    SECTION("multiple holes") {
+        region = rectangle_with_hole(0, 0, 100, 80, 15, 15, 30, 30);
+        auto hole = rectangle(60, 40, 80, 60).contour;
+        hole.reverse(); region.holes.push_back(hole);
+    }
+    FillConcentric fill;
+    fill.spacing = 1.0;
+    fill.angle = 0;
+    FillParams params;
+    params.density = 1.0f;
+    params.dont_adjust = true;
+    params.max_concentric_loops = depth;
+    Surface surface(stInternal, region);
+    const auto all = fill.fill_surface(&surface, params);
+    params.concentric_include_holes = false;
+    const auto outer = fill.fill_surface(&surface, params);
+    REQUIRE(all.size() == depth * (1 + region.holes.size()));
+    REQUIRE(outer.size() == depth);
+    CHECK(diff_pl(all, region).empty());
+    CHECK(diff_pl(outer, region).empty());
+    // Normalize only seam and winding: sorting vertices would miss changed edges.
+    const auto canonical_ring = [](const Polyline& line) {
+        Points points = line.points;
+        points.pop_back();
+        if (Polygon(points).is_clockwise()) std::reverse(points.begin(), points.end());
+        std::rotate(points.begin(), std::min_element(points.begin(), points.end()), points.end());
+        return points;
+    };
+    for (const auto& line : outer) {
+        REQUIRE(line.first_point() == line.last_point());
+        const auto ring = canonical_ring(line);
+        CHECK(std::any_of(all.begin(), all.end(), [&](const auto& old) {
+            return canonical_ring(old) == ring;
+        }));
+    }
+}
+
+TEST_CASE("hole contour settings separate fiber domain policies", "[ContinuousFiber][hole-contours]")
+{
+    ContinuousFiberConfig enabled;
+    enabled.contour_enabled = true;
+    ContinuousFiberConfig disabled = enabled;
+    disabled.contour_include_holes = false;
+    const std::set<FiberPolicyKey> policies{fiber_policy_key(enabled, 0, true), fiber_policy_key(disabled, 0, true)};
+    CHECK(policies.size() == 2);
+}
+
+TEST_CASE("unopened contours can borrow supports on both sides", "[ContinuousFiber][ContourRounding][bilateral]")
+{
+    std::ifstream stream(std::string(TEST_DATA_DIR)+"/continuous_fiber/unopened_contours.json");
+    REQUIRE(stream.good());
+    nlohmann::json fixture;stream>>fixture;
+    const auto read_regions=[](const auto& input) {
+        ExPolygons regions;
+        for (const auto& value:input) {
+            ExPolygon region;
+            for (const auto& point:value["outer"])
+                region.contour.points.emplace_back(point[0].template get<coord_t>(),point[1].template get<coord_t>());
+            for (const auto& points:value["holes"]) {
+                Polygon hole;
+                for (const auto& point:points)
+                    hole.points.emplace_back(point[0].template get<coord_t>(),point[1].template get<coord_t>());
+                region.holes.push_back(std::move(hole));
+            }
+            regions.push_back(std::move(region));
+        }
+        return regions;
+    };
+    for (const auto& input:fixture["domains"]) {
+        CAPTURE(input["display_layer"]);
+        const auto original=read_regions(input["original_region"]);
+        const auto domain=read_regions(input["centerline_allowed_region"]);
+        Polyline3 source;
+        for (const auto& point:input["candidates"][0]["points"])
+            source.points.emplace_back(point[0].get<coord_t>(),point[1].get<coord_t>(),coord_t(0));
+        CAPTURE(unscale<double>(source.length()));
+        ContourRoundingOptions options{.3};options.fiber_width_mm=1.0;
+        const auto rounded=ContinuousFiberFillStrategy::round_contour(source,domain,options);
+        for (const auto& issue:rounded.issues) INFO(contour_rounding_failure_name(issue.reason));
+        REQUIRE(rounded.path);
+        REQUIRE_FALSE(rounded.arcs.empty());
+        CHECK(rounded.issues.empty());
+        CHECK(rounded.path->points.front()==rounded.path->points.back());
+        CHECK(diff_pl(Polylines{rounded.path->to_polyline()},offset_ex(domain,float(scale_(.0001)))).empty());
+        for (const auto& arc:rounded.arcs) CHECK(arc.radius_mm>=.5001-1e-8);
+        auto reseamed=source;reseamed.points.pop_back();
+        std::rotate(reseamed.points.begin(),reseamed.points.begin()+reseamed.points.size()/2,reseamed.points.end());
+        reseamed.points.push_back(reseamed.points.front());
+        const auto rotated=ContinuousFiberFillStrategy::round_contour(reseamed,domain,options);
+        REQUIRE(rotated.path);
+        CHECK(rotated.path->points==rounded.path->points);
+        source.reverse();
+        auto reversed=ContinuousFiberFillStrategy::round_contour(source,domain,options);
+        REQUIRE(reversed.path);reversed.path->reverse();
+        CHECK(reversed.path->points==rounded.path->points);
+        source.reverse();
+
+        // Exercise acceptance and process finalization against the ORIGINAL area,
+        // not just round_contour's centerline-domain checks.
+        ExtrusionPath extrusion(erContinuousFiberContour,.13,1.f,.13f);extrusion.polyline=source;
+        ContinuousFiberConfig config;
+        config.contour_bend_radius_mm=.3;config.contour_boundary_clearance_mm=.2;
+        config.cut_to_contact_length_mm=23;config.landing_length_mm=2;
+        config.minimum_effective_length_mm=.5;config.finish_overlap_length_mm=23;
+        const auto validation=FiberPathValidator::validate({&extrusion},original,config,
+            FiberPathPurpose::Contour,erContinuousFiberContour,{16,input["display_layer"].get<size_t>()-1,0,0});
+        REQUIRE(validation.assignments.size()==1);
+        const auto& assignment=validation.assignments.front();
+        INFO(fiber_rejection_reason_name(assignment.reason));INFO(assignment.detail);
+        REQUIRE(assignment.prepared);
+        CHECK_NOTHROW(assignment.prepared->validate());
+        CHECK(validation.accepted_count()==1);
+        CHECK(validation.audit_assignments().valid());
+    }
 }

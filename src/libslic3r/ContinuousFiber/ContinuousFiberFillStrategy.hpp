@@ -28,7 +28,7 @@ struct ContourArc {
     double begin_mm {0.0}, end_distance_mm {0.0};
 };
 
-enum class ContourRoundingFailure { InvalidInput, SearchNotFound, OutsideDomain, SelfIntersection, TopologyChange, SamplingLimit, SupportConflict, SearchBudgetExceeded, NumericalFailure };
+enum class ContourRoundingFailure { InvalidInput, SearchNotFound, OutsideDomain, SelfIntersection, TopologyChange, SamplingLimit, SupportConflict, SearchBudgetExceeded, NumericalFailure, OptimizerLimit, CandidateLimit };
 struct ContourIssue {
     ContourRoundingFailure reason;
     Polyline source;
@@ -49,7 +49,8 @@ struct TangentSolution {
 };
 struct LocalSolutions {
     std::vector<TangentSolution> values;
-    bool exhausted=false;
+    bool optimizer_limit_reached=false;
+    bool candidates_pruned=false;
     bool numerical_failure=false;
 };
 struct CycleChoice {
@@ -63,25 +64,28 @@ ContourRoundingResult validate_cycle(const std::vector<TangentSolution>& values,
     const ContourRoundingOptions& options);
 
 // Different partitions share their caller's budgets. Canonical keys prevent
-// retries caused only by a rotated seam; local score controls order, not survival.
+// retries caused only by a rotated seam. Prefer fewer unresolved windows, then
+// the single-circle support deficit and fewer merged boundaries. The deficit
+// is only a queue-order heuristic, never a proof that CSC/CCC is infeasible.
 template<class Attempt>
 ContourRoundingResult search_contour_partitions(std::vector<CornerGroup> initial,
     const Polyline& source,size_t& revisions_left,size_t& searches_left,Attempt&& attempt)
 {
     using Partition=std::vector<CornerGroup>;
-    std::vector<std::pair<double,Partition>> pending;
+    using Priority=std::pair<size_t,double>; // unresolved windows, support deficit
+    std::vector<std::pair<Priority,Partition>> pending;
     std::set<std::vector<std::pair<size_t,size_t>>> seen;
-    const auto enqueue=[&](Partition groups,double score) {
+    const auto enqueue=[&](Partition groups,Priority priority) {
         std::vector<std::pair<size_t,size_t>> key;
         for (auto group:groups) key.emplace_back(group.first,group.count);
         if (key.empty()) return;
         std::rotate(key.begin(),std::min_element(key.begin(),key.end()),key.end());
-        if (seen.insert(std::move(key)).second) pending.emplace_back(score,std::move(groups));
+        if (seen.insert(std::move(key)).second) pending.emplace_back(priority,std::move(groups));
     };
-    enqueue(std::move(initial),0);
+    enqueue(std::move(initial),{0,0});
     ContourRoundingResult result;
     while (!pending.empty() && revisions_left>0 && searches_left>0) {
-        const auto next=std::min_element(pending.begin(),pending.end(),[](const auto& a,const auto& b){return a.first<b.first;});
+        const auto next=std::min_element(pending.begin(),pending.end(),[](const auto& a,const auto& b){return a.first!=b.first?a.first<b.first:a.second.size()>b.second.size();});
         auto groups=std::move(next->second);pending.erase(next);
         result=attempt(std::move(groups),enqueue,pending.size());
         if (result.path) return result;
@@ -117,8 +121,9 @@ public:
         const Polyline3& source, const ExPolygons& centerline_domain,
         const ContourRoundingOptions& options);
 
-    // Expensive diagnostics, called only after the rounded path passes process
-    // validation. Returns {source overlap, added overlap} in square millimetres.
+    // Explicit, expensive diagnostic; not part of slicing or path acceptance.
+    // Returns {source overlap, added overlap} in square millimetres. No result
+    // means it has not been requested, not that the overlap is zero.
     static std::pair<double,double> contour_coverage_overlap(
         const Polyline3& source,const Polyline3& rounded,double width);
 

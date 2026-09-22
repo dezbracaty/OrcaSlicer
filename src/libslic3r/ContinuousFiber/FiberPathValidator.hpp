@@ -47,7 +47,6 @@ struct FiberFragmentAssignment {
     FiberRejectionReason reason { FiberRejectionReason::None };
     std::string detail;
     std::vector<ContourIssue> contour_issues;
-    double contour_source_overlap_mm2 {0.0}, contour_added_overlap_mm2 {0.0};
     std::optional<ExtrusionPath> centerline;
     std::shared_ptr<const PreparedFiberPath> prepared;
 };

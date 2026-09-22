@@ -2380,3 +2380,79 @@ TEST_CASE("fiber contour rounding configuration persists and is opt in", "[libsl
     CHECK(snapshot->value("fiber_contour_bend_radius")==std::optional<std::string>{"0.5"});
     CHECK_FALSE(snapshot->value("fiber_contour_rounding_max_reserve").has_value());
 }
+
+
+TEST_CASE("hole contour setting retains default and round trips through configuration", "[libslicer_api][config][fiber][hole-contours]")
+{
+    auto config = libslicer::Config::defaults();
+    auto items = config.settings();
+    const auto* item = find_item(items, "fiber_contour_include_holes");
+    REQUIRE(item != nullptr);
+    CHECK(item->type == libslicer::SettingType::Boolean);
+    CHECK(item->group == libslicer::SettingGroup::Process);
+    CHECK(item->category == "Continuous fiber");
+    CHECK(item->default_value == "1");
+    CHECK_FALSE(item->enabled);
+    REQUIRE(config.set("generate_reinforced_perimeters", "1").success);
+    items = config.settings();
+    CHECK(find_item(items, "fiber_contour_include_holes")->enabled);
+    REQUIRE(config.set("fiber_contour_include_holes", "0").success);
+    const auto saved = config.snapshot().value("fiber_contour_include_holes");
+    REQUIRE(saved == "0");
+    auto restored = libslicer::Config::defaults();
+    REQUIRE(restored.set("fiber_contour_include_holes", *saved).success);
+    CHECK(restored.snapshot().value("fiber_contour_include_holes") == "0");
+    REQUIRE(config.reset("fiber_contour_include_holes").success);
+    CHECK(config.snapshot().value("fiber_contour_include_holes") == "1");
+}
+
+
+TEST_CASE("fiber outer contours do not open a printable bridge next to a hole", "[libslicer_api][fiber][hole-contours]")
+{
+    const auto radius = GENERATE("0", "0.3");
+    CAPTURE(radius);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"fiber_contour_include_holes", "0"}, {"fiber_contour_bend_radius", radius},
+        {"fiber_fill_debug", "1"}, {"generate_reinforced_infills", "0"},
+        {"outer_reinforced_perimeters_counts", "1"}, {"wall_loops", "3"},
+        {"top_shell_layers", "0"}, {"bottom_shell_layers", "0"}
+    }).success);
+    auto object = fiber_debug_ring();
+    // After resin walls this bridge fits a fiber centerline, but the removed
+    // extra erosion/dilation opened the hole and replaced the outer contour.
+    for (auto& vertex : object.volumes.front().vertices)
+        if (vertex.x == 120) vertex.x = 104.6f;
+    libslicer::SliceRequest request;
+    request.config = *library->active_config_snapshot();
+    request.objects.push_back(std::move(object));
+    const auto result = library->slice(request);
+    for (const auto& d : result.diagnostics) UNSCOPED_INFO(d.message);
+    REQUIRE(result.success);
+    REQUIRE(result.preview);
+    REQUIRE(std::any_of(result.preview->fiber_fill_diagnostics.begin(), result.preview->fiber_fill_diagnostics.end(),
+        [](const auto& d) { return d.layer_index == 4 && d.kind == libslicer::FiberDiagnosticKind::OriginalContourRegion && d.boundaries.size() == 2; }));
+    std::set<std::uint64_t> occurrences;
+    for (const auto& segment : result.preview->segments) {
+        if (segment.layer_index != 4 || segment.extrusion_role != libslicer::ToolpathExtrusionRole::ContinuousFiberContour ||
+            segment.deposition == libslicer::ToolpathDepositionKind::None) continue;
+        occurrences.insert(segment.fiber_occurrence);
+        for (const auto& p : {segment.start_mm, segment.end_mm}) {
+            // The outer rectangle lies outside this inset box. Following the
+            // inner hole after a topology-changing opening would enter it.
+            CHECK_FALSE((p.x > 104 && p.x < 156 && p.y > 104 && p.y < 136));
+        }
+    }
+    CHECK(occurrences.size() == 1);
+    std::error_code error;
+    std::filesystem::remove(result.output.path, error);
+}

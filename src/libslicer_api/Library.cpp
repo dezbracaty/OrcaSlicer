@@ -3233,14 +3233,11 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         // Keep planner statistics internal; diagnostics are the existing public
         // channel. Candidates and accepted/rejected fragments are distinct units.
         std::map<std::string, size_t> contour_rounding_failures, fiber_rejections;
-        double source_overlap_mm2 = 0, added_overlap_mm2 = 0;
         size_t fiber_candidates = 0, fiber_accepted = 0, fiber_split = 0;
         for (const auto* object : print.objects())
             for (const auto* layer : object->layers()) {
                 for (const auto& failure : layer->fiber_contour_rounding_failures)
                     contour_rounding_failures[failure.first] += failure.second;
-                source_overlap_mm2 += layer->fiber_contour_source_overlap_mm2;
-                added_overlap_mm2 += layer->fiber_contour_added_overlap_mm2;
                 const auto& stats = layer->fiber_infill_statistics;
                 fiber_candidates += stats.candidates;
                 fiber_accepted += stats.accepted_fragments;
@@ -3254,13 +3251,6 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                 message += " " + failure.first + "=" + std::to_string(failure.second);
             result.diagnostics.push_back({"fiber_contour_rounding", std::move(message), true, "fiber_contour_bend_radius"});
         }
-        if (added_overlap_mm2 > 0)
-            result.diagnostics.push_back({"fiber_contour_coverage_overlap",
-                "Rounded fiber contours add " + std::to_string(added_overlap_mm2) +
-                " mm2 of coverage overlap outside the source overlap regions (source overlap: " +
-                std::to_string(source_overlap_mm2) +
-                " mm2). Centerline-valid contours were retained; coverage overlap is not a bend-radius rejection.",
-                true, "fiber_contour_bend_radius"});
         if (fiber_candidates > 0) {
             std::string message = "Continuous fiber infill: candidates=" + std::to_string(fiber_candidates) +
                 ", accepted_fragments=" + std::to_string(fiber_accepted) +

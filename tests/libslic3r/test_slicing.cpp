@@ -315,3 +315,42 @@ SCENARIO("Slice support material to G-code with dedicated second nozzle", "[slic
     CHECK(used_extruder(result, 1));
     CHECK(result.content.find("T1") != std::string::npos);
 }
+
+
+TEST_CASE("changing hole contours invalidates fill but preserves slice and walls", "[slicing][ContinuousFiber][hole-contours]")
+{
+    setup_test_dirs();
+    Model model = load_obj_model("20mm_cube.obj");
+    auto config = base_print_config();
+    Print print;
+    print.apply(model, config);
+    print.process();
+    REQUIRE(print.objects().size() == 1);
+    const PrintObject* object = print.objects().front();
+    REQUIRE(object->is_step_done(posSlice));
+    REQUIRE(object->is_step_done(posPerimeters));
+    REQUIRE(object->is_step_done(posPrepareInfill));
+    REQUIRE(object->is_step_done(posInfill));
+    const auto slice_stamp = object->step_state_with_timestamp(posSlice).timestamp;
+    const auto wall_stamp = object->step_state_with_timestamp(posPerimeters).timestamp;
+    const auto preparation_stamp = object->step_state_with_timestamp(posPrepareInfill).timestamp;
+    const auto fill_stamp = object->step_state_with_timestamp(posInfill).timestamp;
+
+    config.set_deserialize_strict("fiber_contour_include_holes", "0");
+    CHECK(print.apply(model, config) == PrintBase::APPLY_STATUS_INVALIDATED);
+    REQUIRE(print.objects().size() == 1);
+    REQUIRE(print.objects().front() == object);
+    CHECK(object->is_step_done(posSlice));
+    CHECK(object->is_step_done(posPerimeters));
+    CHECK(object->is_step_done(posPrepareInfill));
+    CHECK_FALSE(object->is_step_done(posInfill));
+    CHECK_FALSE(object->is_step_done(posSimplifyInfill));
+    CHECK_FALSE(print.is_step_done(psGCodeExport));
+
+    print.process();
+    CHECK(object->is_step_done(posInfill));
+    CHECK(object->step_state_with_timestamp(posInfill).timestamp > fill_stamp);
+    CHECK(object->step_state_with_timestamp(posSlice).timestamp == slice_stamp);
+    CHECK(object->step_state_with_timestamp(posPerimeters).timestamp == wall_stamp);
+    CHECK(object->step_state_with_timestamp(posPrepareInfill).timestamp == preparation_stamp);
+}
