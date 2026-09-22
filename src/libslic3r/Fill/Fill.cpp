@@ -1793,8 +1793,10 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         const FiberFillJobParams contour_params = resolve_fiber_fill_params(
             config, domain.policy, FiberCandidateFamily::Contour);
         SurfaceFill contour_job = original_job;
-        // Inset only for physical width and boundary clearance. Additional
-        // opening can join hole boundaries to the outer candidate contour.
+        // Open the centerline domain by half a fiber width before the native
+        // concentric generator. A narrow neck that cannot accommodate the
+        // return turn must not join two independently printable contours.
+        // Coverage/exclusion is still derived only from accepted final paths.
         const double width = config.contour_flow.width();
         if (collect_debug)
             BOOST_LOG_TRIVIAL(debug) << "[FiberContourRadius] layer=" << context.layer.id()
@@ -1802,8 +1804,11 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 << " effective_mm=" << (config.contour_bend_radius_mm > 0 ?
                     std::max(config.contour_bend_radius_mm, 0.5*width + ContourRoundingOptions{}.geometry_tolerance_mm) : 0.0)
                 << " width_mm=" << width;
-        contour_job.expolygons = offset_ex(original_area,
+        const ExPolygons centerline_limit = offset_ex(original_area,
             -float(scale_(0.5 * width + config.contour_boundary_clearance_mm)));
+        contour_job.expolygons = intersection_ex(offset2_ex(original_area,
+            -float(scale_(width + config.contour_boundary_clearance_mm)), float(scale_(0.5 * width))),
+            centerline_limit);
         apply_fiber_fill_params(contour_job.params, contour_params);
 
         ExtrusionEntitiesPtr candidates;
