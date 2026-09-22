@@ -918,7 +918,14 @@ TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libsl
         INFO("diagnostic kind=" << unsigned(path.kind) << " layer=" << path.layer_index
              << " component=" << path.component_id);
         CHECK_FALSE(path.reason.empty());
-        if (path.kind == libslicer::FiberDiagnosticKind::RejectedPath) {
+        if (path.kind == libslicer::FiberDiagnosticKind::ContourCandidate ||
+            path.kind == libslicer::FiberDiagnosticKind::RoundedContourCandidate) {
+            REQUIRE(path.points.size() >= 2);
+            CHECK(path.contour);
+            CHECK(path.source_length_mm > 0);
+            CHECK(path.boundaries.empty());
+            CHECK(path.triangles.empty());
+        } else if (path.kind == libslicer::FiberDiagnosticKind::RejectedPath) {
             REQUIRE(path.points.size() >= 2);
             CHECK(path.source_length_mm > 0);
             path.contour ? ++contour_count : ++infill_count;

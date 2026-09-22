@@ -30,26 +30,11 @@ void FillConcentric::_fill_surface_single(
     // Contract surface polygon by half line width to avoid excesive overlap with perimeter
     ExPolygons contracted = offset_ex(expolygon, -float(scale_(0.5 * (params.multiline - 1) * this->spacing )));
 
-    Polygons loops;
-    const auto append_candidate_loops = [&](const ExPolygons& regions) {
-        for (const ExPolygon& region : regions) {
-            loops.push_back(region.contour);
-            if (params.concentric_include_holes)
-                append(loops, region.holes);
-        }
-    };
-    append_candidate_loops(contracted);
-
+    Polygons loops = to_polygons(contracted);
     ExPolygons last { std::move(contracted) };
-    // `loops` already contains the outermost concentric level.
-    size_t generated_depth = 1;
-    while (! last.empty()) {
-        if (params.max_concentric_loops > 0 && generated_depth >= params.max_concentric_loops)
-            break;
+    while (!last.empty()) {
         last = offset2_ex(last, -(distance + min_spacing/2), +min_spacing/2);
-        // Holes remain in last so offsets cannot expand into excluded material.
-        append_candidate_loops(last);
-        ++generated_depth;
+        append(loops, to_polygons(last));
     }
 
     // generate paths from the outermost to the innermost, to avoid

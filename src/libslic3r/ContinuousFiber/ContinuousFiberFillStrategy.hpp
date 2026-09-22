@@ -26,6 +26,7 @@ struct ContourArc {
     Vec2d center_mm, start_mm, end_mm;
     double radius_mm {0.0}, sweep_radians {0.0};
     double begin_mm {0.0}, end_distance_mm {0.0};
+    double source_sweep_radians {0.0}; // Preserve the speed limit when an arc is trimmed.
 };
 
 enum class ContourRoundingFailure { InvalidInput, SearchNotFound, OutsideDomain, SelfIntersection, TopologyChange, SamplingLimit, SupportConflict, SearchBudgetExceeded, NumericalFailure, OptimizerLimit, CandidateLimit };
@@ -115,8 +116,32 @@ ContourRoundingResult refine_validated_cycle(ContourRoundingResult baseline,
 
 const char* contour_rounding_failure_name(ContourRoundingFailure reason);
 
+enum class FiberContourSide : uint8_t { Outer, Hole };
+
+struct FiberContourCandidate {
+    Polyline3 geometry;
+    FiberContourSide side;
+    size_t boundary_id;
+    size_t depth;
+    size_t region_id {0};
+    size_t part_id {0};
+    size_t geometry_domain_id {0};
+};
+
+struct FiberContourCandidates {
+    ExPolygons centerline_domain;
+    std::vector<ExPolygons> geometry_domains;
+    std::vector<FiberContourCandidate> paths;
+};
+
 class ContinuousFiberFillStrategy {
 public:
+    // Emit source boundaries; the validator owns their allocation priority.
+    // Holes always constrain centerlines, independently of whether they emit paths.
+    static FiberContourCandidates generate_contours(
+        const ExPolygons& original_area, const ContinuousFiberConfig& config);
+
+    // Shape closed candidates before allocation clips them into open strands.
     static ContourRoundingResult round_contour(
         const Polyline3& source, const ExPolygons& centerline_domain,
         const ContourRoundingOptions& options);

@@ -232,7 +232,7 @@ bool continuous_fiber_enabled(const PrintRegionConfig& config)
     return config.generate_reinforced_perimeters.value || config.generate_reinforced_infills.value;
 }
 
-void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose)
+void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose, bool closed_path)
 {
     const auto check = [](double value, const char* name, bool positive = false) {
         if (!std::isfinite(value) || (positive ? value <= 0 : value < 0))
@@ -279,8 +279,9 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
     check(contour ? config.contour_feed_ratio : config.infill_feed_ratio, "fiber feed ratio", true);
     check(contour ? config.contour_feed_correction : config.infill_feed_correction, "fiber feed correction", true);
     check(contour ? config.contour_acceleration_mm_s2 : config.infill_acceleration_mm_s2, "fiber acceleration", true);
-    const double finish = contour ? config.finish_overlap_length_mm : config.finish_extension_length_mm;
-    check(finish, contour ? "fiber_finish_overlap_length" : "fiber_finish_extension_length");
+    const bool loop_finish = contour && closed_path;
+    const double finish = loop_finish ? config.finish_overlap_length_mm : config.finish_extension_length_mm;
+    check(finish, loop_finish ? "fiber_finish_overlap_length" : "fiber_finish_extension_length");
     if (finish > 0) check(config.finish_motion_speed_mm_s, "fiber_finish_motion_speed", true);
     if (contour) {
         check(config.contour_boundary_clearance_mm, "fiber_contour_boundary_clearance");
@@ -316,6 +317,7 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
     result.tail_max_speed_mm_s = source.fiber_tail_max_speed.value;
     result.tail_speed_step_length_mm = source.fiber_tail_speed_step_length.value;
     result.finish_motion_speed_mm_s = source.fiber_finish_motion_speed.value;
+    result.finish_extension_length_mm = source.fiber_finish_extension_length.value;
     if (result.contour_enabled && result.infill_enabled)
         result.contour_infill_clearance_mm = source.fiber_contour_infill_clearance.value;
 
@@ -353,6 +355,7 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         result.contour_feed_correction = correction_for(result.contour_material);
         result.finish_overlap_length_mm = source.fiber_finish_overlap_length.value;
         validate_fiber_process_config(result, FiberPathPurpose::Contour);
+        validate_fiber_process_config(result, FiberPathPurpose::Contour, false);
         result.contour_flow = flow_for(result.contour_material, source.reinforced_perimeters_extrusion_width);
     }
     if (result.infill_enabled) {
@@ -368,7 +371,6 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         result.infill_acceleration_mm_s2 = source.fiber_infill_acceleration.value;
         result.infill_feed_ratio = source.fiber_infill_feed_ratio.value;
         result.infill_feed_correction = correction_for(result.infill_material);
-        result.finish_extension_length_mm = source.fiber_finish_extension_length.value;
         validate_fiber_process_config(result, FiberPathPurpose::Infill);
         result.infill_flow = flow_for(result.infill_material, source.reinforced_infill_extrusion_width);
     }

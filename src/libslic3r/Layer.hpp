@@ -132,7 +132,7 @@ public:
     };
     FiberInfillStatistics fiber_infill_statistics;
     std::map<std::string, size_t> fiber_contour_rounding_failures;
-    enum class FiberDiagnosticKind { RejectedPath, OriginalContourRegion, MissingContourRegion };
+    enum class FiberDiagnosticKind { RejectedPath, OriginalContourRegion, MissingContourRegion, ContourCandidate, RoundedContourCandidate };
     struct FiberFillDiagnostic {
         Polyline geometry;
         std::string reason;

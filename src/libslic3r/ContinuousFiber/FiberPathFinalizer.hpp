@@ -13,7 +13,7 @@ namespace Slic3r {
 class ExtrusionPath;
 // Error-bounded short-edge and collinear normalization. Preserves
 // endpoints/seam; this geometry becomes the source for length and coverage.
-Polyline3 normalize_fiber_geometry(const Polyline3& input);
+Polyline3 normalize_fiber_geometry(const Polyline3& input, const ExPolygons* centerline_domain = nullptr);
 
 enum class FiberFinalizationFailure : uint8_t {
     None,
@@ -40,7 +40,8 @@ public:
         const ExPolygons& allowed_domain,
         const ContinuousFiberConfig& config,
         const FiberFragmentId& id,
-        const std::vector<ContourArc>& arcs = {});
+        const std::vector<ContourArc>& arcs = {},
+        const ExPolygons* planned_centerline_domain = nullptr);
 };
 
 } // namespace Slic3r

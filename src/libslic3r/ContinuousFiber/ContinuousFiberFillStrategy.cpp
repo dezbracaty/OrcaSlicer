@@ -1165,6 +1165,76 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_contour(
     }
 }
 
+FiberContourCandidates ContinuousFiberFillStrategy::generate_contours(
+    const ExPolygons& original_area, const ContinuousFiberConfig& config)
+{
+    FiberContourCandidates result;
+    const double width = config.contour_flow.width();
+    if (!std::isfinite(width) || width <= 0 || !std::isfinite(config.contour_boundary_clearance_mm) ||
+        config.contour_boundary_clearance_mm < 0 || config.contour_count < 0)
+        throw std::invalid_argument("Invalid fiber contour geometry parameters");
+    result.centerline_domain = offset_ex(original_area,
+        -float(scale_(0.5 * width + config.contour_boundary_clearance_mm)));
+    // Canonical source ordering does not depend on the hole switch or caller order.
+    const auto canonical = [](Polygon polygon) {
+        polygon.make_counter_clockwise();
+        if (!polygon.points.empty())
+            std::rotate(polygon.points.begin(), std::min_element(polygon.points.begin(), polygon.points.end()), polygon.points.end());
+        return polygon;
+    };
+    const auto ordered = [&](Polygons polygons) {
+        for (auto& polygon : polygons) polygon = canonical(std::move(polygon));
+        std::sort(polygons.begin(), polygons.end(), [](const Polygon& a, const Polygon& b) { return a.points < b.points; });
+        return polygons;
+    };
+    // Source identity is assigned before any offset can merge a hole with the
+    // exterior. Geometry domains guide shaping; the physical domain above still
+    // contains all real holes and is enforced during allocation.
+    const double inset = 0.5 * width + config.contour_boundary_clearance_mm;
+    std::vector<ExPolygon> regions = original_area;
+    for (auto& region : regions) {
+        region.contour = canonical(std::move(region.contour));
+        region.holes = ordered(std::move(region.holes));
+    }
+    std::sort(regions.begin(), regions.end(), [](const auto& a, const auto& b) {
+        return a.contour.points < b.contour.points;
+    });
+    const auto emit = [&](const ExPolygons& shapes, FiberContourSide side, size_t region,
+                          size_t boundary, size_t depth, size_t geometry_domain) {
+        Polygons rings;
+        for (const auto& shape : shapes) rings.push_back(shape.contour);
+        size_t part = 0;
+        for (auto ring : ordered(std::move(rings))) {
+            if (side == FiberContourSide::Hole) ring.reverse();
+            result.paths.push_back({Polyline3(ring.split_at_index(0)), side, boundary, depth,
+                                    region, part++, geometry_domain});
+        }
+    };
+    for (size_t region_id = 0; region_id < regions.size(); ++region_id) {
+        const auto& region = regions[region_id];
+        const ExPolygons envelope = offset_ex(ExPolygons{ExPolygon(region.contour)}, -float(scale_(inset)));
+        const size_t outer_domain = result.geometry_domains.size();
+        result.geometry_domains.push_back(envelope);
+        ExPolygons outside = intersection_ex(offset2_ex(envelope,
+            -float(scale_(0.5 * width)), float(scale_(0.5 * width))), envelope);
+        for (int depth = 0; depth < config.contour_count; ++depth) {
+            emit(outside, FiberContourSide::Outer, region_id, 0, size_t(depth), outer_domain);
+            if (depth + 1 < config.contour_count)
+                outside = offset2_ex(outside, -float(scale_(1.5 * width)), float(scale_(0.5 * width)));
+        }
+        if (!config.contour_include_holes) continue;
+        for (size_t hole_id = 0; hole_id < region.holes.size(); ++hole_id) {
+            const ExPolygons hole{ExPolygon(region.holes[hole_id])};
+            const size_t hole_domain = result.geometry_domains.size();
+            result.geometry_domains.push_back(diff_ex(envelope, offset_ex(hole, float(scale_(inset)))));
+            for (int depth = 0; depth < config.contour_count; ++depth)
+                emit(offset_ex(hole, float(scale_(inset + depth * width))), FiberContourSide::Hole,
+                     region_id, hole_id, size_t(depth), hole_domain);
+        }
+    }
+    return result;
+}
+
 ExPolygons ContinuousFiberFillStrategy::build_infill_domain(
     const ExPolygons& original_area,
     const ExPolygons& contour_to_infill_keepout)

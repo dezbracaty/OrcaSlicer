@@ -3453,6 +3453,10 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                                     path.kind = FiberDiagnosticKind::RejectedPath; break;
                                 case Slic3r::Layer::FiberDiagnosticKind::OriginalContourRegion:
                                     path.kind = FiberDiagnosticKind::OriginalContourRegion; break;
+                                case Slic3r::Layer::FiberDiagnosticKind::ContourCandidate:
+                                    path.kind = FiberDiagnosticKind::ContourCandidate; break;
+                                case Slic3r::Layer::FiberDiagnosticKind::RoundedContourCandidate:
+                                    path.kind = FiberDiagnosticKind::RoundedContourCandidate; break;
                                 case Slic3r::Layer::FiberDiagnosticKind::MissingContourRegion:
                                     path.kind = FiberDiagnosticKind::MissingContourRegion; break;
                                 }

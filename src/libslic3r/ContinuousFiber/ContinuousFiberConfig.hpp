@@ -89,7 +89,7 @@ void require_fiber_safe_script(const std::string& script, const char* name,
 void validate_fiber_cut_event(const std::string& script,
     FiberMachineProtocol protocol = FiberMachineProtocol::LinearE);
 // Validates common process values and only the requested path family.
-void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose);
+void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose, bool closed_path = true);
 ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region);
 
 } // namespace Slic3r

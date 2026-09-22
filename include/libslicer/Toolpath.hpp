@@ -284,7 +284,7 @@ struct ToolpathStatistics
     std::vector<ToolpathFilamentUsage> filament_usage;
 };
 
-enum class FiberDiagnosticKind : std::uint8_t { RejectedPath, OriginalContourRegion, MissingContourRegion };
+enum class FiberDiagnosticKind : std::uint8_t { RejectedPath, OriginalContourRegion, MissingContourRegion, ContourCandidate, RoundedContourCandidate };
 
 struct FiberFillDiagnosticPath
 {

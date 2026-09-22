@@ -5,7 +5,6 @@
 #include "libslic3r/ContinuousFiber/FiberPathValidator.hpp"
 #include "libslic3r/ContinuousFiber/FiberPolicyKey.hpp"
 #include "libslic3r/BoundingBox.hpp"
-#include "libslic3r/Fill/FillConcentric.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/GCode/FiberGCodeBlockParser.hpp"
 #include "libslic3r/GCodeWriter.hpp"
@@ -611,7 +610,7 @@ TEST_CASE("fiber tail is forcibly sampled by arc length with exact endpoint spee
     }
 }
 
-TEST_CASE("fiber finish is selected by purpose not closed topology", "[ContinuousFiber][finish]")
+TEST_CASE("fiber finish preserves infill policy and supports open contours", "[ContinuousFiber][finish]")
 {
     const auto candidate = path_from_points({{5,5},{25,5},{25,25},{5,25},{5,5}});
     ContinuousFiberConfig config;
@@ -628,9 +627,10 @@ TEST_CASE("fiber finish is selected by purpose not closed topology", "[Continuou
     REQUIRE(contour.prepared);
     CHECK(contour.prepared->finish_strategy == FiberFinishStrategy::LoopOverlap);
     CHECK(contour.prepared->spans.back().geometry.points.back() == Point3::new_scale(8,5,0));
-    const auto unavailable = FiberPathFinalizer::finalize(straight_path(5,5,25,5), domain, config, contour_id);
-    CHECK(unavailable.failure == FiberFinalizationFailure::FinishUnavailable);
-    CHECK_FALSE(unavailable.detail.empty());
+    const auto open = FiberPathFinalizer::finalize(straight_path(5,5,25,5), domain, config, contour_id);
+    REQUIRE(open.prepared);
+    CHECK(open.prepared->finish_strategy == FiberFinishStrategy::TangentExtension);
+    CHECK(open.prepared->spans.back().geometry.points.back() == Point3::new_scale(27,5,0));
 }
 
 TEST_CASE("fiber finish is continuous motion not material clipped by a model hole", "[ContinuousFiber][finish]")
@@ -1979,9 +1979,9 @@ TEST_CASE("arc sampling exhaustion is distinct from a geometric radius conflict"
 }
 
 
-TEST_CASE("concentric hole selection preserves excluded geometry at every depth", "[ContinuousFiber][hole-contours]")
+TEST_CASE("fiber outer candidates are independent of hole selection at every depth", "[ContinuousFiber][hole-contours][priority]")
 {
-    const size_t depth = GENERATE(1, 3);
+    const int depth = GENERATE(1, 3);
     ExPolygon region = rectangle(0, 0, 100, 80);
     SECTION("no holes") {}
     SECTION("one hole") { region = rectangle_with_hole(0, 0, 100, 80, 15, 15, 30, 30); }
@@ -1990,36 +1990,339 @@ TEST_CASE("concentric hole selection preserves excluded geometry at every depth"
         auto hole = rectangle(60, 40, 80, 60).contour;
         hole.reverse(); region.holes.push_back(hole);
     }
-    FillConcentric fill;
-    fill.spacing = 1.0;
-    fill.angle = 0;
-    FillParams params;
-    params.density = 1.0f;
-    params.dont_adjust = true;
-    params.max_concentric_loops = depth;
-    Surface surface(stInternal, region);
-    const auto all = fill.fill_surface(&surface, params);
-    params.concentric_include_holes = false;
-    const auto outer = fill.fill_surface(&surface, params);
-    REQUIRE(all.size() == depth * (1 + region.holes.size()));
-    REQUIRE(outer.size() == depth);
-    CHECK(diff_pl(all, region).empty());
-    CHECK(diff_pl(outer, region).empty());
-    // Normalize only seam and winding: sorting vertices would miss changed edges.
-    const auto canonical_ring = [](const Polyline& line) {
-        Points points = line.points;
-        points.pop_back();
-        if (Polygon(points).is_clockwise()) std::reverse(points.begin(), points.end());
-        std::rotate(points.begin(), std::min_element(points.begin(), points.end()), points.end());
-        return points;
-    };
-    for (const auto& line : outer) {
-        REQUIRE(line.first_point() == line.last_point());
-        const auto ring = canonical_ring(line);
-        CHECK(std::any_of(all.begin(), all.end(), [&](const auto& old) {
-            return canonical_ring(old) == ring;
-        }));
+    ContinuousFiberConfig config;
+    config.contour_flow = Flow(1.f, .13f, .4f);
+    config.contour_count = depth;
+    const auto all = ContinuousFiberFillStrategy::generate_contours({region}, config);
+    config.contour_include_holes = false;
+    const auto outer = ContinuousFiberFillStrategy::generate_contours({region}, config);
+    REQUIRE(all.paths.size() == size_t(depth) * (1 + region.holes.size()));
+    REQUIRE(outer.paths.size() == size_t(depth));
+    CHECK(diff_ex(all.centerline_domain, outer.centerline_domain).empty());
+    for (size_t i = 0; i < outer.paths.size(); ++i) {
+        CHECK(outer.paths[i].geometry.points == all.paths[i].geometry.points);
+        CHECK(outer.paths[i].side == FiberContourSide::Outer);
+        CHECK(outer.paths[i].depth == i);
     }
+}
+
+TEST_CASE("hole strands yield to a printable outer strand without moving it", "[ContinuousFiber][priority]")
+{
+    const ExPolygons region{rectangle_with_hole(0,0,100,80,20,2.06,60,30)};
+    ContinuousFiberConfig config;
+    config.contour_bend_radius_mm=GENERATE(0.,.3);
+    config.contour_flow=Flow(1.f,.13f,.4f); config.contour_count=1;
+    config.contour_boundary_clearance_mm=.2;
+    config.cut_to_contact_length_mm=23; config.landing_length_mm=2;
+    config.minimum_effective_length_mm=.5;
+    config.finish_extension_length_mm=23; config.finish_overlap_length_mm=23;
+    config.contour_include_holes=false;
+    const auto outside=ContinuousFiberFillStrategy::generate_contours(region,config);
+    auto first=FiberPathValidator::validate_contours(outside,region,config,{1,11,0,0});
+    REQUIRE(first.accepted_count()==1);
+    const auto first_points=first.assignments.front().centerline->polyline.points;
+    config.contour_include_holes=true;
+    const auto all=ContinuousFiberFillStrategy::generate_contours(region,config);
+    auto result=FiberPathValidator::validate_contours(all,region,config,{1,11,0,0});
+    REQUIRE(result.accepted_count()==2);
+    CHECK(result.assignments.front().centerline->polyline.points==first_points);
+    CHECK(result.assignments.front().prepared->finish_strategy==FiberFinishStrategy::LoopOverlap);
+    size_t open=0;
+    for (const auto& assignment:result.assignments) if (assignment.prepared && assignment.id.parent.job_ordinal>0) {
+        REQUIRE(assignment.centerline);
+        CHECK_FALSE(assignment.centerline->is_closed());
+        CHECK(assignment.centerline->role()==erContinuousFiberContour);
+        CHECK(assignment.prepared->finish_strategy==FiberFinishStrategy::TangentExtension);
+        CHECK(assignment.prepared->passive_tail_length_mm()==Catch::Approx(23).margin(.001));
+        CHECK(area(intersection_ex(first.physical_footprint,assignment.prepared->physical_coverage))*SCALING_FACTOR*SCALING_FACTOR<.001);
+        ++open;
+    }
+    CHECK(open==1);
+    // A ring's arbitrary seam must not select the complementary clipped arc.
+    for (size_t seam=0;seam+1<all.paths.back().geometry.points.size();++seam) {
+        auto reseamed=all;
+        auto& points=reseamed.paths.back().geometry.points;
+        points.pop_back(); std::rotate(points.begin(),points.begin()+seam,points.end()); points.push_back(points.front());
+        const auto clipped=FiberPathValidator::validate_contours(reseamed,region,config,{1,11,0,0});
+        CHECK(clipped.accepted_count()==result.accepted_count());
+        double before=0,after=0;
+        for (const auto& a:result.assignments) if (a.prepared) before+=a.prepared->total_depositing_length_mm();
+        for (const auto& a:clipped.assignments) {
+            CHECK(a.reason!=FiberRejectionReason::IntervalMappingFailure);
+            if(a.prepared) after+=a.prepared->total_depositing_length_mm();
+        }
+        CHECK(after==Catch::Approx(before).margin(.0001));
+    }
+    CHECK(result.audit_assignments().valid());
+    auto reordered=all; std::reverse(reordered.paths.begin(),reordered.paths.end());
+    const auto again=FiberPathValidator::validate_contours(reordered,region,config,{1,11,0,0});
+    REQUIRE(again.assignments.size()==result.assignments.size());
+    for (size_t i=0;i<result.assignments.size();++i) {
+        CHECK(again.assignments[i].kind==result.assignments[i].kind);
+        REQUIRE(again.assignments[i].centerline);
+        CHECK(again.assignments[i].centerline->polyline.points==result.assignments[i].centerline->polyline.points);
+    }
+}
+
+TEST_CASE("unprintable priority candidates do not reserve fiber space", "[ContinuousFiber][priority]")
+{
+    const ExPolygons region{rectangle(-2,-2,50,50)};
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.13f,.4f); config.contour_count=1;
+    config.cut_to_contact_length_mm=23; config.landing_length_mm=2;
+    config.minimum_effective_length_mm=.5;
+    FiberContourCandidates candidates;
+    candidates.centerline_domain=offset_ex(region,-float(scale_(.5)));
+    candidates.geometry_domains.push_back(candidates.centerline_domain);
+    candidates.paths.push_back({path_from_points({{0,0},{3,0},{3,3},{0,3},{0,0}}).polyline,FiberContourSide::Outer,0,0});
+    candidates.paths.push_back({straight_path(-1,1.5,40,1.5).polyline,FiberContourSide::Hole,0,0});
+    const auto result=FiberPathValidator::validate_contours(candidates,region,config,{1,0,0,0});
+    REQUIRE(result.assignments.size()==2);
+    CHECK(result.assignments.front().reason==FiberRejectionReason::ProcessBudgetTooShort);
+    REQUIRE(result.assignments.back().prepared);
+    CHECK(result.assignments.back().prepared->total_depositing_length_mm()==Catch::Approx(41).margin(.0001));
+    CHECK(result.audit_assignments().valid());
+}
+
+TEST_CASE("layer 12 keeps the outside continuous when hole strands are disabled", "[ContinuousFiber][priority][layer12]")
+{
+    std::ifstream input(std::string(TEST_DATA_DIR)+"/continuous_fiber/layer12_hole_priority.json");
+    REQUIRE(input.good()); nlohmann::json fixture; input>>fixture;
+    ExPolygons region;
+    for (const auto& value:fixture["original"]) {
+        ExPolygon polygon;
+        for (const auto& p:value["outer"]) polygon.contour.points.emplace_back(p[0].get<coord_t>(),p[1].get<coord_t>());
+        for (const auto& ring:value["holes"]) {
+            Polygon hole;for (const auto& p:ring) hole.points.emplace_back(p[0].get<coord_t>(),p[1].get<coord_t>());
+            polygon.holes.push_back(std::move(hole));
+        }
+        region.push_back(std::move(polygon));
+    }
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.13f,.4f); config.contour_count=1;
+    config.contour_boundary_clearance_mm=.2;
+    config.cut_to_contact_length_mm=23; config.landing_length_mm=2;
+    config.minimum_effective_length_mm=.5; config.finish_overlap_length_mm=23;
+    config.finish_extension_length_mm=23;
+    config.contour_include_holes=false;
+    const auto candidates=ContinuousFiberFillStrategy::generate_contours(region,config);
+    const auto result=FiberPathValidator::validate_contours(candidates,region,config,{1,11,0,0});
+    REQUIRE(result.accepted_count()==1);
+    const auto accepted=std::find_if(result.assignments.begin(),result.assignments.end(),[](const auto& a){return bool(a.prepared);});
+    REQUIRE(accepted!=result.assignments.end());
+    // The third, irregular hole really closes its exterior passage after inset.
+    // The two round-hole necks still retain their outer strand, but the path must
+    // no longer detour around the third hole just to preserve a closed loop.
+    CHECK_FALSE(accepted->centerline->is_closed());
+    CHECK(accepted->prepared->total_depositing_length_mm()>240);
+    for (const auto& span:accepted->prepared->spans) if (span.deposits_fiber())
+        CHECK(diff_pl(Polylines{span.geometry.to_polyline()},offset_ex(candidates.centerline_domain,float(scale_(.0001)))).empty());
+    // Both original arrow locations must retain an outside crossing even though
+    // another, genuinely unavailable passage makes the complete path open.
+    for (const auto& cross:std::vector<Line>{
+        Line(Point::new_scale(-37.798726734,2.839246625),Point::new_scale(-37.728978,.780079)),
+        Line(Point::new_scale(-36.709527227,-19.685857915),Point::new_scale(-36.779009,-17.626554))}) {
+        bool hit=false; Point intersection;
+        for (const auto& line:accepted->centerline->polyline.to_polyline().lines())
+            hit=hit || line.intersection(cross,&intersection);
+        CHECK(hit);
+    }
+    config.contour_include_holes=true;
+    const auto with_holes=FiberPathValidator::validate_contours(
+        ContinuousFiberFillStrategy::generate_contours(region,config),region,config,{1,11,0,0});
+    const auto same=std::find_if(with_holes.assignments.begin(),with_holes.assignments.end(),[&](const auto& a){return a.id==accepted->id;});
+    REQUIRE(same!=with_holes.assignments.end()); REQUIRE(same->prepared);
+    CHECK(same->centerline->polyline.points==accepted->centerline->polyline.points);
+}
+
+TEST_CASE("layer 107 partitions conflicting outer strands before finalization", "[ContinuousFiber][priority][layer107]")
+{
+    std::ifstream input(std::string(TEST_DATA_DIR)+"/continuous_fiber/layer107_outer_conflict.json");
+    REQUIRE(input.good()); nlohmann::json fixture; input>>fixture;
+    ExPolygons region;
+    for (const auto& value:fixture["original"]) {
+        ExPolygon polygon;
+        for (const auto& p:value["outer"]) polygon.contour.points.emplace_back(p[0].get<coord_t>(),p[1].get<coord_t>());
+        for (const auto& ring:value["holes"]) {
+            Polygon hole; for (const auto& p:ring) hole.points.emplace_back(p[0].get<coord_t>(),p[1].get<coord_t>());
+            polygon.holes.push_back(std::move(hole));
+        }
+        region.push_back(std::move(polygon));
+    }
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.13f,.4f); config.contour_count=1;
+    config.contour_boundary_clearance_mm=.2; config.contour_include_holes=false;
+    config.cut_to_contact_length_mm=23; config.landing_length_mm=2;
+    config.minimum_effective_length_mm=.5;
+    config.finish_overlap_length_mm=23; config.finish_extension_length_mm=23;
+    const auto candidates=ContinuousFiberFillStrategy::generate_contours(region,config);
+    REQUIRE(candidates.paths.size()>=2);
+    CHECK(candidates.paths[0].side==FiberContourSide::Outer);
+    CHECK(candidates.paths[1].side==FiberContourSide::Outer);
+    CHECK(candidates.paths[0].boundary_id==candidates.paths[1].boundary_id);
+    auto first_only=candidates; first_only.paths.resize(1);
+    const auto first=FiberPathValidator::validate_contours(first_only,region,config,{1,106,0,0});
+    REQUIRE(first.accepted_count()==1);
+    const auto result=FiberPathValidator::validate_contours(candidates,region,config,{1,106,0,0});
+    CHECK(result.audit_assignments().valid());
+    REQUIRE(result.assignments.front().prepared);
+    CHECK(result.assignments.front().centerline->polyline.points==first.assignments.front().centerline->polyline.points);
+    bool clipped=false, open=false;
+    ExPolygons occupied;
+    for (const auto& assignment:result.assignments) {
+        if (assignment.reason==FiberRejectionReason::UnavailableContourRegion ||
+            assignment.reason==FiberRejectionReason::OccupiedContourRegion)
+            clipped=true;
+        if (!assignment.prepared) continue;
+        if (!assignment.centerline->is_closed()) {
+            open=true;
+            CHECK_FALSE(assignment.centerline->is_closed());
+            CHECK(assignment.prepared->finish_strategy==FiberFinishStrategy::TangentExtension);
+            CHECK(assignment.prepared->total_depositing_length_mm()>25.5);
+        }
+        CHECK(std::abs(area(intersection_ex(occupied,assignment.prepared->physical_coverage))) *
+            SCALING_FACTOR*SCALING_FACTOR < .001);
+        occupied=union_ex(occupied,assignment.prepared->physical_coverage);
+    }
+    CHECK(clipped);
+    CHECK(open);
+}
+
+TEST_CASE("fragments of one reference share their depositing occupancy", "[ContinuousFiber][priority][fragment-occupancy]")
+{
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.13f,.4f);config.contour_count=1;
+    config.landing_length_mm=2;config.cut_to_contact_length_mm=23;config.minimum_effective_length_mm=.5;
+    config.finish_extension_length_mm=23;
+    FiberContourCandidates candidates;
+    candidates.centerline_domain={rectangle(-1,-1,39,2)};
+    candidates.geometry_domains={{rectangle(-1,-1,41,2)}};
+    candidates.paths.push_back({path_from_points({{0,0},{40,0},{40,.8},{0,.8}}).polyline,
+        FiberContourSide::Outer,0,0});
+    const auto result=FiberPathValidator::validate_contours(candidates,{rectangle(-2,-2,42,3)},config,{1,60,0,0});
+    CHECK(result.accepted_count()==1);
+    CHECK(result.audit_assignments().valid());
+    CHECK(std::any_of(result.assignments.begin(),result.assignments.end(),[](const auto& a){
+        return a.reason==FiberRejectionReason::OccupiedContourRegion;
+    }));
+}
+
+TEST_CASE("original hole identity survives a closed exterior passage", "[ContinuousFiber][priority][source-boundary]")
+{
+    std::ifstream input(std::string(TEST_DATA_DIR)+"/continuous_fiber/layer55_hole_source.json");
+    REQUIRE(input.good()); nlohmann::json fixture; input>>fixture;
+    ExPolygons region;
+    for (const auto& value:fixture["original"]) {
+        ExPolygon polygon;
+        for (const auto& p:value["outer"]) polygon.contour.points.emplace_back(p[0].get<coord_t>(),p[1].get<coord_t>());
+        for (const auto& ring:value["holes"]) {
+            Polygon hole;for (const auto& p:ring) hole.points.emplace_back(p[0].get<coord_t>(),p[1].get<coord_t>());
+            polygon.holes.push_back(std::move(hole));
+        }
+        region.push_back(std::move(polygon));
+    }
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.13f,.4f);config.contour_count=1;config.contour_boundary_clearance_mm=.2;
+    config.contour_bend_radius_mm=GENERATE(0.,.3);
+    config.cut_to_contact_length_mm=23;config.landing_length_mm=2;config.minimum_effective_length_mm=.5;
+    config.finish_extension_length_mm=23;config.finish_overlap_length_mm=23;
+    config.contour_include_holes=false;
+    const auto outer=ContinuousFiberFillStrategy::generate_contours(region,config);
+    REQUIRE(outer.paths.size()==1);
+    const auto off=FiberPathValidator::validate_contours(outer,region,config,{1,54,0,0},true);
+    REQUIRE(off.accepted_count()>0);
+    REQUIRE(off.reference_paths.size()==1);
+    bool clipped=false;
+    for(const auto& a:off.assignments) {
+        clipped=clipped || a.reason==FiberRejectionReason::UnavailableContourRegion;
+        if(a.prepared) {
+            CHECK_FALSE(a.centerline->is_closed());
+            CHECK(a.prepared->finish_strategy==FiberFinishStrategy::TangentExtension);
+        }
+    }
+    CHECK(clipped);CHECK(off.audit_assignments().valid());
+    config.contour_include_holes=true;
+    const auto all=ContinuousFiberFillStrategy::generate_contours(region,config);
+    CHECK(all.paths.size()==outer.paths.size()+region.front().holes.size());
+    CHECK(all.paths.front().geometry.points==outer.paths.front().geometry.points);
+    // A source hole remains a hole candidate even when erosion removes it from
+    // centerline_domain.holes. Disabling it must never append its rim to outer.
+    size_t surviving=0;for(const auto& d:all.centerline_domain)surviving+=d.holes.size();
+    CHECK(surviving<region.front().holes.size());
+    const auto on=FiberPathValidator::validate_contours(all,region,config,{1,54,0,0});
+    for(const auto& a:off.assignments) if(a.prepared) {
+        const auto same=std::find_if(on.assignments.begin(),on.assignments.end(),[&](const auto& b){return b.id==a.id;});
+        REQUIRE(same!=on.assignments.end());REQUIRE(same->prepared);
+        CHECK(same->centerline->polyline.points==a.centerline->polyline.points);
+    }
+}
+
+TEST_CASE("contour normalization cannot manufacture an unavailable interval", "[ContinuousFiber][priority][normalization-domain]")
+{
+    ExPolygon region;
+    for (const auto& p : std::vector<Vec2d>{{-1,-.00001},{1.9992,-.00001},{1.9992,-11},
+                                          {80,-11},{80,21},{-1,21}})
+        region.contour.points.push_back(Point::new_scale(p.x(), p.y()));
+    auto source = path_from_points({{0,0},{1.9993,0},{2,-.0007},{70,-.0007},
+                                   {70,20},{0,20},{0,0}}, 1.0).polyline;
+    if (GENERATE(false, true)) source.reverse();
+    REQUIRE(diff_pl(Polylines{source.to_polyline()}, ExPolygons{region}).empty());
+
+    ContinuousFiberConfig config;
+    config.contour_flow = Flow(1.f, .13f, .4f);
+    config.contour_count = 1;
+    config.landing_length_mm = 2;
+    config.cut_to_contact_length_mm = 23;
+    config.minimum_effective_length_mm = .5;
+    config.finish_overlap_length_mm = 23;
+    config.finish_extension_length_mm = 23;
+    FiberContourCandidates candidates;
+    candidates.centerline_domain = {region};
+    // Shaping can ignore other source boundaries; normalization must still
+    // preserve the physical domain that allocation will use afterwards.
+    candidates.geometry_domains = {GENERATE(false, true) ?
+        ExPolygons{rectangle(-2,-12,81,22)} : ExPolygons{region}};
+    candidates.paths.push_back({source, FiberContourSide::Outer, 0, 0});
+    const auto result = FiberPathValidator::validate_contours(candidates,
+        offset_ex(ExPolygons{region}, float(scale_(1))), config, {1,0,0,0});
+    REQUIRE(result.assignments.size() == 1);
+    const auto& accepted = result.assignments.front();
+    REQUIRE(accepted.prepared);
+    CHECK(accepted.centerline->is_closed());
+    CHECK(accepted.prepared->finish_strategy == FiberFinishStrategy::LoopOverlap);
+    CHECK(accepted.prepared->total_depositing_length_mm() ==
+        Catch::Approx(unscale<double>(source.length())).margin(.002));
+    const auto checked = offset_ex(candidates.centerline_domain,
+        float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
+    for (const auto& span : accepted.prepared->spans) if (span.deposits_fiber())
+        CHECK(diff_pl(Polylines{span.geometry.to_polyline()}, checked).empty());
+    CHECK(result.audit_assignments().valid());
+}
+
+TEST_CASE("process splits preserve a bend beside the landing boundary", "[ContinuousFiber][priority][command-domain]")
+{
+    ExPolygon region;
+    for (auto p:std::vector<Vec2d>{{-1,0},{1.9993,0},{1.9993,-11},{35,-11},{35,1},{-1,1}})
+        region.contour.points.push_back(Point::new_scale(p.x(),p.y()));
+    const ExPolygons planned{region};
+    const auto small_bend=path_from_points({{0,0},{1.9993,0},{1.9993,-.0007}}).polyline;
+    CHECK(normalize_fiber_geometry(small_bend).points.size()==2);
+    CHECK(normalize_fiber_geometry(small_bend,&planned).points==small_bend.points);
+    auto candidate=path_from_points({{0,0},{1.9993,0},{1.9993,-10},{30,-10}},1.0);
+    ContinuousFiberConfig config;
+    config.landing_length_mm=2; config.cut_to_contact_length_mm=23;
+    config.minimum_effective_length_mm=.5; config.finish_extension_length_mm=23;
+    auto id=test_id(); id.parent.purpose=FiberPathPurpose::Contour;
+    const auto result=FiberPathFinalizer::finalize(candidate,offset_ex(planned,float(scale_(1))),config,id,{},&planned);
+    REQUIRE(result.prepared);
+    CHECK_NOTHROW(result.prepared->validate());
+    CHECK(result.prepared->spans.front().geometry.points.back()==candidate.polyline.points[1]);
+    CHECK(unscale<double>(result.prepared->spans.front().geometry.length())==Catch::Approx(2).margin(.002));
+    CHECK(result.prepared->passive_tail_length_mm()==Catch::Approx(23).margin(.002));
+    CHECK(result.prepared->total_depositing_length_mm()==Catch::Approx(unscale<double>(candidate.length())).margin(.00001));
+    const auto checked=offset_ex(planned,float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
+    for (const auto& span:result.prepared->spans) if(span.deposits_fiber())
+        CHECK(diff_pl(Polylines{span.geometry.to_polyline()},checked).empty());
 }
 
 TEST_CASE("hole contour settings separate fiber domain policies", "[ContinuousFiber][hole-contours]")
