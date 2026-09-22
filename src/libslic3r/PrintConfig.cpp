@@ -1024,6 +1024,14 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(10.0));
 
+    def = this->add("fiber_contour_bend_radius", coFloat);
+    def->label = L("Minimum fiber contour bend radius");
+    def->tooltip = L("Replace contour corners with tangent arcs of at least this radius. The effective minimum is also limited to half the fiber extrusion width plus 0.0001 mm to prevent the inside of a bend from folding. Zero disables rounding. Unresolved contours are reported and are not printed as compliant fiber paths.");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
     def = this->add("fiber_contour_boundary_clearance", coFloat);
     def->label = L("Fiber contour boundary clearance");
     def->tooltip = L("Additional resin clearance between the fiber footprint and the internal core boundary.");
@@ -8637,6 +8645,8 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
     static std::set<std::string> ignore = {
         // Retired whole-path filters: discretized edges are not bend geometry.
         "fiber_minimum_segment_length", "fiber_maximum_turn_angle",
+        // Local tangent connections replace parallel preparation offsets.
+        "fiber_contour_rounding_max_reserve",
         "acceleration", "scale", "rotate", "duplicate", "duplicate_grid",
         "bed_size",
         "print_center", "g0", "wipe_tower_per_color_wipe", 

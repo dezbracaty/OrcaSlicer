@@ -12,7 +12,6 @@ namespace Slic3r {
 struct FiberCoverageRecord {
     FiberDomainId source;
     ExPolygons source_domain;
-    ExPolygons physical_fiber_coverage;
     ExPolygons accepted_contour_exclusion;
     ExPolygons accepted_infill_exclusion;
     ExPolygons resin_domain;

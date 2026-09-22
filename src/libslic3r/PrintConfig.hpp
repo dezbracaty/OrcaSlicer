@@ -1092,6 +1092,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                fiber_minimum_effective_length))
     ((ConfigOptionFloat,                fiber_contour_infill_clearance))
     ((ConfigOptionFloat,                fiber_contour_boundary_clearance))
+    ((ConfigOptionFloat,                fiber_contour_bend_radius))
     ((ConfigOptionFloat,                fiber_resin_overlap))
     ((ConfigOptionFloat,                fiber_prefeed_extra_length))
     ((ConfigOptionFloat,                fiber_prefeed_speed))

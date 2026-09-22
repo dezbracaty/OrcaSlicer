@@ -2358,3 +2358,25 @@ TEST_CASE("inactive fiber infill settings do not prevent contour slicing", "[lib
     std::filesystem::remove(result.output.path);
     if (!result.gcode_3mf.path.empty()) std::filesystem::remove(result.gcode_3mf.path);
 }
+
+TEST_CASE("fiber contour rounding configuration persists and is opt in", "[libslicer_api][fiber-rounding]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id="CFSYS Alpha500 Printer";
+    selection.machine_variant_id="0.4";
+    selection.process_preset_id="CCF&CIRON @CFSYS";
+    selection.filament_preset_ids={"CFSYS CIRON","CFSYS CCF"};
+    selection.filament_physical_tools={0,1};
+    REQUIRE(library->activate_config(selection,{}).success);
+    CHECK(library->active_config_snapshot()->value("fiber_contour_bend_radius")==std::optional<std::string>{"0"});
+    const auto patch=library->apply_active_config_patch({{"fiber_contour_bend_radius","0.5"}});
+    for (const auto& diagnostic:patch.diagnostics) UNSCOPED_INFO(diagnostic.key << ": " << diagnostic.message);
+    REQUIRE(patch.success);
+    const auto snapshot=library->active_config_snapshot();
+    CHECK(snapshot->value("fiber_contour_bend_radius")==std::optional<std::string>{"0.5"});
+    CHECK_FALSE(snapshot->value("fiber_contour_rounding_max_reserve").has_value());
+}

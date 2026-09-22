@@ -284,6 +284,7 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
     if (finish > 0) check(config.finish_motion_speed_mm_s, "fiber_finish_motion_speed", true);
     if (contour) {
         check(config.contour_boundary_clearance_mm, "fiber_contour_boundary_clearance");
+        check(config.contour_bend_radius_mm, "fiber_contour_bend_radius");
         if (config.contour_count < 0) throw std::invalid_argument("Invalid fiber contour count");
     }
     if (config.contour_enabled && config.infill_enabled)
@@ -343,6 +344,7 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         result.contour_count = std::max(0, source.outer_reinforced_perimeters_counts.value);
         result.contour_material = unsigned(std::max(1, source.reinforced_perimeters_filament.value));
         result.contour_boundary_clearance_mm = source.fiber_contour_boundary_clearance.value;
+        result.contour_bend_radius_mm = source.fiber_contour_bend_radius.value;
         result.contour_min_speed_mm_s = source.fiber_contour_min_speed.value;
         result.contour_max_speed_mm_s = source.fiber_contour_max_speed.value;
         result.contour_acceleration_mm_s2 = source.fiber_contour_acceleration.value;

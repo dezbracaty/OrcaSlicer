@@ -131,6 +131,8 @@ public:
         std::map<std::string, size_t> rejected_fragments;
     };
     FiberInfillStatistics fiber_infill_statistics;
+    std::map<std::string, size_t> fiber_contour_rounding_failures;
+    double fiber_contour_source_overlap_mm2 {0.0}, fiber_contour_added_overlap_mm2 {0.0};
     enum class FiberDiagnosticKind { RejectedPath, OriginalContourRegion, MissingContourRegion };
     struct FiberFillDiagnostic {
         Polyline geometry;

@@ -201,7 +201,7 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
                                  "reinforced_infill_filament",
                                  "reinforced_infill_extrusion_width"})) {
         item.enabled = infill_enabled;
-    } else if (item.key == "fiber_contour_boundary_clearance") {
+    } else if (key_is(item.key, {"fiber_contour_boundary_clearance", "fiber_contour_bend_radius"})) {
         item.enabled = contour_enabled;
     } else if (item.key == "fiber_contour_infill_clearance") {
         item.enabled = contour_enabled && infill_enabled;

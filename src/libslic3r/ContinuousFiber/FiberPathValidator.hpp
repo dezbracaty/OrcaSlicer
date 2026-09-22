@@ -3,6 +3,7 @@
 
 #include "ContinuousFiberConfig.hpp"
 #include "FiberPathFinalizer.hpp"
+#include "ContinuousFiberFillStrategy.hpp"
 #include "../ExtrusionEntityCollection.hpp"
 #include "../ExPolygon.hpp"
 
@@ -32,7 +33,8 @@ enum class FiberRejectionReason : uint8_t {
     FinalizedPathOutsideDomain,
     IntervalMappingFailure,
     FinishUnavailable,
-    SamplingLimit
+    SamplingLimit,
+    ContourRoundingUnresolved
 };
 
 const char* fiber_rejection_reason_name(FiberRejectionReason reason);
@@ -44,6 +46,8 @@ struct FiberFragmentAssignment {
     FiberAssignmentKind kind { FiberAssignmentKind::Rejected };
     FiberRejectionReason reason { FiberRejectionReason::None };
     std::string detail;
+    std::vector<ContourIssue> contour_issues;
+    double contour_source_overlap_mm2 {0.0}, contour_added_overlap_mm2 {0.0};
     std::optional<ExtrusionPath> centerline;
     std::shared_ptr<const PreparedFiberPath> prepared;
 };

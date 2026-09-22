@@ -3,6 +3,7 @@
 
 #include "ContinuousFiberConfig.hpp"
 #include "PreparedFiberPath.hpp"
+#include "ContinuousFiberFillStrategy.hpp"
 
 #include <memory>
 #include <string>
@@ -10,7 +11,7 @@
 namespace Slic3r {
 
 class ExtrusionPath;
-// Grid-resolution duplicate/short-edge and collinear normalization. Preserves
+// Error-bounded short-edge and collinear normalization. Preserves
 // endpoints/seam; this geometry becomes the source for length and coverage.
 Polyline3 normalize_fiber_geometry(const Polyline3& input);
 
@@ -38,7 +39,8 @@ public:
         const ExtrusionPath& candidate,
         const ExPolygons& allowed_domain,
         const ContinuousFiberConfig& config,
-        const FiberFragmentId& id);
+        const FiberFragmentId& id,
+        const std::vector<ContourArc>& arcs = {});
 };
 
 } // namespace Slic3r

@@ -1796,6 +1796,12 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         // return turn must not join two independently printable contours.
         // Coverage/exclusion is still derived only from accepted final paths.
         const double width = config.contour_flow.width();
+        if (collect_debug)
+            BOOST_LOG_TRIVIAL(debug) << "[FiberContourRadius] layer=" << context.layer.id()
+                << " requested_mm=" << config.contour_bend_radius_mm
+                << " effective_mm=" << (config.contour_bend_radius_mm > 0 ?
+                    std::max(config.contour_bend_radius_mm, 0.5*width + ContourRoundingOptions{}.geometry_tolerance_mm) : 0.0)
+                << " width_mm=" << width;
         const ExPolygons centerline_limit = offset_ex(original_area,
             -float(scale_(0.5 * width + config.contour_boundary_clearance_mm)));
         contour_job.expolygons = intersection_ex(offset2_ex(original_area,
@@ -1861,9 +1867,6 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     FiberCoverageRecord coverage;
     coverage.source = domain_id;
     coverage.source_domain = original_area;
-    coverage.physical_fiber_coverage = contour_result.physical_footprint;
-    append_expolygons(coverage.physical_fiber_coverage, infill_result.physical_footprint);
-    coverage.physical_fiber_coverage = union_ex(coverage.physical_fiber_coverage);
     coverage.accepted_contour_exclusion = contour_result.resin_exclusion;
     coverage.accepted_infill_exclusion = infill_result.resin_exclusion;
     coverage.outside_domain = contour_result.outside_domain;
@@ -1882,18 +1885,46 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         if (assignment.kind == FiberAssignmentKind::Rejected)
             ++statistics.rejected_fragments[fiber_rejection_reason_name(assignment.reason)];
     }
+    for (const auto& assignment : contour_result.assignments) {
+        if (assignment.kind != FiberAssignmentKind::AcceptedFiber) continue;
+        context.layer.fiber_contour_source_overlap_mm2 += assignment.contour_source_overlap_mm2;
+        context.layer.fiber_contour_added_overlap_mm2 += assignment.contour_added_overlap_mm2;
+        if (assignment.contour_added_overlap_mm2 > 0)
+            BOOST_LOG_TRIVIAL(debug) << "[FiberContourCoverageOverlap] layer=" << context.layer.id()
+                << " candidate=" << assignment.id.parent.path_ordinal
+                << " source_mm2=" << assignment.contour_source_overlap_mm2
+                << " added_mm2=" << assignment.contour_added_overlap_mm2;
+    }
     const auto log_rejections = [&](const FiberValidationResult& validation) {
         for (const FiberFragmentAssignment& assignment : validation.assignments) {
             if (assignment.kind != FiberAssignmentKind::Rejected)
                 continue;
+            std::string detail = assignment.detail;
+            if (assignment.reason == FiberRejectionReason::ContourRoundingUnresolved) {
+                std::set<ContourRoundingFailure> reasons;
+                for (const auto& issue : assignment.contour_issues) reasons.insert(issue.reason);
+                if (reasons.empty())
+                    ++context.layer.fiber_contour_rounding_failures[fiber_rejection_reason_name(assignment.reason)];
+                for (const auto reason : reasons) {
+                    const char* name = contour_rounding_failure_name(reason);
+                    ++context.layer.fiber_contour_rounding_failures[name];
+                    if (!detail.empty()) detail += "; ";
+                    detail += name;
+                }
+            }
             if (context.layer.object()->print()->config().fiber_fill_debug.value && assignment.centerline) {
                 context.layer.fiber_fill_diagnostics.push_back({
                     assignment.centerline->polyline.to_polyline(),
-                    fiber_rejection_reason_name(assignment.reason),
+                    std::string(fiber_rejection_reason_name(assignment.reason)) + "; " + detail,
                     assignment.id.parent.purpose == FiberPathPurpose::Contour,
                     assignment.source_end_mm - assignment.source_begin_mm,
                     Layer::FiberDiagnosticKind::RejectedPath, {},
                     domain_id.policy_group_id, domain_id.component_id});
+                for (const auto& issue : assignment.contour_issues)
+                    context.layer.fiber_fill_diagnostics.push_back({
+                        issue.source, contour_rounding_failure_name(issue.reason), true,
+                        unscale<double>(issue.source.length()), Layer::FiberDiagnosticKind::RejectedPath,
+                        {}, domain_id.policy_group_id, domain_id.component_id});
             }
             BOOST_LOG_TRIVIAL(debug)
                 << "[FiberRejected] layer=" << context.layer.id()
@@ -1906,7 +1937,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 << " source_begin_mm=" << assignment.source_begin_mm
                 << " source_end_mm=" << assignment.source_end_mm
                 << " source_length_mm=" << validation.candidates.at(assignment.id.parent.path_ordinal).length_mm
-                << " reason=" << fiber_rejection_reason_name(assignment.reason) << " detail=" << assignment.detail;
+                << " reason=" << fiber_rejection_reason_name(assignment.reason) << " detail=" << detail;
         }
     };
     log_rejections(contour_result);
@@ -1961,6 +1992,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 {
     fiber_infill_statistics = {};
     fiber_fill_diagnostics.clear();
+    fiber_contour_rounding_failures.clear();
+    fiber_contour_source_overlap_mm2 = fiber_contour_added_overlap_mm2 = 0;
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");
