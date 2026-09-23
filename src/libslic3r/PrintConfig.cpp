@@ -950,7 +950,7 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Fiber contours around holes");
     def->category = L("Continuous fiber");
     def->tooltip = L("Generate fiber contour loops around closed holes in the fiber region. Disabling this option keeps holes excluded from all material paths and does not change fiber infill patterns.");
-    def->set_default_value(new ConfigOptionBool(true));
+    def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("outer_reinforced_perimeters_counts", coInt);
     def->label = L("Continuous fiber contour count");
@@ -1045,7 +1045,7 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;
-    def->set_default_value(new ConfigOptionFloat(0.0));
+    def->set_default_value(new ConfigOptionFloat(0.05));
 
     def = this->add("fiber_contour_infill_clearance", coFloat);
     def->label = L("Fiber contour to infill clearance");

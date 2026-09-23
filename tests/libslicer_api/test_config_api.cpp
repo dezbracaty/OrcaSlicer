@@ -340,7 +340,8 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     CHECK(*start_speed == "10");
     CHECK(*minimum_effective == "0.5");
     CHECK(config->value("fiber_minimum_path_length") == std::optional<std::string>{"0"});
-    CHECK(config->value("fiber_contour_boundary_clearance") == "0.2");
+    CHECK(config->value("fiber_contour_boundary_clearance") == "0.05");
+    CHECK(config->value("fiber_contour_include_holes") == "0");
     CHECK(*contour_speed == "10");
     CHECK(*infill_speed == "10");
     CHECK(*contour_acceleration == "500");
@@ -2398,19 +2399,20 @@ TEST_CASE("hole contour setting retains default and round trips through configur
     CHECK(item->type == libslicer::SettingType::Boolean);
     CHECK(item->group == libslicer::SettingGroup::Process);
     CHECK(item->category == "Continuous fiber");
-    CHECK(item->default_value == "1");
+    CHECK(item->default_value == "0");
+    CHECK(config.snapshot().value("fiber_contour_boundary_clearance") == "0.05");
     CHECK_FALSE(item->enabled);
     REQUIRE(config.set("generate_reinforced_perimeters", "1").success);
     items = config.settings();
     CHECK(find_item(items, "fiber_contour_include_holes")->enabled);
-    REQUIRE(config.set("fiber_contour_include_holes", "0").success);
+    REQUIRE(config.set("fiber_contour_include_holes", "1").success);
     const auto saved = config.snapshot().value("fiber_contour_include_holes");
-    REQUIRE(saved == "0");
+    REQUIRE(saved == "1");
     auto restored = libslicer::Config::defaults();
     REQUIRE(restored.set("fiber_contour_include_holes", *saved).success);
-    CHECK(restored.snapshot().value("fiber_contour_include_holes") == "0");
+    CHECK(restored.snapshot().value("fiber_contour_include_holes") == "1");
     REQUIRE(config.reset("fiber_contour_include_holes").success);
-    CHECK(config.snapshot().value("fiber_contour_include_holes") == "1");
+    CHECK(config.snapshot().value("fiber_contour_include_holes") == "0");
 }
 
 
