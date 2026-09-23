@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <tuple>
 #include <limits>
 #include <stdexcept>
 #include <nlopt.hpp>
@@ -287,10 +288,15 @@ struct DomainDistance {
         for (const auto& edge:edges) lines.emplace_back(edge.a,edge.a+edge.delta);
         tree=AABBTreeLines::build_aabb_tree_over_indexed_lines(lines);
     }
-    double outside_distance(const Vec2d& p) const {
-        size_t nearest=size_t(-1);Vec2d point=Vec2d::Zero();
-        const double squared=AABBTreeLines::squared_distance_to_indexed_lines(lines,tree,p,nearest,point);
-        return squared<0?HUGE_VAL:std::sqrt(squared)*AABBTreeLines::point_outside_closed_contours(lines,tree,p);
+    double outside_distance(const Vec2d& p,size_t& nearest) const {
+        // The previous edge is a witness, not an approximate nearest result.
+        // Its exact distance bounds the tree search for the next nearby sample.
+        double squared=HUGE_VAL;
+        if (nearest<lines.size()) squared=line_alg::distance_to_squared(lines[nearest],p);
+        Vec2d point=Vec2d::Zero();
+        const double closer=AABBTreeLines::squared_distance_to_indexed_lines(lines,tree,p,nearest,point,squared);
+        if (closer>=0) squared=closer;
+        return std::isfinite(squared)?std::sqrt(squared)*AABBTreeLines::point_outside_closed_contours(lines,tree,p):HUGE_VAL;
     }
     void nearby_edges(const Vec2d& center,double radius,std::vector<size_t>& found) const {
         // A vertex or perpendicular foot within the radial band must lie in
@@ -513,22 +519,38 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
         const DomainDistance* distances;
         double tolerance;
         const std::vector<Vec2d>* knots;
-        std::function<void(TangentSolution)> retain;
+        std::function<void(TangentSolution,std::optional<double>)> retain;
         mutable std::vector<size_t> nearby;
+        mutable size_t nearest_edge=size_t(-1);
         mutable std::vector<double> last_parameters;
         mutable std::optional<TangentSolution> last_connection;
         mutable double last_violation=0;
+        mutable std::optional<double> last_score;
+        mutable std::optional<double> last_constraint;
         const std::optional<TangentSolution>& evaluate(const std::vector<double>& x) const {
             // COBYLA evaluates objective and constraint at the same pose. Share
             // only that exact pose, within this optimizer run and this thread.
             if (x!=last_parameters) {
                 last_connection=connection(*problem,family,x,last_violation);
                 last_parameters=x;
+                last_score.reset();
+                last_constraint.reset();
             }
             return last_connection;
         }
+        double score() const {
+            if (!last_score)
+                last_score=connection_score(*last_connection,*knots,problem->minimum_radius,
+                    problem->incoming_length,problem->absolute_turn);
+            return *last_score;
+        }
         double constraint(const std::vector<double>& x) const {
             const auto& value=evaluate(x);
+            if (last_constraint) return *last_constraint;
+            last_constraint=boundary_violation(value);
+            return *last_constraint;
+        }
+        double boundary_violation(const std::optional<TangentSolution>& value) const {
             if (!value) return 1+last_violation/problem->minimum_radius;
             const double winding_error=turn_violation(*value,problem->turn_radians,problem->heading_min,problem->heading_max);
             if (winding_error>1e-8) return winding_error;
@@ -539,13 +561,13 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
                 // Final acceptance uses the error-bounded discretization.
                 const size_t count=32;
                 for (size_t i=0;i<=count;++i)
-                    outside=std::max(outside,distances->outside_distance(arc_point(arc,double(i)/count)));
+                    outside=std::max(outside,distances->outside_distance(arc_point(arc,double(i)/count),nearest_edge));
                 const auto inspect_direction=[&](const Vec2d& radial) {
                     const double direction=std::copysign(1.0,arc.sweep_radians);
                     double angle=direction*turn(arc.start_mm-arc.center_mm,radial);
                     if (angle<0) angle+=2*PI;
                     if (angle<=std::abs(arc.sweep_radians) && radial.squaredNorm()>1e-18)
-                        outside=std::max(outside,distances->outside_distance(arc.center_mm+arc.radius_mm*radial.normalized()));
+                        outside=std::max(outside,distances->outside_distance(arc.center_mm+arc.radius_mm*radial.normalized(),nearest_edge));
                 };
                 const double band=arc.radius_mm*std::abs(arc.sweep_radians)/count;
                 distances->nearby_edges(arc.center_mm,arc.radius_mm+band,nearby);
@@ -562,10 +584,10 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
                 if (k) {
                     const Vec2d a=value->arcs[k-1].end_mm,b=arc.start_mm;
                     for (size_t i=1;i<16;++i)
-                        outside=std::max(outside,distances->outside_distance(a+(b-a)*(double(i)/16)));
+                        outside=std::max(outside,distances->outside_distance(a+(b-a)*(double(i)/16),nearest_edge));
                 }
             }
-            if (outside<=0) retain(*value);
+            if (outside<=0) retain(*value,last_score);
             return (outside+tolerance)/problem->minimum_radius;
         }
         static double boundary(const std::vector<double>& x,std::vector<double>&,void* data) {
@@ -575,7 +597,7 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
             const auto& self=*static_cast<Search*>(data);
             const auto& value=self.evaluate(x);
             if (!value) return 100+self.last_violation/self.problem->minimum_radius;
-            return connection_score(*value,*self.knots,self.problem->minimum_radius,self.problem->incoming_length,self.problem->absolute_turn);
+            return self.score();
         }
     };
     // A wedge has a closed-form equal-radius solution. Check all branches
@@ -884,10 +906,19 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
     const auto p=canonical_ring(source);
     if (p.size()<3 || !simple(source.points)) { result.issues.push_back({ContourRoundingFailure::InvalidInput,source}); return result; }
     std::optional<DomainDistance> distances;
+    // The unconstrained pool may accumulate constrained solutions. Keep exact
+    // constrained queries separate so failed searches can also be reused.
     std::map<std::pair<size_t,size_t>,LocalSolutions> cache;
+    std::map<std::tuple<size_t,size_t,double,double>,LocalSolutions> constrained_cache;
     size_t revisions_left=2*p.size(),local_queries_left=2*p.size(),searches_left=128;
     bool budget_exhausted=false,optimizer_limit=false,numerical_failure=false;
     const auto solve=[&](CornerGroup group,double lo=0.0,double hi=HUGE_VAL) {
+        const auto key=std::make_tuple(group.first,group.count,lo,hi);
+        const bool constrained=lo!=0.0 || hi!=HUGE_VAL;
+        if (constrained) {
+            const auto found=constrained_cache.find(key);
+            if (found!=constrained_cache.end()) return found->second;
+        }
         if (local_queries_left==0) {
             budget_exhausted=true;
             // Cached partitions may still form a valid ring without another
@@ -898,6 +929,7 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
         auto local=solve_group(p,group,options,domain,distances,lo,hi);
         optimizer_limit|=local.optimizer_limit_reached;
         numerical_failure|=local.values.empty() && local.numerical_failure;
+        if (constrained) constrained_cache.emplace(key,local);
         return local;
     };
     const auto cached=[&](CornerGroup group)->LocalSolutions& {
@@ -915,7 +947,11 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
     };
     const auto priority=[&](const Partition& groups) {
         size_t unresolved=0;double deficit=0;
-        for (const auto& group:groups) if (cached(group).values.empty()) {
+        for (const auto& group:groups) {
+            const auto found=cache.find({group.first,group.count});
+            if (found!=cache.end() && !found->second.values.empty()) continue;
+            // Ranking must not solve windows in branches that may never be
+            // attempted. Unknown windows use only this analytic estimate.
             ++unresolved;
             if (const auto support=supports(p,group)) {
                 const Vec2d contact=support->base+options.minimum_radius_mm*support->slope;

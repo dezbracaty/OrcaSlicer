@@ -1309,6 +1309,11 @@ TEST_CASE("contour rounding has explicit disabled and infeasible outcomes", "[Co
     CHECK_FALSE(impossible.path);
     REQUIRE_FALSE(impossible.issues.empty());
     CHECK(path.polyline.points.size()==5);
+    // A nonempty container can still offset to an empty domain. Distance
+    // queries must report unavailable geometry rather than produce NaNs.
+    const auto empty_domain=ContinuousFiberFillStrategy::round_contour(path.polyline,ExPolygons{ExPolygon{}},{.5});
+    CHECK_FALSE(empty_domain.path);
+    CHECK_FALSE(empty_domain.issues.empty());
 }
 
 TEST_CASE("tangent rounding expands towards insufficient supports", "[ContinuousFiber][ContourRounding]")
