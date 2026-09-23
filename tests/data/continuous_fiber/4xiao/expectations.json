@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "model": "model.stl",
+  "model_fnv1a64": "75f709c509cd3724",
+  "config": "config.json",
+  "layer_count": 32,
+  "first_required_layer": 4,
+  "last_required_layer": 24,
+  "outer_contours_per_layer": 1,
+  "minimum_outer_length_mm": 200.0,
+  "minimum_outer_x_span_mm": 80.0,
+  "closure_tolerance_mm": 0.002,
+  "candidate_match_tolerance_mm": 0.005,
+  "notes": [
+    "Each of layers 4 through 24 must emit exactly one complete exterior contour. Hole contours do not count.",
+    "200 mm length and 80 mm X span distinguish the model-wide exterior from local rings for this fixed 4xiao placement. These are test requirements, not production filters.",
+    "Closure, length and span alone do not pass: a closed ring detouring along the hole edges must fail the spatial contract.",
+    "Reject split exteriors, missing exteriors and unmatched geometry. Planner rejection reasons never waive a failure.",
+    "Fixed case: CFSYS Alpha500, CIRON + CCF, 0 mm bend radius, one contour, hole contours enabled. Debug is enabled only to identify source boundaries."
+  ],
+  "spatial_contract": {
+    "coordinate_system": "Bed XY in mm after tool-offset compensation; STL bounding-box center placed at (217.5, 177.5).",
+    "provenance": "Left circular bores measured from the fixed STL cross-section, radius 3 mm. Passage boxes cover the exterior side of these bores, X=178..183, between the bores and the left-lobe outside wall; they are acceptance landmarks, not planner output.",
+    "enclosed_disks": [
+      {
+        "name": "left_upper_bore",
+        "center": [
+          180.65342,
+          164.09337
+        ],
+        "radius_mm": 3.0
+      },
+      {
+        "name": "left_lower_bore",
+        "center": [
+          179.83872,
+          174.06012
+        ],
+        "radius_mm": 3.0
+      }
+    ],
+    "passages": [
+      {
+        "name": "upper_outer_passage",
+        "bounds_xyxy": [
+          178.0,
+          158.0,
+          183.0,
+          159.5
+        ]
+      },
+      {
+        "name": "lower_outer_passage",
+        "bounds_xyxy": [
+          178.0,
+          178.7,
+          183.0,
+          180.1
+        ]
+      }
+    ],
+    "rule": "The SAME simple closed main exterior must enclose BOTH disks and cross EACH rectangle continuously from its left edge to its right edge (or reverse). Separate paths or separated visits cannot combine coverage."
+  }
+}
