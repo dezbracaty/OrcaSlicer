@@ -37,3 +37,7 @@ add_test(NAME Fiber4xiaoAcceptance COMMAND fiber_4xiao_acceptance)
 set_tests_properties(Fiber4xiaoAcceptance PROPERTIES LABELS "fiber_acceptance" TIMEOUT 120 RUN_SERIAL TRUE)
 add_test(NAME Fiber4xiaoAcceptanceChecker COMMAND fiber_4xiao_acceptance --self-test)
 set_tests_properties(Fiber4xiaoAcceptanceChecker PROPERTIES LABELS "fiber_acceptance" TIMEOUT 10)
+
+# Additional current-settings regression; the fixed gate above stays unchanged.
+add_test(NAME Fiber4xiaoClosedOuterRegression COMMAND fiber_4xiao_acceptance --closed-outer-regression)
+set_tests_properties(Fiber4xiaoClosedOuterRegression PROPERTIES LABELS "fiber_closed_outer" TIMEOUT 120 RUN_SERIAL TRUE)

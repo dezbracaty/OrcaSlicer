@@ -1223,9 +1223,10 @@ FiberContourCandidates ContinuousFiberFillStrategy::generate_contours(
         std::sort(polygons.begin(), polygons.end(), [](const Polygon& a, const Polygon& b) { return a.points < b.points; });
         return polygons;
     };
-    // Source identity is assigned before any offset can merge a hole with the
-    // exterior. Geometry domains guide shaping; the physical domain above still
-    // contains all real holes and is enforced during allocation.
+    // Preserve source identities even when an expanded hole joins the exterior.
+    // Only exterior-connected obstacle groups change the outer route. Expanding
+    // every hole into the outer envelope would unnecessarily split narrow lobes
+    // around independent bores and let small local rings displace the main loop.
     const double inset = 0.5 * width + config.contour_boundary_clearance_mm;
     std::vector<ExPolygon> regions = original_area;
     for (auto& region : regions) {
@@ -1236,27 +1237,52 @@ FiberContourCandidates ContinuousFiberFillStrategy::generate_contours(
         return a.contour.points < b.contour.points;
     });
     const auto emit = [&](const ExPolygons& shapes, FiberContourSide side, size_t region,
-                          size_t boundary, size_t depth, size_t geometry_domain) {
+                          size_t boundary, size_t depth, size_t geometry_domain,
+                          const std::vector<size_t>& rerouted_holes = {}) {
         Polygons rings;
         for (const auto& shape : shapes) rings.push_back(shape.contour);
         size_t part = 0;
         for (auto ring : ordered(std::move(rings))) {
             if (side == FiberContourSide::Hole) ring.reverse();
             result.paths.push_back({Polyline3(ring.split_at_index(0)), side, boundary, depth,
-                                    region, part++, geometry_domain});
+                                    region, part++, geometry_domain, rerouted_holes});
         }
     };
     for (size_t region_id = 0; region_id < regions.size(); ++region_id) {
         const auto& region = regions[region_id];
         const ExPolygons envelope = offset_ex(ExPolygons{ExPolygon(region.contour)}, -float(scale_(inset)));
-        const size_t outer_domain = result.geometry_domains.size();
-        result.geometry_domains.push_back(envelope);
-        ExPolygons outside = intersection_ex(offset2_ex(envelope,
-            -float(scale_(0.5 * width)), float(scale_(0.5 * width))), envelope);
         for (int depth = 0; depth < config.contour_count; ++depth) {
-            emit(outside, FiberContourSide::Outer, region_id, 0, size_t(depth), outer_domain);
-            if (depth + 1 < config.contour_count)
-                outside = offset2_ex(outside, -float(scale_(1.5 * width)), float(scale_(0.5 * width)));
+            const double depth_inset = inset + depth * width;
+            const ExPolygons depth_envelope = offset_ex(ExPolygons{ExPolygon(region.contour)},
+                -float(scale_(depth_inset)));
+            std::vector<ExPolygons> expanded_holes;
+            ExPolygons obstacles;
+            for (const auto& hole : region.holes) {
+                expanded_holes.push_back(offset_ex(ExPolygons{ExPolygon(hole)}, float(scale_(depth_inset))));
+                append(obstacles, expanded_holes.back());
+            }
+            // Union first: a chain of touching holes can reach the exterior even
+            // when only one original hole directly touches it. A tangent passage
+            // within the geometry tolerance is also unavailable to a finite strip.
+            const ExPolygons interior = offset_ex(depth_envelope,
+                -float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
+            ExPolygons exterior_obstacles;
+            for (const auto& group : union_ex(obstacles))
+                if (!diff_ex(ExPolygons{group}, interior).empty())
+                    exterior_obstacles.push_back(group);
+            std::vector<size_t> rerouted_holes;
+            for (size_t hole_id = 0; hole_id < expanded_holes.size(); ++hole_id)
+                if (!intersection_ex(expanded_holes[hole_id], exterior_obstacles).empty())
+                    rerouted_holes.push_back(hole_id);
+            const ExPolygons route_domain = exterior_obstacles.empty() ? depth_envelope :
+                diff_ex(depth_envelope, exterior_obstacles);
+            const size_t outer_domain = result.geometry_domains.size();
+            // Rounding must obey all actual holes, including ones not absorbed
+            // into the outer route, and preserve the new loop's enclosure.
+            result.geometry_domains.push_back(intersection_ex(route_domain, result.centerline_domain));
+            const ExPolygons outside = intersection_ex(offset2_ex(route_domain,
+                -float(scale_(0.5 * width)), float(scale_(0.5 * width))), route_domain);
+            emit(outside, FiberContourSide::Outer, region_id, 0, size_t(depth), outer_domain, rerouted_holes);
         }
         if (!config.contour_include_holes) continue;
         for (size_t hole_id = 0; hole_id < region.holes.size(); ++hole_id) {

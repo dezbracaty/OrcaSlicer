@@ -1761,13 +1761,23 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
             record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
                            "original_contour_domain_before_candidate_generation");
         const auto candidates = ContinuousFiberFillStrategy::generate_contours(original_area, config);
-        if (collect_debug) for (const auto& candidate : candidates.paths)
+        if (std::none_of(candidates.paths.begin(), candidates.paths.end(),
+                [](const auto& candidate) { return candidate.side == FiberContourSide::Outer; }))
+            ++context.layer.fiber_outer_contour_failures["no_outer_contour_candidate"];
+        if (collect_debug) for (const auto& candidate : candidates.paths) {
+            std::string rerouted_holes;
+            for (const auto hole : candidate.rerouted_hole_ids) {
+                if (!rerouted_holes.empty()) rerouted_holes += ",";
+                rerouted_holes += std::to_string(hole);
+            }
             context.layer.fiber_fill_diagnostics.push_back({candidate.geometry.to_polyline(),
                 std::string(candidate.side==FiberContourSide::Outer ? "outer" : "hole")+
                     "; region="+std::to_string(candidate.region_id)+"; boundary="+std::to_string(candidate.boundary_id)+
-                    "; depth="+std::to_string(candidate.depth)+"; part="+std::to_string(candidate.part_id),
+                    "; depth="+std::to_string(candidate.depth)+"; part="+std::to_string(candidate.part_id)+
+                    "; rerouted_holes="+rerouted_holes,
                 true,unscale<double>(candidate.geometry.length()),Layer::FiberDiagnosticKind::ContourCandidate,
                 {},domain_id.policy_group_id,domain_id.component_id});
+        }
         contour_result = FiberPathValidator::validate_contours(candidates, original_area, config, domain_id, collect_debug);
         if (collect_debug) {
             for (const auto& reference:contour_result.reference_paths)
@@ -1839,6 +1849,10 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
             if (assignment.kind != FiberAssignmentKind::Rejected)
                 continue;
             std::string detail = assignment.detail;
+            const auto extent = std::find_if(validation.candidates.begin(), validation.candidates.end(),
+                [&](const auto& candidate) { return candidate.id == assignment.id.parent; });
+            if (extent != validation.candidates.end() && extent->requires_closed_loop)
+                ++context.layer.fiber_outer_contour_failures[fiber_rejection_reason_name(assignment.reason)];
             if (assignment.reason == FiberRejectionReason::ContourRoundingUnresolved) {
                 std::set<ContourRoundingFailure> reasons;
                 for (const auto& issue : assignment.contour_issues) reasons.insert(issue.reason);
@@ -1938,6 +1952,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     fiber_infill_statistics = {};
     fiber_fill_diagnostics.clear();
     fiber_contour_rounding_failures.clear();
+    fiber_outer_contour_failures.clear();
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");

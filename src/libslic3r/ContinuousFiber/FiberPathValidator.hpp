@@ -36,7 +36,8 @@ enum class FiberRejectionReason : uint8_t {
     SamplingLimit,
     ContourRoundingUnresolved,
     OccupiedContourRegion,
-    UnavailableContourRegion
+    UnavailableContourRegion,
+    OpenOuterContour
 };
 
 const char* fiber_rejection_reason_name(FiberRejectionReason reason);
@@ -56,6 +57,7 @@ struct FiberFragmentAssignment {
 struct FiberCandidateExtent {
     FiberCandidateId id;
     double length_mm { 0.0 };
+    bool requires_closed_loop { false };
 };
 
 struct FiberAssignmentAudit {
@@ -108,7 +110,8 @@ private:
         const ContinuousFiberConfig& config, FiberPathPurpose purpose,
         ExtrusionRole output_role, const FiberDomainId& domain_id, size_t job_ordinal,
         const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
-        const ExPolygons* physical_centerline_domain, bool collect_debug);
+        const ExPolygons* physical_centerline_domain, bool collect_debug,
+        bool requires_closed_loop = false);
 };
 
 } // namespace Slic3r

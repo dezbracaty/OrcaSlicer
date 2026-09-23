@@ -895,6 +895,8 @@ TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libsl
     REQUIRE(normal.success);
     REQUIRE(normal.preview);
     CHECK(normal.preview->fiber_fill_diagnostics.empty());
+    if (!model) CHECK(std::any_of(normal.diagnostics.begin(), normal.diagnostics.end(),
+        [](const auto& d) { return d.code == "fiber_outer_contour_rejected"; }));
     REQUIRE(request.config.value("fiber_fill_debug") == "0");
     REQUIRE(library->apply_active_config_patch({{"fiber_fill_debug", "1"}}).success);
     request.config = *library->active_config_snapshot();

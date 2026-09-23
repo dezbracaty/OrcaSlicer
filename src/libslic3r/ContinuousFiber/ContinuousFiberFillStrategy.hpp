@@ -126,6 +126,9 @@ struct FiberContourCandidate {
     size_t region_id {0};
     size_t part_id {0};
     size_t geometry_domain_id {0};
+    // Original hole identities absorbed into the reconstructed exterior.
+    // Independent hole-loop selection never controls these obstacles.
+    std::vector<size_t> rerouted_hole_ids;
 };
 
 struct FiberContourCandidates {
@@ -136,12 +139,13 @@ struct FiberContourCandidates {
 
 class ContinuousFiberFillStrategy {
 public:
-    // Emit source boundaries; the validator owns their allocation priority.
+    // Reconstruct closed exterior boundaries where inset closes a passage.
+    // The validator owns allocation priority and commits exteriors atomically.
     // Holes always constrain centerlines, independently of whether they emit paths.
     static FiberContourCandidates generate_contours(
         const ExPolygons& original_area, const ContinuousFiberConfig& config);
 
-    // Shape closed candidates before allocation clips them into open strands.
+    // Shape closed candidates before allocation; exteriors must remain closed.
     static ContourRoundingResult round_contour(
         const Polyline3& source, const ExPolygons& centerline_domain,
         const ContourRoundingOptions& options);

@@ -347,19 +347,34 @@ void self_test(const Json& rule)
 int main(int argc,char** argv)
 {
     const fs::path assets=fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao";
-    const fs::path output=FIBER_ACCEPTANCE_OUTPUT_DIR;
+    const bool closed_outer_regression=argc==2 && std::string(argv[1])=="--closed-outer-regression";
+    const fs::path output=closed_outer_regression ? fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR)/"closed-outer-regression" :
+        fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR);
     const bool checking=argc==2 && std::string(argv[1])=="--self-test";
     try {
-        require(argc==1 || checking,"Usage: fiber_4xiao_acceptance [--self-test]");
-        const Json rule=read_json(assets/"expectations.json");
+        require(argc==1 || checking || closed_outer_regression,"Usage: fiber_4xiao_acceptance [--self-test|--closed-outer-regression]");
+        Json rule=read_json(assets/"expectations.json");
         require(rule.at("schema_version")==1 && rule.at("first_required_layer")==4 && rule.at("last_required_layer")==24 && rule.at("outer_contours_per_layer")==1,"Unexpected acceptance contract");
         if (checking) {self_test(rule);return 0;}
+        // Separate regression for the user's current settings and the transition
+        // from a blocked exterior passage to an open concavity. Never alter the
+        // original pinned acceptance run or relax its geometric checker.
+        if (closed_outer_regression) {
+            rule["first_required_layer"]=14;
+            rule["last_required_layer"]=17;
+            rule["notes"]=Json::array({"Closed-outer regression: 0.05 mm clearance, hole loops disabled; display layers 14..17 must retain one complete main outer around both left bores."});
+        }
         fs::create_directories(output);
         write_json(output/"report.json",{{"passed",false},{"status","running"}});
         const fs::path model=assets/rule.at("model").get<std::string>();
         require(fingerprint(model)==rule.at("model_fnv1a64").get<std::string>(),"Model fingerprint does not match the fixed fixture");
         const fs::path config_file=assets/rule.at("config").get<std::string>();
-        const Json config=read_json(config_file);const auto& selection=config.at("selection");
+        Json config=read_json(config_file);
+        if (closed_outer_regression) {
+            config["settings"]["fiber_contour_boundary_clearance"]="0.05";
+            config["settings"]["fiber_contour_include_holes"]="0";
+        }
+        const auto& selection=config.at("selection");
         libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
         auto library=libslicer::Library::open(options);require(bool(library),"Cannot open slicer library");
         libslicer::ConfigSelection selected;
@@ -401,7 +416,14 @@ int main(int argc,char** argv)
         std::vector<Point> offsets;std::istringstream offset_text(effective.at("extruder_offset").get<std::string>());
         for(std::string pair;std::getline(offset_text,pair,',');) {const auto x=pair.find('x');require(x!=std::string::npos,"Invalid tool offset");offsets.push_back({std::stod(pair.substr(0,x)),std::stod(pair.substr(x+1))});}
         std::ifstream gcode(result.output.path);require(bool(gcode),"Missing output G-code");
-        const auto blocks=read_blocks(gcode,offsets);Json report=evaluate(rule,blocks,candidates);
+        const auto blocks=read_blocks(gcode,offsets);
+        if (closed_outer_regression)
+            for (const auto& block : blocks)
+                require(block.points.size()>=4 && distance(block.points.front(),block.points.back())<=rule.at("closure_tolerance_mm").get<double>(),
+                    "Open outer deposition on display layer " + std::to_string(block.layer));
+        Json report=evaluate(rule,blocks,candidates);
+        report["case"]=closed_outer_regression?"closed_outer_regression":"fixed_acceptance";
+        report["config_overrides"]=closed_outer_regression ? Json{{"fiber_contour_boundary_clearance","0.05"},{"fiber_contour_include_holes","0"}} : Json::object();
         report["contract"]=rule;report["config_fingerprint"]=fingerprint(config_file);report["gcode_fingerprint"]=fingerprint(result.output.path);
         report["binary_fingerprint"]=fingerprint(fs::absolute(argv[0]));report["slice_seconds"]=seconds;report["gcode"]=result.output.path;
         report["status"]=report.at("passed").get<bool>()?"passed":"failed";

@@ -337,7 +337,7 @@ TEST_CASE("changing fiber contour or resin settings preserves slice and walls", 
     const auto fill_stamp = object->step_state_with_timestamp(posInfill).timestamp;
 
     const auto edit = GENERATE(
-        std::make_pair("fiber_contour_include_holes", "0"),
+        std::make_pair("fiber_contour_include_holes", "1"),
         std::make_pair("fiber_resin_fill_density", "60%"),
         std::make_pair("fiber_resin_fill_line_width", "0.6"),
         std::make_pair("fiber_resin_fill_speed", "35"),

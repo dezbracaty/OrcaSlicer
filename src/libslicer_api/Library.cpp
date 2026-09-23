@@ -3239,6 +3239,14 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             for (const auto* layer : object->layers()) {
                 for (const auto& failure : layer->fiber_contour_rounding_failures)
                     contour_rounding_failures[failure.first] += failure.second;
+                if (!layer->fiber_outer_contour_failures.empty()) {
+                    std::string message = "Some complete fiber outer loops were omitted on layer " +
+                        std::to_string(layer->id() + 1) + "; partial outer strands were not emitted. Reasons:";
+                    for (const auto& failure : layer->fiber_outer_contour_failures)
+                        message += " " + failure.first + "=" + std::to_string(failure.second);
+                    result.diagnostics.push_back({"fiber_outer_contour_rejected", std::move(message), true,
+                        "generate_reinforced_perimeters"});
+                }
                 const auto& stats = layer->fiber_infill_statistics;
                 fiber_candidates += stats.candidates;
                 fiber_accepted += stats.accepted_fragments;
