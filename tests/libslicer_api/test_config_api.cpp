@@ -1348,7 +1348,7 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
             ++contour_segments;
         else if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::ContinuousFiberInfill)
             ++infill_segments;
-        else if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::SparseInfill)
+        else if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::ResinInfill)
             ++resin_segments;
     }
     INFO("contour_segments=" << contour_segments
@@ -2462,4 +2462,165 @@ TEST_CASE("fiber outer contours do not open a printable bridge next to a hole", 
     CHECK(occurrences.size() == 1);
     std::error_code error;
     std::filesystem::remove(result.output.path, error);
+}
+
+TEST_CASE("resin infill settings expose independent values and validate unsupported patterns", "[libslicer_api][fiber][resin-fill]")
+{
+    auto config = libslicer::Config::defaults();
+    auto items = config.settings();
+    CHECK(find_item(items, "fiber_resin_fill_mode") == nullptr);
+    for (const auto& item : items)
+        if (item.key.rfind("fiber_resin_fill_", 0) == 0) CHECK_FALSE(item.enabled);
+    REQUIRE(config.set("generate_reinforced_perimeters", "1").success);
+    for (const auto& item : config.settings())
+        if (item.key.rfind("fiber_resin_fill_", 0) == 0) CHECK(item.enabled);
+    REQUIRE(config.set("generate_reinforced_perimeters", "0").success);
+    REQUIRE(config.set("generate_reinforced_infills", "1").success);
+    for (const auto& item : config.settings())
+        if (item.key.rfind("fiber_resin_fill_", 0) == 0) CHECK(item.enabled);
+    const auto ordinary = config.snapshot().value("sparse_infill_density");
+    REQUIRE(config.set("fiber_resin_fill_density", "60%").success);
+    CHECK(config.snapshot().value("sparse_infill_density") == ordinary);
+    REQUIRE(config.set("fiber_resin_fill_pattern", "lightning").success);
+    const auto errors = config.validate();
+    CHECK(std::any_of(errors.begin(), errors.end(), [](const auto& error) {
+        return error.message == "Unsupported independent resin infill pattern";
+    }));
+    REQUIRE(config.reset("fiber_resin_fill_pattern").success);
+    CHECK_FALSE(config.set("fiber_resin_fill_density", "101%").success);
+    const auto snapshot = config.snapshot();
+    REQUIRE(config.set("generate_reinforced_infills", "0").success);
+    for (const auto& item : config.settings())
+        if (item.key.rfind("fiber_resin_fill_", 0) == 0) CHECK_FALSE(item.enabled);
+    CHECK(snapshot.value("fiber_resin_fill_density") == "60%");
+    CHECK(config.snapshot().value("fiber_resin_fill_density") == "60%");
+}
+
+TEST_CASE("independent resin infill preserves fiber and ordinary layers", "[libslicer_api][fiber][resin-fill][slice]")
+{
+    using Role = libslicer::ToolpathExtrusionRole;
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"},
+        {"top_shell_layers", "2"}, {"bottom_shell_layers", "2"},
+        {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "0"},
+        {"fiber_contour_bend_radius", "0"}, {"fiber_layer_height_ratio", "2"},
+        {"sparse_infill_density", "15%"}, {"sparse_infill_pattern", "grid"},
+        {"fiber_resin_fill_pattern", "rectilinear"},
+        {"fiber_resin_fill_density", "30%"}, {"fiber_resin_fill_line_width", "0.5"},
+        {"fiber_resin_fill_speed", "17"}, {"fiber_resin_fill_acceleration", "123"},
+        {"enable_support", "0"}, {"slow_down_for_layer_cooling", "0,0"}}).success);
+    auto model = fiber_infill_block();
+    for (auto& vertex : model.volumes.front().vertices) vertex.z *= .25f;
+    const auto slice = [&]() {
+        libslicer::SliceRequest request;
+        request.objects = {model};
+        request.config = *library->active_config_snapshot();
+        auto result = library->slice(request);
+        for (const auto& d : result.diagnostics) INFO(d.message);
+        REQUIRE(result.success); REQUIRE(result.preview);
+        return result;
+    };
+    const auto segments = [](const libslicer::ToolpathPreview& preview, Role role) {
+        std::vector<std::tuple<unsigned,float,float,float,float,float,float>> result;
+        for (const auto& s : preview.segments)
+            if (s.extrusion_role == role && s.deposition != libslicer::ToolpathDepositionKind::None)
+                result.emplace_back(s.layer_index, s.start_mm.x, s.start_mm.y, s.start_mm.z,
+                    s.end_mm.x, s.end_mm.y, s.end_mm.z);
+        std::sort(result.begin(),result.end());
+        return result;
+    };
+    const auto reference_config = *library->active_config_snapshot();
+    const auto low = slice();
+    const auto fiber = segments(*low.preview,Role::ContinuousFiberContour);
+    REQUIRE_FALSE(fiber.empty());
+    const auto ordinary = segments(*low.preview,Role::SparseInfill);
+    REQUIRE_FALSE(ordinary.empty());
+    size_t resin_count = 0;
+    for (const auto& s : low.preview->segments) if (s.extrusion_role == Role::ResinInfill) {
+        ++resin_count;
+        CHECK(s.layer_index % 2 == 0);
+        CHECK(s.deposition == libslicer::ToolpathDepositionKind::Thermoplastic);
+        CHECK(s.tool_id == 0);
+        CHECK(s.width_mm == Catch::Approx(.5).margin(.001));
+        CHECK(s.nominal_speed_mm_s <= 17.001);
+        CHECK(s.acceleration_mm_s2 == Catch::Approx(123).margin(.1));
+    }
+    REQUIRE(resin_count > 0);
+    const auto imported = library->load_gcode_preview({low.output.path});
+    REQUIRE(imported.success); REQUIRE(imported.preview);
+    CHECK(segments(*imported.preview,Role::ResinInfill) == segments(*low.preview,Role::ResinInfill));
+    // Ordinary sparse controls must not leak into resin jobs on fiber layers.
+    REQUIRE(library->apply_active_config_patch({{"sparse_infill_density", "40%"},
+        {"sparse_infill_pattern", "triangles"}, {"infill_direction", "70"},
+        {"sparse_infill_rotate_template", "10,30"}, {"align_infill_direction_to_model", "1"},
+        {"sparse_infill_line_width", "0.65"}, {"fill_multiline", "2"},
+        {"infill_anchor", "0"}, {"infill_anchor_max", "0"},
+        {"sparse_infill_speed", "80"}, {"sparse_infill_acceleration", "456"}}).success);
+    const auto changed_sparse = slice();
+    CHECK(segments(*changed_sparse.preview,Role::ResinInfill) == segments(*low.preview,Role::ResinInfill));
+    CHECK(segments(*changed_sparse.preview,Role::SparseInfill) != ordinary);
+    for (const auto& segment : changed_sparse.preview->segments) if (segment.extrusion_role == Role::ResinInfill) {
+        CHECK(segment.width_mm == Catch::Approx(.5).margin(.001));
+        CHECK(segment.nominal_speed_mm_s <= 17.001);
+        CHECK(segment.acceleration_mm_s2 == Catch::Approx(123).margin(.1));
+    }
+    std::vector<std::pair<std::string, std::string>> restore_sparse;
+    for (const auto* key : {"sparse_infill_density", "sparse_infill_pattern", "infill_direction",
+        "sparse_infill_rotate_template", "align_infill_direction_to_model", "sparse_infill_line_width",
+        "fill_multiline", "infill_anchor", "infill_anchor_max", "sparse_infill_speed", "sparse_infill_acceleration"})
+        restore_sparse.emplace_back(key, *reference_config.value(key));
+    REQUIRE(library->apply_active_config_patch(restore_sparse).success);
+    REQUIRE(library->apply_active_config_patch({{"fiber_resin_fill_density", "60%"}}).success);
+    const auto high = slice();
+    CHECK(segments(*high.preview,Role::ContinuousFiberContour) == fiber);
+    CHECK(segments(*high.preview,Role::SparseInfill) == ordinary);
+    CHECK(segments(*high.preview,Role::TopSurface) == segments(*low.preview,Role::TopSurface));
+    CHECK(segments(*high.preview,Role::ResinInfill).size() > segments(*low.preview,Role::ResinInfill).size());
+    REQUIRE(library->apply_active_config_patch({{"fiber_resin_fill_density", "0%"}}).success);
+    const auto off = slice();
+    CHECK(segments(*off.preview,Role::ResinInfill).empty());
+    CHECK(segments(*off.preview,Role::ContinuousFiberContour) == fiber);
+    CHECK(segments(*off.preview,Role::SparseInfill) == ordinary);
+    REQUIRE(library->apply_active_config_patch({{"sparse_infill_density", "0%"}, {"fiber_resin_fill_density", "30%"}}).success);
+    const auto no_sparse = slice();
+    CHECK_FALSE(segments(*no_sparse.preview,Role::ResinInfill).empty());
+    CHECK_FALSE(segments(*no_sparse.preview,Role::ContinuousFiberContour).empty());
+    CHECK(segments(*no_sparse.preview,Role::SparseInfill).empty());
+    // Geometrically rejected fiber still leaves an explicitly configured resin job.
+    REQUIRE(library->apply_active_config_patch({{"fiber_minimum_path_length", "10000"}}).success);
+    const auto rejected = slice();
+    CHECK(segments(*rejected.preview,Role::ContinuousFiberContour).empty());
+    CHECK_FALSE(segments(*rejected.preview,Role::ResinInfill).empty());
+    // Every exposed pattern must work with both sparse and full resin density.
+    REQUIRE(library->apply_active_config_patch({{"fiber_minimum_path_length", "0"},
+        {"sparse_infill_density", "100%"}}).success);
+    for (const auto* pattern : {"rectilinear", "grid", "triangles", "cubic", "gyroid", "concentric"}) {
+        for (const auto* density : {"30%", "100%"}) {
+            INFO(pattern); INFO(density);
+            REQUIRE(library->apply_active_config_patch({{"fiber_resin_fill_pattern", pattern},
+                {"fiber_resin_fill_density", density}}).success);
+            const auto patterned = slice();
+            CHECK_FALSE(segments(*patterned.preview,Role::ResinInfill).empty());
+            CHECK_FALSE(segments(*patterned.preview,Role::ContinuousFiberContour).empty());
+            std::filesystem::remove(patterned.output.path);
+        }
+    }
+    REQUIRE(library->apply_active_config_patch({{"sparse_infill_density", "15%"},
+        {"generate_reinforced_perimeters", "0"}, {"fiber_resin_fill_density", "60%"}}).success);
+    const auto disabled = slice();
+    CHECK(segments(*disabled.preview,Role::ResinInfill).empty());
+    CHECK(segments(*disabled.preview,Role::ContinuousFiberContour).empty());
+    CHECK_FALSE(segments(*disabled.preview,Role::SparseInfill).empty());
+    for (const auto* result : {&low,&high,&off,&no_sparse,&rejected,&changed_sparse,&disabled})
+        std::filesystem::remove(result->output.path);
 }

@@ -66,6 +66,10 @@ struct ContinuousFiberConfig {
 };
 
 bool continuous_fiber_enabled(const PrintRegionConfig& config);
+bool continuous_fiber_active_on_layer(const PrintRegionConfig& config, size_t layer_id);
+// Map resin settings to the shared infill generator without inheriting sparse fill controls.
+PrintRegionConfig resolve_resin_fill_config(const PrintRegionConfig& config);
+Flow resin_infill_flow(const LayerRegion& region, double height, bool first_layer);
 bool is_fiber_filament(const GCodeConfig& config, unsigned filament);
 // Material indices, logical extruders and physical tool IDs are distinct.
 bool has_fiber_tool(const GCodeConfig& config);

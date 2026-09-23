@@ -1469,6 +1469,7 @@ ToolpathExtrusionRole to_extrusion_role(Slic3r::ExtrusionRole role)
     case Slic3r::erMixed:                    return ToolpathExtrusionRole::Mixed;
     case Slic3r::erContinuousFiberContour:   return ToolpathExtrusionRole::ContinuousFiberContour;
     case Slic3r::erContinuousFiberInfill:    return ToolpathExtrusionRole::ContinuousFiberInfill;
+    case Slic3r::erResinInfill:              return ToolpathExtrusionRole::ResinInfill;
     default:                                 return ToolpathExtrusionRole::None;
     }
 }

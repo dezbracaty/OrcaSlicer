@@ -84,6 +84,7 @@ enum AuthorizationType {
     atKeyPassword, atUserPassword
 };
 
+
 enum InfillPattern : int {
     ipMonotonic, ipMonotonicLine,
     ipRectilinear, ipAlignedRectilinear, ipZigZag, ipCrossZag, ipLockedZag,
@@ -1095,6 +1096,17 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                fiber_contour_boundary_clearance))
     ((ConfigOptionFloat,                fiber_contour_bend_radius))
     ((ConfigOptionFloat,                fiber_resin_overlap))
+    ((ConfigOptionPercent, fiber_resin_fill_density))
+    ((ConfigOptionEnum<InfillPattern>, fiber_resin_fill_pattern))
+    ((ConfigOptionFloat, fiber_resin_fill_direction))
+    ((ConfigOptionString, fiber_resin_fill_rotate_template))
+    ((ConfigOptionBool, fiber_resin_fill_align_to_model))
+    ((ConfigOptionFloatOrPercent, fiber_resin_fill_line_width))
+    ((ConfigOptionInt, fiber_resin_fill_multiline))
+    ((ConfigOptionFloatOrPercent, fiber_resin_fill_anchor))
+    ((ConfigOptionFloatOrPercent, fiber_resin_fill_anchor_max))
+    ((ConfigOptionFloat, fiber_resin_fill_speed))
+    ((ConfigOptionFloatOrPercent, fiber_resin_fill_acceleration))
     ((ConfigOptionFloat,                fiber_prefeed_extra_length))
     ((ConfigOptionFloat,                fiber_prefeed_speed))
     ((ConfigOptionFloat,                fiber_z_hop_height))

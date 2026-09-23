@@ -45,6 +45,7 @@ enum ExtrusionRole : uint8_t {
     // numbers retain their original meaning.
     erContinuousFiberContour,
     erContinuousFiberInfill,
+    erResinInfill,
     erCount
 };
 
@@ -86,7 +87,8 @@ inline bool is_infill(ExtrusionRole role)
         || role == erBottomSurface
         || role == erIroning
         || role == erContinuousFiberContour
-        || role == erContinuousFiberInfill;
+        || role == erContinuousFiberInfill
+        || role == erResinInfill;
 }
 
 inline bool is_top_surface(ExtrusionRole role)

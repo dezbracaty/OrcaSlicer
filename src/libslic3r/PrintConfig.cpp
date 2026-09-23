@@ -1,4 +1,5 @@
 #include "PrintConfig.hpp"
+#include "ContinuousFiber/ContinuousFiberConfig.hpp"
 #include "PrintConfigConstants.hpp"
 #include "ClipperUtils.hpp"
 #include "Config.hpp"
@@ -1059,6 +1060,88 @@ void PrintConfigDef::init_fff_params()
     def->sidetext = L("mm");
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(0.05));
+
+    def = this->add("fiber_resin_fill_pattern", coEnum);
+    def->label = L("Resin infill pattern");
+    def->category = L("Continuous fiber resin infill");
+    def->enum_keys_map = &ConfigOptionEnum<InfillPattern>::get_enum_values();
+    def->enum_values = {"rectilinear", "grid", "triangles", "cubic", "gyroid", "concentric"};
+    def->enum_labels = {L("Rectilinear"), L("Grid"), L("Triangles"), L("Cubic"), L("Gyroid"), L("Concentric")};
+    def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
+
+    def = this->add("fiber_resin_fill_density", coPercent);
+    def->label = L("Resin infill density");
+    def->tooltip = L("Density of resin infill in the remaining internal area on fiber layers. Zero disables resin infill without disabling fiber.");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("%");
+    def->min = 0;
+    def->max = 100;
+    def->set_default_value(new ConfigOptionPercent(15));
+
+    def = this->add("fiber_resin_fill_direction", coFloat);
+    def->label = L("Resin infill direction");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("°");
+    def->min = 0;
+    def->max = 360;
+    def->set_default_value(new ConfigOptionFloat(45));
+
+    def = this->add("fiber_resin_fill_rotate_template", coString);
+    def->label = L("Resin infill rotation template");
+    def->category = L("Continuous fiber resin infill");
+    def->set_default_value(new ConfigOptionString(""));
+
+    def = this->add("fiber_resin_fill_align_to_model", coBool);
+    def->label = L("Align resin infill to model");
+    def->category = L("Continuous fiber resin infill");
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("fiber_resin_fill_line_width", coFloatOrPercent);
+    def->label = L("Resin infill line width");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("mm or %");
+    def->min = 0;
+    def->max = 1000;
+    def->ratio_over = "nozzle_diameter";
+    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+
+    def = this->add("fiber_resin_fill_multiline", coInt);
+    def->label = L("Resin infill line multiplier");
+    def->category = L("Continuous fiber resin infill");
+    def->min = 1;
+    def->max = 100;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("fiber_resin_fill_anchor", coFloatOrPercent);
+    def->label = L("Resin infill anchor length");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("mm or %");
+    def->min = 0;
+    def->ratio_over = "fiber_resin_fill_line_width";
+    def->set_default_value(new ConfigOptionFloatOrPercent(400., true));
+
+    def = this->add("fiber_resin_fill_anchor_max", coFloatOrPercent);
+    def->label = L("Maximum resin infill anchor length");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("mm or %");
+    def->min = 0;
+    def->ratio_over = "fiber_resin_fill_line_width";
+    def->set_default_value(new ConfigOptionFloatOrPercent(20., false));
+
+    def = this->add("fiber_resin_fill_speed", coFloat);
+    def->label = L("Resin infill speed");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("mm/s");
+    def->min = 1;
+    def->set_default_value(new ConfigOptionFloat(100.));
+
+    def = this->add("fiber_resin_fill_acceleration", coFloatOrPercent);
+    def->label = L("Resin infill acceleration");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("mm/s² or %");
+    def->min = 0;
+    def->ratio_over = "default_acceleration";
+    def->set_default_value(new ConfigOptionFloatOrPercent(100., true));
 
     def = this->add("fiber_cut_to_contact_length", coFloat);
     def->label = L("Fiber cutter to contact distance");
@@ -10764,6 +10847,10 @@ std::map<std::string, std::string> validate_machine_gcode_config(const PrintConf
 std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool under_cli)
 {
     std::map<std::string, std::string> error_message = validate_machine_gcode_config(cfg);
+    if (continuous_fiber_enabled(cfg)) {
+        try { resolve_resin_fill_config(cfg); }
+        catch (const std::invalid_argument& e) { error_message.emplace("fiber_resin_fill_pattern", e.what()); }
+    }
     // --layer-height
     if (cfg.get_abs_value("layer_height") <= 0) {
         error_message.emplace("layer_height", L("invalid value ") + std::to_string(cfg.get_abs_value("layer_height")));

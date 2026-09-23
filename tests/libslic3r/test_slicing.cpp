@@ -317,7 +317,7 @@ SCENARIO("Slice support material to G-code with dedicated second nozzle", "[slic
 }
 
 
-TEST_CASE("changing hole contours invalidates fill but preserves slice and walls", "[slicing][ContinuousFiber][hole-contours]")
+TEST_CASE("changing fiber contour or resin settings preserves slice and walls", "[slicing][ContinuousFiber][hole-contours][resin-fill]")
 {
     setup_test_dirs();
     Model model = load_obj_model("20mm_cube.obj");
@@ -336,7 +336,14 @@ TEST_CASE("changing hole contours invalidates fill but preserves slice and walls
     const auto preparation_stamp = object->step_state_with_timestamp(posPrepareInfill).timestamp;
     const auto fill_stamp = object->step_state_with_timestamp(posInfill).timestamp;
 
-    config.set_deserialize_strict("fiber_contour_include_holes", "0");
+    const auto edit = GENERATE(
+        std::make_pair("fiber_contour_include_holes", "0"),
+        std::make_pair("fiber_resin_fill_density", "60%"),
+        std::make_pair("fiber_resin_fill_line_width", "0.6"),
+        std::make_pair("fiber_resin_fill_speed", "35"),
+        std::make_pair("fiber_resin_fill_acceleration", "500"));
+    INFO(edit.first);
+    config.set_deserialize_strict(edit.first, edit.second);
     CHECK(print.apply(model, config) == PrintBase::APPLY_STATUS_INVALIDATED);
     REQUIRE(print.objects().size() == 1);
     REQUIRE(print.objects().front() == object);

@@ -57,7 +57,8 @@ enum class ToolpathExtrusionRole : std::uint8_t
     Custom,
     Mixed,
     ContinuousFiberContour,
-    ContinuousFiberInfill
+    ContinuousFiberInfill,
+    ResinInfill
 };
 
 enum class ToolpathEventKind : std::uint8_t

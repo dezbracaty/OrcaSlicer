@@ -271,6 +271,7 @@ struct SurfaceFillParams
     size_t 			idx = 0;
 	// Infill speed setting for the effective extrusion role.
 	float role_speed = 0;
+    double role_acceleration = 0;
 
     // Params for lattice infill angles
     float lateral_lattice_angle_1 = 0.f;
@@ -310,6 +311,7 @@ struct SurfaceFillParams
 		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, bridge);
 		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, extrusion_role);
 		RETURN_COMPARE_NON_EQUAL(role_speed);
+        RETURN_COMPARE_NON_EQUAL(role_acceleration);
         RETURN_COMPARE_NON_EQUAL(lateral_lattice_angle_1);
 		RETURN_COMPARE_NON_EQUAL(lateral_lattice_angle_2);
 		RETURN_COMPARE_NON_EQUAL(symmetric_infill_y_axis);
@@ -337,6 +339,7 @@ struct SurfaceFillParams
 				this->flow                    == rhs.flow                    &&
 				this->extrusion_role          == rhs.extrusion_role          &&
 				this->role_speed              == rhs.role_speed              &&
+                this->role_acceleration       == rhs.role_acceleration       &&
                 this->lateral_lattice_angle_1 == rhs.lateral_lattice_angle_1 &&
 				this->lateral_lattice_angle_2 == rhs.lateral_lattice_angle_2 &&
 				this->infill_lock_depth       == rhs.infill_lock_depth       &&
@@ -945,7 +948,23 @@ void split_solid_surface(size_t layer_id, const SurfaceFill &fill, ExPolygons &n
 #endif
 }
 
-using FillSurfaceView = std::vector<SurfaceCollection>;
+enum class FillPurpose { Ordinary, FiberResin };
+struct FillSurfaceInputs {
+    SurfaceCollection surfaces;
+    std::vector<FillPurpose> purposes;
+    void append(Surface surface, FillPurpose purpose) {
+        surfaces.surfaces.push_back(std::move(surface));
+        purposes.push_back(purpose);
+    }
+};
+using FillSurfaceView = std::vector<FillSurfaceInputs>;
+
+bool is_fiber_source_surface(const Layer& layer, const PrintRegionConfig& config, const Surface& surface)
+{
+    return continuous_fiber_active_on_layer(config, layer.id()) && !surface.is_bridge() &&
+        (surface.surface_type == stInternal ||
+         (surface.surface_type == stInternalSolid && config.sparse_infill_density.value >= 100.0 - EPSILON));
+}
 
 std::vector<SurfaceFill> group_fills(
     const Layer& layer,
@@ -961,7 +980,7 @@ std::vector<SurfaceFill> group_fills(
     bool 												has_internal_voids = false;
 	const PrintObjectConfig&							object_config = layer.object()->config();
 	const auto& surfaces_for_region = [&](size_t region_id) -> const SurfaceCollection& {
-		return surface_view == nullptr ? layer.regions()[region_id]->fill_surfaces : surface_view->at(region_id);
+		return surface_view == nullptr ? layer.regions()[region_id]->fill_surfaces : surface_view->at(region_id).surfaces;
 	};
 
 	auto append_flow_param = [](std::map<Flow, ExPolygons> &flow_params, Flow flow, const ExPolygon &exp) {
@@ -982,13 +1001,23 @@ std::vector<SurfaceFill> group_fills(
 
 	for (size_t region_id = 0; region_id < layer.regions().size(); ++ region_id) {
 		const LayerRegion  &layerm = *layer.regions()[region_id];
+        std::optional<PrintRegionConfig> resin_config;
 		const SurfaceCollection& region_surfaces = surfaces_for_region(region_id);
 		region_to_surface_params[region_id].assign(region_surfaces.size(), nullptr);
 	    for (const Surface &surface : region_surfaces.surfaces)
 	        if (surface.surface_type == stInternalVoid)
 	        	has_internal_voids = true;
 	        else {
-		        const PrintRegionConfig &region_config = layerm.region().config();
+                const auto& original_config = layerm.region().config();
+                const size_t surface_index = &surface - region_surfaces.surfaces.data();
+                const bool is_resin_fill = surface_view &&
+                    surface_view->at(region_id).purposes.at(surface_index) == FillPurpose::FiberResin;
+                if (is_resin_fill && !resin_config)
+                    resin_config = resolve_resin_fill_config(original_config);
+                const PrintRegionConfig& region_config = is_resin_fill ? *resin_config : original_config;
+                // Every surface starts from defaults; a prior pattern must not
+                // leave state on the next ordinary or resin fill.
+                params = SurfaceFillParams{};
 		        FlowRole extrusion_role = surface.is_top() ? frTopSolidInfill : (surface.is_solid() ? frSolidInfill : frInfill);
 		        bool     is_bridge 	    = layer.id() > 0 && surface.is_bridge();
 		        params.extruder 	 = layerm.region().extruder(extrusion_role);
@@ -1027,7 +1056,8 @@ std::vector<SurfaceFill> group_fills(
                             params.pattern = ipRectilinear;
                         params.density = 100.f;
                     }
-                } else if (params.density <= 0)
+                } else if (params.density <= 0 &&
+                    !(collect_fiber_policy && is_fiber_source_surface(layer, original_config, surface)))
                     continue;
 
 				params.extrusion_role = erInternalInfill;
@@ -1085,7 +1115,9 @@ std::vector<SurfaceFill> group_fills(
 				params.flow   = params.bridge ?
 					//Orca: enable thick bridge based on config
 					layerm.bridging_flow(extrusion_role, is_thick_bridge) :
-					layerm.flow(extrusion_role, (surface.thickness == -1) ? layer.height : surface.thickness);
+                    (is_resin_fill ? resin_infill_flow(layerm,
+                        surface.thickness == -1 ? layer.height : surface.thickness, layer.id() == 0) :
+                        layerm.flow(extrusion_role, surface.thickness == -1 ? layer.height : surface.thickness));
 
 				params.role_speed = 0;
                 if (params.extrusion_role == erBridgeInfill)
@@ -1107,7 +1139,9 @@ std::vector<SurfaceFill> group_fills(
 		        } else {
 					// Internal infill. Calculating infill line spacing independent of the current layer height and 1st layer status,
 					// so that internall infill will be aligned over all layers of the current region.
-		            params.spacing = layerm.region().flow(*layer.object(), frInfill, layer.object()->config().layer_height, false).spacing();
+		            params.spacing = is_resin_fill ?
+                        resin_infill_flow(layerm, layer.object()->config().layer_height, false).spacing() :
+                        layerm.region().flow(*layer.object(), frInfill, layer.object()->config().layer_height, false).spacing();
 		            // Anchor a sparse infill to inner perimeters with the following anchor length:
 			        params.anchor_length = float(region_config.infill_anchor);
 					if (region_config.infill_anchor.percent)
@@ -1138,6 +1172,11 @@ std::vector<SurfaceFill> group_fills(
 
 				}
 
+                if (is_resin_fill) {
+                    params.extrusion_role = erResinInfill;
+                    params.role_acceleration = original_config.fiber_resin_fill_acceleration.get_abs_value(
+                        layer.object()->config().default_acceleration.value);
+                }
                 auto it_params = set_surface_params.find(params);
 
 		        if (it_params == set_surface_params.end())
@@ -1176,12 +1215,7 @@ std::vector<SurfaceFill> group_fills(
 						// At 100% core density Orca represents that core as InternalSolid.
 						// Merging every solid shell with sparse core changes island
 						// topology, joining separate reference contour loops together.
-						const bool fiber_surface =
-							(surface.surface_type == stInternal ||
-							 (surface.surface_type == stInternalSolid && region_config.sparse_infill_density.value >= 100.0 - EPSILON)) &&
-							!params->bridge && continuous_fiber_enabled(region_config) &&
-							region_config.fiber_layer_height_ratio.value > 0 &&
-							layer.id() % size_t(region_config.fiber_layer_height_ratio.value) == 0;
+                        const bool fiber_surface = is_fiber_source_surface(layer, region_config, surface) && !params->bridge;
 						if (fiber_surface) {
 							ContinuousFiberConfig fiber_config = resolve_continuous_fiber_config(layer, layerm);
 							contributor.fiber_policy = fiber_policy_key(fiber_config, params->angle, params->fixed_angle);
@@ -1398,6 +1432,7 @@ static void execute_surface_fill_job(
     ExtrusionEntitiesPtr&       destination,
     const FillExecutionPolicy&  policy)
 {
+    if (surface_fill.params.density <= 0) return;
     Layer& layer = context.layer;
     LayerRegion* layerm = layer.regions()[surface_fill.region_id];
 
@@ -1872,7 +1907,7 @@ FillSurfaceView build_resin_surface_view(
     for (size_t region_id = 0; region_id < layer.regions().size(); ++region_id)
         for (const Surface& surface : layer.regions()[region_id]->fill_surfaces.surfaces)
             if (surface.surface_type == stInternalVoid)
-                result[region_id].surfaces.push_back(surface);
+                result[region_id].append(surface, FillPurpose::Ordinary);
 
     for (const SurfaceFill& job : original_jobs) {
         for (const FillDomainContributor& contributor : job.contributors) {
@@ -1882,7 +1917,13 @@ FillSurfaceView build_resin_surface_view(
             for (ExPolygon& resin_part : resin_domain) {
                 Surface resin_surface = contributor.original_surface;
                 resin_surface.expolygon = std::move(resin_part);
-                result.at(contributor.id.region_id).surfaces.emplace_back(std::move(resin_surface));
+                const bool fiber_source = contributor.fiber_policy.has_value();
+                // 100% ordinary core density may have classified the source as
+                // InternalSolid. Residual resin fill has its own density.
+                if (fiber_source)
+                    resin_surface.surface_type = stInternal;
+                result.at(contributor.id.region_id).append(std::move(resin_surface),
+                    fiber_source ? FillPurpose::FiberResin : FillPurpose::Ordinary);
             }
         }
     }
@@ -1904,9 +1945,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     const bool fiber_layer_enabled = std::any_of(
         m_regions.begin(), m_regions.end(), [this](const LayerRegion* region) {
             const PrintRegionConfig& config = region->region().config();
-            return continuous_fiber_enabled(config) &&
-                config.fiber_layer_height_ratio.value > 0 &&
-                this->id() % size_t(config.fiber_layer_height_ratio.value) == 0;
+            return continuous_fiber_active_on_layer(config, this->id());
         });
     LockRegionParam lock_param;
     std::vector<SurfaceFill> surface_fills = group_fills(
@@ -1935,13 +1974,11 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 
     const std::vector<FiberIslandDomainPlan> fiber_domains = build_fiber_island_domains(*this, surface_fills);
     std::map<FillDomainContributorId, ExPolygons> contributor_exclusions;
-    bool has_accepted_fiber = false;
     for (const FiberIslandDomainPlan& domain : fiber_domains) {
         FiberDomainExecutionResult fiber_result = execute_continuous_fiber_domain(
             execution_context, domain, transaction);
         if (fiber_result.accepted_exclusion.empty())
             continue;
-        has_accepted_fiber = true;
         for (const FillDomainContributor* contributor : domain.contributors) {
             ExPolygons projected = intersection_ex(
                 fiber_result.accepted_exclusion,
@@ -1955,7 +1992,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         }
     }
 
-    if (has_accepted_fiber) {
+    if (!fiber_domains.empty()) {
         FillSurfaceView resin_surface_view = build_resin_surface_view(
             *this, surface_fills, contributor_exclusions);
         LockRegionParam resin_lock_param;

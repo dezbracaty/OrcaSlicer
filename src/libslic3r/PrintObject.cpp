@@ -1350,7 +1350,8 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "internal_bridge_density") {
             steps.emplace_back(posPrepareInfill);
         } else if (
-               opt_key == "fiber_contour_include_holes"
+               opt_key.rfind("fiber_resin_fill_", 0) == 0
+            || opt_key == "fiber_contour_include_holes"
             || opt_key == "top_surface_pattern"
             || opt_key == "bottom_surface_pattern"
             || opt_key == "internal_solid_infill_pattern"

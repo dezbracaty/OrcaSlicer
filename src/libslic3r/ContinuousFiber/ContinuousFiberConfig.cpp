@@ -232,6 +232,55 @@ bool continuous_fiber_enabled(const PrintRegionConfig& config)
     return config.generate_reinforced_perimeters.value || config.generate_reinforced_infills.value;
 }
 
+bool continuous_fiber_active_on_layer(const PrintRegionConfig& config, size_t layer_id)
+{
+    return continuous_fiber_enabled(config) && config.fiber_layer_height_ratio.value > 0 &&
+        layer_id % size_t(config.fiber_layer_height_ratio.value) == 0;
+}
+
+Flow resin_infill_flow(const LayerRegion& region, double height, bool first_layer)
+{
+    const PrintObject& object = *region.layer()->object();
+    const auto& print_config = object.print()->config();
+    auto width = first_layer && print_config.initial_layer_line_width.value > 0 ?
+        print_config.initial_layer_line_width : region.region().config().fiber_resin_fill_line_width;
+    if (width.value == 0) width = object.config().line_width;
+    const double nozzle = print_config.nozzle_diameter.get_at(region.region().extruder(frInfill) - 1);
+    return Flow::new_from_config_width(frInfill, width, nozzle, height);
+}
+
+PrintRegionConfig resolve_resin_fill_config(const PrintRegionConfig& config)
+{
+    PrintRegionConfig result = config;
+    switch (config.fiber_resin_fill_pattern.value) {
+    case ipRectilinear: case ipGrid: case ipTriangles: case ipCubic: case ipGyroid: case ipConcentric: break;
+    default: throw std::invalid_argument("Unsupported independent resin infill pattern");
+    }
+    const auto check = [](double v, const char* key, double lo, double hi) {
+        if (!std::isfinite(v) || v < lo || v > hi)
+            throw std::invalid_argument(std::string("Invalid ") + key);
+    };
+    check(config.fiber_resin_fill_density.value, "fiber_resin_fill_density", 0, 100);
+    check(config.fiber_resin_fill_direction.value, "fiber_resin_fill_direction", 0, 360);
+    check(config.fiber_resin_fill_line_width.value, "fiber_resin_fill_line_width", 0, 1000);
+    check(config.fiber_resin_fill_multiline.value, "fiber_resin_fill_multiline", 1, 100);
+    check(config.fiber_resin_fill_anchor.value, "fiber_resin_fill_anchor", 0, HUGE_VAL);
+    check(config.fiber_resin_fill_anchor_max.value, "fiber_resin_fill_anchor_max", 0, HUGE_VAL);
+    check(config.fiber_resin_fill_speed.value, "fiber_resin_fill_speed", 1, HUGE_VAL);
+    check(config.fiber_resin_fill_acceleration.value, "fiber_resin_fill_acceleration", 0, HUGE_VAL);
+    result.sparse_infill_density = config.fiber_resin_fill_density;
+    result.sparse_infill_pattern = config.fiber_resin_fill_pattern;
+    result.infill_direction = config.fiber_resin_fill_direction;
+    result.sparse_infill_rotate_template = config.fiber_resin_fill_rotate_template;
+    result.align_infill_direction_to_model = config.fiber_resin_fill_align_to_model;
+    result.sparse_infill_line_width = config.fiber_resin_fill_line_width;
+    result.fill_multiline = config.fiber_resin_fill_multiline;
+    result.infill_anchor = config.fiber_resin_fill_anchor;
+    result.infill_anchor_max = config.fiber_resin_fill_anchor_max;
+    result.sparse_infill_speed = config.fiber_resin_fill_speed;
+    return result;
+}
+
 void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose, bool closed_path)
 {
     const auto check = [](double value, const char* name, bool positive = false) {

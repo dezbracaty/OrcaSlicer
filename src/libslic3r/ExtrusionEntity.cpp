@@ -641,6 +641,7 @@ std::string ExtrusionEntity::role_to_string(ExtrusionRole role)
         case erWipeTower                    : return L("Prime tower");
         case erContinuousFiberContour       : return L("Continuous fiber contour");
         case erContinuousFiberInfill        : return L("Continuous fiber infill");
+        case erResinInfill                  : return L("Resin infill");
         case erCustom                       : return L("Custom");
         case erMixed                        : return L("Multiple");
         default                             : assert(false);
@@ -688,6 +689,8 @@ ExtrusionRole ExtrusionEntity::string_to_role(const std::string_view role)
         return erContinuousFiberContour;
     else if (role == L("Continuous fiber infill"))
         return erContinuousFiberInfill;
+    else if (role == L("Resin infill"))
+        return erResinInfill;
     else if (role == L("Custom"))
         return erCustom;
     else if (role == L("Multiple"))

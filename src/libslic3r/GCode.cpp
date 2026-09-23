@@ -6766,6 +6766,8 @@ std::string GCode::_extrude(
 #endif
         } else if (m_config.get_abs_value("bridge_acceleration") > 0 && is_bridge(path.role())) {
             acceleration = m_config.get_abs_value("bridge_acceleration");
+        } else if (path.role() == erResinInfill && m_config.get_abs_value("fiber_resin_fill_acceleration") > 0) {
+            acceleration = m_config.get_abs_value("fiber_resin_fill_acceleration");
         } else if (m_config.get_abs_value("sparse_infill_acceleration") > 0 && path.role() == erInternalInfill) {
             acceleration = m_config.get_abs_value("sparse_infill_acceleration");
         } else if (m_config.get_abs_value("internal_solid_infill_acceleration") > 0 && (path.role() == erSolidInfill)) {
@@ -6833,7 +6835,7 @@ std::string GCode::_extrude(
             _mm3_per_mm *= m_config.inner_wall_flow_ratio;
         } else if (path.role() == erOverhangPerimeter) {
             _mm3_per_mm *= m_config.overhang_flow_ratio;
-        } else if (path.role() == erInternalInfill || path.role() == erContinuousFiberContour || path.role() == erContinuousFiberInfill) {
+        } else if (path.role() == erInternalInfill || path.role() == erResinInfill || path.role() == erContinuousFiberContour || path.role() == erContinuousFiberInfill) {
             _mm3_per_mm *= m_config.sparse_infill_flow_ratio;
         } else if (path.role() == erSolidInfill) {
             _mm3_per_mm *= m_config.internal_solid_infill_flow_ratio;
@@ -6873,6 +6875,8 @@ std::string GCode::_extrude(
             speed = m_config.get_abs_value("internal_bridge_speed");
         } else if (path.role() == erOverhangPerimeter || path.role() == erSupportTransition || path.role() == erBridgeInfill) {
             speed = m_config.get_abs_value("bridge_speed");
+        } else if (path.role() == erResinInfill) {
+            speed = m_config.get_abs_value("fiber_resin_fill_speed");
         } else if (path.role() == erInternalInfill) {
             speed = m_config.get_abs_value("sparse_infill_speed");
         } else if (path.role() == erSolidInfill) {
@@ -7635,6 +7639,7 @@ std::string GCode::extrusion_role_to_string_for_parser(const ExtrusionRole & rol
         case erWipeTower: return "WipeTower";
         case erContinuousFiberContour: return "ContinuousFiberContour";
         case erContinuousFiberInfill: return "ContinuousFiberInfill";
+        case erResinInfill: return "ResinInfill";
         case erCustom:
         case erMixed:
         case erCount:
