@@ -1634,7 +1634,8 @@ void apply_fiber_infill_params(SurfaceFillParams& destination,
     destination.pattern = config.infill_pattern;
     destination.density = float(config.infill_density);
     destination.flow = config.infill_flow;
-    destination.spacing = config.infill_flow.spacing();
+    // Continuous fiber occupies its configured width; plastic bead overlap does not set its pitch.
+    destination.spacing = config.infill_flow.width();
     destination.angle = float(policy.infill_direction);
     destination.fixed_angle = policy.fixed_direction;
     destination.extruder = config.infill_material;

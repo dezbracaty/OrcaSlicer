@@ -10,6 +10,7 @@
 #include <cmath>
 #include <initializer_list>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -196,19 +197,17 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
         item.enabled = contour_enabled || infill_enabled;
     } else if (key_is(item.key, {"fiber_contour_include_holes",
                           "outer_reinforced_perimeters_counts",
-                          "reinforced_perimeters_filament",
-                          "reinforced_perimeters_extrusion_width"})) {
+                          "reinforced_perimeters_filament"})) {
         item.enabled = contour_enabled;
     } else if (key_is(item.key, {"reinforced_infill_density",
                                  "reinforced_infill_pattern",
-                                 "reinforced_infill_filament",
-                                 "reinforced_infill_extrusion_width"})) {
+                                 "reinforced_infill_filament"})) {
         item.enabled = infill_enabled;
     } else if (key_is(item.key, {"fiber_contour_boundary_clearance", "fiber_contour_bend_radius"})) {
         item.enabled = contour_enabled;
     } else if (item.key == "fiber_contour_infill_clearance") {
         item.enabled = contour_enabled && infill_enabled;
-    } else if (key_is(item.key, {"fiber_layer_height_ratio",
+    } else if (key_is(item.key, {"fiber_width", "fiber_layer_height_ratio",
                                  "fiber_fill_debug",
                                  "fiber_minimum_path_length",
                                  "fiber_minimum_effective_length",
@@ -408,6 +407,13 @@ SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std:
                 return failure(key, "Configuration option is read-only");
             }
 
+            if (key == "fiber_width") {
+                // Scalar float deserialization accepts trailing text; fiber width must be millimeters.
+                std::istringstream input(serialized_value);
+                double width = 0.0;
+                if (!(input >> width) || !(input >> std::ws).eof() || !std::isfinite(width) || width <= 0)
+                    return failure(key, "Fiber width must be a positive number in millimeters");
+            }
             candidate.set_deserialize_strict(key, serialized_value);
             const auto* option_definition = Slic3r::print_config_def.get(key);
             const auto* option            = candidate.option(key);

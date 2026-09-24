@@ -994,21 +994,13 @@ void PrintConfigDef::init_fff_params()
     def->min = 1;
     def->set_default_value(new ConfigOptionInt(2));
 
-    def = this->add("reinforced_perimeters_extrusion_width", coFloatOrPercent);
-    def->label = L("Continuous fiber contour width");
+    def = this->add("fiber_width", coFloat);
+    def->label = L("Fiber width");
     def->category = L("Continuous fiber");
-    def->sidetext = L("mm or %");
-    def->ratio_over = "nozzle_diameter";
-    def->min = 0;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0.8, false));
-
-    def = this->add("reinforced_infill_extrusion_width", coFloatOrPercent);
-    def->label = L("Continuous fiber infill width");
-    def->category = L("Continuous fiber");
-    def->sidetext = L("mm or %");
-    def->ratio_over = "nozzle_diameter";
-    def->min = 0;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0.8, false));
+    def->tooltip = L("Physical fiber width shared by continuous fiber contours and infill. Specify a positive width in millimeters.");
+    def->sidetext = "mm";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(0.8));
 
     def = this->add("fiber_layer_height_ratio", coInt);
     def->label = L("Continuous fiber layer interval");

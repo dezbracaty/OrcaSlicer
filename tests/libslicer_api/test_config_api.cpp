@@ -225,6 +225,34 @@ TEST_CASE("configuration snapshot is independent", "[libslicer_api][config]")
     CHECK_FALSE(snapshot.value("missing_option").has_value());
 }
 
+TEST_CASE("fiber width is one positive millimeter setting", "[libslicer_api][config][fiber-width]")
+{
+    auto config = libslicer::Config::defaults();
+    auto items = config.settings();
+    const auto* width = find_item(items, "fiber_width");
+    REQUIRE(width != nullptr);
+    CHECK(width->type == libslicer::SettingType::Float);
+    CHECK(width->unit == "mm");
+    CHECK(width->group == libslicer::SettingGroup::Process);
+    CHECK(width->level == libslicer::SettingLevel::Simple);
+    CHECK_FALSE(width->enabled);
+    CHECK(find_item(items, "reinforced_perimeters_extrusion_width") == nullptr);
+    CHECK(find_item(items, "reinforced_infill_extrusion_width") == nullptr);
+    REQUIRE(config.set("generate_reinforced_perimeters", "1").success);
+    items = config.settings();
+    CHECK(find_item(items, "fiber_width")->enabled);
+    REQUIRE(config.set("generate_reinforced_perimeters", "0").success);
+    REQUIRE(config.set("generate_reinforced_infills", "1").success);
+    items = config.settings();
+    CHECK(find_item(items, "fiber_width")->enabled);
+    REQUIRE(config.set("fiber_width", "1.2").success);
+    for (const auto* invalid : {"0", "-1", "100%", "1mm", "nan", "inf"}) {
+        INFO(invalid);
+        CHECK_FALSE(config.set("fiber_width", invalid).success);
+        CHECK(config.snapshot().value("fiber_width") == "1.2");
+    }
+}
+
 TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_api][config][fiber]")
 {
     auto config = libslicer::Config::defaults();
@@ -605,6 +633,87 @@ libslicer::SliceObjectInput fiber_infill_block()
     object.volumes.push_back(std::move(volume));
     return object;
 }
+}
+
+TEST_CASE("fiber width reaches both path roles and preview independently of resin width", "[libslicer_api][fiber-width][slice]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "1"},
+        {"reinforced_infill_density", "100%"}, {"infill_direction", "0"},
+        {"sparse_infill_rotate_template", "0"}}).success);
+    for (const auto* width : {"0.8", "1.2"}) {
+        std::optional<double> reference_pitch;
+        for (const auto* resin_width : {"0.42", "0.64"}) {
+            INFO("fiber=" << width << " resin=" << resin_width);
+            REQUIRE(library->apply_active_config_patch({{"fiber_width", width},
+                {"line_width", resin_width}, {"sparse_infill_line_width", resin_width},
+                {"fiber_resin_fill_line_width", resin_width}}).success);
+            libslicer::SliceRequest request;
+            request.config = *library->active_config_snapshot();
+            request.objects.push_back(fiber_infill_block());
+            const auto sliced = library->slice(request);
+            for (const auto& d : sliced.diagnostics) INFO(d.message);
+            REQUIRE(sliced.success);
+            REQUIRE(sliced.preview);
+            const auto check_widths = [&](const auto& preview) {
+                size_t contours = 0, infills = 0;
+                for (const auto& segment : preview.segments) {
+                    const auto role = segment.extrusion_role;
+                    if (role != libslicer::ToolpathExtrusionRole::ContinuousFiberContour &&
+                        role != libslicer::ToolpathExtrusionRole::ContinuousFiberInfill) continue;
+                    REQUIRE(segment.width_mm == Catch::Approx(std::stod(width)).margin(1e-5));
+                    if (role == libslicer::ToolpathExtrusionRole::ContinuousFiberContour) ++contours;
+                    else ++infills;
+                }
+                REQUIRE(contours > 0);
+                REQUIRE(infills > 0);
+            };
+            check_widths(*sliced.preview);
+            const auto imported = library->load_gcode_preview({sliced.output.path});
+            REQUIRE(imported.success);
+            REQUIRE(imported.preview);
+            check_widths(*imported.preview);
+            // Sample parallel straight infill runs in each layer. Command subdivision
+            // and process phases may split each run into several preview segments.
+            std::map<std::pair<unsigned, bool>, std::set<long long>> lines;
+            for (const auto& segment : sliced.preview->segments) {
+                if (segment.extrusion_role != libslicer::ToolpathExtrusionRole::ContinuousFiberInfill) continue;
+                const auto& a = segment.start_mm;
+                const auto& b = segment.end_mm;
+                if (std::abs(a.x-b.x) < 1e-4 && std::abs(a.y-b.y) > 1)
+                    lines[{segment.layer_index, true}].insert(std::llround(a.x*10000));
+                if (std::abs(a.y-b.y) < 1e-4 && std::abs(a.x-b.x) > 1)
+                    lines[{segment.layer_index, false}].insert(std::llround(a.y*10000));
+            }
+            size_t measured = 0;
+            for (const auto& [layer, positions] : lines) {
+                if (positions.size() < 10) continue;
+                std::vector<double> pitches;
+                for (auto it = std::next(positions.begin()); it != positions.end(); ++it)
+                    pitches.push_back(double(*it-*std::prev(it))/10000.0);
+                std::sort(pitches.begin(), pitches.end());
+                const double pitch = pitches[pitches.size()/2];
+                CHECK(pitch == Catch::Approx(std::stod(width)).margin(0.002));
+                if (reference_pitch) CHECK(pitch == Catch::Approx(*reference_pitch).margin(0.002));
+                else reference_pitch = pitch;
+                ++measured;
+            }
+            REQUIRE(measured > 0);
+            std::error_code error;
+            std::filesystem::remove(sliced.output.path, error);
+        }
+    }
 }
 
 TEST_CASE("ordinary multi-tool printing uses configured clearance without fiber", "[libslicer_api][machine-gcode][slice]")
@@ -2351,7 +2460,6 @@ TEST_CASE("inactive fiber infill settings do not prevent contour slicing", "[lib
     REQUIRE(library->activate_config(selection, {
         {"generate_reinforced_infills", "0"},
         {"fiber_infill_max_speed", "0"},
-        {"reinforced_infill_extrusion_width", "0.05"},
         {"fiber_resin_overlap", "0.05"}}).success);
     libslicer::SliceRequest request;
     request.config = *library->active_config_snapshot();

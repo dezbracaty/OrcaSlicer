@@ -379,17 +379,18 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
             throw std::runtime_error("Missing fiber feed correction for material");
         return print_config.filament_fiber_feed_correction.values[material - 1];
     };
-    const auto flow_for = [&](unsigned material, const ConfigOptionFloatOrPercent& width) {
+    const double width = source.fiber_width.value;
+    if (!std::isfinite(width) || width <= 0 || result.resin_overlap_mm >= 0.5 * width)
+        throw std::runtime_error("fiber_width must be positive and fiber_resin_overlap smaller than half its width");
+    const auto flow_for = [&](unsigned material) {
         if (material == 0 || material > print_config.filament_map.values.size())
             throw std::runtime_error("Continuous fiber material has no extruder mapping");
         const int extruder = print_config.filament_map.values[material - 1] - 1;
         if (extruder < 0 || size_t(extruder) >= print_config.nozzle_diameter.values.size())
             throw std::runtime_error("Continuous fiber extruder is outside the configured nozzle set");
         const float nozzle = float(print_config.nozzle_diameter.values[extruder]);
-        const Flow flow = Flow::new_from_config_width(frInfill, width, nozzle, float(layer.height));
-        if (!std::isfinite(flow.width()) || flow.width() <= 0 || result.resin_overlap_mm >= 0.5 * flow.width())
-            throw std::runtime_error("Fiber width must be positive and fiber_resin_overlap smaller than half its width");
-        return flow;
+        // Width is explicit and shared by both path roles. No nozzle-based auto width.
+        return Flow(float(width), float(layer.height), nozzle);
     };
     if (result.contour_enabled) {
         result.contour_include_holes = source.fiber_contour_include_holes.value;
@@ -405,7 +406,7 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         result.finish_overlap_length_mm = source.fiber_finish_overlap_length.value;
         validate_fiber_process_config(result, FiberPathPurpose::Contour);
         validate_fiber_process_config(result, FiberPathPurpose::Contour, false);
-        result.contour_flow = flow_for(result.contour_material, source.reinforced_perimeters_extrusion_width);
+        result.contour_flow = flow_for(result.contour_material);
     }
     if (result.infill_enabled) {
         result.infill_pattern = source.reinforced_infill_pattern.value;
@@ -421,7 +422,7 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         result.infill_feed_ratio = source.fiber_infill_feed_ratio.value;
         result.infill_feed_correction = correction_for(result.infill_material);
         validate_fiber_process_config(result, FiberPathPurpose::Infill);
-        result.infill_flow = flow_for(result.infill_material, source.reinforced_infill_extrusion_width);
+        result.infill_flow = flow_for(result.infill_material);
     }
     return result;
 }
