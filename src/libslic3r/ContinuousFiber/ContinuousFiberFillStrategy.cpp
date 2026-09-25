@@ -1201,6 +1201,93 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_contour(
     }
 }
 
+namespace {
+ExPolygons fiber_region_offset(const ExPolygons& material, double distance_mm, ClipperLib::JoinType join)
+{
+    if (material.empty()) return {};
+    if (distance_mm == 0) return union_ex(material);
+    ClipperLib::ClipperOffset offset;
+    // Leave room for composing clearance, coverage and centerline offsets
+    // inside the validator's half-tolerance partition budget.
+    offset.ArcTolerance = scale_(0.25 * ContourRoundingOptions{}.chord_tolerance_mm);
+    offset.MiterLimit = DefaultMiterLimit;
+    offset.ShortestEdgeLength = 0;
+    for (const auto& path : ClipperUtils::ExPolygonsProvider(material))
+        offset.AddPath(path, join, ClipperLib::etClosedPolygon);
+    ClipperLib::Paths paths;
+    offset.Execute(paths, scale_(distance_mm));
+    return ClipperPaths_to_Slic3rExPolygons(paths, true);
+}
+} // namespace
+
+ExPolygons fiber_material_offset(const ExPolygons& material, double distance_mm)
+{
+    return fiber_region_offset(material, distance_mm, ClipperLib::jtRound);
+}
+
+ExPolygons fiber_contour_coverage(const Polyline& path, double radius_mm)
+{
+    if (radius_mm <= 0 || path.points.size() < 2) return {};
+    ClipperLib::ClipperOffset offset;
+    // Leave room for composing clearance, coverage and centerline offsets
+    // inside the validator's half-tolerance partition budget.
+    offset.ArcTolerance = scale_(0.25 * ContourRoundingOptions{}.chord_tolerance_mm);
+    offset.ShortestEdgeLength = 0;
+    for (const auto& points : ClipperUtils::SinglePathProvider(path.points))
+        offset.AddPath(points, ClipperLib::jtRound,
+            path.points.front() == path.points.back() ? ClipperLib::etClosedLine : ClipperLib::etOpenButt);
+    ClipperLib::Paths paths;
+    offset.Execute(paths, scale_(radius_mm));
+    return ClipperPaths_to_Slic3rExPolygons(paths, true);
+}
+
+FiberContourCandidates ContinuousFiberFillStrategy::generate_contour_level(
+    const ExPolygons& remaining_material, double width_mm, const ExPolygons* hole_frontier)
+{
+    if (!std::isfinite(width_mm) || width_mm <= 0)
+        throw std::invalid_argument("Invalid fiber contour width");
+    FiberContourCandidates result;
+    result.centerline_domain = fiber_material_offset(remaining_material, -0.5 * width_mm);
+    ExPolygons shapes;
+    if (hole_frontier) {
+        shapes = fiber_material_offset(*hole_frontier, 0.5 * width_mm);
+    } else {
+        // Preserve the existing finite-width opening of an exterior route:
+        // the two sides of a thin neck belong to the SAME depositing loop.
+        // Independent holes are constraints, not emitted sides of that loop;
+        // opening across those holes would wrongly close a one-strand passage.
+        for (const auto& component : result.centerline_domain) {
+            const ExPolygons envelope{ExPolygon(component.contour)};
+            // This is the existing route topology filter, not tool-envelope
+            // expansion. Bounded miters preserve supported straight corners;
+            // configured bend rounding remains the validator's responsibility.
+            const auto opened = fiber_region_offset(
+                fiber_region_offset(envelope, -0.5 * width_mm, ClipperLib::jtMiter),
+                0.5 * width_mm, ClipperLib::jtMiter);
+            append(shapes, intersection_ex(opened, ExPolygons{component}));
+        }
+    }
+    for (auto& shape : shapes) {
+        shape.contour.make_counter_clockwise();
+        if (!shape.contour.points.empty())
+            std::rotate(shape.contour.points.begin(),
+                std::min_element(shape.contour.points.begin(), shape.contour.points.end()), shape.contour.points.end());
+    }
+    std::sort(shapes.begin(), shapes.end(), [](const auto& a, const auto& b) {
+        return a.contour.points < b.contour.points;
+    });
+    for (auto& shape : shapes) {
+        const size_t geometry_domain = result.geometry_domains.size();
+        result.geometry_domains.push_back(hole_frontier ?
+            diff_ex(result.centerline_domain, *hole_frontier) : ExPolygons{shape});
+        if (hole_frontier) shape.contour.reverse();
+        result.paths.push_back({Polyline3(shape.contour.split_at_index(0)),
+            hole_frontier ? FiberContourSide::Hole : FiberContourSide::Outer,
+            0, 0, 0, result.paths.size(), geometry_domain, {}});
+    }
+    return result;
+}
+
 FiberContourCandidates ContinuousFiberFillStrategy::generate_contours(
     const ExPolygons& original_area, const ContinuousFiberConfig& config)
 {

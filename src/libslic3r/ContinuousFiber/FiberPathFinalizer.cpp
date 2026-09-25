@@ -1,6 +1,8 @@
 #include "FiberPathFinalizer.hpp"
+#include "ContinuousFiberFillStrategy.hpp"
 
 #include "../ClipperUtils.hpp"
+#include "../BoundingBox.hpp"
 #include "../ExtrusionEntity.hpp"
 
 #include <algorithm>
@@ -66,6 +68,24 @@ Polyline3 normalized_xy(const Polyline3& input, std::vector<double>* source_posi
         knots.push_back(i);
     }
     std::vector<size_t> retained;
+    const BoundingBox domain_bounds = centerline_domain ? get_extents(*centerline_domain) : BoundingBox{};
+    std::optional<BoundingBox> clip_window;
+    Polygons local_domain;
+    const auto chord_inside_domain = [&](const Point& from, const Point& to) {
+        if (!clip_window || !clip_window->contains(from) || !clip_window->contains(to)) {
+            clip_window = BoundingBox(Points{from, to});
+            // Reuse a horizontal slab. Keep its full X extent so Clipper sees
+            // every scanbeam event between the chord endpoints, including
+            // distant vertices at the same Y. A small XY crop can change
+            // integer rounding decisions on nearly collinear boundary edges.
+            // The margin controls cache reuse only, not geometric tolerance.
+            clip_window->offset(scale_(0.25));
+            clip_window->min.x() = std::min(clip_window->min.x(), domain_bounds.min.x());
+            clip_window->max.x() = std::max(clip_window->max.x(), domain_bounds.max.x());
+            local_domain = ClipperUtils::clip_clipper_polygons_with_subject_bbox(*centerline_domain, *clip_window);
+        }
+        return diff_pl(Polyline(Points{from, to}), local_domain).empty();
+    };
     for (size_t index=0;index<knots.size();++index) {
         const auto& point=input.points[knots[index]];
         while (result.points.size()>=2) {
@@ -84,9 +104,9 @@ Polyline3 normalized_xy(const Polyline3& input, std::vector<double>* source_posi
             if (!within) break;
             // A short chord may satisfy the error bound yet cut across a concave
             // domain edge. Geometry cleanup must preserve the planned domain.
-            if (centerline_domain && !diff_pl(Polylines{Polyline(Points{
+            if (centerline_domain && !chord_inside_domain(
                     Point(result.points[result.points.size()-2].x(), result.points[result.points.size()-2].y()),
-                    Point(point.x(), point.y())})}, *centerline_domain).empty()) break;
+                    Point(point.x(), point.y()))) break;
             result.points.pop_back();retained.pop_back();
         }
         result.points.push_back(point);retained.push_back(index);
@@ -441,8 +461,36 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     Polygons physical;
     Polygons exclusion;
     Polygons keepout;
-    for (const FiberMotionSpan& span : prepared->spans)
-        append_coverage(candidate, span, physical, exclusion, keepout, config, contour);
+    if (contour) {
+        // Process boundaries do not introduce physical end caps in a continuous
+        // strand. Sweep connected deposition once, including the cyclic seam.
+        Polyline depositing;
+        const auto flush = [&] {
+            const double physical_radius = 0.5 * candidate.width;
+            const double exclusion_radius = physical_radius - config.resin_overlap_mm;
+            const double keepout_radius = physical_radius + config.contour_infill_clearance_mm;
+            auto footprint = to_polygons(fiber_contour_coverage(depositing, physical_radius));
+            // Equal radii have the same raw sweep. Domain clipping below still
+            // applies each coverage policy independently.
+            append(exclusion, exclusion_radius == physical_radius ? footprint :
+                to_polygons(fiber_contour_coverage(depositing, exclusion_radius)));
+            append(keepout, keepout_radius == physical_radius ? footprint :
+                to_polygons(fiber_contour_coverage(depositing, keepout_radius)));
+            append(physical, std::move(footprint));
+            depositing.points.clear();
+        };
+        for (const auto& span : prepared->spans) if (span.deposits_fiber()) {
+            const auto points = span.geometry.to_polyline().points;
+            if (points.empty()) continue;
+            if (!depositing.points.empty() && depositing.points.back() != points.front()) flush();
+            depositing.points.insert(depositing.points.end(),
+                points.begin() + (depositing.points.empty() ? 0 : 1), points.end());
+        }
+        flush();
+    } else {
+        for (const FiberMotionSpan& span : prepared->spans)
+            append_coverage(candidate, span, physical, exclusion, keepout, config, false);
+    }
 
     prepared->physical_coverage = union_ex(physical);
     prepared->outside_domain = diff_ex(prepared->physical_coverage, allowed_domain, ApplySafetyOffset::Yes);

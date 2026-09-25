@@ -955,7 +955,7 @@ void PrintConfigDef::init_fff_params()
     def = this->add("outer_reinforced_perimeters_counts", coInt);
     def->label = L("Continuous fiber contour count");
     def->category = L("Continuous fiber");
-    def->tooltip = L("Maximum concentric offset depth used for continuous fiber contours.");
+    def->tooltip = L("Maximum number of successive continuous fiber contour levels. Each accepted closed contour may produce multiple contours at the next level; rejected contours do not produce deeper levels.");
     def->min = 0;
     def->max = 100;
     def->set_default_value(new ConfigOptionInt(1));

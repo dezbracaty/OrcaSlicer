@@ -137,11 +137,22 @@ struct FiberContourCandidates {
     std::vector<FiberContourCandidate> paths;
 };
 
+// Circular finite-width tool envelope. These operations share a bounded arc
+// error and do not use the general offset's distance-dependent decimation.
+ExPolygons fiber_material_offset(const ExPolygons& material, double distance_mm);
+ExPolygons fiber_contour_coverage(const Polyline& path, double radius_mm);
+
 class ContinuousFiberFillStrategy {
 public:
-    // Reconstruct closed exterior boundaries where inset closes a passage.
-    // The validator owns allocation priority and commits exteriors atomically.
-    // Holes always constrain centerlines, independently of whether they emit paths.
+    // Clearance has already been applied to remaining_material. A hole
+    // frontier encloses the original hole and previously accepted rings.
+    static FiberContourCandidates generate_contour_level(
+        const ExPolygons& remaining_material, double width_mm,
+        const ExPolygons* hole_frontier = nullptr);
+
+    // Independent geometric reference offsets, also used by geometry tests.
+    // This low-level utility does not enforce ancestry: production slicing uses
+    // FiberPathValidator::plan_contours and generate_contour_level instead.
     static FiberContourCandidates generate_contours(
         const ExPolygons& original_area, const ContinuousFiberConfig& config);
 

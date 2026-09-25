@@ -1761,25 +1761,25 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         if (collect_debug)
             record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
                            "original_contour_domain_before_candidate_generation");
-        const auto candidates = ContinuousFiberFillStrategy::generate_contours(original_area, config);
-        if (std::none_of(candidates.paths.begin(), candidates.paths.end(),
-                [](const auto& candidate) { return candidate.side == FiberContourSide::Outer; }))
+        auto plan = FiberPathValidator::plan_contours(original_area, config, domain_id, collect_debug);
+        if (std::none_of(plan.nodes.begin(), plan.nodes.end(),
+                [](const auto& node) { return node.side == FiberContourSide::Outer; }))
             ++context.layer.fiber_outer_contour_failures["no_outer_contour_candidate"];
-        if (collect_debug) for (const auto& candidate : candidates.paths) {
-            std::string rerouted_holes;
-            for (const auto hole : candidate.rerouted_hole_ids) {
-                if (!rerouted_holes.empty()) rerouted_holes += ",";
-                rerouted_holes += std::to_string(hole);
-            }
-            context.layer.fiber_fill_diagnostics.push_back({candidate.geometry.to_polyline(),
-                std::string(candidate.side==FiberContourSide::Outer ? "outer" : "hole")+
-                    "; region="+std::to_string(candidate.region_id)+"; boundary="+std::to_string(candidate.boundary_id)+
-                    "; depth="+std::to_string(candidate.depth)+"; part="+std::to_string(candidate.part_id)+
-                    "; rerouted_holes="+rerouted_holes,
-                true,unscale<double>(candidate.geometry.length()),Layer::FiberDiagnosticKind::ContourCandidate,
-                {},domain_id.policy_group_id,domain_id.component_id});
+        if (collect_debug) for (const auto& node : plan.nodes) {
+            if (!node.source) continue;
+            std::string stop_detail;
+            for (const auto& stop : plan.stops) if (stop.parent && *stop.parent == node.id)
+                stop_detail += "; stop_depth=" + std::to_string(stop.depth) + "; stop_reason=" + stop.reason;
+            context.layer.fiber_fill_diagnostics.push_back({*node.source,
+                std::string(node.side == FiberContourSide::Outer ? "outer" : "hole") +
+                    "; region=" + std::to_string(node.region_id) + "; boundary=" + std::to_string(node.boundary_id) +
+                    "; depth=" + std::to_string(node.depth) + "; part=" + std::to_string(node.part_id) +
+                    "; candidate=" + std::to_string(node.id.job_ordinal) +
+                    "; parent=" + (node.parent ? std::to_string(node.parent->job_ordinal) : "root") + stop_detail,
+                true, unscale<double>(node.source->length()), Layer::FiberDiagnosticKind::ContourCandidate,
+                {}, domain_id.policy_group_id, domain_id.component_id});
         }
-        contour_result = FiberPathValidator::validate_contours(candidates, original_area, config, domain_id, collect_debug);
+        contour_result = std::move(plan.validation);
         if (collect_debug) {
             for (const auto& reference:contour_result.reference_paths)
                 context.layer.fiber_fill_diagnostics.push_back({reference.polyline.to_polyline(),

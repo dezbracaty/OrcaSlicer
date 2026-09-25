@@ -89,8 +89,35 @@ struct FiberValidationResult {
     void release_to(ExtrusionEntitiesPtr& destination);
 };
 
+struct FiberContourPlanNode {
+    FiberCandidateId id;
+    std::optional<FiberCandidateId> parent;
+    size_t depth {0};
+    FiberContourSide side {FiberContourSide::Outer};
+    size_t region_id {0}, boundary_id {0}, part_id {0};
+    std::optional<Polyline> source; // Debug only; never used for allocation.
+};
+
+struct FiberContourBranchStop {
+    std::optional<FiberCandidateId> parent;
+    size_t depth {0};
+    FiberContourSide side {FiberContourSide::Outer};
+    std::string reason; // A stop is not a material void or rejected path.
+};
+
+struct FiberContourPlanResult {
+    FiberValidationResult validation;
+    std::vector<FiberContourPlanNode> nodes;
+    std::vector<FiberContourBranchStop> stops;
+    bool audit_lineage() const;
+};
+
 class FiberPathValidator {
 public:
+    static FiberContourPlanResult plan_contours(
+        const ExPolygons& original_area, const ContinuousFiberConfig& config,
+        const FiberDomainId& domain_id, bool collect_debug = false);
+
     static FiberValidationResult validate_contours(
         const FiberContourCandidates& candidates, const ExPolygons& allowed_domain,
         const ContinuousFiberConfig& config, const FiberDomainId& domain_id, bool collect_debug = false);
