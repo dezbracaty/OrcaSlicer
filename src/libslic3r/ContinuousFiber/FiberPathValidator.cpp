@@ -548,7 +548,9 @@ FiberValidationResult FiberPathValidator::validate_impl(
         // Source shaping may ignore other boundaries, but simplification must
         // not create a shortcut outside the physical domain and then clip it
         // as an unavailable interval during allocation.
-        try { if (!source_arcs) path.polyline = normalize_fiber_geometry(input.polyline,
+        // Empty arc metadata permits normalization, but its non-null pointer
+        // still identifies a whole generated path for containment below.
+        try { if (!source_arcs || source_arcs->empty()) path.polyline = normalize_fiber_geometry(input.polyline,
             requires_closed_loop && planned_centerline_domain ? planned_centerline_domain : physical_centerline_domain); }
         catch (const std::invalid_argument&) { planar = false; }
         const FiberCandidateId candidate_id {domain_id, purpose, job_ordinal, path_ordinal++};

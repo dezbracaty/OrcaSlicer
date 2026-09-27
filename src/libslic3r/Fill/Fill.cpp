@@ -1453,11 +1453,6 @@ static void execute_surface_fill_job(
 		// Fill::fill_surface() applies (overlap - spacing / 2). Compensate only
 		// when the physical fiber width is greater than its Flow spacing.
 		f->overlap = 0.5 * surface_fill.params.spacing - boundary_inset;
-		// Rectilinear connects at its outer contour, 0.45 spacing beyond
-		// FillBase's nominal inset. Fiber cannot borrow a plastic wall's
-		// overlap allowance: keep those connectors inside the safe domain.
-		if (surface_fill.params.pattern == ipRectilinear)
-			f->overlap -= 0.45 * surface_fill.params.spacing;
 	}
     f->adapt_fill_octree = surface_fill.params.pattern == ipSupportCubic
         ? context.support_fill_octree
@@ -1807,7 +1802,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         if (!infill_job.expolygons.empty()) {
             apply_fiber_infill_params(infill_job.params, config, domain.policy);
 
-            if (config.infill_pattern == ipRectilinear && config.infill_bend_radius_mm > 0) {
+            if (config.infill_pattern == ipRectilinear) {
                 std::unique_ptr<Fill> direction(Fill::new_from_type(ipRectilinear));
                 direction->set_bounding_box(context.object_bbox);
                 direction->layer_id = context.layer.id();

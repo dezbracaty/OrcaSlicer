@@ -27,7 +27,7 @@ orcaslicer_discover_tests(libslicer_api_tests)
 # expectations to accommodate planner output.
 add_executable(fiber_4xiao_acceptance fiber_4xiao_acceptance.cpp)
 target_compile_features(fiber_4xiao_acceptance PRIVATE cxx_std_17)
-target_link_libraries(fiber_4xiao_acceptance PRIVATE libslicer::libslicer nlohmann_json)
+target_link_libraries(fiber_4xiao_acceptance PRIVATE libslicer::libslicer libslic3r nlohmann_json)
 target_include_directories(fiber_4xiao_acceptance PRIVATE ${CMAKE_SOURCE_DIR}/deps_src)
 target_compile_definitions(fiber_4xiao_acceptance PRIVATE
     LIBSLICER_TEST_RESOURCE_DIR="${CMAKE_SOURCE_DIR}/resources"
@@ -41,3 +41,10 @@ set_tests_properties(Fiber4xiaoAcceptanceChecker PROPERTIES LABELS "fiber_accept
 # Additional current-settings regression; the fixed gate above stays unchanged.
 add_test(NAME Fiber4xiaoClosedOuterRegression COMMAND fiber_4xiao_acceptance --closed-outer-regression)
 set_tests_properties(Fiber4xiaoClosedOuterRegression PROPERTIES LABELS "fiber_closed_outer" TIMEOUT 120 RUN_SERIAL TRUE)
+
+# Independent geometry check of the complete model; plastic leftovers remain enabled.
+add_test(NAME Fiber4xiaoInfillGap COMMAND fiber_4xiao_acceptance --infill-gap)
+add_test(NAME Fiber4xiaoInfillGapCurrent COMMAND fiber_4xiao_acceptance --infill-gap-current)
+add_test(NAME Fiber4xiaoInfillGapChecker COMMAND fiber_4xiao_acceptance --infill-gap-self-test)
+set_tests_properties(Fiber4xiaoInfillGap Fiber4xiaoInfillGapCurrent PROPERTIES LABELS "fiber_infill_gap" TIMEOUT 180 RUN_SERIAL TRUE)
+set_tests_properties(Fiber4xiaoInfillGapChecker PROPERTIES LABELS "fiber_infill_gap" TIMEOUT 20)

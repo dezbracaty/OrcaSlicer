@@ -5,7 +5,9 @@
 
 #include <array>
 #include <cmath>
+#include <map>
 #include <memory>
+#include <tuple>
 
 namespace Slic3r {
 namespace {
@@ -189,6 +191,72 @@ std::vector<Row> scan_rows(const ExPolygons& domain, coord_t origin, coord_t pit
         std::sort(row.scans.begin(), row.scans.end(), [](const auto& a, const auto& b) { return a.lo < b.lo; });
     return rows;
 }
+
+using BoundaryKey = std::tuple<size_t, size_t, size_t, size_t, int>;
+using BoundaryReturns = std::map<BoundaryKey, Polylines>;
+
+// A zero-radius turn follows the same boundary that clipped the scanlines.
+// Consecutive endpoints on a ring delimit an unused boundary arc: connecting
+// them cannot jump across a hole or pass another scan endpoint.
+BoundaryReturns boundary_returns(const ExPolygons& domain, const std::vector<Row>& rows,
+    const Linesf& edges, const AABBTreeIndirect::Tree<2, double>& tree)
+{
+    const Polygons rings = to_polygons(domain);
+    std::vector<std::pair<size_t, size_t>> edge_locations;
+    for (size_t ring = 0; ring < rings.size(); ++ring)
+        for (size_t edge = 0; edge < rings[ring].points.size(); ++edge)
+            edge_locations.emplace_back(ring, edge);
+    struct End { size_t row, scan; int side; double position; Point point; };
+    std::vector<std::vector<End>> ends(rings.size());
+    for (size_t row = 0; row < rows.size(); ++row)
+        for (size_t scan = 0; scan < rows[row].scans.size(); ++scan)
+            for (int side : {-1, 1}) {
+                const auto& interval = rows[row].scans[scan];
+                const Vec2d point(side < 0 ? interval.lo : interval.hi, rows[row].y);
+                size_t edge = 0;
+                Vec2d nearest;
+                const double distance = AABBTreeLines::squared_distance_to_indexed_lines(
+                    edges, tree, point, edge, nearest, coordinate_error_mm * coordinate_error_mm);
+                if (distance < 0)
+                    throw std::runtime_error("Fiber scan endpoint is not on its centerline boundary");
+                const auto [ring, segment] = edge_locations[edge];
+                const auto delta = edges[edge].b - edges[edge].a;
+                const double t = delta.squaredNorm() == 0 ? 0 :
+                    std::clamp((nearest - edges[edge].a).dot(delta) / delta.squaredNorm(), 0.0, 1.0);
+                double position = double(segment) + t;
+                if (position == rings[ring].points.size()) position = 0;
+                ends[ring].push_back({row, scan, side, position, scaled(point)});
+            }
+    BoundaryReturns result;
+    for (size_t ring = 0; ring < rings.size(); ++ring) {
+        auto& points = ends[ring];
+        std::sort(points.begin(), points.end(), [](const End& a, const End& b) {
+            return std::tie(a.position, a.row, a.scan, a.side) < std::tie(b.position, b.row, b.scan, b.side);
+        });
+        const auto& boundary = rings[ring].points;
+        for (size_t i = 0; i < points.size(); ++i) {
+            const auto& a = points[i];
+            const auto& b = points[(i + 1) % points.size()];
+            if (a.side != b.side || (a.row + 1 != b.row && b.row + 1 != a.row)) continue;
+            double end = b.position;
+            if (end <= a.position) end += boundary.size();
+            Polyline path(Points{a.point});
+            const coord_t lo = std::min(a.point.y(), b.point.y()), hi = std::max(a.point.y(), b.point.y());
+            bool inside_strip = true;
+            for (size_t vertex = size_t(std::floor(a.position)) + 1; double(vertex) < end; ++vertex) {
+                const Point& point = boundary[vertex % boundary.size()];
+                if (point.y() < lo || point.y() > hi) { inside_strip = false; break; }
+                if (path.points.back() != point) path.points.push_back(point);
+            }
+            if (!inside_strip) continue;
+            if (path.points.back() != b.point) path.points.push_back(b.point);
+            result[{a.row, a.scan, b.row, b.scan, a.side}].push_back(path);
+            path.reverse();
+            result[{b.row, b.scan, a.row, a.scan, a.side}].push_back(std::move(path));
+        }
+    }
+    return result;
+}
 } // namespace
 
 FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
@@ -196,9 +264,9 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
     double rotation_radians, const Point& grid_origin)
 {
     const double radius = config.infill_bend_radius_mm, width = config.infill_flow.width();
-    if (!std::isfinite(radius) || radius <= 0 || !std::isfinite(width) || width <= 0 ||
+    if (!std::isfinite(radius) || radius < 0 || !std::isfinite(width) || width <= 0 ||
         !std::isfinite(config.infill_density) || config.infill_density <= 0 || config.infill_density > 100 ||
-        !std::isfinite(rotation_radians)) throw std::invalid_argument("Invalid rounded fiber infill parameters");
+        !std::isfinite(rotation_radians)) throw std::invalid_argument("Invalid rectilinear fiber infill parameters");
     const double requested_pitch = width * 100 / config.infill_density;
     if (requested_pitch > unscale<double>(std::numeric_limits<coord_t>::max()) / 4)
         throw std::invalid_argument("Fiber scanline spacing is outside the supported coordinate range");
@@ -224,7 +292,8 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
     auto rows = scan_rows(local, scaled(frame.transpose() * mm(grid_origin)).y(), pitch_scaled, config.infill_density == 100);
     const auto edges = boundary_lines(local);
     const auto tree = AABBTreeLines::build_aabb_tree_over_indexed_lines(edges);
-    const auto shape = make_return(radius, pitch);
+    const auto shape = radius > 0 ? std::optional<ReturnShape>(make_return(radius, pitch)) : std::nullopt;
+    const auto boundary_links = radius == 0 ? boundary_returns(local, rows, edges, tree) : BoundaryReturns{};
     // Each row interval is visited once. Turns in different strips are separated
     // by the scan grid; independent turns sharing a strip also reserve width.
     struct Strip {
@@ -237,7 +306,7 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
     for (size_t first = 0; first < rows.size(); ++first) for (size_t seed = 0; seed < rows[first].scans.size(); ++seed) {
         if (rows[first].scans[seed].used) continue;
         struct Visit { size_t row, scan; };
-        struct Link { double position; int direction; };
+        struct Link { double position; int direction; Polyline boundary; };
         std::vector<Visit> visits{{first, seed}};
         std::vector<Link> links;
         rows[first].scans[seed].used = true;
@@ -247,8 +316,10 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
             for (;;) {
                 const auto visit = visits.back();
                 const auto& current = rows[visit.row].scans[visit.scan];
-                const double entry = links.empty() ? (direction > 0 ? current.lo : current.hi) : links.back().position;
+                const double entry = links.empty() ? (direction > 0 ? current.lo : current.hi) :
+                    (shape ? links.back().position : unscale<double>(links.back().boundary.points.back().x()));
                 std::optional<double> best;
+                Polyline best_boundary;
                 Visit next_visit{};
                 for (int step : {1, -1}) {
                     if ((step < 0 && visit.row == 0) || (step > 0 && visit.row + 1 == rows.size())) continue;
@@ -261,28 +332,47 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
                             direction > 0 ? other.lo : -other.hi});
                         const double hi = std::min(direction > 0 ? current.hi : -current.lo,
                             direction > 0 ? other.hi : -other.lo);
-                        if (hi < lo) continue;
+                        const auto boundary = shape ? boundary_links.end() :
+                            boundary_links.find({visit.row, visit.scan, target, next, direction});
+                        if (shape ? hi < lo : boundary == boundary_links.end()) continue;
                         // A strip changes only when a return is committed. Keep
                         // the same batch union and boundary order on rebuilds.
                         if (strip && !strip->pending.empty()) {
                             for (const auto& previous : strip->pending)
                                 append(strip->occupied, fiber_contour_coverage(previous, width));
                             strip->pending.clear();
-                            strip->domain = diff_ex(local, union_ex(strip->occupied));
-                            strip->edges = boundary_lines(strip->domain);
-                            strip->tree = AABBTreeLines::build_aabb_tree_over_indexed_lines(strip->edges);
+                            if (shape) {
+                                strip->domain = diff_ex(local, union_ex(strip->occupied));
+                                strip->edges = boundary_lines(strip->domain);
+                                strip->tree = AABBTreeLines::build_aabb_tree_over_indexed_lines(strip->edges);
+                            } else {
+                                strip->occupied = union_ex(strip->occupied);
+                            }
                         }
-                        auto t = place_return(shape, strip ? strip->domain : local,
-                            strip ? strip->edges : edges, strip ? strip->tree : tree,
-                            rows[std::min(visit.row, target)].y, direction, lo, hi);
-                        if (t && (!best || *t > *best + coordinate_error_mm)) { best = t; next_visit = {target, next}; }
+                        if (shape) {
+                            auto t = place_return(*shape, strip ? strip->domain : local,
+                                strip ? strip->edges : edges, strip ? strip->tree : tree,
+                                rows[std::min(visit.row, target)].y, direction, lo, hi);
+                            if (t && (!best || *t > *best + coordinate_error_mm)) { best = t; next_visit = {target, next}; }
+                        } else for (const auto& path : boundary->second) {
+                            if (direction * (unscale<double>(path.points.front().x()) - entry) < -coordinate_error_mm) continue;
+                            // The arc already lies on the original domain boundary.
+                            // Check only newly occupied material: subtracting it
+                            // from the domain can round unrelated boundary edges
+                            // and falsely disconnect otherwise valid scanlines.
+                            if (strip && !intersection_pl(Polylines{path}, strip->occupied).empty()) continue;
+                            const double score = -unscale<double>(path.length());
+                            if (!best || score > *best + coordinate_error_mm) {
+                                best = score; best_boundary = path; next_visit = {target, next};
+                            }
+                        }
                     }
                 }
                 if (!best) return;
                 const size_t strip = std::min(visit.row, next_visit.row);
                 if (!strips[strip]) strips[strip] = std::make_unique<Strip>();
-                strips[strip]->pending.push_back(translated_return(shape, *best, rows[strip].y, direction));
-                links.push_back({direction * *best, direction});
+                strips[strip]->pending.push_back(shape ? translated_return(*shape, *best, rows[strip].y, direction) : best_boundary);
+                links.push_back({shape ? direction * *best : 0, direction, std::move(best_boundary)});
                 visits.push_back(next_visit);
                 rows[next_visit.row].scans[next_visit.scan].used = true;
                 direction = -direction;
@@ -291,6 +381,7 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
         grow(1);
         std::reverse(visits.begin(), visits.end());
         std::reverse(links.begin(), links.end());
+        if (!shape) for (auto& link : links) link.boundary.reverse();
         grow(links.empty() ? -1 : -links.back().direction);
 
         FiberInfillPath path;
@@ -308,20 +399,24 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
         append_point({links.empty() || links.front().direction > 0 ? head.lo : head.hi, rows[visits.front().row].y});
         for (size_t j = 0; j < links.size(); ++j) {
             const auto& link = links[j];
+            if (!shape) {
+                for (const auto& point : link.boundary.points) append_point(mm(point));
+                continue;
+            }
             const int step = visits[j + 1].row > visits[j].row ? 1 : -1;
             const auto local_point = [&](const Vec2d& p) -> Vec2d {
                 return {link.position + link.direction * p.x(), rows[visits[j].row].y + step * p.y()};
             };
             const auto world = [&](const Vec2d& p) -> Vec2d { return frame * local_point(p); };
             for (size_t k = 0; k < 2; ++k) {
-                const auto indices = shape.arc_indices[k];
-                append_point(local_point(shape.samples[indices.first]));
+                const auto indices = shape->arc_indices[k];
+                append_point(local_point(shape->samples[indices.first]));
                 ContourArc arc;
                 arc.center_mm = world({0, k == 0 ? radius : pitch - radius});
-                arc.start_mm = world(shape.samples[indices.first]); arc.end_mm = world(shape.samples[indices.second]);
+                arc.start_mm = world(shape->samples[indices.first]); arc.end_mm = world(shape->samples[indices.second]);
                 arc.radius_mm = radius; arc.sweep_radians = arc.source_sweep_radians = -link.direction * step * PI / 2;
                 arc.begin_mm = station;
-                for (size_t i = indices.first + 1; i <= indices.second; ++i) append_point(local_point(shape.samples[i]));
+                for (size_t i = indices.first + 1; i <= indices.second; ++i) append_point(local_point(shape->samples[i]));
                 arc.end_distance_mm = station; path.arcs.push_back(arc);
             }
         }

@@ -2926,3 +2926,179 @@ TEST_CASE("rounded coverage integer spurs do not create artificial half turns", 
     REQUIRE(reverse.path);reverse.path->reverse();
     CHECK(reverse.path->points==rounded.path->points);
 }
+
+
+TEST_CASE("zero radius fiber returns reach the material boundary without extra retreat", "[ContinuousFiber][BoundaryInfill]")
+{
+    for (const float width : {.6f, 1.f}) for (const double density : {40., 100.}) {
+        CAPTURE(width, density);
+        ContinuousFiberConfig config;
+        config.infill_flow=Flow(width,.13f,.4f);config.infill_density=density;config.infill_bend_radius_mm=0;
+        const ExPolygons material{rectangle(0,0,12,40)};
+        const auto generated=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+        REQUIRE(generated.paths.size()==1);
+        const auto& path=generated.paths.front();
+        CHECK(path.arcs.empty());
+        const double half=double(width)/2;
+        size_t returns=0, scans=0;
+        for (const auto& line:path.geometry.to_polyline().lines()) {
+            if (line.a.x()==line.b.x()) {
+                ++scans;
+                CHECK(unscale<double>(std::min(line.a.y(),line.b.y()))==Catch::Approx(half).margin(.000002));
+                CHECK(unscale<double>(std::max(line.a.y(),line.b.y()))==Catch::Approx(40-half).margin(.000002));
+            } else {
+                ++returns;
+                CHECK(line.a.y()==line.b.y());
+                CHECK(unscale<double>(std::abs(line.a.x()-line.b.x()))==Catch::Approx(width*100/density).margin(.000002));
+                const double y=unscale<double>(line.a.y());
+                CHECK(std::min(std::abs(y-half),std::abs(y-(40-half)))<.000002);
+            }
+        }
+        CHECK(scans>3);CHECK(returns+1==scans);
+        CHECK(ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0)).paths.front().geometry.points==path.geometry.points);
+    }
+}
+
+TEST_CASE("zero radius fiber preserves all scan intervals around holes and concavities", "[ContinuousFiber][BoundaryInfill]")
+{
+    Polygon sloped;
+    for (const Vec2d& p:std::vector<Vec2d>{{0,0},{12,0},{12,28},{0,40}}) sloped.points.push_back(Point::new_scale(p.x(),p.y()));
+    const std::vector<ExPolygons> materials{
+        {ExPolygon(sloped)},
+        {rectangle_with_hole(0,0,12,40,4,10,8,30)},
+        diff_ex(ExPolygons{rectangle(0,0,12,40)},ExPolygons{rectangle(5,28,7,41)}),
+        {rectangle(0,0,12,40),rectangle(20,1,30,39)}};
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(1.f,.13f,.4f);config.infill_bend_radius_mm=0;
+    for (size_t shape=0;shape<materials.size();++shape) for (double angle:{0.,.37,PI/2})
+        for (double density:{40.,100.}) for(double phase:{0.,-.00005}) {
+        CAPTURE(shape,angle,density,phase);config.infill_density=density;
+        const auto generated=ContinuousFiberFillStrategy::generate_rectilinear(materials[shape],config,angle,Point::new_scale(phase,0));
+        REQUIRE_FALSE(generated.paths.empty());
+        // Independently clip a fixed scan grid against the half-width material
+        // offset. Compare whole intervals, not just the generated endpoints.
+        auto reference=fiber_material_offset(materials[shape],-.5);
+        Eigen::Matrix2d frame;frame<<-std::sin(angle),std::cos(angle),std::cos(angle),std::sin(angle);
+        for (auto& region:reference) {
+            auto transform=[&](Polygon& ring) { for(auto& p:ring.points)p=Point::new_scale((frame*p.cast<double>()*SCALING_FACTOR).x(),(frame*p.cast<double>()*SCALING_FACTOR).y());ring.reverse(); };
+            transform(region.contour);for(auto& hole:region.holes)transform(hole);
+        }
+        const auto bounds=get_extents(reference);const coord_t pitch=scale_(100/density);
+        const coord_t origin=scale_(std::cos(angle)*phase);
+        coord_t y=origin+coord_t(std::floor(double(bounds.min.y()-origin)/pitch))*pitch;
+        if(density==100)y+=(pitch+coord_t(SCALED_EPSILON))/2;
+        Polylines grid;
+        for(;y<=bounds.max.y();y+=pitch)grid.emplace_back(Points{{bounds.min.x()-1,y},{bounds.max.x()+1,y}});
+        const auto scans=intersection_pl(grid,reference);
+        REQUIRE_FALSE(scans.empty());
+        Lines actual;
+        for(const auto& path:generated.paths) {
+            CHECK(path.arcs.empty());
+            CHECK(diff_pl(Polylines{path.geometry.to_polyline()},offset_ex(fiber_material_offset(materials[shape],-.5),scale_(.00001))).empty());
+            Polyline local=path.geometry.to_polyline();
+            for(auto& p:local.points) {const Vec2d v=frame*p.cast<double>()*SCALING_FACTOR;p=Point::new_scale(v.x(),v.y());}
+            append(actual,local.lines());
+            const auto lines=path.geometry.to_polyline().lines();
+            bool crossing=false;
+            for(size_t i=0;i<lines.size();++i)for(size_t j=i+2;j<lines.size();++j) {
+                Point intersection;if(lines[i].intersection(lines[j],&intersection))crossing=true;
+            }
+            CHECK_FALSE(crossing);
+        }
+        for(const auto& scan:scans) {
+            const double y=scan.points.front().y();
+            const double lo=std::min(scan.points.front().x(),scan.points.back().x());
+            const double hi=std::max(scan.points.front().x(),scan.points.back().x());
+            std::vector<std::pair<double,double>> intervals;
+            for(const auto& line:actual)if(std::abs(line.a.y()-y)<=4 && std::abs(line.b.y()-y)<=4) {
+                const double a=std::max(lo,double(std::min(line.a.x(),line.b.x())));
+                const double b=std::min(hi,double(std::max(line.a.x(),line.b.x())));
+                if(b>a)intervals.emplace_back(a,b);
+            }
+            std::sort(intervals.begin(),intervals.end());
+            double end=lo;
+            for(const auto& interval:intervals) {
+                CHECK(interval.first<=end+4); // No omitted scan interval.
+                CHECK(interval.first>=end-4); // No duplicated scan interval.
+                end=std::max(end,interval.second);
+            }
+            CHECK(end>=hi-4);
+        }
+    }
+}
+
+TEST_CASE("zero radius generated paths retain whole candidate validation and normal resin leftovers", "[ContinuousFiber][BoundaryInfill]")
+{
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(1.f,.13f,.4f);config.infill_density=100;config.infill_bend_radius_mm=0;
+    config.landing_length_mm=2;config.cut_to_contact_length_mm=23;config.minimum_effective_length_mm=.5;
+    config.finish_extension_length_mm=23;
+    const ExPolygons material{rectangle(0,0,12,40),rectangle(30,0,32,2)};
+    auto candidates=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+    const auto validated=FiberPathValidator::validate_infill(candidates,material,config,{1,0,0,0});
+    REQUIRE(validated.accepted_count()==1);
+    CHECK(validated.audit_assignments().valid());
+    REQUIRE(validated.assignments.size()>1);
+    bool short_rejected=false;
+    for(const auto& assignment:validated.assignments)if(assignment.kind==FiberAssignmentKind::Rejected) {
+        CHECK((assignment.reason==FiberRejectionReason::TooShort || assignment.reason==FiberRejectionReason::ProcessBudgetTooShort));
+        short_rejected=true;
+    }
+    CHECK(short_rejected);
+    const auto resin=ContinuousFiberFillStrategy::build_resin_area(material,validated.resin_exclusion);
+    CHECK_FALSE(intersection_ex(resin,ExPolygons{rectangle(30,0,32,2)}).empty());
+    candidates.paths.front().geometry.points.back().x()+=scale_(100.);
+    CHECK_THROWS(FiberPathValidator::validate_infill(candidates,material,config,{1,0,0,0}));
+}
+
+TEST_CASE("contour clearance and infill half width are applied once", "[ContinuousFiber][BoundaryInfill]")
+{
+    for(double gap:{0.,.2}) {
+        ContinuousFiberConfig config;
+        config.infill_flow=Flow(1.f,.13f,.4f);config.infill_density=100;config.infill_bend_radius_mm=0;
+        // A finalized 1 mm contour centered on y=1 reserves material up to 1.5+gap.
+        const ExPolygons source{rectangle(0,0,12,40)},keepout{rectangle(0,0,12,1.5+gap)};
+        const auto material=ContinuousFiberFillStrategy::build_infill_domain(source,keepout);
+        const auto paths=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+        REQUIRE(paths.paths.size()==1);
+        const auto bounds=get_extents(paths.paths.front().geometry.to_polyline());
+        CHECK(unscale<double>(bounds.min.y())==Catch::Approx(2.+gap).margin(.00002));
+    }
+}
+
+TEST_CASE("distant fiber islands cannot disconnect boundary returns", "[ContinuousFiber][BoundaryInfill]")
+{
+    Polygon polygon;
+    for(const Vec2d& p:std::vector<Vec2d>{{0,0},{11.13,.17},{13.02,27.11},{7.63,29.83},{1.14,31.17}})
+        polygon.points.push_back(Point::new_scale(p.x(),p.y()));
+    const ExPolygon first(polygon);
+    ExPolygon second=first;second.translate(Point::new_scale(50.127,1.373));
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(1.f,.13f,.4f);config.infill_density=100;config.infill_bend_radius_mm=0;
+    for(double angle:{0.,.37,.785398})for(double phase:{0.,.123,.5}) {
+        CAPTURE(angle,phase);
+        const auto a=ContinuousFiberFillStrategy::generate_rectilinear({first},config,angle,Point::new_scale(phase,0));
+        const auto b=ContinuousFiberFillStrategy::generate_rectilinear({second},config,angle,Point::new_scale(phase,0));
+        const auto together=ContinuousFiberFillStrategy::generate_rectilinear({first,second},config,angle,Point::new_scale(phase,0));
+        CHECK(together.paths.size()==a.paths.size()+b.paths.size());
+        for(const auto* isolated:{&a,&b})for(const auto& path:isolated->paths)
+            CHECK(std::any_of(together.paths.begin(),together.paths.end(),[&](const auto& combined) {return combined.geometry.points==path.geometry.points;}));
+    }
+}
+
+
+TEST_CASE("arc-free rounded infill remains an intact candidate at the process threshold", "[ContinuousFiber][BoundaryInfill]")
+{
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(1.f,.13f,.4f);config.infill_density=100;config.infill_bend_radius_mm=.5;
+    config.landing_length_mm=2;config.cut_to_contact_length_mm=23;config.minimum_effective_length_mm=.5;
+    config.finish_extension_length_mm=23;
+    for(double length:{25.49,25.51}) {
+        const ExPolygons material{rectangle(0,0,1.8,length+1)};
+        const auto candidates=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+        REQUIRE(candidates.paths.size()==1);REQUIRE(candidates.paths.front().arcs.empty());
+        const auto validated=FiberPathValidator::validate_infill(candidates,material,config,{1,0,0,0});
+        CHECK(validated.accepted_count()==(length>25.5?1:0));
+        CHECK(validated.audit_assignments().valid());
+    }
+}
