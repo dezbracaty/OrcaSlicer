@@ -337,6 +337,7 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
         check(config.contour_bend_radius_mm, "fiber_contour_bend_radius");
         if (config.contour_count < 0) throw std::invalid_argument("Invalid fiber contour count");
     }
+    if (!contour) check(config.infill_bend_radius_mm, "fiber_infill_bend_radius");
     if (config.contour_enabled && config.infill_enabled)
         check(config.contour_infill_clearance_mm, "fiber_contour_infill_clearance");
 }
@@ -410,6 +411,7 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
     }
     if (result.infill_enabled) {
         result.infill_pattern = source.reinforced_infill_pattern.value;
+        result.infill_bend_radius_mm = source.fiber_infill_bend_radius.value;
         if (result.infill_pattern != ipRectilinear && result.infill_pattern != ipConcentric)
             throw std::runtime_error("Continuous fiber infill supports only rectilinear and concentric patterns");
         if (!std::isfinite(source.reinforced_infill_density.value))

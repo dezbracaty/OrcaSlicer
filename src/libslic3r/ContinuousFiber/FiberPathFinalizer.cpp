@@ -434,7 +434,7 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     const ExPolygons centerline_domain = planned_centerline_domain ?
         offset_ex(*planned_centerline_domain, float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm))) :
         check_centerline ? offset_ex(allowed_domain, -float(scale_(0.5*candidate.width +
-            config.contour_boundary_clearance_mm - ContourRoundingOptions{}.geometry_tolerance_mm))) : ExPolygons{};
+            (contour ? config.contour_boundary_clearance_mm : 0.0) - ContourRoundingOptions{}.geometry_tolerance_mm))) : ExPolygons{};
     try {
         plan_edges(*prepared, candidate.polyline, config, arcs, check_centerline ? &centerline_domain : nullptr);
     } catch (const std::length_error& error) {
@@ -461,7 +461,7 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     Polygons physical;
     Polygons exclusion;
     Polygons keepout;
-    if (contour) {
+    if (contour || !arcs.empty()) {
         // Process boundaries do not introduce physical end caps in a continuous
         // strand. Sweep connected deposition once, including the cyclic seam.
         Polyline depositing;
@@ -474,7 +474,7 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
             // applies each coverage policy independently.
             append(exclusion, exclusion_radius == physical_radius ? footprint :
                 to_polygons(fiber_contour_coverage(depositing, exclusion_radius)));
-            append(keepout, keepout_radius == physical_radius ? footprint :
+            if (contour) append(keepout, keepout_radius == physical_radius ? footprint :
                 to_polygons(fiber_contour_coverage(depositing, keepout_radius)));
             append(physical, std::move(footprint));
             depositing.points.clear();

@@ -3233,12 +3233,10 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         }
         // Keep planner statistics internal; diagnostics are the existing public
         // channel. Candidates and accepted/rejected fragments are distinct units.
-        std::map<std::string, size_t> contour_rounding_failures, fiber_rejections;
+        std::map<std::string, size_t> fiber_rejections;
         size_t fiber_candidates = 0, fiber_accepted = 0, fiber_split = 0;
         for (const auto* object : print.objects())
             for (const auto* layer : object->layers()) {
-                for (const auto& failure : layer->fiber_contour_rounding_failures)
-                    contour_rounding_failures[failure.first] += failure.second;
                 if (!layer->fiber_outer_contour_failures.empty()) {
                     std::string message = "Some complete fiber outer loops were omitted on layer " +
                         std::to_string(layer->id() + 1) + "; partial outer strands were not emitted. Reasons:";
@@ -3254,12 +3252,6 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                 for (const auto& entry : stats.rejected_fragments)
                     fiber_rejections[entry.first] += entry.second;
             }
-        if (!contour_rounding_failures.empty()) {
-            std::string message = "Some fiber contours were omitted because rounding did not produce a validated path. Reasons below distinguish geometry conflicts, search limits and numerical failures; enable fiber fill debugging to inspect their locations:";
-            for (const auto& failure : contour_rounding_failures)
-                message += " " + failure.first + "=" + std::to_string(failure.second);
-            result.diagnostics.push_back({"fiber_contour_rounding", std::move(message), true, "fiber_contour_bend_radius"});
-        }
         if (fiber_candidates > 0) {
             std::string message = "Continuous fiber infill: candidates=" + std::to_string(fiber_candidates) +
                 ", accepted_fragments=" + std::to_string(fiber_accepted) +

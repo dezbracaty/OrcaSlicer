@@ -7,18 +7,16 @@
 #include <limits>
 #include <utility>
 #include <vector>
-#include <stdexcept>
 #include <algorithm>
 #include <set>
 
 namespace Slic3r {
 
 struct ContourRoundingOptions {
-    double minimum_radius_mm {0.0};
+    // Exact centerline radius; zero disables rounding.
+    double radius_mm {0.0};
     double chord_tolerance_mm {0.00005};
     double geometry_tolerance_mm {0.0001};
-    // Process width, not the preview scale. Zero requests centerline geometry only.
-    double fiber_width_mm {0.0};
 };
 
 // Analytic arc plus its interval on the discretized result, not the source ring.
@@ -95,23 +93,6 @@ ContourRoundingResult search_contour_partitions(std::vector<CornerGroup> initial
     return result;
 }
 
-// Never replace an accepted ring until the complete proposal passes validation.
-// A sampling limit during optional improvement leaves the accepted ring intact.
-template<class Refine,class Validate>
-ContourRoundingResult refine_validated_cycle(ContourRoundingResult baseline,
-    std::vector<TangentSolution> proposal,Refine&& refine,Validate&& validate)
-{
-    if (!baseline.path) return baseline;
-    try {
-        if (refine(proposal)) {
-            auto improved=validate(proposal);
-            if (improved.path) return improved;
-        }
-    } catch (const std::length_error&) {
-        // Only sampling-budget exhaustion is an expected unsuccessful improvement.
-    }
-    return baseline;
-}
 } // namespace continuous_fiber_detail
 
 const char* contour_rounding_failure_name(ContourRoundingFailure reason);
@@ -120,15 +101,8 @@ enum class FiberContourSide : uint8_t { Outer, Hole };
 
 struct FiberContourCandidate {
     Polyline3 geometry;
-    FiberContourSide side;
-    size_t boundary_id;
-    size_t depth;
-    size_t region_id {0};
     size_t part_id {0};
     size_t geometry_domain_id {0};
-    // Original hole identities absorbed into the reconstructed exterior.
-    // Independent hole-loop selection never controls these obstacles.
-    std::vector<size_t> rerouted_hole_ids;
 };
 
 struct FiberContourCandidates {
@@ -142,19 +116,28 @@ struct FiberContourCandidates {
 ExPolygons fiber_material_offset(const ExPolygons& material, double distance_mm);
 ExPolygons fiber_contour_coverage(const Polyline& path, double radius_mm);
 
+struct FiberInfillPath {
+    Polyline3 geometry;
+    std::vector<ContourArc> arcs;
+};
+
+struct FiberInfillCandidates {
+    ExPolygons centerline_domain;
+    std::vector<FiberInfillPath> paths;
+};
+
 class ContinuousFiberFillStrategy {
 public:
+    // Rotation and origin are resolved by Fill, including layer alternation.
+    static FiberInfillCandidates generate_rectilinear(
+        const ExPolygons& material, const ContinuousFiberConfig& config,
+        double rotation_radians, const Point& grid_origin);
+
     // Clearance has already been applied to remaining_material. A hole
     // frontier encloses the original hole and previously accepted rings.
     static FiberContourCandidates generate_contour_level(
         const ExPolygons& remaining_material, double width_mm,
         const ExPolygons* hole_frontier = nullptr);
-
-    // Independent geometric reference offsets, also used by geometry tests.
-    // This low-level utility does not enforce ancestry: production slicing uses
-    // FiberPathValidator::plan_contours and generate_contour_level instead.
-    static FiberContourCandidates generate_contours(
-        const ExPolygons& original_area, const ContinuousFiberConfig& config);
 
     // Shape closed candidates before allocation; exteriors must remain closed.
     static ContourRoundingResult round_contour(

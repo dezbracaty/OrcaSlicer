@@ -2497,6 +2497,10 @@ TEST_CASE("fiber contour rounding configuration persists and is opt in", "[libsl
     const auto snapshot=library->active_config_snapshot();
     CHECK(snapshot->value("fiber_contour_bend_radius")==std::optional<std::string>{"0.5"});
     CHECK_FALSE(snapshot->value("fiber_contour_rounding_max_reserve").has_value());
+    CHECK(snapshot->value("fiber_infill_bend_radius")==std::optional<std::string>{"0"});
+    REQUIRE(library->apply_active_config_patch({{"fiber_infill_bend_radius","0.3"}}).success);
+    CHECK(library->active_config_snapshot()->value("fiber_infill_bend_radius")==std::optional<std::string>{"0.3"});
+    CHECK(library->active_config_snapshot()->value("fiber_contour_bend_radius")==std::optional<std::string>{"0.5"});
 }
 
 

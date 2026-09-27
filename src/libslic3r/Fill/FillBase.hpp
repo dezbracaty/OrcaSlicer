@@ -115,6 +115,9 @@ static_assert(IsTriviallyCopyable<FillParams>::value, "FillParams class is not P
 class Fill
 {
 public:
+    // Shared orientation for generators that retain analytic curve metadata.
+    std::pair<float, Point> infill_direction(const Surface& surface) const { return _infill_direction(&surface); }
+
     // Index of the layer.
     size_t      layer_id;
     // Z coordinate of the top print surface, in unscaled coordinates

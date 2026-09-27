@@ -1807,13 +1807,25 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         if (!infill_job.expolygons.empty()) {
             apply_fiber_infill_params(infill_job.params, config, domain.policy);
 
-            ExtrusionEntitiesPtr candidates;
-            const FillExecutionPolicy infill_policy { false, false, true };
-            execute_surface_fill_job(context, infill_job, candidates, infill_policy);
-            OwnedCandidateEntities owner(std::move(candidates));
-            infill_result = FiberPathValidator::validate(
-                owner.root.entities, infill_allowed_domain, config, FiberPathPurpose::Infill,
-                erContinuousFiberInfill, domain_id);
+            if (config.infill_pattern == ipRectilinear && config.infill_bend_radius_mm > 0) {
+                std::unique_ptr<Fill> direction(Fill::new_from_type(ipRectilinear));
+                direction->set_bounding_box(context.object_bbox);
+                direction->layer_id = context.layer.id();
+                direction->angle = infill_job.params.angle;
+                direction->fixed_angle = infill_job.params.fixed_angle;
+                const auto orientation = direction->infill_direction(infill_job.surface);
+                const auto candidates = ContinuousFiberFillStrategy::generate_rectilinear(
+                    infill_allowed_domain, config, orientation.first, orientation.second);
+                infill_result = FiberPathValidator::validate_infill(candidates, infill_allowed_domain, config, domain_id);
+            } else {
+                ExtrusionEntitiesPtr candidates;
+                const FillExecutionPolicy infill_policy { false, false, true };
+                execute_surface_fill_job(context, infill_job, candidates, infill_policy);
+                OwnedCandidateEntities owner(std::move(candidates));
+                infill_result = FiberPathValidator::validate(
+                    owner.root.entities, infill_allowed_domain, config, FiberPathPurpose::Infill,
+                    erContinuousFiberInfill, domain_id);
+            }
         }
     }
 
@@ -1854,18 +1866,6 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 [&](const auto& candidate) { return candidate.id == assignment.id.parent; });
             if (extent != validation.candidates.end() && extent->requires_closed_loop)
                 ++context.layer.fiber_outer_contour_failures[fiber_rejection_reason_name(assignment.reason)];
-            if (assignment.reason == FiberRejectionReason::ContourRoundingUnresolved) {
-                std::set<ContourRoundingFailure> reasons;
-                for (const auto& issue : assignment.contour_issues) reasons.insert(issue.reason);
-                if (reasons.empty())
-                    ++context.layer.fiber_contour_rounding_failures[fiber_rejection_reason_name(assignment.reason)];
-                for (const auto reason : reasons) {
-                    const char* name = contour_rounding_failure_name(reason);
-                    ++context.layer.fiber_contour_rounding_failures[name];
-                    if (!detail.empty()) detail += "; ";
-                    detail += name;
-                }
-            }
             if (context.layer.object()->print()->config().fiber_fill_debug.value && assignment.centerline) {
                 context.layer.fiber_fill_diagnostics.push_back({
                     assignment.centerline->polyline.to_polyline(),
@@ -1952,7 +1952,6 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 {
     fiber_infill_statistics = {};
     fiber_fill_diagnostics.clear();
-    fiber_contour_rounding_failures.clear();
     fiber_outer_contour_failures.clear();
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING

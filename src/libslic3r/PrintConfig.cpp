@@ -1024,8 +1024,16 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionFloat(10.0));
 
     def = this->add("fiber_contour_bend_radius", coFloat);
-    def->label = L("Minimum fiber contour bend radius");
-    def->tooltip = L("Replace contour corners with tangent arcs of at least this radius. The effective minimum is also limited to half the fiber extrusion width plus 0.0001 mm to prevent the inside of a bend from folding. Zero disables rounding. Unresolved contours are reported and are not printed as compliant fiber paths.");
+    def->label = L("Fiber contour bend radius");
+    def->tooltip = L("Replace contour corners with tangent arcs of exactly this centerline radius. Zero disables rounding. If the contour solver cannot resolve a path at this radius, slicing stops with an error.");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_infill_bend_radius", coFloat);
+    def->label = L("Fiber infill bend radius");
+    def->tooltip = L("Use exactly this centerline radius for rectilinear fiber returns. Zero disables rounded returns. Scanline spacing must be at least twice this radius.");
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;

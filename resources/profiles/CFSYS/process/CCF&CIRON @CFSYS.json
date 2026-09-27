@@ -2,6 +2,7 @@
   "type": "process",
   "instantiation": "true",
   "fiber_infill_max_speed": "10",
+  "fiber_infill_bend_radius": "0",
   "fiber_contour_max_speed": "10",
   "fiber_infill_feed_ratio": "1",
   "fiber_contour_feed_ratio": "1",

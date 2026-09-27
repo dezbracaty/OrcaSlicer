@@ -118,9 +118,9 @@ public:
         const ExPolygons& original_area, const ContinuousFiberConfig& config,
         const FiberDomainId& domain_id, bool collect_debug = false);
 
-    static FiberValidationResult validate_contours(
-        const FiberContourCandidates& candidates, const ExPolygons& allowed_domain,
-        const ContinuousFiberConfig& config, const FiberDomainId& domain_id, bool collect_debug = false);
+    static FiberValidationResult validate_infill(
+        const FiberInfillCandidates& candidates, const ExPolygons& allowed_domain,
+        const ContinuousFiberConfig& config, const FiberDomainId& domain_id);
 
     static FiberValidationResult validate(
         const ExtrusionEntitiesPtr& candidates,
@@ -138,7 +138,7 @@ private:
         ExtrusionRole output_role, const FiberDomainId& domain_id, size_t job_ordinal,
         const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
         const ExPolygons* physical_centerline_domain, bool collect_debug,
-        bool requires_closed_loop = false);
+        bool requires_closed_loop = false, const std::vector<ContourArc>* source_arcs = nullptr);
 };
 
 } // namespace Slic3r

@@ -107,6 +107,7 @@ set(lisbslic3r_sources
     ContourZ.cpp
     ContinuousFiber/ContinuousFiberConfig.cpp
     ContinuousFiber/ContinuousFiberConfig.hpp
+    ContinuousFiber/ContinuousFiberRectilinear.cpp
     ContinuousFiber/ContinuousFiberFillStrategy.cpp
     ContinuousFiber/ContinuousFiberFillStrategy.hpp
     ContinuousFiber/FiberCoverageLedger.cpp

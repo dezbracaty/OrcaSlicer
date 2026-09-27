@@ -131,7 +131,6 @@ public:
         std::map<std::string, size_t> rejected_fragments;
     };
     FiberInfillStatistics fiber_infill_statistics;
-    std::map<std::string, size_t> fiber_contour_rounding_failures;
     std::map<std::string, size_t> fiber_outer_contour_failures;
     enum class FiberDiagnosticKind { RejectedPath, OriginalContourRegion, MissingContourRegion, ContourCandidate, RoundedContourCandidate };
     struct FiberFillDiagnostic {

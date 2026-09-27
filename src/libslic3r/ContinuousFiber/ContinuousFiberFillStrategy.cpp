@@ -51,8 +51,12 @@ std::vector<Vec2d> canonical_ring(const Polyline& source)
         for (size_t i = 0; i < p.size(); ++i) {
             const Vec2d u = p[i]-p[(i+p.size()-1)%p.size()];
             const Vec2d v = p[(i+1)%p.size()]-p[i];
-            if (u.norm() < 1e-9 || (u.dot(v) > 0 &&
-                std::abs(cross2(u,v))/(u+v).norm() <= straight_tolerance_mm)) {
+            // Integer offsets can leave a one-unit reverse spur on an otherwise
+            // smooth boundary. The clamped segment-distance check below retains
+            // real reversals and bounds every removed source point, including
+            // points removed by earlier simplification steps.
+            if (u.norm() < 1e-9 ||
+                std::abs(cross2(u,v))/(u+v).norm() <= straight_tolerance_mm) {
                 const size_t before=(i+p.size()-1)%p.size(),after=(i+1)%p.size();
                 const Vec2d a=p[before],delta=p[after]-a;
                 bool within=delta.squaredNorm()>1e-18;
@@ -117,25 +121,6 @@ std::optional<TangentSupports> supports(const std::vector<Vec2d>& p, CornerGroup
     s.base=solve(s.c-s.a);
     s.slope=solve(std::copysign(1.0,s.angle)*(left_normal(s.v)-left_normal(s.u)));
     return s;
-}
-
-std::optional<std::pair<double,double>> radius_interval(const TangentSupports& s, double minimum,
-    double incoming_min=0,double outgoing_max=HUGE_VAL)
-{
-    double lo=minimum, hi=std::numeric_limits<double>::infinity();
-    for (size_t i=0; i<2; ++i) {
-        const double z=s.base[i], k=s.slope[i];
-        const double lower=i==0?std::max(0.0,incoming_min):0.0;
-        const double upper=i==0?s.incoming_length:std::min(s.outgoing_length,outgoing_max);
-        if (upper<lower) return {};
-        if (std::abs(k)<1e-12) { if (z < lower-1e-8 || z>upper+1e-8) return {}; }
-        else {
-            const double a=(lower-z)/k, b=(upper-z)/k;
-            lo=std::max(lo,std::min(a,b)); hi=std::min(hi,std::max(a,b));
-        }
-    }
-    if (!std::isfinite(hi) || hi<lo) return {};
-    return {{lo,hi}};
 }
 
 TangentSolution circle(const TangentSupports& s, double radius)
@@ -215,46 +200,44 @@ Polyline sample_connection(const TangentSolution& value, double tolerance)
     return line;
 }
 
-// A connection is C, CSC or CCC. The supports and all three radii are
-// independent; Rmin is a lower bound, not the radius of every arc.
+// A connection is C, CSC or CCC. Only the two support contacts vary;
+// every arc uses the configured centerline radius.
 struct ConnectionFamily { int first, last, branch; }; // branch == 0: CSC
 struct ConnectionProblem {
     Vec2d entry, exit, u, v;
-    double incoming_length, outgoing_length, minimum_radius;
+    double incoming_length, outgoing_length, radius;
     double turn_radians=0, absolute_turn=0;
     double heading_min=0, heading_max=0;
 };
 std::optional<TangentSolution> connection(const ConnectionProblem& p,
     ConnectionFamily family, const std::vector<double>& x, double& violation)
 {
-    const double retreat=x[0]*p.minimum_radius, advance=x[1]*p.minimum_radius;
-    const double r0=x[2]*p.minimum_radius, rm=(family.branch==0?0:x[3])*p.minimum_radius, r1=x.back()*p.minimum_radius;
+    const double retreat=x[0]*p.radius, advance=x[1]*p.radius;
+    const double radius=p.radius;
     const Vec2d a=p.entry-retreat*p.u, b=p.exit+advance*p.v;
-    const Vec2d c0=a+family.first*r0*left_normal(p.u);
-    const Vec2d c1=b+family.last*r1*left_normal(p.v), delta=c1-c0;
+    const Vec2d c0=a+family.first*radius*left_normal(p.u);
+    const Vec2d c1=b+family.last*radius*left_normal(p.v), delta=c1-c0;
     const double d=delta.norm();
     TangentSolution result{{},p.incoming_length-retreat,advance};
     violation=0;
     if (family.branch==0) {
-        const double normal=family.last*r1-family.first*r0;
+        const double normal=family.last*radius-family.first*radius;
         violation=std::max(0.0,std::abs(normal)-d);
         if (violation>0 || d<1e-10) { violation=std::max(violation,1e-8); return {}; }
         const double angle=std::atan2(delta.y(),delta.x())-std::asin(std::clamp(normal/d,-1.0,1.0));
         const Vec2d tangent(std::cos(angle),std::sin(angle));
-        const Vec2d t0=c0-family.first*r0*left_normal(tangent),t1=c1-family.last*r1*left_normal(tangent);
-        result.arcs={connecting_arc(c0,a,t0,r0,family.first),
-                     connecting_arc(c1,t1,b,r1,family.last)};
+        const Vec2d t0=c0-family.first*radius*left_normal(tangent),t1=c1-family.last*radius*left_normal(tangent);
+        result.arcs={connecting_arc(c0,a,t0,radius,family.first),
+                     connecting_arc(c1,t1,b,radius,family.last)};
     } else {
-        const double a_radius=r0+rm,b_radius=r1+rm;
-        violation=std::max({0.0,d-a_radius-b_radius,std::abs(a_radius-b_radius)-d});
+        violation=std::max(0.0,d-4*radius);
         if (violation>0 || d<1e-10) { violation=std::max(violation,1e-8); return {}; }
-        const double along=(d*d+a_radius*a_radius-b_radius*b_radius)/(2*d);
-        const double height=std::sqrt(std::max(0.0,a_radius*a_radius-along*along));
-        const Vec2d middle=c0+along*delta/d+family.branch*height*left_normal(delta/d);
-        const Vec2d t0=(rm*c0+r0*middle)/(r0+rm),t1=(rm*c1+r1*middle)/(r1+rm);
-        result.arcs={connecting_arc(c0,a,t0,r0,family.first),
-                     connecting_arc(middle,t0,t1,rm,-family.first),
-                     connecting_arc(c1,t1,b,r1,family.last)};
+        const double height=std::sqrt(std::max(0.0,4*radius*radius-.25*d*d));
+        const Vec2d middle=.5*(c0+c1)+family.branch*height*left_normal(delta/d);
+        const Vec2d t0=.5*(c0+middle),t1=.5*(c1+middle);
+        result.arcs={connecting_arc(c0,a,t0,radius,family.first),
+                     connecting_arc(middle,t0,t1,radius,-family.first),
+                     connecting_arc(c1,t1,b,radius,family.last)};
     }
     return result;
 }
@@ -467,51 +450,30 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
         for (const auto& old:result.values) if (same_connection(old,value)) return;
         if (!feasible(value)) return;
         const double incoming_length=(p[group.first]-p[(group.first+p.size()-1)%p.size()]).norm();
-        value.score=known_score?*known_score:connection_score(value,knots,options.minimum_radius_mm,incoming_length,absolute_turn);
+        value.score=known_score?*known_score:connection_score(value,knots,options.radius_mm,incoming_length,absolute_turn);
         result.values.push_back(std::move(value));
     };
-    if (const auto s=supports(p,group))
-        if (const auto interval=radius_interval(*s,options.minimum_radius_mm,incoming_min,outgoing_max)) {
-            add(circle(*s,interval->first));
-            if (group.count>1 && interval->second-interval->first>1e-10) {
-                // Do not assume a unimodal objective. Sample the entire support
-                // interval, then refine around the best sampled score. Retain
-                // distinct valid poses so neighbouring windows still have choices.
-                constexpr size_t samples=16;
-                const double step=(interval->second-interval->first)/samples;
-                double best_radius=interval->first,best_score=HUGE_VAL;
-                const double incoming_length=s->incoming_length;
-                const auto inspect=[&](double radius) {
-                    auto value=circle(*s,radius);
-                    const double score=connection_score(value,knots,options.minimum_radius_mm,incoming_length,absolute_turn);
-                    if (score<best_score) { best_score=score;best_radius=radius; }
-                    add(std::move(value),score);
-                };
-                for (size_t i=0;i<=samples;++i) inspect(interval->first+i*step);
-                double width=step;
-                for (size_t pass=0;pass<3;++pass) {
-                    const double lo=std::max(interval->first,best_radius-width);
-                    const double hi=std::min(interval->second,best_radius+width);
-                    for (size_t i=1;i<samples;++i) inspect(lo+(hi-lo)*double(i)/samples);
-                    width=(hi-lo)/samples;
-                }
-            }
-            if (!result.values.empty()) { prune_candidates(result);return result; }
-        }
+    if (const auto s=supports(p,group)) {
+        auto value=circle(*s,options.radius_mm);
+        if (value.incoming_remaining>=-1e-8 && value.incoming_remaining<=s->incoming_length+1e-8 &&
+            value.outgoing_consumed>=-1e-8 && value.outgoing_consumed<=s->outgoing_length+1e-8)
+            add(std::move(value));
+        if (!result.values.empty()) return result;
+    }
     const size_t n=p.size(),last=(group.first+group.count-1)%n;
     ConnectionProblem problem;
     problem.entry=p[group.first]; problem.exit=p[last];
     problem.u=problem.entry-p[(group.first+n-1)%n]; problem.v=p[(last+1)%n]-problem.exit;
     problem.incoming_length=problem.u.norm(); problem.outgoing_length=problem.v.norm();
-    problem.minimum_radius=options.minimum_radius_mm;
+    problem.radius=options.radius_mm;
     problem.turn_radians=source_turn;problem.absolute_turn=absolute_turn;
     problem.heading_min=heading_min;problem.heading_max=heading_max;
     if (problem.incoming_length<1e-9 || problem.outgoing_length<1e-9) return result;
     problem.u/=problem.incoming_length; problem.v/=problem.outgoing_length;
     const double half=std::abs(turn(problem.u,problem.v))*.5,sine=std::sin(half);
     const double anchor=sine+std::sqrt(sine*sine+2*(1-std::cos(half)));
-    const std::vector<double> upper={(problem.incoming_length-incoming_min)/options.minimum_radius_mm,
-        std::min(problem.outgoing_length,outgoing_max)/options.minimum_radius_mm,HUGE_VAL,HUGE_VAL,HUGE_VAL};
+    const std::vector<double> upper={(problem.incoming_length-incoming_min)/options.radius_mm,
+        std::min(problem.outgoing_length,outgoing_max)/options.radius_mm};
     if (upper[0]<1e-8 || upper[1]<1e-8) return result;
     struct Search {
         const ConnectionProblem* problem;
@@ -540,7 +502,7 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
         }
         double score() const {
             if (!last_score)
-                last_score=connection_score(*last_connection,*knots,problem->minimum_radius,
+                last_score=connection_score(*last_connection,*knots,problem->radius,
                     problem->incoming_length,problem->absolute_turn);
             return *last_score;
         }
@@ -551,7 +513,7 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
             return *last_constraint;
         }
         double boundary_violation(const std::optional<TangentSolution>& value) const {
-            if (!value) return 1+last_violation/problem->minimum_radius;
+            if (!value) return 1+last_violation/problem->radius;
             const double winding_error=turn_violation(*value,problem->turn_radians,problem->heading_min,problem->heading_max);
             if (winding_error>1e-8) return winding_error;
             double outside=-HUGE_VAL;
@@ -588,7 +550,7 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
                 }
             }
             if (outside<=0) retain(*value,last_score);
-            return (outside+tolerance)/problem->minimum_radius;
+            return (outside+tolerance)/problem->radius;
         }
         static double boundary(const std::vector<double>& x,std::vector<double>&,void* data) {
             return static_cast<Search*>(data)->constraint(x);
@@ -596,15 +558,23 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
         static double objective(const std::vector<double>& x,std::vector<double>&,void* data) {
             const auto& self=*static_cast<Search*>(data);
             const auto& value=self.evaluate(x);
-            if (!value) return 100+self.last_violation/self.problem->minimum_radius;
+            if (!value) return 100+self.last_violation/self.problem->radius;
             return self.score();
         }
     };
+    // Coupled turns have displaced supports. Seed their actual tangent
+    // contacts instead of assuming both contacts retreat by the same distance.
+    std::vector<double> tangent_seed{std::min(upper[0],anchor),std::min(upper[1],anchor)};
+    if (const auto s=supports(p,group)) {
+        const Vec2d contact=s->base+options.radius_mm*s->slope;
+        tangent_seed[0]=std::clamp((s->incoming_length-contact.x())/options.radius_mm,0.0,upper[0]);
+        tangent_seed[1]=std::clamp(contact.y()/options.radius_mm,0.0,upper[1]);
+    }
     // A wedge has a closed-form equal-radius solution. Check all branches
     // before invoking the numerical solver for coupled/irregular windows.
     for (int first:{1,-1}) for (int branch:{1,-1}) {
-        std::vector<double> x={std::min(upper[0],anchor+2*options.geometry_tolerance_mm/options.minimum_radius_mm),
-            std::min(upper[1],anchor+2*options.geometry_tolerance_mm/options.minimum_radius_mm),1,1,1};
+        std::vector<double> x={std::min(upper[0],anchor+2*options.geometry_tolerance_mm/options.radius_mm),
+            std::min(upper[1],anchor+2*options.geometry_tolerance_mm/options.radius_mm)};
         double violation;
         if (auto value=connection(problem,{first,first,branch},x,violation)) add(*value);
     }
@@ -614,21 +584,21 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
     if (!distances) distances.emplace(domain);
     for (int first:{1,-1}) for (int kind=0;kind<4;++kind) {
         ConnectionFamily family{first,kind<2?(kind==0?first:-first):first,kind<2?0:(kind==2?1:-1)};
-        // Two geometric poses: wedge tangency and the middle of each available
-        // support. Optimization moves the two contacts independently.
-        for (int seed=0;seed<2;++seed) {
-            std::vector<double> x={std::min(upper[0],anchor),std::min(upper[1],anchor),1,1,1};
-            if (seed) { x[0]=upper[0]*.5; x[1]=upper[1]*.5; }
+        // Single-circle tangency, symmetric CCC retreat and the support
+        // midpoint seed distinct contact poses without changing the radius.
+        const std::vector<std::vector<double>> seeds{tangent_seed,
+            {std::min(upper[0],anchor),std::min(upper[1],anchor)},
+            {upper[0]*.5,upper[1]*.5}};
+        for (size_t seed=0;seed<seeds.size();++seed) {
+            if (std::find(seeds.begin(),seeds.begin()+seed,seeds[seed])!=seeds.begin()+seed) continue;
+            auto x=seeds[seed];
             Search search{&problem,family,&*distances,options.chord_tolerance_mm*.5,&knots,add};
-            const size_t dimensions=family.branch==0?4:5;
-            x.resize(dimensions);
-            auto bounds=upper;bounds.resize(dimensions);
-            std::vector<double> lower(dimensions,1.0);lower[0]=lower[1]=0;
-            nlopt::opt optimizer(nlopt::LN_COBYLA,unsigned(dimensions));
-            optimizer.set_lower_bounds(lower); optimizer.set_upper_bounds(bounds);
+            nlopt::opt optimizer(nlopt::LN_COBYLA,2);
+            optimizer.set_lower_bounds(std::vector<double>{0,0});
+            optimizer.set_upper_bounds(upper);
             optimizer.set_min_objective(Search::objective,&search);
             optimizer.add_inequality_constraint(Search::boundary,&search,1e-8);
-            std::vector<double> step(dimensions,.25);
+            std::vector<double> step(2);
             step[0]=std::min(.5,upper[0]*.25);step[1]=std::min(.5,upper[1]*.25);
             optimizer.set_initial_step(step);
             optimizer.set_xtol_abs(1e-5); optimizer.set_maxeval(180);
@@ -654,12 +624,12 @@ std::vector<CornerGroup> conflict_windows(const std::vector<Vec2d>& p,
     for (size_t i=0;i<n;++i) {
         const double angle=turn(p[i]-p[(i+n-1)%n],p[(i+1)%n]-p[i]);
         const double half=std::min(std::abs(angle),PI-1e-7)*.5;
-        retreat[i]=options.minimum_radius_mm*std::tan(half);
+        retreat[i]=options.radius_mm*std::tan(half);
         if (const auto s=supports(p,{i,1})) {
-            const auto value=circle(*s,options.minimum_radius_mm);
+            const auto value=circle(*s,options.radius_mm);
             if (!inside(sample_connection(value,options.chord_tolerance_mm),domain)) {
                 const double sine=std::sin(half);
-                retreat[i]=std::max(retreat[i],options.minimum_radius_mm*(sine+std::sqrt(sine*sine+2*(1-std::cos(half)))));
+                retreat[i]=std::max(retreat[i],options.radius_mm*(sine+std::sqrt(sine*sine+2*(1-std::cos(half)))));
             }
         }
     }
@@ -954,7 +924,7 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
             // attempted. Unknown windows use only this analytic estimate.
             ++unresolved;
             if (const auto support=supports(p,group)) {
-                const Vec2d contact=support->base+options.minimum_radius_mm*support->slope;
+                const Vec2d contact=support->base+options.radius_mm*support->slope;
                 deficit+=std::max({0.0,-contact.x(),contact.x()-support->incoming_length})+
                     std::max({0.0,-contact.y(),contact.y()-support->outgoing_length});
             }
@@ -1083,30 +1053,7 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
             return validate_cycle(values,source,domain,output_domain,options);
         });
         searches_left-=allowance-remaining;
-        if (!result.path) return result;
-        // Improvement is optional and transactional: immutable candidates retain
-        // the accepted baseline even if a better local pose crosses a distant edge.
-        std::vector<TangentSolution> proposal;
-        for (size_t i=0;i<groups.size();++i) proposal.push_back(candidates[i].values[choice.indices[i]]);
-        return refine_validated_cycle(std::move(result),std::move(proposal),[&](auto& proposal) {
-            bool improved=false;
-            for (size_t i=0;i<groups.size() && local_queries_left>0;++i) {
-                auto& selected=proposal[i];
-                const auto& unconstrained=cache.at({groups[i].first,groups[i].count}).values;
-                const auto best=std::min_element(unconstrained.begin(),unconstrained.end(),
-                    [](const auto& a,const auto& b){return a.score<b.score;});
-                if (best==unconstrained.end() || selected.score<=best->score+1e-8) continue;
-                const double lo=proposal[(i+groups.size()-1)%groups.size()].outgoing_consumed;
-                const double hi=proposal[(i+1)%groups.size()].incoming_remaining;
-                auto refined=solve(groups[i],lo,hi);
-                for (auto& value:refined.values) if (value.score<selected.score-1e-8) {
-                    selected=std::move(value);improved=true;
-                }
-            }
-            return improved;
-        },[&](const auto& proposal) {
-            return validate_cycle(proposal,source,domain,output_domain,options);
-        });
+        return result;
     };
     result=search_contour_partitions(conflict_windows(p,options,domain),source,
         revisions_left,searches_left,attempt);
@@ -1173,16 +1120,15 @@ const char* contour_rounding_failure_name(ContourRoundingFailure reason)
 ContourRoundingResult ContinuousFiberFillStrategy::round_contour(
     const Polyline3& source,const ExPolygons& centerline_domain,const ContourRoundingOptions& options)
 {
-    if (options.minimum_radius_mm==0) {
+    if (options.radius_mm==0) {
         ContourRoundingResult result; result.path=source; return result;
     }
     const Polyline line=source.to_polyline();
     ContourRoundingResult invalid;
     invalid.issues.push_back({ContourRoundingFailure::InvalidInput,line});
-    if (!std::isfinite(options.minimum_radius_mm) || options.minimum_radius_mm<0 ||
+    if (!std::isfinite(options.radius_mm) || options.radius_mm<0 ||
         !std::isfinite(options.chord_tolerance_mm) || options.chord_tolerance_mm<=0 ||
         !std::isfinite(options.geometry_tolerance_mm) || options.geometry_tolerance_mm<=options.chord_tolerance_mm ||
-        !std::isfinite(options.fiber_width_mm) || options.fiber_width_mm<0 ||
         line.points.size()<4 || line.points.front()!=line.points.back() || centerline_domain.empty() ||
         std::any_of(source.points.begin(),source.points.end(),[](const Point3& p){return p.z()!=0;})) return invalid;
     try {
@@ -1191,11 +1137,7 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_contour(
         // Curved primitives reserve chord error for their analytic arcs. Straight
         // support gaps have no chord error and use the full geometry tolerance.
         const ExPolygons output_domain=offset_ex(centerline_domain,float(scale_(options.geometry_tolerance_mm)));
-        auto effective=options;
-        if (options.fiber_width_mm>0)
-            effective.minimum_radius_mm=std::max(options.minimum_radius_mm,
-                .5*options.fiber_width_mm+options.geometry_tolerance_mm);
-        return solve_ring(line,comparison_domain,output_domain,effective);
+        return solve_ring(line,comparison_domain,output_domain,options);
     } catch (const std::length_error&) {
         invalid.issues.front().reason=ContourRoundingFailure::SamplingLimit; return invalid;
     }
@@ -1278,108 +1220,11 @@ FiberContourCandidates ContinuousFiberFillStrategy::generate_contour_level(
     });
     for (auto& shape : shapes) {
         const size_t geometry_domain = result.geometry_domains.size();
-        result.geometry_domains.push_back(hole_frontier ?
-            diff_ex(result.centerline_domain, *hole_frontier) : ExPolygons{shape});
+        // The planner supplies a hole's shaping domain from its own frontier.
+        if (!hole_frontier) result.geometry_domains.push_back(ExPolygons{shape});
         if (hole_frontier) shape.contour.reverse();
         result.paths.push_back({Polyline3(shape.contour.split_at_index(0)),
-            hole_frontier ? FiberContourSide::Hole : FiberContourSide::Outer,
-            0, 0, 0, result.paths.size(), geometry_domain, {}});
-    }
-    return result;
-}
-
-FiberContourCandidates ContinuousFiberFillStrategy::generate_contours(
-    const ExPolygons& original_area, const ContinuousFiberConfig& config)
-{
-    FiberContourCandidates result;
-    const double width = config.contour_flow.width();
-    if (!std::isfinite(width) || width <= 0 || !std::isfinite(config.contour_boundary_clearance_mm) ||
-        config.contour_boundary_clearance_mm < 0 || config.contour_count < 0)
-        throw std::invalid_argument("Invalid fiber contour geometry parameters");
-    result.centerline_domain = offset_ex(original_area,
-        -float(scale_(0.5 * width + config.contour_boundary_clearance_mm)));
-    // Canonical source ordering does not depend on the hole switch or caller order.
-    const auto canonical = [](Polygon polygon) {
-        polygon.make_counter_clockwise();
-        if (!polygon.points.empty())
-            std::rotate(polygon.points.begin(), std::min_element(polygon.points.begin(), polygon.points.end()), polygon.points.end());
-        return polygon;
-    };
-    const auto ordered = [&](Polygons polygons) {
-        for (auto& polygon : polygons) polygon = canonical(std::move(polygon));
-        std::sort(polygons.begin(), polygons.end(), [](const Polygon& a, const Polygon& b) { return a.points < b.points; });
-        return polygons;
-    };
-    // Preserve source identities even when an expanded hole joins the exterior.
-    // Only exterior-connected obstacle groups change the outer route. Expanding
-    // every hole into the outer envelope would unnecessarily split narrow lobes
-    // around independent bores and let small local rings displace the main loop.
-    const double inset = 0.5 * width + config.contour_boundary_clearance_mm;
-    std::vector<ExPolygon> regions = original_area;
-    for (auto& region : regions) {
-        region.contour = canonical(std::move(region.contour));
-        region.holes = ordered(std::move(region.holes));
-    }
-    std::sort(regions.begin(), regions.end(), [](const auto& a, const auto& b) {
-        return a.contour.points < b.contour.points;
-    });
-    const auto emit = [&](const ExPolygons& shapes, FiberContourSide side, size_t region,
-                          size_t boundary, size_t depth, size_t geometry_domain,
-                          const std::vector<size_t>& rerouted_holes = {}) {
-        Polygons rings;
-        for (const auto& shape : shapes) rings.push_back(shape.contour);
-        size_t part = 0;
-        for (auto ring : ordered(std::move(rings))) {
-            if (side == FiberContourSide::Hole) ring.reverse();
-            result.paths.push_back({Polyline3(ring.split_at_index(0)), side, boundary, depth,
-                                    region, part++, geometry_domain, rerouted_holes});
-        }
-    };
-    for (size_t region_id = 0; region_id < regions.size(); ++region_id) {
-        const auto& region = regions[region_id];
-        const ExPolygons envelope = offset_ex(ExPolygons{ExPolygon(region.contour)}, -float(scale_(inset)));
-        for (int depth = 0; depth < config.contour_count; ++depth) {
-            const double depth_inset = inset + depth * width;
-            const ExPolygons depth_envelope = offset_ex(ExPolygons{ExPolygon(region.contour)},
-                -float(scale_(depth_inset)));
-            std::vector<ExPolygons> expanded_holes;
-            ExPolygons obstacles;
-            for (const auto& hole : region.holes) {
-                expanded_holes.push_back(offset_ex(ExPolygons{ExPolygon(hole)}, float(scale_(depth_inset))));
-                append(obstacles, expanded_holes.back());
-            }
-            // Union first: a chain of touching holes can reach the exterior even
-            // when only one original hole directly touches it. A tangent passage
-            // within the geometry tolerance is also unavailable to a finite strip.
-            const ExPolygons interior = offset_ex(depth_envelope,
-                -float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
-            ExPolygons exterior_obstacles;
-            for (const auto& group : union_ex(obstacles))
-                if (!diff_ex(ExPolygons{group}, interior).empty())
-                    exterior_obstacles.push_back(group);
-            std::vector<size_t> rerouted_holes;
-            for (size_t hole_id = 0; hole_id < expanded_holes.size(); ++hole_id)
-                if (!intersection_ex(expanded_holes[hole_id], exterior_obstacles).empty())
-                    rerouted_holes.push_back(hole_id);
-            const ExPolygons route_domain = exterior_obstacles.empty() ? depth_envelope :
-                diff_ex(depth_envelope, exterior_obstacles);
-            const size_t outer_domain = result.geometry_domains.size();
-            // Rounding must obey all actual holes, including ones not absorbed
-            // into the outer route, and preserve the new loop's enclosure.
-            result.geometry_domains.push_back(intersection_ex(route_domain, result.centerline_domain));
-            const ExPolygons outside = intersection_ex(offset2_ex(route_domain,
-                -float(scale_(0.5 * width)), float(scale_(0.5 * width))), route_domain);
-            emit(outside, FiberContourSide::Outer, region_id, 0, size_t(depth), outer_domain, rerouted_holes);
-        }
-        if (!config.contour_include_holes) continue;
-        for (size_t hole_id = 0; hole_id < region.holes.size(); ++hole_id) {
-            const ExPolygons hole{ExPolygon(region.holes[hole_id])};
-            const size_t hole_domain = result.geometry_domains.size();
-            result.geometry_domains.push_back(diff_ex(envelope, offset_ex(hole, float(scale_(inset)))));
-            for (int depth = 0; depth < config.contour_count; ++depth)
-                emit(offset_ex(hole, float(scale_(inset + depth * width))), FiberContourSide::Hole,
-                     region_id, hole_id, size_t(depth), hole_domain);
-        }
+            result.paths.size(), geometry_domain});
     }
     return result;
 }

@@ -205,6 +205,8 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
         item.enabled = infill_enabled;
     } else if (key_is(item.key, {"fiber_contour_boundary_clearance", "fiber_contour_bend_radius"})) {
         item.enabled = contour_enabled;
+    } else if (item.key == "fiber_infill_bend_radius") {
+        item.enabled = infill_enabled && config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
     } else if (item.key == "fiber_contour_infill_clearance") {
         item.enabled = contour_enabled && infill_enabled;
     } else if (key_is(item.key, {"fiber_width", "fiber_layer_height_ratio",
