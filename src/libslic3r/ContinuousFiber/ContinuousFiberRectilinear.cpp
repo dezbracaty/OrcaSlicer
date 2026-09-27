@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cmath>
+#include <memory>
 
 namespace Slic3r {
 namespace {
@@ -226,7 +227,13 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
     const auto shape = make_return(radius, pitch);
     // Each row interval is visited once. Turns in different strips are separated
     // by the scan grid; independent turns sharing a strip also reserve width.
-    std::vector<Polylines> placed_returns(rows.size());
+    struct Strip {
+        Polylines pending;
+        ExPolygons occupied, domain;
+        Linesf edges;
+        AABBTreeIndirect::Tree<2, double> tree;
+    };
+    std::vector<std::unique_ptr<Strip>> strips(rows.size());
     for (size_t first = 0; first < rows.size(); ++first) for (size_t seed = 0; seed < rows[first].scans.size(); ++seed) {
         if (rows[first].scans[seed].used) continue;
         struct Visit { size_t row, scan; };
@@ -246,19 +253,7 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
                 for (int step : {1, -1}) {
                     if ((step < 0 && visit.row == 0) || (step > 0 && visit.row + 1 == rows.size())) continue;
                     const size_t target = step > 0 ? visit.row + 1 : visit.row - 1;
-                    if (std::none_of(rows[target].scans.begin(), rows[target].scans.end(), [](const auto& scan) { return !scan.used; })) continue;
-                    const size_t strip = std::min(visit.row, target);
-                    ExPolygons restricted;
-                    Linesf restricted_edges;
-                    AABBTreeIndirect::Tree<2, double> restricted_tree;
-                    const bool has_previous = !placed_returns[strip].empty();
-                    if (has_previous) {
-                        ExPolygons occupied;
-                        for (const auto& previous : placed_returns[strip]) append(occupied, fiber_contour_coverage(previous, width));
-                        restricted = diff_ex(local, union_ex(occupied));
-                        restricted_edges = boundary_lines(restricted);
-                        restricted_tree = AABBTreeLines::build_aabb_tree_over_indexed_lines(restricted_edges);
-                    }
+                    auto& strip = strips[std::min(visit.row, target)];
                     for (size_t next = 0; next < rows[target].scans.size(); ++next) {
                         const auto& other = rows[target].scans[next];
                         if (other.used) continue;
@@ -266,15 +261,27 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
                             direction > 0 ? other.lo : -other.hi});
                         const double hi = std::min(direction > 0 ? current.hi : -current.lo,
                             direction > 0 ? other.hi : -other.lo);
-                        auto t = place_return(shape, has_previous ? restricted : local,
-                            has_previous ? restricted_edges : edges, has_previous ? restricted_tree : tree,
-                            rows[strip].y, direction, lo, hi);
+                        if (hi < lo) continue;
+                        // A strip changes only when a return is committed. Keep
+                        // the same batch union and boundary order on rebuilds.
+                        if (strip && !strip->pending.empty()) {
+                            for (const auto& previous : strip->pending)
+                                append(strip->occupied, fiber_contour_coverage(previous, width));
+                            strip->pending.clear();
+                            strip->domain = diff_ex(local, union_ex(strip->occupied));
+                            strip->edges = boundary_lines(strip->domain);
+                            strip->tree = AABBTreeLines::build_aabb_tree_over_indexed_lines(strip->edges);
+                        }
+                        auto t = place_return(shape, strip ? strip->domain : local,
+                            strip ? strip->edges : edges, strip ? strip->tree : tree,
+                            rows[std::min(visit.row, target)].y, direction, lo, hi);
                         if (t && (!best || *t > *best + coordinate_error_mm)) { best = t; next_visit = {target, next}; }
                     }
                 }
                 if (!best) return;
                 const size_t strip = std::min(visit.row, next_visit.row);
-                placed_returns[strip].push_back(translated_return(shape, *best, rows[strip].y, direction));
+                if (!strips[strip]) strips[strip] = std::make_unique<Strip>();
+                strips[strip]->pending.push_back(translated_return(shape, *best, rows[strip].y, direction));
                 links.push_back({direction * *best, direction});
                 visits.push_back(next_visit);
                 rows[next_visit.row].scans[next_visit.scan].used = true;

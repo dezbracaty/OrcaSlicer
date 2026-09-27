@@ -955,7 +955,8 @@ FiberContourPlanResult FiberPathValidator::plan_contours(
                     }
                     coverage_changed = !accepted.physical_footprint.empty();
                     merge_validation(result, std::move(accepted));
-                    result.physical_footprint = union_ex(result.physical_footprint);
+                    if (coverage_changed)
+                        result.physical_footprint = union_ex(result.physical_footprint);
                 }
             }
             current = std::move(next);
