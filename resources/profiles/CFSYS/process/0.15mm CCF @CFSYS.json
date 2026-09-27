@@ -161,7 +161,7 @@
   "reinforced_infill_density": "100%",
   "fiber_width": "0.94",
   "reinforced_infill_filament": "2",
-  "reinforced_infill_pattern": "concentric",
+  "reinforced_infill_pattern": "rectilinear",
   "reinforced_perimeters_filament": "2",
   "resolution": "0.012",
   "role_based_wipe_speed": "1",

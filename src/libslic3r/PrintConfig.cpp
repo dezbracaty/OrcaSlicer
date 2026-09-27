@@ -972,7 +972,7 @@ void PrintConfigDef::init_fff_params()
     def->sidetext = "%";
     def->min = 0;
     def->max = 100;
-    def->set_default_value(new ConfigOptionPercent(40));
+    def->set_default_value(new ConfigOptionPercent(100));
 
     def = this->add("reinforced_infill_pattern", coEnum);
     def->label = L("Continuous fiber infill pattern");
@@ -1076,7 +1076,7 @@ void PrintConfigDef::init_fff_params()
     def->sidetext = L("%");
     def->min = 0;
     def->max = 100;
-    def->set_default_value(new ConfigOptionPercent(15));
+    def->set_default_value(new ConfigOptionPercent(100));
 
     def = this->add("fiber_resin_fill_direction", coFloat);
     def->label = L("Resin infill direction");

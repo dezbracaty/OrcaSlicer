@@ -1,6 +1,10 @@
 {
   "type": "process",
   "instantiation": "true",
+  "generate_reinforced_infills": "1",
+  "reinforced_infill_pattern": "rectilinear",
+  "reinforced_infill_density": "100%",
+  "fiber_resin_fill_density": "100%",
   "fiber_infill_max_speed": "10",
   "fiber_infill_bend_radius": "0",
   "fiber_contour_max_speed": "10",
