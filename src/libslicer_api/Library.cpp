@@ -1,4 +1,3 @@
-#define NANOSVG_IMPLEMENTATION
 #include <nanosvg/nanosvg.h>
 
 #include <libslicer/Library.hpp>

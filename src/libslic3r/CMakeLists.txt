@@ -675,5 +675,8 @@ if(WIN32)
 endif()
 
 if (SLIC3R_PCH AND NOT SLIC3R_SYNTAXONLY)
+    # NanoSVG's implementation is inside its include guard. A forced PCH may
+    # include its declarations before NSVGUtils.cpp enables the implementation.
+    set_source_files_properties(NSVGUtils.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
     add_precompiled_header(libslic3r pchheader.hpp FORCEINCLUDE)
 endif ()

@@ -1,3 +1,8 @@
+// Keep NanoSVG definitions with the core users so static consumers link too.
+#define NANOSVG_IMPLEMENTATION
+#include <nanosvg/nanosvg.h>
+#undef NANOSVG_IMPLEMENTATION
+
 #include "NSVGUtils.hpp"
 #include <array>
 #include <charconv> // to_chars
