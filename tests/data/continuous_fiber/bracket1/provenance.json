@@ -1,0 +1,10 @@
+{
+  "model_sha256": "69e9ce2aec97cdcb34ba8dfe6b81acd85adde8a675f791afa7f763613d94ebb4",
+  "expected_layers": 38,
+  "placement": [
+    217.5,
+    177.5,
+    2.5
+  ],
+  "note": "Original temporary G-code removed by application; config reconstructed from subsequent application export with original geometry settings pinned."
+}

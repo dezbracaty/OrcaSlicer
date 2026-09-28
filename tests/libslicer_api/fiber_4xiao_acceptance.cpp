@@ -856,6 +856,48 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
 }
 
 
+// Frozen application input. Diagnostics are exported for the independent
+// G-code material-envelope checker (which does not call the production planner).
+int resin_model(const fs::path& fixture, const fs::path& output, const fs::path& overrides)
+{
+    fs::create_directories(output);
+    auto config=read_json(fixture/"config.json");
+    if(!overrides.empty()){const auto changes=read_json(overrides);for(auto it=changes.begin();it!=changes.end();++it)config["settings"][it.key()]=it.value();}
+    const auto& selection=config.at("selection");
+    libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);libslicer::ConfigSelection selected;
+    selected.machine_model_id=selection.at("machine_model_id");selected.machine_variant_id=selection.at("machine_variant_id");selected.process_preset_id=selection.at("process_preset_id");
+    selected.filament_preset_ids=selection.at("filament_preset_ids").get<std::vector<std::string>>();selected.filament_physical_tools=selection.at("filament_physical_tools").get<std::vector<unsigned>>();
+    require(library->activate_config(selected).success,"Cannot activate resin regression presets");
+    const auto before=*library->active_config_snapshot();const auto items=library->active_config()->settings;
+    std::vector<std::pair<std::string,std::string>> patch;
+    for(auto it=config["settings"].begin();it!=config["settings"].end();++it) {
+        const auto old=before.value(it.key());
+        if(old && *old!=it.value().get<std::string>() && std::any_of(items.begin(),items.end(),[&](const auto& item){return item.key==it.key();}))patch.emplace_back(it.key(),it.value().get<std::string>());
+    }
+    const auto applied=library->apply_active_config_patch(patch);
+    for(const auto& d:applied.diagnostics)std::cerr<<d.key<<": "<<d.message<<'\n';
+    require(applied.success,"Resin regression config rejected");
+    libslicer::SliceRequest request;request.config=*library->active_config_snapshot();request.center_on_build_plate=false;
+    Json effective=Json::object();for(const auto& item:request.config.values())effective[item.first]=item.second;
+    write_json(output/"effective_config.json",effective);
+    for(const auto& item:patch)require(effective[item.first]==item.second,"Effective parameter mismatch: "+item.first);
+    request.objects.push_back(read_model(fixture/"model.stl"));request.output_gcode_path=(output/"model.gcode").string();
+    const auto started=std::chrono::steady_clock::now();const auto result=library->slice(request);
+    Json report={{"slice_success",result.success},{"slice_seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()},{"diagnostics",Json::array()}};
+    for(const auto& d:result.diagnostics)report["diagnostics"].push_back({{"code",d.code},{"message",d.message}});
+    write_json(output/"report.json",report);require(result.success && result.preview,"Resin regression slice failed");
+    report["layer_count"]=result.preview->layers.size();report["model_fingerprint"]=fingerprint(fixture/"model.stl");
+    Json domains=Json::array();
+    for(const auto& d:result.preview->fiber_fill_diagnostics) {
+        Json row={{"layer",d.layer_index+1},{"kind",int(d.kind)},{"reason",d.reason},{"component",d.component_id},{"contour",d.contour},{"source_length_mm",d.source_length_mm},{"boundaries",Json::array()},{"points",Json::array()}};
+        for(auto p:d.points)row["points"].push_back({p.x,p.y});
+        for(const auto& boundary:d.boundaries){Json ring=Json::array();for(auto p:boundary)ring.push_back({p.x,p.y});row["boundaries"].push_back(ring);}
+        domains.push_back(std::move(row));
+    }
+    write_json(output/"domains.json",domains);write_json(output/"report.json",report);
+    std::cout<<"Slice complete: "<<output<<" ("<<report["slice_seconds"]<<" s)\n";return 0;
+}
 
 } // namespace
 
@@ -870,6 +912,7 @@ int main(int argc,char** argv)
         fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR);
     const bool checking=argc==2 && std::string(argv[1])=="--self-test";
     try {
+        if((argc==4 || argc==5) && std::string(argv[1])=="--resin-model")return resin_model(argv[2],argv[3],argc==5?fs::path(argv[4]):fs::path{});
         if(argc==2 && std::string(argv[1])=="--rounded-self-test") {rounded_checker_self_test();return 0;}
         if(argc==6 && std::string(argv[1])=="--rounded-model")
             return rounded_model_acceptance(argv[2],std::stoul(argv[3]),std::stoi(argv[4]),argv[5]);

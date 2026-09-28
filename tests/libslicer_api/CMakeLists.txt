@@ -67,3 +67,32 @@ if(FIBER_7XIAO_MODEL)
         set_tests_properties(Fiber7xiaoRounded${_count} PROPERTIES LABELS "fiber_rounded" TIMEOUT 240 RUN_SERIAL TRUE)
     endforeach()
 endif()
+
+add_test(NAME FiberBracketResinSlice COMMAND fiber_4xiao_acceptance --resin-model
+    "${CMAKE_SOURCE_DIR}/tests/data/continuous_fiber/bracket1"
+    "${CMAKE_CURRENT_BINARY_DIR}/bracket-resin")
+set_tests_properties(FiberBracketResinSlice PROPERTIES LABELS "fiber_resin" TIMEOUT 240 RUN_SERIAL TRUE FIXTURES_SETUP bracket_resin)
+# The independent final-G-code oracle uses GEOS via Shapely, not slicer geometry.
+set(FIBER_GEOMETRY_PYTHON "" CACHE FILEPATH "Python with Shapely >= 2 for independent fiber/resin regression")
+if(FIBER_GEOMETRY_PYTHON)
+    add_test(NAME FiberResinChecker COMMAND "${FIBER_GEOMETRY_PYTHON}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/check_fiber_resin.py" --self-test)
+    add_test(NAME FiberBracketResinGeometry COMMAND "${FIBER_GEOMETRY_PYTHON}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/check_fiber_resin.py"
+        "${CMAKE_CURRENT_BINARY_DIR}/bracket-resin" --expected-layers 38)
+    set_tests_properties(FiberBracketResinGeometry PROPERTIES LABELS "fiber_resin" TIMEOUT 240 FIXTURES_REQUIRED bracket_resin)
+endif()
+
+foreach(_mode IN ITEMS contour_only infill_only no_fiber sparse_resin resin_off zero_radius concentric_resin)
+    add_test(NAME FiberBracket_${_mode} COMMAND fiber_4xiao_acceptance --resin-model
+        "${CMAKE_SOURCE_DIR}/tests/data/continuous_fiber/bracket1"
+        "${CMAKE_CURRENT_BINARY_DIR}/bracket-${_mode}"
+        "${CMAKE_SOURCE_DIR}/tests/data/continuous_fiber/bracket1/${_mode}.json")
+    set_tests_properties(FiberBracket_${_mode} PROPERTIES LABELS "fiber_resin_matrix" TIMEOUT 240 RUN_SERIAL TRUE FIXTURES_SETUP bracket_${_mode})
+    if(FIBER_GEOMETRY_PYTHON)
+        add_test(NAME FiberBracket_${_mode}_Geometry COMMAND "${FIBER_GEOMETRY_PYTHON}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/check_fiber_resin.py"
+            "${CMAKE_CURRENT_BINARY_DIR}/bracket-${_mode}" --expected-layers 38)
+        set_tests_properties(FiberBracket_${_mode}_Geometry PROPERTIES LABELS "fiber_resin_matrix" TIMEOUT 240 FIXTURES_REQUIRED bracket_${_mode})
+    endif()
+endforeach()
