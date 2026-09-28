@@ -3,6 +3,8 @@
 #include <libslicer/Library.hpp>
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/AABBTreeLines.hpp"
+#include "libslic3r/Geometry.hpp"
 #include "libslic3r/GCodeWriter.hpp"
 #include "libslic3r/ContinuousFiber/ContinuousFiberFillStrategy.hpp"
 #include <nlohmann/json.hpp>
@@ -700,6 +702,161 @@ Json evaluate_gap(const libslicer::ToolpathPreview& preview,const std::vector<Bl
     return result;
 }
 
+// Positive-radius acceptance uses the emitted fixed-radius return template,
+// not the zero-radius requirement to cover each scan interval up to its end.
+Json check_rounded_domain(const Slic3r::ExPolygons& centerlines,const std::vector<GapPath>& paths,double angle)
+{
+    constexpr double radius=.3,pitch=1.;
+    Json report={{"passed",true},{"failures",Json::array()},{"accepted_paths",0},{"returns",0},{"max_shape_error_mm",0.}};
+    const auto fail=[&](const char* reason){report["passed"]=false;if(report["failures"].size()<12)report["failures"].push_back(reason);};
+    Slic3r::Linesf edges;
+    for(const auto& ring:Slic3r::to_polygons(centerlines))for(const auto& line:ring.lines())
+        edges.emplace_back(line.a.cast<double>()*SCALING_FACTOR,line.b.cast<double>()*SCALING_FACTOR);
+    const auto tree=Slic3r::AABBTreeLines::build_aabb_tree_over_indexed_lines(edges);
+    const auto containing=reference_offset(centerlines,gap_final_error);
+    const auto local=[&](Point p){return Point{-std::sin(angle)*p.x+std::cos(angle)*p.y,std::cos(angle)*p.x+std::sin(angle)*p.y};};
+    for(const auto& path:paths)if(path.accepted) {
+        report["accepted_paths"]=report["accepted_paths"].get<int>()+1;
+        if(!Slic3r::diff_pl(Slic3r::Polylines{integer_path(path.points)},containing).empty())fail("outside_centerline_domain");
+        Path points;for(Point p:path.points)points.push_back(local(p));
+        std::vector<std::pair<size_t,size_t>> scans;
+        for(size_t i=1;i<points.size();++i)
+            // R=.3 arc chords are <.012 mm. Process boundaries can subdivide
+            // a straight support, so extend the shape check to those fragments.
+            if(std::abs(points[i].y-points[i-1].y)<.0015 && std::abs(points[i].x-points[i-1].x)>.02) {
+                if(!scans.empty() && scans.back().second==i-1)scans.back().second=i;
+                else scans.emplace_back(i-1,i);
+            }
+        for(size_t k=1;k<scans.size();++k) {
+            const size_t first=scans[k-1].second,last=scans[k].first;
+            if(last<=first+1)continue;
+            const double dy=points[last].y-points[first].y;
+            if(std::abs(dy)<gap_final_error)continue;
+            if(std::abs(std::abs(dy)-pitch)>gap_final_error){fail("unclassified_return");continue;}
+            const double direction=std::copysign(1.,points[first].x-points[scans[k-1].first].x),step=std::copysign(1.,dy);
+            Path shape;std::vector<double> contacts;
+            for(size_t i=first;i<=last;++i) {
+                const Point q{direction*(points[i].x-points[first].x),step*(points[i].y-points[first].y)};shape.push_back(q);
+                if(q.y>.003 && q.y<radius)contacts.push_back(q.x-std::sqrt(std::max(0.,radius*radius-std::pow(q.y-radius,2))));
+                else if(q.y>pitch-radius && q.y<pitch-.003)contacts.push_back(q.x-std::sqrt(std::max(0.,radius*radius-std::pow(q.y-(pitch-radius),2))));
+                else if(q.y>=radius && q.y<=pitch-radius)contacts.push_back(q.x-radius);
+            }
+            if(contacts.empty()){fail("missing_return_arc");continue;}
+            std::sort(contacts.begin(),contacts.end());const double contact=contacts[contacts.size()/2];double error=0;
+            for(auto q:shape) {
+                q.x-=contact;double deviation;
+                if(q.x<=0 && (std::abs(q.y)<.003 || std::abs(q.y-pitch)<.003))deviation=std::min(std::abs(q.y),std::abs(q.y-pitch));
+                else if(q.y<radius)deviation=std::abs(std::hypot(q.x,q.y-radius)-radius);
+                else if(q.y>pitch-radius)deviation=std::abs(std::hypot(q.x,q.y-(pitch-radius))-radius);
+                else deviation=std::abs(q.x-radius);
+                error=std::max(error,deviation);
+            }
+            report["max_shape_error_mm"]=std::max(report["max_shape_error_mm"].get<double>(),error);
+            if(error>gap_final_error)fail("wrong_return_radius_or_shape");
+            double nearest=HUGE_VAL;
+            for(size_t i=first;i<=last;++i) {
+                size_t edge=0;Slic3r::Vec2d point;
+                const auto p=path.points[i];
+                const double squared=Slic3r::AABBTreeLines::squared_distance_to_indexed_lines(edges,tree,Slic3r::Vec2d(p.x,p.y),edge,point);
+                if(squared>=0)nearest=std::min(nearest,std::sqrt(squared));
+            }
+            // Contact may be in the interior of the straight connector, not
+            // at a G-code vertex. Check segment-to-boundary distance as well.
+            if(nearest>gap_final_error)for(size_t i=first+1;i<=last;++i) {
+                const auto a=path.points[i-1],b=path.points[i];
+                const Slic3r::Vec2d lo(std::min(a.x,b.x)-nearest,std::min(a.y,b.y)-nearest),hi(std::max(a.x,b.x)+nearest,std::max(a.y,b.y)+nearest);
+                Slic3r::AABBTreeIndirect::traverse(tree,Slic3r::AABBTreeIndirect::intersecting(Eigen::AlignedBox<double,2>(lo,hi)),[&](const auto& node) {
+                    const auto& edge=edges[node.idx];const Point c{edge.a.x(),edge.a.y()},d{edge.b.x(),edge.b.y()};
+                    if(Slic3r::Geometry::segments_intersect(Slic3r::Point::new_scale(a.x,a.y),Slic3r::Point::new_scale(b.x,b.y),Slic3r::Point::new_scale(c.x,c.y),Slic3r::Point::new_scale(d.x,d.y)))nearest=0;
+                    else nearest=std::min({nearest,point_segment_distance(a,c,d),point_segment_distance(b,c,d),point_segment_distance(c,a,b),point_segment_distance(d,a,b)});
+                    return nearest>gap_final_error;
+                });
+            }
+            if(nearest>gap_final_error)fail("return_has_unexplained_boundary_retreat");
+            report["returns"]=report["returns"].get<int>()+1;
+        }
+    }
+    return report;
+}
+
+void rounded_checker_self_test()
+{
+    const Slic3r::ExPolygons domain{Slic3r::ExPolygon(Slic3r::Polygon(integer_path({{0,0},{10,0},{10,3},{0,3}}).points))};
+    const auto path=[](double radius,double contact) {
+        Path points{{contact-2,1}};
+        for(int k=0;k<2;++k)for(int i=0;i<=80;++i) {
+            const double a=(-1+k)*PI/2+(PI/2)*i/80;
+            points.push_back({contact+radius*std::cos(a),(k?2-radius:1+radius)+radius*std::sin(a)});
+        }
+        points.push_back({contact-2,2});return points;
+    };
+    // angle=-pi/2 keeps X and reverses Y, preserving the same return contract.
+    require(check_rounded_domain(domain,{{path(.3,9.7),true}},-PI/2)["passed"].get<bool>(),"Valid rounded return rejected");
+    require(!check_rounded_domain(domain,{{path(.3,9.25),true}},-PI/2)["passed"].get<bool>(),"Extra .45 mm retreat passed");
+    require(!check_rounded_domain(domain,{{path(.5,9.5),true}},-PI/2)["passed"].get<bool>(),"Wrong .5 mm radius passed");
+}
+
+int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int contours,const fs::path& output)
+{
+    fs::create_directories(output);
+    const auto pinned=read_json(fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao/config.json");const auto& selection=pinned.at("selection");
+    libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);libslicer::ConfigSelection selected;
+    selected.machine_model_id=selection.at("machine_model_id");selected.machine_variant_id=selection.at("machine_variant_id");selected.process_preset_id=selection.at("process_preset_id");
+    selected.filament_preset_ids=selection.at("filament_preset_ids").get<std::vector<std::string>>();selected.filament_physical_tools=selection.at("filament_physical_tools").get<std::vector<unsigned>>();
+    require(library->activate_config(selected).success,"Cannot activate model acceptance presets");
+    const std::vector<std::pair<std::string,std::string>> patch{{"fiber_contour_bend_radius","0.3"},{"fiber_infill_bend_radius","0.3"},
+        {"outer_reinforced_perimeters_counts",std::to_string(contours)},{"generate_reinforced_infills","1"},{"reinforced_infill_pattern","rectilinear"},
+        {"reinforced_infill_density","100%"},{"fiber_resin_fill_density","100%"},{"fiber_fill_debug","1"}};
+    require(library->apply_active_config_patch(patch).success,"Rounded acceptance parameters rejected");
+    libslicer::SliceRequest request;request.config=*library->active_config_snapshot();request.center_on_build_plate=false;
+    Json effective=Json::object();for(const auto& setting:request.config.values())effective[setting.first]=setting.second;
+    for(const auto& setting:patch)require(effective.at(setting.first)==setting.second,"Effective acceptance parameter differs: "+setting.first);
+    require(effective.at("fiber_width")=="1" && effective.at("fiber_contour_infill_clearance")=="0","Unexpected rounded acceptance geometry");
+    write_json(output/"effective_config.json",effective);request.objects.push_back(read_model(model));request.output_gcode_path=(output/"model.gcode").string();
+    const auto started=std::chrono::steady_clock::now();const auto result=library->slice(request);
+    Json report={{"passed",false},{"model_fingerprint",fingerprint(model)},{"slice_success",result.success},{"slice_seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()},
+        {"layers",Json::array()},{"failures",Json::array()},{"diagnostics",Json::array()}};
+    for(const auto& d:result.diagnostics)report["diagnostics"].push_back({{"code",d.code},{"message",d.message}});
+    write_json(output/"report.json",report);require(result.success && result.preview,"Rounded full-model slice failed");require(result.preview->layers.size()==expected_layers,"Unexpected rounded model layer count");
+    std::vector<Point> offsets;std::istringstream stream(effective.at("extruder_offset").get<std::string>());for(std::string item;std::getline(stream,item,',');){const auto x=item.find('x');offsets.push_back({std::stod(item.substr(0,x)),std::stod(item.substr(x+1))});}
+    std::ifstream gcode(result.output.path);require(bool(gcode),"Missing rounded G-code");const auto blocks=read_blocks(gcode,offsets,true);
+    report["passed"]=true;report["layer_count"]=expected_layers;report["gcode_fingerprint"]=fingerprint(result.output.path);size_t sources=0,returns=0,resin=0;
+    for(const auto& segment:result.preview->segments)if(segment.extrusion_role==libslicer::ToolpathExtrusionRole::ResinInfill && segment.deposition==libslicer::ToolpathDepositionKind::Thermoplastic)++resin;
+    const double budget=std::stod(effective.at("fiber_landing_length").get<std::string>())+std::stod(effective.at("fiber_start_stabilization_length").get<std::string>())+
+        std::stod(effective.at("fiber_minimum_effective_length").get<std::string>())+std::stod(effective.at("fiber_cut_to_contact_length").get<std::string>());
+    std::set<std::pair<size_t,size_t>> seen;
+    for(const auto& source:result.preview->fiber_fill_diagnostics)if(source.kind==libslicer::FiberDiagnosticKind::OriginalContourRegion) {
+        const size_t layer=source.layer_index+1;++sources;require(seen.emplace(layer,source.component_id).second,"Duplicate source region");require(!source.boundaries.empty(),"Missing source region");
+        Slic3r::ExPolygon area;
+        for(size_t i=0;i<source.boundaries.size();++i){Slic3r::Polygon ring;for(const auto& p:source.boundaries[i])ring.points.push_back(Slic3r::Point::new_scale(p.x,p.y));if(i==0)area.contour=std::move(ring);else area.holes.push_back(std::move(ring));}
+        Slic3r::ExPolygons occupied;std::vector<GapPath> paths;double central=0;size_t contour_count=0;
+        bool central_short_rejection=false;
+        const auto window=Slic3r::ExPolygons{Slic3r::ExPolygon(Slic3r::Polygon(integer_path({{183,165},{199,165},{199,176},{183,176}}).points))};
+        for(const auto& block:blocks)if(block.layer==layer && block.component==source.component_id) {
+            if(block.contour){Slic3r::append(occupied,reference_sweep(block.points,.5));++contour_count;}
+            else {paths.push_back({block.points,true});for(const auto& part:Slic3r::intersection_pl(Slic3r::Polylines{integer_path(block.points)},window))central+=Slic3r::unscale<double>(part.length());}
+        }
+        for(const auto& d:result.preview->fiber_fill_diagnostics)if(d.layer_index+1==layer && d.component_id==source.component_id && !d.contour && d.kind==libslicer::FiberDiagnosticKind::RejectedPath) {
+            Path points;for(auto p:d.points)points.push_back({p.x,p.y});check_short_rejection(points,d.reason,std::stod(effective.at("fiber_minimum_path_length").get<std::string>()),budget);
+            if(points.size()>1 && !Slic3r::intersection_pl(Slic3r::Polylines{integer_path(points)},window).empty())central_short_rejection=true;
+        }
+        const auto keepout=Slic3r::intersection_ex(Slic3r::union_ex(occupied),Slic3r::ExPolygons{area},Slic3r::ApplySafetyOffset::Yes);
+        const auto domain=reference_offset(Slic3r::diff_ex(Slic3r::ExPolygons{area},keepout,Slic3r::ApplySafetyOffset::Yes),-.5);
+        float angle=float(45*PI/180);if((layer-1)&1)angle+=float(PI/2);angle+=float(PI/2);
+        auto row=check_rounded_domain(domain,paths,angle);row["layer"]=layer;row["component"]=source.component_id;row["contours"]=contour_count;row["central_accepted_length_mm"]=central;row["central_short_rejection"]=central_short_rejection;returns+=row["returns"].get<size_t>();
+        if(expected_layers==32 && source.component_id==0 && (paths.empty() || !contour_count || (central<=0 && !(layer==24 && central_short_rejection)))) {row["passed"]=false;row["failures"].push_back("main_and_central_region_require_actual_fiber");}
+        if(!row["passed"].get<bool>())report["passed"]=false;report["layers"].push_back(std::move(row));
+    }
+    for(const auto& block:blocks)require(seen.count({size_t(block.layer),block.component}),"Depositing path without source region");
+    if(expected_layers==32)for(size_t layer=4;layer<=24;++layer){std::vector<size_t> components;for(auto key:seen)if(key.first==layer)components.push_back(key.second);check_components(components,layer==24?65:1);}
+    require(sources>0 && returns>0 && resin>0,"Rounded acceptance requires source regions, real fiber returns and resin leftovers");
+    report["returns"]=returns;report["resin_segments"]=resin;write_json(output/"report.json",report);
+    std::cout<<(report["passed"].get<bool>()?"PASS":"FAIL")<<" rounded model layers="<<expected_layers<<" returns="<<returns<<" report="<<(output/"report.json")<<'\n';return report["passed"].get<bool>()?0:1;
+}
+
+
+
 } // namespace
 
 int main(int argc,char** argv)
@@ -709,10 +866,13 @@ int main(int argc,char** argv)
     const bool gap_checking=argc==2 && std::string(argv[1])=="--infill-gap-self-test";
     const bool gap=gap_current || (argc==2 && std::string(argv[1])=="--infill-gap");
     const bool closed_outer_regression=argc==2 && std::string(argv[1])=="--closed-outer-regression";
-    const fs::path output=gap ? fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR)/(gap_current?"infill-gap-current":"infill-gap") : closed_outer_regression ? fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR)/"closed-outer-regression" :
+    const fs::path output=argc==6 && std::string(argv[1])=="--rounded-model" ? fs::path(argv[5]) : gap ? fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR)/(gap_current?"infill-gap-current":"infill-gap") : closed_outer_regression ? fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR)/"closed-outer-regression" :
         fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR);
     const bool checking=argc==2 && std::string(argv[1])=="--self-test";
     try {
+        if(argc==2 && std::string(argv[1])=="--rounded-self-test") {rounded_checker_self_test();return 0;}
+        if(argc==6 && std::string(argv[1])=="--rounded-model")
+            return rounded_model_acceptance(argv[2],std::stoul(argv[3]),std::stoi(argv[4]),argv[5]);
         require(argc==1 || checking || closed_outer_regression || gap || gap_checking,"Usage: fiber_4xiao_acceptance [--self-test|--closed-outer-regression]");
         require(SCALING_FACTOR==1e-6,"Update the frozen integer coordinate budget");
         Json rule=read_json(assets/"expectations.json");

@@ -26,20 +26,6 @@ double area_mm2(const ExPolygons& polygons)
     return unscaled<double>(unscaled<double>(std::abs(area(polygons))));
 }
 
-void append_coverage(const ExtrusionPath& source, const FiberMotionSpan& span, Polygons& physical, Polygons& exclusion,
-                     Polygons& keepout, const ContinuousFiberConfig& config, bool contour)
-{
-    if (!span.deposits_fiber() || span.geometry.points.size() < 2)
-        return;
-
-    ExtrusionPath path(span.geometry, source);
-    path.polygons_covered_by_width(physical, 0.0f);
-    path.polygons_covered_by_width(exclusion, -float(scale_(config.resin_overlap_mm)));
-    if (contour)
-        path.polygons_covered_by_width(keepout, float(scale_(config.contour_infill_clearance_mm)));
-}
-
-
 // Preserve endpoints and bound the deviation of EVERY removed source knot.
 // The optional map relates retained points to their original arc length, so
 // command cleanup cannot shift a bend's speed interval or a process boundary.
@@ -461,7 +447,9 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     Polygons physical;
     Polygons exclusion;
     Polygons keepout;
-    if (contour || !arcs.empty()) {
+    {
+        // All fiber uses the circular material envelope used to construct its
+        // centerline domain, including infill without explicit return arcs.
         // Process boundaries do not introduce physical end caps in a continuous
         // strand. Sweep connected deposition once, including the cyclic seam.
         Polyline depositing;
@@ -487,9 +475,6 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
                 points.begin() + (depositing.points.empty() ? 0 : 1), points.end());
         }
         flush();
-    } else {
-        for (const FiberMotionSpan& span : prepared->spans)
-            append_coverage(candidate, span, physical, exclusion, keepout, config, false);
     }
 
     prepared->physical_coverage = union_ex(physical);

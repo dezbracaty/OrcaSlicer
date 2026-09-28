@@ -27,7 +27,7 @@ struct ContourArc {
     double source_sweep_radians {0.0}; // Preserve the speed limit when an arc is trimmed.
 };
 
-enum class ContourRoundingFailure { InvalidInput, SearchNotFound, OutsideDomain, SelfIntersection, TopologyChange, SamplingLimit, SupportConflict, SearchBudgetExceeded, NumericalFailure, OptimizerLimit, CandidateLimit };
+enum class ContourRoundingFailure { InvalidInput, SearchNotFound, OutsideDomain, SelfIntersection, TopologyChange, SamplingLimit, SupportConflict, SearchBudgetExceeded, NumericalFailure, OptimizerLimit, CandidateLimit, InsufficientSpace };
 struct ContourIssue {
     ContourRoundingFailure reason;
     Polyline source;

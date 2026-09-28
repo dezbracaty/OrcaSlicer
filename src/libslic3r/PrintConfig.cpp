@@ -1025,7 +1025,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("fiber_contour_bend_radius", coFloat);
     def->label = L("Fiber contour bend radius");
-    def->tooltip = L("Replace contour corners with tangent arcs of exactly this centerline radius. Zero disables rounding. If the contour solver cannot resolve a path at this radius, slicing stops with an error.");
+    def->tooltip = L("Replace contour corners with tangent arcs of exactly this centerline radius. Zero disables rounding. Regions proven too small for a closed contour at this radius are left for resin infill. Unresolved rounding stops slicing with an error.");
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;

@@ -48,3 +48,22 @@ add_test(NAME Fiber4xiaoInfillGapCurrent COMMAND fiber_4xiao_acceptance --infill
 add_test(NAME Fiber4xiaoInfillGapChecker COMMAND fiber_4xiao_acceptance --infill-gap-self-test)
 set_tests_properties(Fiber4xiaoInfillGap Fiber4xiaoInfillGapCurrent PROPERTIES LABELS "fiber_infill_gap" TIMEOUT 180 RUN_SERIAL TRUE)
 set_tests_properties(Fiber4xiaoInfillGapChecker PROPERTIES LABELS "fiber_infill_gap" TIMEOUT 20)
+
+# Positive-radius coverage gates. Layer 24 may reject its central candidate
+# when it cannot satisfy the landing/effective/tail process budget.
+add_test(NAME FiberRoundedChecker COMMAND fiber_4xiao_acceptance --rounded-self-test)
+set_tests_properties(FiberRoundedChecker PROPERTIES LABELS "fiber_rounded" TIMEOUT 20)
+foreach(_count IN ITEMS 1 4)
+    add_test(NAME Fiber4xiaoRounded${_count} COMMAND fiber_4xiao_acceptance --rounded-model
+        "${CMAKE_SOURCE_DIR}/tests/data/continuous_fiber/4xiao/model.stl" 32 ${_count}
+        "${CMAKE_CURRENT_BINARY_DIR}/4xiao-acceptance/rounded-${_count}")
+    set_tests_properties(Fiber4xiaoRounded${_count} PROPERTIES LABELS "fiber_rounded" TIMEOUT 180 RUN_SERIAL TRUE)
+endforeach()
+set(FIBER_7XIAO_MODEL "" CACHE FILEPATH "Optional 7xiao STL for full-model rounded fiber acceptance")
+if(FIBER_7XIAO_MODEL)
+    foreach(_count IN ITEMS 1 4)
+        add_test(NAME Fiber7xiaoRounded${_count} COMMAND fiber_4xiao_acceptance --rounded-model
+            "${FIBER_7XIAO_MODEL}" 212 ${_count} "${CMAKE_CURRENT_BINARY_DIR}/7xiao-acceptance/rounded-${_count}")
+        set_tests_properties(Fiber7xiaoRounded${_count} PROPERTIES LABELS "fiber_rounded" TIMEOUT 240 RUN_SERIAL TRUE)
+    endforeach()
+endif()

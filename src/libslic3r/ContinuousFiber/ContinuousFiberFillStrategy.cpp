@@ -258,18 +258,45 @@ struct DomainDistance {
     struct Edge { Vec2d a, delta; double length_squared; };
     std::vector<Edge> edges;
     Linesf lines;
+    Lines boundaries;
+    const ExPolygons& domain;
     AABBTreeIndirect::Tree<2,double> tree;
-    explicit DomainDistance(const ExPolygons& domain) {
+    explicit DomainDistance(const ExPolygons& domain) : domain(domain) {
         const auto append=[&](const Polygon& ring) {
             for (size_t i=0;i<ring.points.size();++i) {
                 const Vec2d a=mm_point(ring.points[i]),d=mm_point(ring.points[(i+1)%ring.points.size()])-a;
-                if (d.squaredNorm()>0) edges.push_back({a,d,d.squaredNorm()});
+                if (d.squaredNorm()>0) {
+                    edges.push_back({a,d,d.squaredNorm()});
+                    boundaries.emplace_back(ring.points[i],ring.points[(i+1)%ring.points.size()]);
+                }
             }
         };
         for (const auto& region:domain) { append(region.contour); for (const auto& h:region.holes) append(h); }
         lines.reserve(edges.size());
         for (const auto& edge:edges) lines.emplace_back(edge.a,edge.a+edge.delta);
         tree=AABBTreeLines::build_aabb_tree_over_indexed_lines(lines);
+    }
+    bool contains(const Polyline& path) const {
+        if (path.points.size()<2) return inside(path,domain);
+        const int outside=AABBTreeLines::point_outside_closed_contours(lines,tree,mm_point(path.points.front()));
+        if (outside==0) return inside(path,domain);
+        // Without a boundary intersection, a connected polyline stays on the
+        // same side as its first point. Integer intersection predicates preserve
+        // exact contacts; those use Clipper's existing boundary semantics.
+        for (size_t i=1;i<path.points.size();++i) {
+            if (path.points[i-1]==path.points[i]) continue;
+            const Vec2d a=mm_point(path.points[i-1]),b=mm_point(path.points[i]);
+            const Eigen::AlignedBox<double,2> box(a.cwiseMin(b)-Vec2d::Constant(SCALING_FACTOR),
+                a.cwiseMax(b)+Vec2d::Constant(SCALING_FACTOR));
+            bool contact=false;
+            AABBTreeIndirect::traverse(tree,AABBTreeIndirect::intersecting(box),[&](const auto& node) {
+                const auto& edge=boundaries[node.idx];
+                contact=Geometry::segments_intersect(path.points[i-1],path.points[i],edge.a,edge.b);
+                return !contact;
+            });
+            if (contact) return inside(path,domain);
+        }
+        return outside<0;
     }
     double outside_distance(const Vec2d& p,size_t& nearest) const {
         // The previous edge is a witness, not an approximate nearest result.
@@ -426,7 +453,7 @@ void prune_candidates(LocalSolutions& solutions)
 }
 
 LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
-    const ContourRoundingOptions& options, const ExPolygons& domain, std::optional<DomainDistance>& distances,
+    const ContourRoundingOptions& options, const DomainDistance& distances,
     double incoming_min=0,double outgoing_max=HUGE_VAL)
 {
     LocalSolutions result;
@@ -443,7 +470,7 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
         if (value.incoming_remaining<incoming_min-1e-8 || value.outgoing_consumed>outgoing_max+1e-8) return false;
         if (turn_violation(value,source_turn,heading_min,heading_max)>1e-8) return false;
         const auto line=sample_connection(value,options.chord_tolerance_mm);
-        return line.points.size()>1 && inside(line,domain) && simple(line.points);
+        return line.points.size()>1 && distances.contains(line) && simple(line.points);
     };
     const auto add=[&](TangentSolution value,std::optional<double> known_score=std::nullopt) {
         // Repeated optimizer poses must not repeat clipping and self-intersection checks.
@@ -581,7 +608,6 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
     // An isolated wedge uses the analytic symmetric construction. For coupled
     // turns that construction is only a seed, not an acceptable stopping rule.
     if (group.count==1 && !result.values.empty()) return result;
-    if (!distances) distances.emplace(domain);
     for (int first:{1,-1}) for (int kind=0;kind<4;++kind) {
         ConnectionFamily family{first,kind<2?(kind==0?first:-first):first,kind<2?0:(kind==2?1:-1)};
         // Single-circle tangency, symmetric CCC retreat and the support
@@ -592,7 +618,7 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
         for (size_t seed=0;seed<seeds.size();++seed) {
             if (std::find(seeds.begin(),seeds.begin()+seed,seeds[seed])!=seeds.begin()+seed) continue;
             auto x=seeds[seed];
-            Search search{&problem,family,&*distances,options.chord_tolerance_mm*.5,&knots,add};
+            Search search{&problem,family,&distances,options.chord_tolerance_mm*.5,&knots,add};
             nlopt::opt optimizer(nlopt::LN_COBYLA,2);
             optimizer.set_lower_bounds(std::vector<double>{0,0});
             optimizer.set_upper_bounds(upper);
@@ -616,7 +642,7 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
 // Adjacent turns share a finite support. Form connected conflict windows before
 // searching, including a turn whose nominal single arc falls outside the domain.
 std::vector<CornerGroup> conflict_windows(const std::vector<Vec2d>& p,
-    const ContourRoundingOptions& options,const ExPolygons& domain)
+    const ContourRoundingOptions& options,const DomainDistance& domain)
 {
     const size_t n=p.size();
     std::vector<double> retreat(n);
@@ -627,7 +653,7 @@ std::vector<CornerGroup> conflict_windows(const std::vector<Vec2d>& p,
         retreat[i]=options.radius_mm*std::tan(half);
         if (const auto s=supports(p,{i,1})) {
             const auto value=circle(*s,options.radius_mm);
-            if (!inside(sample_connection(value,options.chord_tolerance_mm),domain)) {
+            if (!domain.contains(sample_connection(value,options.chord_tolerance_mm))) {
                 const double sine=std::sin(half);
                 retreat[i]=std::max(retreat[i],options.radius_mm*(sine+std::sqrt(sine*sine+2*(1-std::cos(half)))));
             }
@@ -875,7 +901,22 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
     ContourRoundingResult result;
     const auto p=canonical_ring(source);
     if (p.size()<3 || !simple(source.points)) { result.issues.push_back({ContourRoundingFailure::InvalidInput,source}); return result; }
-    std::optional<DomainDistance> distances;
+    // Prove geometric infeasibility before spending any search budget.
+    // A bounded-curvature simple closed curve encloses an R disk (Pestov-Ionin).
+    // Fill holes in an outer approximation: a valid loop may surround a hole.
+    // The reduced test radius reserves arc/offset/coordinate error only; the
+    // radius used to generate the path is never changed.
+    const double disk_margin=2*options.chord_tolerance_mm+
+        2*(0.25*ContourRoundingOptions{}.chord_tolerance_mm)+8*std::sqrt(2.0)*SCALING_FACTOR;
+    if (options.radius_mm>disk_margin) {
+        auto envelopes=fiber_material_offset(output_domain,options.chord_tolerance_mm);
+        for (auto& region:envelopes) region.holes.clear();
+        if (fiber_material_offset(union_ex(envelopes),-(options.radius_mm-disk_margin)).empty()) {
+            result.issues.push_back({ContourRoundingFailure::InsufficientSpace,source});
+            return result;
+        }
+    }
+    const DomainDistance distances(domain);
     // The unconstrained pool may accumulate constrained solutions. Keep exact
     // constrained queries separate so failed searches can also be reused.
     std::map<std::pair<size_t,size_t>,LocalSolutions> cache;
@@ -896,7 +937,7 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
             return LocalSolutions{};
         }
         --local_queries_left;
-        auto local=solve_group(p,group,options,domain,distances,lo,hi);
+        auto local=solve_group(p,group,options,distances,lo,hi);
         optimizer_limit|=local.optimizer_limit_reached;
         numerical_failure|=local.values.empty() && local.numerical_failure;
         if (constrained) constrained_cache.emplace(key,local);
@@ -931,6 +972,32 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
         }
         return std::make_pair(unresolved,deficit);
     };
+    const Partition initial=conflict_windows(p,options,distances);
+    Partition expanded=initial;
+    // A sharp turn can consume several short edges of a sampled boundary.
+    // Propagate its analytic contacts to usable supports before spending local
+    // solves on each intermediate window. This is an alternate partition of
+    // the same search: it uses the same constraint propagation and validation,
+    // and never pre-solves candidates before the original partition is tried.
+    bool changed=true;
+    while (changed) {
+        changed=false;
+        for (size_t i=0;i<expanded.size();++i) if (const auto s=supports(p,expanded[i])) {
+            const Vec2d contact=s->base+options.radius_mm*s->slope;
+            double incoming_min=0,outgoing_max=s->outgoing_length;
+            if (const auto previous=supports(p,expanded[(i+expanded.size()-1)%expanded.size()]))
+                incoming_min=std::max(incoming_min,(previous->base+options.radius_mm*previous->slope).y());
+            if (const auto next=supports(p,expanded[(i+1)%expanded.size()]))
+                outgoing_max=std::min(outgoing_max,(next->base+options.radius_mm*next->slope).x());
+            const double left=incoming_min-contact.x(),right=contact.y()-outgoing_max;
+            if (std::max(left,right)<=1e-8) continue;
+            const size_t before=left>right?(i+expanded.size()-1)%expanded.size():i;
+            if (expanded[before].count+expanded[(before+1)%expanded.size()].count>=p.size()-1) continue;
+            expanded=merged_partition(std::move(expanded),before,2);
+            changed=true;break;
+        }
+    }
+    bool expanded_queued=false;
     const auto attempt=[&](Partition groups,const auto& enqueue,size_t queued_partitions) {
         ContourRoundingResult result;
         std::vector<LocalSolutions> candidates;
@@ -949,6 +1016,13 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
                     result.issues.push_back({ContourRoundingFailure::SearchNotFound,source}); return result;
                 }
                 candidates.push_back(cached(group));
+            }
+            if (!expanded_queued) {
+                expanded_queued=true;
+                if (expanded.size()!=initial.size()) {
+                    enqueue(expanded,priority(expanded));
+                    ++queued_partitions;
+                }
             }
             bool unresolved=false;
             for (size_t i=0;i<groups.size();++i) if (candidates[i].values.empty()) {
@@ -1055,8 +1129,7 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
         searches_left-=allowance-remaining;
         return result;
     };
-    result=search_contour_partitions(conflict_windows(p,options,domain),source,
-        revisions_left,searches_left,attempt);
+    result=search_contour_partitions(initial,source,revisions_left,searches_left,attempt);
     if (!result.path) {
         const auto report=[&](bool occurred,ContourRoundingFailure reason) {
             if (occurred && std::none_of(result.issues.begin(),result.issues.end(),[&](const auto& issue){return issue.reason==reason;}))
@@ -1111,6 +1184,7 @@ const char* contour_rounding_failure_name(ContourRoundingFailure reason)
     case ContourRoundingFailure::SearchBudgetExceeded:return "rounding_search_budget_exceeded";
     case ContourRoundingFailure::NumericalFailure:return "rounding_numerical_failure";
     case ContourRoundingFailure::OptimizerLimit:return "rounding_optimizer_limit";
+    case ContourRoundingFailure::InsufficientSpace:return "rounding_insufficient_space";
     case ContourRoundingFailure::CandidateLimit:return "rounding_candidate_limit";
     case ContourRoundingFailure::SamplingLimit:return "rounding_sampling_limit";
     }

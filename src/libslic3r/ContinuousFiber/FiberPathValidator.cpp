@@ -565,7 +565,9 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 (geometry_domain ? *geometry_domain : centerline_domain_for_width(path.width));
             auto rounded=ContinuousFiberFillStrategy::round_contour(path.polyline, rounding_domain, options);
             if (!rounded.path) {
-                whole_path_reason=FiberRejectionReason::ContourRoundingUnresolved;
+                whole_path_reason=rounded.issues.size()==1 &&
+                    rounded.issues.front().reason==ContourRoundingFailure::InsufficientSpace ?
+                    FiberRejectionReason::UnavailableContourRegion : FiberRejectionReason::ContourRoundingUnresolved;
                 rounding_issues=std::move(rounded.issues);
             } else {
                 path.polyline=std::move(*rounded.path);
