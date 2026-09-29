@@ -1,5 +1,5 @@
-// Fixed-model acceptance, independent of planner pass/fail decisions.
-// Run via CTest -L fiber_acceptance; reports and G-code remain in the build tree.
+// Shared 4xiao model regressions, independent of planner pass/fail decisions.
+// Reports and G-code remain in the build tree.
 #include <libslicer/Library.hpp>
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/BoundingBox.hpp"
@@ -916,15 +916,14 @@ int main(int argc,char** argv)
         if(argc==2 && std::string(argv[1])=="--rounded-self-test") {rounded_checker_self_test();return 0;}
         if(argc==6 && std::string(argv[1])=="--rounded-model")
             return rounded_model_acceptance(argv[2],std::stoul(argv[3]),std::stoi(argv[4]),argv[5]);
-        require(argc==1 || checking || closed_outer_regression || gap || gap_checking,"Usage: fiber_4xiao_acceptance [--self-test|--closed-outer-regression]");
+        require(checking || closed_outer_regression || gap || gap_checking,"Usage: fiber_4xiao_acceptance [--self-test|--closed-outer-regression|--infill-gap|--infill-gap-current|--infill-gap-self-test]");
         require(SCALING_FACTOR==1e-6,"Update the frozen integer coordinate budget");
         Json rule=read_json(assets/"expectations.json");
         require(rule.at("schema_version")==1 && rule.at("first_required_layer")==4 && rule.at("last_required_layer")==24 && rule.at("outer_contours_per_layer")==1,"Unexpected acceptance contract");
         if (checking) {self_test(rule);return 0;}
         if(gap_checking){gap_checker_self_test();return 0;}
-        // Separate regression for the user's current settings and the transition
-        // from a blocked exterior passage to an open concavity. Never alter the
-        // original pinned acceptance run or relax its geometric checker.
+        // Check the user's current settings and the transition from a blocked
+        // exterior passage to an open concavity.
         if (closed_outer_regression) {
             rule["first_required_layer"]=14;
             rule["last_required_layer"]=17;
@@ -1008,7 +1007,7 @@ int main(int argc,char** argv)
                 require(block.points.size()>=4 && distance(block.points.front(),block.points.back())<=rule.at("closure_tolerance_mm").get<double>(),
                     "Open outer deposition on display layer " + std::to_string(block.layer));
         Json report=evaluate(rule,blocks,candidates);
-        report["case"]=closed_outer_regression?"closed_outer_regression":"fixed_acceptance";
+        report["case"]="closed_outer_regression";
         report["config_overrides"]=closed_outer_regression ? Json{{"fiber_contour_boundary_clearance","0.05"},{"fiber_contour_include_holes","0"}} : Json::object();
         report["contract"]=rule;report["config_fingerprint"]=fingerprint(config_file);report["gcode_fingerprint"]=fingerprint(result.output.path);
         report["binary_fingerprint"]=fingerprint(fs::absolute(argv[0]));report["slice_seconds"]=seconds;report["gcode"]=result.output.path;
