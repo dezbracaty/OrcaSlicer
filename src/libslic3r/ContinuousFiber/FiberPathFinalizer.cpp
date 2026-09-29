@@ -445,7 +445,6 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         }
     }
     Polygons physical;
-    Polygons exclusion;
     Polygons keepout;
     {
         // All fiber uses the circular material envelope used to construct its
@@ -455,13 +454,8 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         Polyline depositing;
         const auto flush = [&] {
             const double physical_radius = 0.5 * candidate.width;
-            const double exclusion_radius = physical_radius - config.resin_overlap_mm;
             const double keepout_radius = physical_radius + config.contour_infill_clearance_mm;
             auto footprint = to_polygons(fiber_contour_coverage(depositing, physical_radius));
-            // Equal radii have the same raw sweep. Domain clipping below still
-            // applies each coverage policy independently.
-            append(exclusion, exclusion_radius == physical_radius ? footprint :
-                to_polygons(fiber_contour_coverage(depositing, exclusion_radius)));
             if (contour) append(keepout, keepout_radius == physical_radius ? footprint :
                 to_polygons(fiber_contour_coverage(depositing, keepout_radius)));
             append(physical, std::move(footprint));
@@ -486,7 +480,11 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         return result;
     }
 
-    prepared->resin_exclusion = intersection_ex(union_ex(exclusion), allowed_domain, ApplySafetyOffset::Yes);
+    // Resin may only occupy material not actually deposited by fiber. Shrinking
+    // individual strands creates artificial channels between touching strands.
+    // Keep the existing field as the material-allocation result, not a second
+    // (overlap-reduced) representation of strand width.
+    prepared->resin_exclusion = intersection_ex(prepared->physical_coverage, allowed_domain);
     if (contour)
         prepared->contour_to_infill_keepout = intersection_ex(union_ex(keepout), allowed_domain, ApplySafetyOffset::Yes);
     result.prepared = std::move(prepared);

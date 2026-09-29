@@ -277,7 +277,7 @@ TEST_CASE("contour coverage policies retain their widths and domain clipping", "
     };
     CHECK(area_mm2(result.prepared->physical_coverage) == Catch::Approx(50.0).margin(.002));
     CHECK(area_mm2(result.prepared->resin_exclusion) ==
-        Catch::Approx(50.0 * (1.0 - 2.0 * config.resin_overlap_mm)).margin(.002));
+        Catch::Approx(50.0).margin(.002));
     CHECK(area_mm2(result.prepared->contour_to_infill_keepout) ==
         Catch::Approx(config.contour_infill_clearance_mm == 0 ? 50.0 : 60.0).margin(.002));
     CHECK(result.prepared->outside_domain.empty());
@@ -3184,4 +3184,22 @@ TEST_CASE("closed fiber rounding distinguishes insufficient space from unresolve
     const auto small=path_from_points({{0,0},{2,0},{2,2},{0,2},{0,0}});
     const auto tangent=ContinuousFiberFillStrategy::round_contour(small.polyline,{rectangle(0,0,2,2)},{1.});
     CHECK(tangent.path.has_value());
+}
+
+TEST_CASE("touching deposited fibers leave no internal resin channels", "[ContinuousFiber][FiberResinOccupancy]")
+{
+    const ExPolygons domain{rectangle(0,0,40,5)};
+    ContinuousFiberConfig config;
+    // A saved legacy overlap value must not reduce actual material occupancy.
+    config.resin_overlap_mm=GENERATE(0.0,.05,.1);
+    auto a=straight_path(1,1,39,1),b=straight_path(1,2,39,2),c=straight_path(1,3,39,3);
+    a.width=b.width=c.width=1.;
+    const auto accepted=FiberPathValidator::validate({&a,&b,&c},domain,config,
+        FiberPathPurpose::Infill,erContinuousFiberInfill,{16,4,0,0});
+    REQUIRE(accepted.accepted_count()==3);
+    const auto resin=ContinuousFiberFillStrategy::build_resin_area(domain,accepted.resin_exclusion);
+    CHECK(intersection_ex(resin,ExPolygons{rectangle(2,.6,38,3.4)}).empty());
+    CHECK(diff_ex(ExPolygons{rectangle(2,3.6,38,4.9)},resin).empty());
+    CHECK(diff_ex(accepted.physical_footprint,accepted.resin_exclusion).empty());
+    CHECK(intersection_ex(resin,accepted.physical_footprint).empty());
 }
