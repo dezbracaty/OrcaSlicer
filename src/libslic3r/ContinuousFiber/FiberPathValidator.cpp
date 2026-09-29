@@ -563,10 +563,13 @@ FiberValidationResult FiberPathValidator::validate_impl(
             const ExPolygons rounding_domain = requires_closed_loop && geometry_domain && planned_centerline_domain ?
                 intersection_ex(*geometry_domain, *planned_centerline_domain) :
                 (geometry_domain ? *geometry_domain : centerline_domain_for_width(path.width));
-            auto rounded=ContinuousFiberFillStrategy::round_contour(path.polyline, rounding_domain, options);
+            auto rounded=requires_closed_loop ?
+                ContinuousFiberFillStrategy::round_outer_contour(path.polyline, rounding_domain, options) :
+                ContinuousFiberFillStrategy::round_hole_contour(path.polyline, rounding_domain, options);
             if (!rounded.path) {
                 whole_path_reason=rounded.issues.size()==1 &&
-                    rounded.issues.front().reason==ContourRoundingFailure::InsufficientSpace ?
+                    (rounded.issues.front().reason==ContourRoundingFailure::InsufficientSpace ||
+                     rounded.issues.front().reason==ContourRoundingFailure::SourceOutsideCurrentDomain) ?
                     FiberRejectionReason::UnavailableContourRegion : FiberRejectionReason::ContourRoundingUnresolved;
                 rounding_issues=std::move(rounded.issues);
             } else {

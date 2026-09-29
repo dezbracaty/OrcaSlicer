@@ -14,6 +14,9 @@
 #include <functional>
 #include <variant>
 #include <queue>
+#include <GccAna_Circ2d2TanRad.hxx>
+#include <GccEnt_QualifiedLin.hxx>
+#include <gp_Lin2d.hxx>
 
 namespace Slic3r {
 
@@ -23,6 +26,7 @@ constexpr double straight_tolerance_mm = 0.00002;
 constexpr size_t maximum_samples = 200000;
 Vec2d left_normal(const Vec2d& v) { return {-v.y(), v.x()}; }
 double turn(const Vec2d& a, const Vec2d& b) { return std::atan2(cross2(a,b), a.dot(b)); }
+bool requires_outer_rounding(double radians) { return radians>=PI/2-1e-7; }
 Point scaled_point(const Vec2d& p) { return Point::new_scale(p.x(), p.y()); }
 Vec2d mm_point(const Point& p) { return {unscale<double>(p.x()), unscale<double>(p.y())}; }
 
@@ -1187,11 +1191,326 @@ const char* contour_rounding_failure_name(ContourRoundingFailure reason)
     case ContourRoundingFailure::InsufficientSpace:return "rounding_insufficient_space";
     case ContourRoundingFailure::CandidateLimit:return "rounding_candidate_limit";
     case ContourRoundingFailure::SamplingLimit:return "rounding_sampling_limit";
+    case ContourRoundingFailure::LocalConnectionUnavailable:return "local_contour_connection_unavailable";
+    case ContourRoundingFailure::SourceOutsideCurrentDomain:return "contour_source_outside_current_domain";
     }
     return "unknown";
 }
 
-ContourRoundingResult ContinuousFiberFillStrategy::round_contour(
+namespace {
+
+// OCCT constructs the exact-radius circle on the material side of both
+// directed supports. Segment bounds and the permitted region are checked here,
+// since its two-line construction deliberately operates on infinite lines.
+std::optional<TangentSolution> outer_corner_circle(const std::vector<Vec2d>& p,
+    size_t i,const ContourRoundingOptions& options,const DomainDistance& domain)
+{
+    const size_t n=p.size();
+    const Vec2d a=p[(i+n-1)%n],b=p[i],c=p[(i+1)%n];
+    const double in_length=(b-a).norm(),out_length=(c-b).norm();
+    if (in_length<1e-9 || out_length<1e-9) return {};
+    const Vec2d u=(b-a)/in_length,v=(c-b)/out_length;
+    if (!requires_outer_rounding(turn(u,v))) return {};
+    const gp_Lin2d first(gp_Pnt2d(a.x(),a.y()),gp_Dir2d(u.x(),u.y()));
+    const gp_Lin2d second(gp_Pnt2d(b.x(),b.y()),gp_Dir2d(v.x(),v.y()));
+    const GccAna_Circ2d2TanRad circles(GccEnt_QualifiedLin(first,GccEnt_enclosed),
+        GccEnt_QualifiedLin(second,GccEnt_enclosed),options.radius_mm,options.geometry_tolerance_mm);
+    if (!circles.IsDone()) return {};
+    for (int k=1;k<=circles.NbSolutions();++k) {
+        Standard_Real parameter,argument;
+        gp_Pnt2d contact1,contact2;
+        circles.Tangency1(k,parameter,argument,contact1);
+        circles.Tangency2(k,parameter,argument,contact2);
+        const Vec2d start(contact1.X(),contact1.Y()),end(contact2.X(),contact2.Y());
+        const double incoming=(start-a).dot(u),outgoing=(end-b).dot(v);
+        if (incoming < -1e-8 || incoming > in_length+1e-8 ||
+            outgoing < -1e-8 || outgoing > out_length+1e-8) continue;
+        const gp_Pnt2d center=circles.ThisSolution(k).Location();
+        TangentSolution value;
+        value.incoming_remaining=incoming;
+        value.outgoing_consumed=outgoing;
+        value.arcs.push_back(connecting_arc(Vec2d(center.X(),center.Y()),start,end,options.radius_mm,1));
+        value.arcs.front().source_sweep_radians=turn(u,v);
+        if (value.arcs.front().sweep_radians<=0 ||
+            std::abs(value.arcs.front().sweep_radians-turn(u,v))>1e-6) continue;
+        const Polyline sampled=sample_connection(value,options.chord_tolerance_mm);
+        if (sampled.points.size()>1 && domain.contains(sampled)) return value;
+    }
+    return {};
+}
+
+struct OuterWindowState {
+    std::vector<bool> included_vertices;
+    std::vector<bool> joined_edges;
+
+    bool operator<(const OuterWindowState& other) const {
+        return std::tie(included_vertices,joined_edges)<
+            std::tie(other.included_vertices,other.joined_edges);
+    }
+};
+
+std::vector<CornerGroup> outer_windows(const OuterWindowState& state)
+{
+    const auto& active=state.included_vertices;
+    const auto& joined=state.joined_edges;
+    const size_t n=active.size();
+    const auto gap=std::find(joined.begin(),joined.end(),false);
+    if (gap==joined.end()) return {{0,n}};
+    const size_t start=(size_t(gap-joined.begin())+1)%n;
+    std::vector<CornerGroup> groups;
+    for (size_t offset=0;offset<n;) {
+        const size_t i=(start+offset)%n;
+        if (!active[i]) {++offset;continue;}
+        CornerGroup group{i,1};
+        while (offset+group.count<n && joined[(i+group.count-1)%n]) ++group.count;
+        groups.push_back(group);
+        offset+=group.count;
+    }
+    return groups;
+}
+
+double outer_removed_length(const TangentSolution& value,const std::vector<Vec2d>& p,CornerGroup group)
+{
+    const size_t n=p.size();
+    double length=(p[group.first]-p[(group.first+n-1)%n]).norm()-value.incoming_remaining+
+        value.outgoing_consumed;
+    for (size_t k=1;k<group.count;++k)
+        length+=(p[(group.first+k)%n]-p[(group.first+k-1)%n]).norm();
+    return length;
+}
+
+ContourRoundingResult assemble_outer(const std::vector<Vec2d>& p,
+    const std::vector<CornerGroup>& groups,const std::vector<TangentSolution>& chosen,
+    const Polyline& source,const ExPolygons& domain,const ContourRoundingOptions& options)
+{
+    ContourRoundingResult result;
+    Polyline output;
+    double length=0;
+    const auto append=[&](const Point& point) {
+        if (!output.points.empty()) {
+            if (output.points.back()==point) return;
+            length+=unscale<double>((point-output.points.back()).cast<double>().norm());
+        }
+        output.points.push_back(point);
+        if (output.points.size()>maximum_samples) throw std::length_error("Contour exceeds sampling budget");
+    };
+    for (size_t i=0;i<groups.size();++i) {
+        for (const auto& piece:connection_primitives(chosen[i])) {
+            if (const auto* segment=std::get_if<Linef>(&piece)) {
+                append(scaled_point(segment->a));append(scaled_point(segment->b));
+            } else {
+                ContourArc arc=std::get<ContourArc>(piece);
+                const Polyline sampled=discretize(arc,options.chord_tolerance_mm);
+                append(sampled.points.front());arc.begin_mm=length;
+                for (const Point& point:sampled.points) append(point);
+                arc.end_distance_mm=length;
+                if (arc.end_distance_mm>arc.begin_mm) result.arcs.push_back(arc);
+            }
+        }
+        const size_t end=(groups[i].first+groups[i].count-1)%p.size();
+        const size_t next=groups[(i+1)%groups.size()].first;
+        for (size_t j=(end+1)%p.size();j!=next;j=(j+1)%p.size()) append(scaled_point(p[j]));
+        append(scaled_point(chosen[(i+1)%groups.size()].arcs.front().start_mm));
+    }
+    if (output.points.front()!=output.points.back()) append(output.points.front());
+    if (!simple(output.points)) result.issues.push_back({ContourRoundingFailure::SelfIntersection,source});
+    if (!inside(output,domain)) result.issues.push_back({ContourRoundingFailure::OutsideDomain,source});
+    Polygon original(Points(source.points.begin(),source.points.end()-1));
+    Polygon rounded(Points(output.points.begin(),output.points.end()-1));
+    original.make_counter_clockwise();rounded.make_counter_clockwise();
+    for (const auto& region:domain) for (auto hole:region.holes) {
+        hole.make_counter_clockwise();
+        const double before=area(intersection_ex(Polygons{original},Polygons{hole}));
+        const double after=area(intersection_ex(Polygons{rounded},Polygons{hole}));
+        if (std::abs(after-before)>scale_(options.geometry_tolerance_mm)*hole.length()) {
+            result.issues.push_back({ContourRoundingFailure::TopologyChange,source});break;
+        }
+    }
+    if (!result.issues.empty()) {result.arcs.clear();return result;}
+    if (Polygon(Points(source.points.begin(),source.points.end()-1)).is_clockwise()) {
+        const double total=unscale<double>(output.length());
+        output.reverse();std::reverse(result.arcs.begin(),result.arcs.end());
+        for (auto& arc:result.arcs) {
+            std::swap(arc.start_mm,arc.end_mm);arc.sweep_radians=-arc.sweep_radians;
+            arc.source_sweep_radians=-arc.source_sweep_radians;
+            const double begin=total-arc.end_distance_mm;
+            arc.end_distance_mm=total-arc.begin_mm;arc.begin_mm=begin;
+        }
+    }
+    result.path=Polyline3(output);
+    return result;
+}
+
+} // namespace
+
+ContourRoundingResult ContinuousFiberFillStrategy::round_outer_contour(
+    const Polyline3& source,const ExPolygons& centerline_domain,const ContourRoundingOptions& options)
+{
+    if (options.radius_mm==0) {ContourRoundingResult result;result.path=source;return result;}
+    const Polyline line=source.to_polyline();
+    ContourRoundingResult invalid;
+    invalid.issues.push_back({ContourRoundingFailure::InvalidInput,line});
+    if (!std::isfinite(options.radius_mm) || options.radius_mm<0 ||
+        !std::isfinite(options.chord_tolerance_mm) || options.chord_tolerance_mm<=0 ||
+        !std::isfinite(options.geometry_tolerance_mm) || options.geometry_tolerance_mm<=options.chord_tolerance_mm ||
+        line.points.size()<4 || line.points.front()!=line.points.back() || centerline_domain.empty() ||
+        std::any_of(source.points.begin(),source.points.end(),[](const Point3& p){return p.z()!=0;})) return invalid;
+    try {
+        const auto p=canonical_ring(line);
+        if (p.size()<3 || !simple(line.points)) return invalid;
+        const ExPolygons comparison_domain=offset_ex(centerline_domain,float(scale_(
+            options.geometry_tolerance_mm-options.chord_tolerance_mm)));
+        const ExPolygons output_domain=offset_ex(centerline_domain,float(scale_(options.geometry_tolerance_mm)));
+        std::vector<bool> rounded_turns(p.size(),false);
+        for (size_t i=0;i<p.size();++i)
+            rounded_turns[i]=requires_outer_rounding(turn(p[i]-p[(i+p.size()-1)%p.size()],p[(i+1)%p.size()]-p[i]));
+        // Earlier contour siblings may have consumed this candidate's source
+        // after its geometry was generated. A turn that is not radius-treated
+        // must remain on the output loop. Reject the complete candidate if
+        // that turn is no longer available.
+        bool fixed_vertex_outside=false;
+        for (size_t i=0;i<p.size() && !fixed_vertex_outside;++i) if (!rounded_turns[i]) {
+            const Point point=scaled_point(p[i]);
+            fixed_vertex_outside=std::none_of(output_domain.begin(),output_domain.end(),[&](const ExPolygon& region) {
+                return region.contains(point,true);
+            });
+        }
+        if (fixed_vertex_outside) {
+            ContourRoundingResult result;
+            result.issues.push_back({ContourRoundingFailure::SourceOutsideCurrentDomain,line});
+            return result;
+        }
+        Polylines fixed_segments;
+        for (size_t i=0;i<p.size();++i) {
+            const size_t next=(i+1)%p.size();
+            if (!rounded_turns[i] && !rounded_turns[next])
+                fixed_segments.emplace_back(Points{scaled_point(p[i]),scaled_point(p[next])});
+        }
+        if (!fixed_segments.empty() && !diff_pl(fixed_segments,output_domain).empty()) {
+            ContourRoundingResult result;
+            result.issues.push_back({ContourRoundingFailure::SourceOutsideCurrentDomain,line});
+            return result;
+        }
+        if (std::none_of(rounded_turns.begin(),rounded_turns.end(),[](bool value){return value;})) {
+            ContourRoundingResult result;
+            if (inside(line,output_domain)) result.path=source;
+            else result.issues.push_back({ContourRoundingFailure::OutsideDomain,line});
+            return result;
+        }
+        // With no untouched support to anchor a local window, use the existing
+        // closed-ring solver for the complete set of radius-treated turns.
+        if (std::all_of(rounded_turns.begin(),rounded_turns.end(),[](bool value){return value;}))
+            return solve_ring(line,comparison_domain,output_domain,options);
+        const DomainDistance distances(comparison_domain);
+        OuterWindowState initial{rounded_turns,std::vector<bool>(p.size(),false)};
+        // Neighbouring treated corners are independent while their exact-radius
+        // tangent contacts fit in order on the shared support. Vertex adjacency
+        // alone says nothing about a contact conflict: a long straight edge may
+        // separate two corners that each need an ordinary single-circle fillet.
+        std::vector<double> retreat(p.size(),0.0);
+        for (size_t i=0;i<p.size();++i) if (rounded_turns[i]) {
+            const double angle=turn(p[i]-p[(i+p.size()-1)%p.size()],p[(i+1)%p.size()]-p[i]);
+            retreat[i]=options.radius_mm*std::tan(std::min(angle,PI-1e-7)*.5);
+        }
+        for (size_t i=0;i<p.size();++i) {
+            const size_t next=(i+1)%p.size();
+            if (!rounded_turns[i] || !rounded_turns[next]) continue;
+            initial.joined_edges[i]=retreat[i]+retreat[next]>(p[next]-p[i]).norm()+1e-8;
+        }
+        std::vector<OuterWindowState> pending{initial};
+        std::set<OuterWindowState> seen{initial};
+        size_t revisions=0;
+        while (!pending.empty() && revisions++<2*p.size()) {
+            auto state=std::move(pending.front());pending.erase(pending.begin());
+            const auto groups=outer_windows(state);
+            if (groups.empty()) continue;
+            std::vector<LocalSolutions> pools;
+            size_t unresolved=groups.size();
+            for (size_t i=0;i<groups.size();++i) {
+                const CornerGroup group=groups[i];
+                LocalSolutions local;
+                if (group.count==1)
+                    if (auto exact=outer_corner_circle(p,group.first,options,distances)) local.values.push_back(*exact);
+                if (local.values.empty()) local=solve_group(p,group,options,distances);
+                if (local.values.empty() && unresolved==groups.size()) unresolved=i;
+                std::stable_sort(local.values.begin(),local.values.end(),[&](const auto& a,const auto& b) {
+                    const double x=outer_removed_length(a,p,group),y=outer_removed_length(b,p,group);
+                    return std::abs(x-y)>1e-8?x<y:a.score<b.score;
+                });
+                pools.push_back(std::move(local));
+            }
+            if (unresolved==groups.size()) {
+                std::vector<TangentSolution> chosen(groups.size());
+                size_t combinations=0;
+                size_t support_conflict=groups.size();
+                ContourRoundingResult failure;
+                std::function<bool(size_t)> attempt=[&](size_t i) {
+                    if (i==groups.size()) {
+                        if (++combinations>128) return false;
+                        // Distinct windows may still use the same support if a
+                        // locally valid multi-arc connection reaches farther
+                        // than its nominal single-circle contact. Never stitch
+                        // them in reverse order: that would fold the fiber.
+                        for (size_t k=0;k<groups.size();++k) {
+                            const size_t end=(groups[k].first+groups[k].count-1)%p.size();
+                            const size_t next=(k+1)%groups.size();
+                            if ((end+1)%p.size()==groups[next].first &&
+                                chosen[k].outgoing_consumed>chosen[next].incoming_remaining+1e-8) {
+                                support_conflict=k;
+                                return false;
+                            }
+                        }
+                        auto result=assemble_outer(p,groups,chosen,line,output_domain,options);
+                        if (result.path) {failure=std::move(result);return true;}
+                        failure=std::move(result);return false;
+                    }
+                    for (const auto& value:pools[i].values) {
+                        chosen[i]=value;
+                        if (attempt(i+1)) return true;
+                        if (combinations>128) break;
+                    }
+                    return false;
+                };
+                if (attempt(0)) return failure;
+                if (combinations>128) {
+                    failure.issues.push_back({ContourRoundingFailure::SearchBudgetExceeded,line});
+                    return failure;
+                }
+                if (support_conflict<groups.size()) {
+                    auto expanded=state;
+                    const size_t edge=(groups[support_conflict].first+
+                        groups[support_conflict].count-1)%p.size();
+                    expanded.joined_edges[edge]=true;
+                    if (seen.insert(expanded).second)
+                        pending.push_back(std::move(expanded));
+                }
+            }
+            // Only enlarge the unresolved local window. An untouched long
+            // support is retained up to the new analytic tangent contact.
+            const size_t failing=unresolved==groups.size()?0:unresolved;
+            const CornerGroup group=groups[failing];
+            for (const size_t neighbour:{(group.first+p.size()-1)%p.size(),
+                    (group.first+group.count)%p.size()}) {
+                auto expanded=state;
+                expanded.included_vertices[neighbour]=true;
+                const size_t edge=neighbour==(group.first+p.size()-1)%p.size() ?
+                    neighbour : (group.first+group.count-1)%p.size();
+                expanded.joined_edges[edge]=true;
+                if (seen.insert(expanded).second &&
+                    std::count(expanded.included_vertices.begin(),expanded.included_vertices.end(),true)<p.size()-1)
+                    pending.push_back(std::move(expanded));
+            }
+        }
+        ContourRoundingResult unresolved;
+        unresolved.issues.push_back({pending.empty()?ContourRoundingFailure::LocalConnectionUnavailable:
+            ContourRoundingFailure::SearchBudgetExceeded,line});
+        return unresolved;
+    } catch (const std::length_error&) {
+        invalid.issues.front().reason=ContourRoundingFailure::SamplingLimit;return invalid;
+    }
+}
+
+ContourRoundingResult ContinuousFiberFillStrategy::round_hole_contour(
     const Polyline3& source,const ExPolygons& centerline_domain,const ContourRoundingOptions& options)
 {
     if (options.radius_mm==0) {

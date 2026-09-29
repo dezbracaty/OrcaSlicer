@@ -27,7 +27,7 @@ struct ContourArc {
     double source_sweep_radians {0.0}; // Preserve the speed limit when an arc is trimmed.
 };
 
-enum class ContourRoundingFailure { InvalidInput, SearchNotFound, OutsideDomain, SelfIntersection, TopologyChange, SamplingLimit, SupportConflict, SearchBudgetExceeded, NumericalFailure, OptimizerLimit, CandidateLimit, InsufficientSpace };
+enum class ContourRoundingFailure { InvalidInput, SearchNotFound, OutsideDomain, SelfIntersection, TopologyChange, SamplingLimit, SupportConflict, SearchBudgetExceeded, NumericalFailure, OptimizerLimit, CandidateLimit, InsufficientSpace, LocalConnectionUnavailable, SourceOutsideCurrentDomain };
 struct ContourIssue {
     ContourRoundingFailure reason;
     Polyline source;
@@ -139,8 +139,13 @@ public:
         const ExPolygons& remaining_material, double width_mm,
         const ExPolygons* hole_frontier = nullptr);
 
-    // Shape closed candidates before allocation; exteriors must remain closed.
-    static ContourRoundingResult round_contour(
+    // Round right and acute exterior turns. The complete exterior must remain closed.
+    static ContourRoundingResult round_outer_contour(
+        const Polyline3& source, const ExPolygons& centerline_domain,
+        const ContourRoundingOptions& options);
+
+    // Preserve the existing hole-frontier solver and its open-contour allocation.
+    static ContourRoundingResult round_hole_contour(
         const Polyline3& source, const ExPolygons& centerline_domain,
         const ContourRoundingOptions& options);
 
