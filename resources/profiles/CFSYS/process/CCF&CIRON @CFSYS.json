@@ -6,7 +6,7 @@
   "reinforced_infill_density": "100%",
   "fiber_resin_fill_density": "100%",
   "fiber_infill_max_speed": "10",
-  "fiber_infill_bend_radius": "0.3",
+  "fiber_infill_bend_radius": "0.5",
   "fiber_contour_bend_radius": "0.3",
   "fiber_contour_max_speed": "10",
   "fiber_infill_feed_ratio": "1",
