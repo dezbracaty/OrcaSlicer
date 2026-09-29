@@ -26,7 +26,7 @@ constexpr double straight_tolerance_mm = 0.00002;
 constexpr size_t maximum_samples = 200000;
 Vec2d left_normal(const Vec2d& v) { return {-v.y(), v.x()}; }
 double turn(const Vec2d& a, const Vec2d& b) { return std::atan2(cross2(a,b), a.dot(b)); }
-bool requires_outer_rounding(double radians) { return radians>=PI/2-1e-7; }
+bool requires_outer_rounding(double radians) { return radians>1e-7; }
 Point scaled_point(const Vec2d& p) { return Point::new_scale(p.x(), p.y()); }
 Vec2d mm_point(const Point& p) { return {unscale<double>(p.x()), unscale<double>(p.y())}; }
 
@@ -76,6 +76,39 @@ std::vector<Vec2d> canonical_ring(const Polyline& source)
     }
     rotate_start();
     return p;
+}
+
+// The offset contour already contains short chords sampled from smooth arcs.
+// Those vertices are not corners. Keep them only when the adjacent turns have
+// continuous curvature and the chord error is within the sampling budget.
+bool sampled_smooth_turn(const std::vector<Vec2d>& p,size_t i,
+                         const ContourRoundingOptions& options)
+{
+    const size_t n=p.size();
+    const auto angle_at=[&](size_t j) {
+        return turn(p[j]-p[(j+n-1)%n],p[(j+1)%n]-p[j]);
+    };
+    const auto curvature_at=[&](size_t j) {
+        const double before=(p[j]-p[(j+n-1)%n]).norm();
+        const double after=(p[(j+1)%n]-p[j]).norm();
+        return angle_at(j)/(.5*(before+after));
+    };
+    const double angle=angle_at(i);
+    if (angle<=0 || angle>PI/6 || angle_at((i+n-1)%n)<=0 || angle_at((i+1)%n)<=0)
+        return false;
+    const double before=(p[i]-p[(i+n-1)%n]).norm();
+    const double after=(p[(i+1)%n]-p[i]).norm();
+    if (std::max(before,after)*angle/8 > 4*options.chord_tolerance_mm)
+        return false;
+    const double k=curvature_at(i),left=curvature_at((i+n-1)%n),right=curvature_at((i+1)%n);
+    // The wider three-point circle is less sensitive to integer-coordinate
+    // rounding than the curvature of a single short sample chord.
+    const Vec2d u=p[i]-p[(i+n-2)%n],v=p[(i+2)%n]-p[i];
+    const double twice_area=2*std::abs(cross2(u,v));
+    if (twice_area<1e-12 || u.norm()*v.norm()*(u+v).norm()/twice_area <
+            options.radius_mm-options.geometry_tolerance_mm) return false;
+    return std::abs(k-left)<=.5*std::max(k,left) &&
+           std::abs(k-right)<=.5*std::max(k,right);
 }
 
 bool inside(const Polyline& path, const ExPolygons& domain)
@@ -899,12 +932,8 @@ ContourRoundingResult validated_cycle(const std::vector<LocalSolutions>& candida
     return result;
 }
 
-ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain,
-    const ExPolygons& output_domain,const ContourRoundingOptions& options)
+bool radius_disk_fits(const ExPolygons& output_domain,const ContourRoundingOptions& options)
 {
-    ContourRoundingResult result;
-    const auto p=canonical_ring(source);
-    if (p.size()<3 || !simple(source.points)) { result.issues.push_back({ContourRoundingFailure::InvalidInput,source}); return result; }
     // Prove geometric infeasibility before spending any search budget.
     // A bounded-curvature simple closed curve encloses an R disk (Pestov-Ionin).
     // Fill holes in an outer approximation: a valid loop may surround a hole.
@@ -912,13 +941,21 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
     // radius used to generate the path is never changed.
     const double disk_margin=2*options.chord_tolerance_mm+
         2*(0.25*ContourRoundingOptions{}.chord_tolerance_mm)+8*std::sqrt(2.0)*SCALING_FACTOR;
-    if (options.radius_mm>disk_margin) {
-        auto envelopes=fiber_material_offset(output_domain,options.chord_tolerance_mm);
-        for (auto& region:envelopes) region.holes.clear();
-        if (fiber_material_offset(union_ex(envelopes),-(options.radius_mm-disk_margin)).empty()) {
-            result.issues.push_back({ContourRoundingFailure::InsufficientSpace,source});
-            return result;
-        }
+    if (options.radius_mm<=disk_margin) return true;
+    auto envelopes=fiber_material_offset(output_domain,options.chord_tolerance_mm);
+    for (auto& region:envelopes) region.holes.clear();
+    return !fiber_material_offset(union_ex(envelopes),-(options.radius_mm-disk_margin)).empty();
+}
+
+ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain,
+    const ExPolygons& output_domain,const ContourRoundingOptions& options)
+{
+    ContourRoundingResult result;
+    const auto p=canonical_ring(source);
+    if (p.size()<3 || !simple(source.points)) { result.issues.push_back({ContourRoundingFailure::InvalidInput,source}); return result; }
+    if (!radius_disk_fits(output_domain,options)) {
+        result.issues.push_back({ContourRoundingFailure::InsufficientSpace,source});
+        return result;
     }
     const DomainDistance distances(domain);
     // The unconstrained pool may accumulate constrained solutions. Keep exact
@@ -1363,7 +1400,8 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_outer_contour(
         const ExPolygons output_domain=offset_ex(centerline_domain,float(scale_(options.geometry_tolerance_mm)));
         std::vector<bool> rounded_turns(p.size(),false);
         for (size_t i=0;i<p.size();++i)
-            rounded_turns[i]=requires_outer_rounding(turn(p[i]-p[(i+p.size()-1)%p.size()],p[(i+1)%p.size()]-p[i]));
+            rounded_turns[i]=requires_outer_rounding(turn(p[i]-p[(i+p.size()-1)%p.size()],p[(i+1)%p.size()]-p[i])) &&
+                !sampled_smooth_turn(p,i,options);
         // Earlier contour siblings may have consumed this candidate's source
         // after its geometry was generated. A turn that is not radius-treated
         // must remain on the output loop. Reject the complete candidate if
@@ -1397,21 +1435,56 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_outer_contour(
             else result.issues.push_back({ContourRoundingFailure::OutsideDomain,line});
             return result;
         }
+        if (!radius_disk_fits(output_domain,options)) {
+            ContourRoundingResult result;
+            result.issues.push_back({ContourRoundingFailure::InsufficientSpace,line});
+            return result;
+        }
+        const DomainDistance distances(comparison_domain);
+        // An occupied corner may be trimmed back only as far as its
+        // exact-radius tangent contact. It cannot be moved across a sibling's
+        // occupied region by a different whole-ring solution.
+        std::vector<double> retreat(p.size(),0.0);
+        for (size_t i=0;i<p.size();++i) if (rounded_turns[i]) {
+            const double angle=turn(p[i]-p[(i+p.size()-1)%p.size()],p[(i+1)%p.size()]-p[i]);
+            retreat[i]=options.radius_mm*std::tan(std::min(angle,PI-1e-7)*.5);
+            size_t nearest=size_t(-1);
+            if (distances.outside_distance(p[i],nearest)>retreat[i]+options.geometry_tolerance_mm) {
+                ContourRoundingResult result;
+                result.issues.push_back({ContourRoundingFailure::SourceOutsideCurrentDomain,line});
+                return result;
+            }
+        }
+        const auto faithful_to_source=[&](const ContourRoundingResult& candidate) {
+            if (!candidate.path) return false;
+            const Polyline output=candidate.path->to_polyline();
+            for (size_t i=0;i<p.size();++i) {
+                double squared=HUGE_VAL;
+                for (size_t j=1;j<output.points.size();++j)
+                    squared=std::min(squared,point_segment_distance_squared(p[i],
+                        mm_point(output.points[j-1]),mm_point(output.points[j])));
+                // Rounded corners may move within their tangent contact or
+                // one radius. Other source vertices are fixed support.
+                const double allowed=std::max(retreat[i],rounded_turns[i]?options.radius_mm:0.0)+
+                    options.geometry_tolerance_mm+straight_tolerance_mm;
+                if (squared>allowed*allowed) return false;
+            }
+            return true;
+        };
         // With no untouched support to anchor a local window, use the existing
         // closed-ring solver for the complete set of radius-treated turns.
-        if (std::all_of(rounded_turns.begin(),rounded_turns.end(),[](bool value){return value;}))
-            return solve_ring(line,comparison_domain,output_domain,options);
-        const DomainDistance distances(comparison_domain);
+        if (std::all_of(rounded_turns.begin(),rounded_turns.end(),[](bool value){return value;})) {
+            auto whole_ring=solve_ring(line,comparison_domain,output_domain,options);
+            if (!whole_ring.path || faithful_to_source(whole_ring)) return whole_ring;
+            ContourRoundingResult result;
+            result.issues.push_back({ContourRoundingFailure::LocalConnectionUnavailable,line});
+            return result;
+        }
         OuterWindowState initial{rounded_turns,std::vector<bool>(p.size(),false)};
         // Neighbouring treated corners are independent while their exact-radius
         // tangent contacts fit in order on the shared support. Vertex adjacency
         // alone says nothing about a contact conflict: a long straight edge may
         // separate two corners that each need an ordinary single-circle fillet.
-        std::vector<double> retreat(p.size(),0.0);
-        for (size_t i=0;i<p.size();++i) if (rounded_turns[i]) {
-            const double angle=turn(p[i]-p[(i+p.size()-1)%p.size()],p[(i+1)%p.size()]-p[i]);
-            retreat[i]=options.radius_mm*std::tan(std::min(angle,PI-1e-7)*.5);
-        }
         for (size_t i=0;i<p.size();++i) {
             const size_t next=(i+1)%p.size();
             if (!rounded_turns[i] || !rounded_turns[next]) continue;
@@ -1489,8 +1562,20 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_outer_contour(
             // support is retained up to the new analytic tangent contact.
             const size_t failing=unresolved==groups.size()?0:unresolved;
             const CornerGroup group=groups[failing];
+            bool expand_before=true,expand_after=true;
+            if (const auto support=supports(p,group)) {
+                const Vec2d contact=support->base+options.radius_mm*support->slope;
+                const bool before_short=contact.x()<0;
+                const bool after_short=contact.y()>support->outgoing_length;
+                if (before_short!=after_short) {
+                    expand_before=before_short;
+                    expand_after=after_short;
+                }
+            }
             for (const size_t neighbour:{(group.first+p.size()-1)%p.size(),
                     (group.first+group.count)%p.size()}) {
+                if (neighbour==(group.first+p.size()-1)%p.size() && !expand_before) continue;
+                if (neighbour==(group.first+group.count)%p.size() && !expand_after) continue;
                 auto expanded=state;
                 expanded.included_vertices[neighbour]=true;
                 const size_t edge=neighbour==(group.first+p.size()-1)%p.size() ?
@@ -1502,6 +1587,12 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_outer_contour(
             }
         }
         ContourRoundingResult unresolved;
+        // A cluster of tight turns may have no usable untouched support for
+        // the local windows. Search the complete ring before rejecting it.
+        auto whole_ring=solve_ring(line,comparison_domain,output_domain,options);
+        if (faithful_to_source(whole_ring)) return whole_ring;
+        if (!whole_ring.issues.empty() && whole_ring.issues.front().reason==ContourRoundingFailure::InsufficientSpace)
+            return whole_ring;
         unresolved.issues.push_back({pending.empty()?ContourRoundingFailure::LocalConnectionUnavailable:
             ContourRoundingFailure::SearchBudgetExceeded,line});
         return unresolved;

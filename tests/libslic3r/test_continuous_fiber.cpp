@@ -1376,14 +1376,14 @@ TEST_CASE("tangent rounding expands towards insufficient supports", "[Continuous
     }
 }
 
-TEST_CASE("outer contour rounds right and acute turns while preserving obtuse supports", "[ContinuousFiber][ContourRounding][outer]")
+TEST_CASE("outer contour rounds sharp direction changes including turns below 90 degrees", "[ContinuousFiber][ContourRounding][outer]")
 {
     const auto source=path_from_points({{0,0},{10,0},{14,2},{10,4},{0,4},{0,0}});
     const ExPolygons domain{rectangle(-1,-1,15,5)};
     const auto rounded=ContinuousFiberFillStrategy::round_outer_contour(source.polyline,domain,{.3});
     for (const auto& issue:rounded.issues) INFO(contour_rounding_failure_name(issue.reason));
     REQUIRE(rounded.path);
-    REQUIRE(rounded.arcs.size()==3);
+    REQUIRE(rounded.arcs.size()==5);
     CHECK(rounded.path->points.front()==rounded.path->points.back());
     for (const auto& arc:rounded.arcs) CHECK(arc.radius_mm==Catch::Approx(.3));
     CHECK(std::count_if(rounded.arcs.begin(),rounded.arcs.end(),[](const auto& arc) {
@@ -1391,9 +1391,9 @@ TEST_CASE("outer contour rounds right and acute turns while preserving obtuse su
     })>=1);
     CHECK(unscale<double>(rounded.path->length())>unscale<double>(source.polyline.length())-1.0);
     for (const Point& original:{Point::new_scale(10,0),Point::new_scale(10,4)})
-        CHECK(std::find_if(rounded.path->points.begin(),rounded.path->points.end(),[&](const Point3& p) {
+        CHECK(std::none_of(rounded.path->points.begin(),rounded.path->points.end(),[&](const Point3& p) {
             return p.x()==original.x() && p.y()==original.y();
-        })!=rounded.path->points.end());
+        }));
     const auto square=path_from_points({{0,0},{10,0},{10,10},{0,10},{0,0}});
     const auto rounded_square=ContinuousFiberFillStrategy::round_outer_contour(square.polyline,
         {rectangle(-1,-1,11,11)},{.3});
@@ -1405,13 +1405,25 @@ TEST_CASE("outer contour rounds right and acute turns while preserving obtuse su
         CHECK(std::abs(arc.sweep_radians)==Catch::Approx(PI/2));
     }
     const auto obtuse=path_from_points({{10,0},{5,8},{-5,8},{-10,0},{-5,-8},{5,-8},{10,0}});
-    const auto unchanged=ContinuousFiberFillStrategy::round_outer_contour(obtuse.polyline,
+    const auto rounded_obtuse=ContinuousFiberFillStrategy::round_outer_contour(obtuse.polyline,
         {rectangle(-11,-9,11,9)},{.3});
-    REQUIRE(unchanged.path);
-    CHECK(unchanged.arcs.empty());
-    CHECK(unchanged.path->points==obtuse.polyline.points);
-    const auto occupied=ContinuousFiberFillStrategy::round_outer_contour(source.polyline,
+    REQUIRE(rounded_obtuse.path);
+    CHECK(rounded_obtuse.arcs.size()==6);
+    for (const auto& arc:rounded_obtuse.arcs)
+        CHECK(std::abs(arc.sweep_radians)<PI/2);
+    // The original pointed-candidate occupancy case must remain covered: an
+    // all-convex ring cannot move its tip across five millimeters of occupied
+    // sibling space just because every vertex is eligible for rounding.
+    const auto occupied_tip=ContinuousFiberFillStrategy::round_outer_contour(source.polyline,
         {rectangle(-1,-1,9,5)},{.3});
+    REQUIRE_FALSE(occupied_tip.path);
+    REQUIRE(occupied_tip.issues.size()==1);
+    CHECK(occupied_tip.issues.front().reason==ContourRoundingFailure::SourceOutsideCurrentDomain);
+    // The inward notch is a fixed (negative) turn, so sibling occupancy must
+    // still reject a candidate whose notch has left the available domain.
+    const auto notched=path_from_points({{0,0},{10,0},{10,4},{6,4},{6,2},{4,2},{4,4},{0,4},{0,0}});
+    const auto occupied=ContinuousFiberFillStrategy::round_outer_contour(notched.polyline,
+        {rectangle(-1,-1,5,5)},{.3});
     REQUIRE_FALSE(occupied.path);
     REQUIRE(occupied.issues.size()==1);
     CHECK(occupied.issues.front().reason==ContourRoundingFailure::SourceOutsideCurrentDomain);
@@ -1424,7 +1436,45 @@ TEST_CASE("outer contour rounds right and acute turns while preserving obtuse su
         {edge_occupied},{.3});
     REQUIRE_FALSE(crossing.path);
     REQUIRE(crossing.issues.size()==1);
-    CHECK(crossing.issues.front().reason==ContourRoundingFailure::SourceOutsideCurrentDomain);
+    CHECK(crossing.issues.front().reason==ContourRoundingFailure::OutsideDomain);
+}
+
+TEST_CASE("oversized outer radius is classified as insufficient space", "[ContinuousFiber][ContourRounding][outer]")
+{
+    const auto notched=path_from_points({{0,0},{10,0},{10,4},{6,4},{6,2},{4,2},{4,4},{0,4},{0,0}});
+    const auto rounded=ContinuousFiberFillStrategy::round_outer_contour(notched.polyline,
+        {rectangle(-1,-1,11,5)},{30});
+    REQUIRE_FALSE(rounded.path);
+    REQUIRE(rounded.issues.size()==1);
+    CHECK(rounded.issues.front().reason==ContourRoundingFailure::InsufficientSpace);
+}
+
+TEST_CASE("outer triangle rounds when every corner requires treatment", "[ContinuousFiber][ContourRounding][outer]")
+{
+    const auto triangle=path_from_points({{0,0},{10,0},{5,8.660254},{0,0}});
+    const auto rounded=ContinuousFiberFillStrategy::round_outer_contour(triangle.polyline,
+        {rectangle(-1,-1,11,10)},{.3});
+    for (const auto& issue:rounded.issues) INFO(contour_rounding_failure_name(issue.reason));
+    REQUIRE(rounded.path);
+    REQUIRE(rounded.arcs.size()==3);
+    CHECK(rounded.path->points.front()==rounded.path->points.back());
+    for (const auto& arc:rounded.arcs) CHECK(arc.radius_mm==Catch::Approx(.3));
+}
+
+TEST_CASE("sampled smooth outer arcs are not treated as hard corners", "[ContinuousFiber][ContourRounding][outer]")
+{
+    Polyline3 circle;
+    for (int i=0;i<90;++i) {
+        const double angle=2*PI*i/90;
+        circle.points.emplace_back(Point::new_scale(2+.3*std::cos(angle),2+.3*std::sin(angle)),0);
+    }
+    circle.points.push_back(circle.points.front());
+    const auto rounded=ContinuousFiberFillStrategy::round_outer_contour(circle,
+        {rectangle(1,1,3,3)},{.3});
+    for (const auto& issue:rounded.issues) INFO(contour_rounding_failure_name(issue.reason));
+    REQUIRE(rounded.path);
+    CHECK(rounded.arcs.empty());
+    CHECK(rounded.path->points==circle.points);
 }
 
 TEST_CASE("short-edge normalization preserves resolvable geometric deviation", "[ContinuousFiber][ContourRounding]")
@@ -2964,7 +3014,7 @@ TEST_CASE("contour process width cannot change the configured radius", "[Continu
             candidates.geometry_domains.at(candidate.geometry_domain_id),{radius});
         for (const auto& issue:result.issues) INFO(contour_rounding_failure_name(issue.reason));
         REQUIRE(result.path);
-        REQUIRE(result.arcs.size()==3);
+        REQUIRE(result.arcs.size()==5);
         for (const auto& arc:result.arcs) CHECK(arc.radius_mm==Catch::Approx(radius));
     }
 }

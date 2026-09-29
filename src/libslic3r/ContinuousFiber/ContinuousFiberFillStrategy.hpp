@@ -139,7 +139,8 @@ public:
         const ExPolygons& remaining_material, double width_mm,
         const ExPolygons* hole_frontier = nullptr);
 
-    // Round right and acute exterior turns. The complete exterior must remain closed.
+    // Round exterior direction changes, including turns of 90 degrees or less.
+    // The complete exterior must remain closed.
     static ContourRoundingResult round_outer_contour(
         const Polyline3& source, const ExPolygons& centerline_domain,
         const ContourRoundingOptions& options);
