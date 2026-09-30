@@ -840,19 +840,30 @@ bool FiberContourPlanResult::audit_lineage() const
     return true;
 }
 
-FiberContourPlanResult FiberPathValidator::plan_contours(
-    const ExPolygons& original_area, const ContinuousFiberConfig& config,
-    const FiberDomainId& domain_id, bool collect_debug)
+namespace {
+
+struct RingStageOptions {
+    const Flow& flow;
+    double boundary_clearance_mm;
+    double bend_radius_mm;
+    size_t max_depth;
+    bool include_holes;
+    FiberPathPurpose purpose;
+    ExtrusionRole output_role;
+};
+
+// Shared branch traversal for ring-based fiber stages. Candidate validation
+// remains with each caller so its geometry and deposition rules stay explicit.
+template <class ValidateCandidate>
+FiberContourPlanResult plan_ring_stage(
+    const ExPolygons& original_area, const FiberDomainId& domain_id,
+    bool collect_debug, const RingStageOptions& stage, ValidateCandidate&& validate_candidate)
 {
-    const double width = config.contour_flow.width();
-    const double clearance = config.contour_boundary_clearance_mm;
-    if (!std::isfinite(width) || width <= 0 || !std::isfinite(clearance) || clearance < 0 || config.contour_count < 0)
-        throw std::invalid_argument("Invalid fiber contour geometry parameters");
+    const double width = stage.flow.width();
+    const double clearance = stage.boundary_clearance_mm;
     FiberContourPlanResult plan;
     auto& result = plan.validation;
-    result.output_role = erContinuousFiberContour;
-    if (config.contour_count == 0) return plan;
-    validate_fiber_process_config(config, FiberPathPurpose::Contour);
+    result.output_role = stage.output_role;
 
     struct Branch {
         ExPolygons material;
@@ -885,7 +896,7 @@ FiberContourPlanResult FiberPathValidator::plan_contours(
         0.5 * ContourRoundingOptions{}.geometry_tolerance_mm);
     size_t job = 0;
     for (const auto side : {FiberContourSide::Outer, FiberContourSide::Hole}) {
-        if (side == FiberContourSide::Hole && !config.contour_include_holes) continue;
+        if (side == FiberContourSide::Hole && !stage.include_holes) continue;
         std::vector<Branch> current;
         for (size_t region = 0; region < regions.size(); ++region) {
             const auto root = fiber_material_offset(ExPolygons{regions[region]}, -clearance);
@@ -897,7 +908,7 @@ FiberContourPlanResult FiberPathValidator::plan_contours(
                     std::nullopt, region, hole});
             }
         }
-        for (size_t depth = 0; depth < size_t(config.contour_count) && !current.empty(); ++depth) {
+        for (size_t depth = 0; depth < stage.max_depth && !current.empty(); ++depth) {
             std::vector<Branch> next;
             for (const auto& branch : current) {
                 const ExPolygons remaining = diff_ex(branch.material, result.physical_footprint);
@@ -908,13 +919,13 @@ FiberContourPlanResult FiberPathValidator::plan_contours(
                 // material. Requiring a complete ring inside that clipped domain
                 // would reject valid strands before they can be allocated.
                 ExPolygons hole_rounding_domain;
-                if (side == FiberContourSide::Hole && config.contour_bend_radius_mm > 0) {
+                if (side == FiberContourSide::Hole && stage.bend_radius_mm > 0) {
                     const auto frontier = fiber_material_offset(branch.hole_frontier, 0.5 * width);
                     auto bounds = get_extents(frontier);
                     // C/CSC/CCC arcs cannot reach farther than 4R from their
                     // support contacts. This finite bound represents the outside
                     // of the hole; actual material is checked during allocation.
-                    bounds.offset(scale_(4 * config.contour_bend_radius_mm +
+                    bounds.offset(scale_(4 * stage.bend_radius_mm +
                         ContourRoundingOptions{}.geometry_tolerance_mm));
                     hole_rounding_domain = diff_ex(ExPolygons{ExPolygon(bounds.polygon())}, frontier);
                 }
@@ -926,11 +937,11 @@ FiberContourPlanResult FiberPathValidator::plan_contours(
                 ExPolygons updated_available;
                 bool coverage_changed = false;
                 for (const auto& candidate : candidates.paths) {
-                    const FiberCandidateId id{domain_id, FiberPathPurpose::Contour, job++, 0};
+                    const FiberCandidateId id{domain_id, stage.purpose, job++, 0};
                     plan.nodes.push_back({id, branch.parent, depth, side, branch.region, branch.boundary,
                         candidate.part_id, collect_debug ? std::optional<Polyline>(candidate.geometry.to_polyline()) : std::nullopt});
-                    ExtrusionPath path(erContinuousFiberContour, config.contour_flow.mm3_per_mm(),
-                        config.contour_flow.width(), config.contour_flow.height());
+                    ExtrusionPath path(stage.output_role, stage.flow.mm3_per_mm(),
+                        stage.flow.width(), stage.flow.height());
                     path.polyline = candidate.geometry;
                     // Earlier siblings may have committed coverage after this
                     // level's geometry was extracted. Recheck against that state.
@@ -939,20 +950,11 @@ FiberContourPlanResult FiberPathValidator::plan_contours(
                             diff_ex(branch.material, result.physical_footprint), -0.5 * width);
                         available = &updated_available;
                     }
-                    auto accepted = validate_impl({&path}, original_area, config, FiberPathPurpose::Contour,
-                        erContinuousFiberContour, domain_id, id.job_ordinal, available,
+                    auto accepted = validate_candidate(path, id.job_ordinal, available,
                         side == FiberContourSide::Outer ? &candidates.geometry_domains.at(candidate.geometry_domain_id) :
-                            &hole_rounding_domain, &physical_partition,
-                        collect_debug, side == FiberContourSide::Outer);
-                    for (const auto& assignment : accepted.assignments)
-                        if (assignment.reason == FiberRejectionReason::IntervalMappingFailure ||
-                            assignment.reason == FiberRejectionReason::InvalidParameter ||
-                            assignment.reason == FiberRejectionReason::FinalizedPathOutsideDomain)
-                            throw std::runtime_error("Fiber contour planning failed at layer " + std::to_string(domain_id.layer_id + 1) +
-                                ", candidate " + std::to_string(id.job_ordinal) + ": " +
-                                fiber_rejection_reason_name(assignment.reason) + "; " + assignment.detail);
+                            &hole_rounding_domain, &physical_partition, side == FiberContourSide::Outer);
                     const auto cycle = accepted_cycle(accepted, id);
-                    if (cycle && depth + 1 < size_t(config.contour_count)) {
+                    if (cycle && depth + 1 < stage.max_depth) {
                         const ExPolygons enclosed{ExPolygon(*cycle)};
                         if (side == FiberContourSide::Outer)
                             next.push_back({intersection_ex(remaining, enclosed), {}, id, branch.region, branch.boundary});
@@ -977,6 +979,43 @@ FiberContourPlanResult FiberPathValidator::plan_contours(
     result.contour_to_infill_keepout = union_ex(result.contour_to_infill_keepout);
     if (!plan.audit_lineage()) throw std::runtime_error("Continuous fiber contour lineage audit failed");
     return plan;
+}
+
+} // namespace
+
+FiberContourPlanResult FiberPathValidator::plan_contours(
+    const ExPolygons& original_area, const ContinuousFiberConfig& config,
+    const FiberDomainId& domain_id, bool collect_debug)
+{
+    const double width = config.contour_flow.width();
+    const double clearance = config.contour_boundary_clearance_mm;
+    if (!std::isfinite(width) || width <= 0 || !std::isfinite(clearance) || clearance < 0 || config.contour_count < 0)
+        throw std::invalid_argument("Invalid fiber contour geometry parameters");
+    if (config.contour_count == 0) {
+        FiberContourPlanResult plan;
+        plan.validation.output_role = erContinuousFiberContour;
+        return plan;
+    }
+    validate_fiber_process_config(config, FiberPathPurpose::Contour);
+    const RingStageOptions stage{config.contour_flow, config.contour_boundary_clearance_mm,
+        config.contour_bend_radius_mm, size_t(config.contour_count), config.contour_include_holes,
+        FiberPathPurpose::Contour, erContinuousFiberContour};
+    const auto validate_candidate = [&](ExtrusionPath& path, size_t job_ordinal,
+        const ExPolygons* available, const ExPolygons* geometry_domain,
+        const ExPolygons* physical_partition, bool requires_closed_loop) {
+        auto accepted = validate_impl({&path}, original_area, config, FiberPathPurpose::Contour,
+            erContinuousFiberContour, domain_id, job_ordinal, available, geometry_domain,
+            physical_partition, collect_debug, requires_closed_loop);
+        for (const auto& assignment : accepted.assignments)
+            if (assignment.reason == FiberRejectionReason::IntervalMappingFailure ||
+                assignment.reason == FiberRejectionReason::InvalidParameter ||
+                assignment.reason == FiberRejectionReason::FinalizedPathOutsideDomain)
+                throw std::runtime_error("Fiber contour planning failed at layer " + std::to_string(domain_id.layer_id + 1) +
+                    ", candidate " + std::to_string(job_ordinal) + ": " +
+                    fiber_rejection_reason_name(assignment.reason) + "; " + assignment.detail);
+        return accepted;
+    };
+    return plan_ring_stage(original_area, domain_id, collect_debug, stage, validate_candidate);
 }
 
 } // namespace Slic3r
