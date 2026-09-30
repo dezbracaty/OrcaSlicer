@@ -150,6 +150,7 @@
     "fiber_contour_infill_clearance": "0",
     "fiber_contour_max_speed": "10",
     "fiber_contour_min_speed": "10",
+    "fiber_corner_stabilization_length": "0",
     "fiber_corner_transition_length": "5",
     "fiber_cut_gcode": "M400\\nS0\\nM400\\n",
     "fiber_cut_to_contact_length": "23",

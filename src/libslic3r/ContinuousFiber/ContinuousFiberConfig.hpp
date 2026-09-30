@@ -49,6 +49,7 @@ struct ContinuousFiberConfig {
     double contour_boundary_clearance_mm { 0.0 };
     double contour_bend_radius_mm { 0.0 };
     double infill_bend_radius_mm { 0.0 };
+    double corner_stabilization_length_mm { 0.0 };
     double contour_min_speed_mm_s { 3.0 };
     double infill_min_speed_mm_s { 3.0 };
     double corner_transition_length_mm { 5.0 };

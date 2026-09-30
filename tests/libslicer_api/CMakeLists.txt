@@ -10,7 +10,7 @@ target_link_libraries(libslicer_api_tests
         PNG::PNG
 )
 
-target_include_directories(libslicer_api_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(libslicer_api_tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/deps_src)
 target_compile_definitions(libslicer_api_tests PRIVATE
     LIBSLICER_TEST_RESOURCE_DIR="${CMAKE_SOURCE_DIR}/resources"
     LIBSLICER_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data"
@@ -43,24 +43,21 @@ add_test(NAME Fiber4xiaoInfillGapChecker COMMAND fiber_4xiao_acceptance --infill
 set_tests_properties(Fiber4xiaoInfillGap Fiber4xiaoInfillGapCurrent PROPERTIES LABELS "fiber_infill_gap" TIMEOUT 180 RUN_SERIAL TRUE)
 set_tests_properties(Fiber4xiaoInfillGapChecker PROPERTIES LABELS "fiber_infill_gap" TIMEOUT 20)
 
-# Positive-radius coverage gates. Layer 24 may reject its central candidate
-# when it cannot satisfy the landing/effective/tail process budget.
+# Both production-model fixtures must slice successfully with every supported
+# contour count. Keep these registered unconditionally so CI cannot skip them.
 add_test(NAME FiberRoundedChecker COMMAND fiber_4xiao_acceptance --rounded-self-test)
 set_tests_properties(FiberRoundedChecker PROPERTIES LABELS "fiber_rounded" TIMEOUT 20)
-foreach(_count IN ITEMS 1 4)
+set(FIBER_TEST_MODELS_DIR "${CMAKE_SOURCE_DIR}/models/continuous_fiber")
+foreach(_count IN ITEMS 1 2 3 4)
     add_test(NAME Fiber4xiaoRounded${_count} COMMAND fiber_4xiao_acceptance --rounded-model
-        "${CMAKE_SOURCE_DIR}/tests/data/continuous_fiber/4xiao/model.stl" 32 ${_count}
+        "${FIBER_TEST_MODELS_DIR}/4xiao.stl" 32 ${_count}
         "${CMAKE_CURRENT_BINARY_DIR}/4xiao-acceptance/rounded-${_count}")
     set_tests_properties(Fiber4xiaoRounded${_count} PROPERTIES LABELS "fiber_rounded" TIMEOUT 180 RUN_SERIAL TRUE)
+    add_test(NAME Fiber7xiaoRounded${_count} COMMAND fiber_4xiao_acceptance --rounded-model
+        "${FIBER_TEST_MODELS_DIR}/7xiao.stl" 212 ${_count}
+        "${CMAKE_CURRENT_BINARY_DIR}/7xiao-acceptance/rounded-${_count}")
+    set_tests_properties(Fiber7xiaoRounded${_count} PROPERTIES LABELS "fiber_rounded" TIMEOUT 240 RUN_SERIAL TRUE)
 endforeach()
-set(FIBER_7XIAO_MODEL "" CACHE FILEPATH "Optional 7xiao STL for full-model rounded fiber acceptance")
-if(FIBER_7XIAO_MODEL)
-    foreach(_count IN ITEMS 1 4)
-        add_test(NAME Fiber7xiaoRounded${_count} COMMAND fiber_4xiao_acceptance --rounded-model
-            "${FIBER_7XIAO_MODEL}" 212 ${_count} "${CMAKE_CURRENT_BINARY_DIR}/7xiao-acceptance/rounded-${_count}")
-        set_tests_properties(Fiber7xiaoRounded${_count} PROPERTIES LABELS "fiber_rounded" TIMEOUT 240 RUN_SERIAL TRUE)
-    endforeach()
-endif()
 
 add_test(NAME FiberBracketResinSlice COMMAND fiber_4xiao_acceptance --resin-model
     "${CMAKE_SOURCE_DIR}/tests/data/continuous_fiber/bracket1"

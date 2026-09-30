@@ -1,4 +1,5 @@
 {
+  "model": "../../../../models/continuous_fiber/bracket1.stl",
   "selection": {
     "machine_model_id": "CFSYS Alpha500 Printer",
     "machine_variant_id": "0.4",

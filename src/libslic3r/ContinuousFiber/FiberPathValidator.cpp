@@ -567,10 +567,14 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 ContinuousFiberFillStrategy::round_outer_contour(path.polyline, rounding_domain, options) :
                 ContinuousFiberFillStrategy::round_hole_contour(path.polyline, rounding_domain, options);
             if (!rounded.path) {
-                whole_path_reason=rounded.issues.size()==1 &&
-                    (rounded.issues.front().reason==ContourRoundingFailure::InsufficientSpace ||
-                     rounded.issues.front().reason==ContourRoundingFailure::SourceOutsideCurrentDomain) ?
-                    FiberRejectionReason::UnavailableContourRegion : FiberRejectionReason::ContourRoundingUnresolved;
+                const bool single_issue=rounded.issues.size()==1;
+                const auto reason=single_issue?rounded.issues.front().reason:ContourRoundingFailure::SearchNotFound;
+                whole_path_reason=single_issue &&
+                    (reason==ContourRoundingFailure::InsufficientSpace ||
+                     reason==ContourRoundingFailure::SourceOutsideCurrentDomain) ?
+                    FiberRejectionReason::UnavailableContourRegion :
+                    single_issue && reason==ContourRoundingFailure::InvalidInput ?
+                    FiberRejectionReason::InvalidParameter : FiberRejectionReason::ContourRoundingUnresolved;
                 rounding_issues=std::move(rounded.issues);
             } else {
                 path.polyline=std::move(*rounded.path);
@@ -943,7 +947,6 @@ FiberContourPlanResult FiberPathValidator::plan_contours(
                     for (const auto& assignment : accepted.assignments)
                         if (assignment.reason == FiberRejectionReason::IntervalMappingFailure ||
                             assignment.reason == FiberRejectionReason::InvalidParameter ||
-                            assignment.reason == FiberRejectionReason::ContourRoundingUnresolved ||
                             assignment.reason == FiberRejectionReason::FinalizedPathOutsideDomain)
                             throw std::runtime_error("Fiber contour planning failed at layer " + std::to_string(domain_id.layer_id + 1) +
                                 ", candidate " + std::to_string(id.job_ordinal) + ": " +

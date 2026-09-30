@@ -1461,6 +1461,70 @@ TEST_CASE("outer triangle rounds when every corner requires treatment", "[Contin
     for (const auto& arc:rounded.arcs) CHECK(arc.radius_mm==Catch::Approx(.3));
 }
 
+TEST_CASE("7xiao exterior rounding retains a closed path at captured failure regions", "[ContinuousFiber][ContourRounding][7xiao_outer]")
+{
+    const auto name=GENERATE("7xiao_outer_layer120_candidate0.json",
+        "7xiao_outer_layer179_candidate1.json");
+    INFO(name);
+    std::ifstream stream(std::string(TEST_DATA_DIR)+"/continuous_fiber/"+name);
+    REQUIRE(stream.good());
+    nlohmann::json fixture;stream>>fixture;
+    Polyline3 source;
+    for (const auto& point:fixture.at("source"))
+        source.points.emplace_back(point[0].get<coord_t>(),point[1].get<coord_t>(),coord_t(0));
+    ExPolygons domain;
+    for (const auto& rings:fixture.at("domain")) {
+        ExPolygon region;
+        for (const auto& point:rings[0])
+            region.contour.points.emplace_back(point[0].get<coord_t>(),point[1].get<coord_t>());
+        for (size_t i=1;i<rings.size();++i) {
+            Polygon hole;
+            for (const auto& point:rings[i])
+                hole.points.emplace_back(point[0].get<coord_t>(),point[1].get<coord_t>());
+            region.holes.push_back(std::move(hole));
+        }
+        domain.push_back(std::move(region));
+    }
+    const double radius=fixture.at("radius").get<double>();
+    const auto rounded=ContinuousFiberFillStrategy::round_outer_contour(source,domain,{radius});
+    for (const auto& issue:rounded.issues) INFO(contour_rounding_failure_name(issue.reason));
+    REQUIRE(rounded.path);
+    CHECK(rounded.path->points.front()==rounded.path->points.back());
+    CHECK_FALSE(rounded.arcs.empty());
+    for (const auto& arc:rounded.arcs) CHECK(arc.radius_mm==Catch::Approx(radius));
+    const auto& points=rounded.path->points;
+    const auto tangent_at=[&](const ContourArc& arc,bool start) {
+        const Vec2d position=start?arc.start_mm:arc.end_mm;
+        const Point sampled=Point::new_scale(position.x(),position.y());
+        const auto found=std::find_if(points.begin(),points.end()-1,[&](const Point3& p){return p.x()==sampled.x() && p.y()==sampled.y();});
+        REQUIRE(found!=points.end()-1);
+        const size_t index=size_t(found-points.begin()),count=points.size()-1;
+        const auto mm=[](const Point3& p){return Vec2d(unscale<double>(p.x()),unscale<double>(p.y()));};
+        const Vec2d chord=start?mm(points[index])-mm(points[(index+count-1)%count]):
+            mm(points[(index+1)%count])-mm(points[index]);
+        const Vec2d radial=position-arc.center_mm;
+        const Vec2d tangent=std::copysign(1.,arc.sweep_radians)*Vec2d(-radial.y(),radial.x());
+        REQUIRE(chord.norm()>0);
+        CHECK(std::abs(cross2(chord.normalized(),tangent.normalized()))<.05);
+    };
+    for (const auto& arc:rounded.arcs) {tangent_at(arc,true);tangent_at(arc,false);}
+    CHECK(diff_pl(Polylines{rounded.path->to_polyline()},
+        offset_ex(domain,scale_(ContourRoundingOptions{}.geometry_tolerance_mm))).empty());
+    auto reversed=source;
+    reversed.reverse();
+    const auto opposite=ContinuousFiberFillStrategy::round_outer_contour(reversed,domain,{radius});
+    REQUIRE(opposite.path);
+    CHECK(opposite.path->points.front()==opposite.path->points.back());
+    for (const auto& arc:opposite.arcs) CHECK(arc.radius_mm==Catch::Approx(radius));
+    auto reseamed=source;
+    reseamed.points.pop_back();
+    std::rotate(reseamed.points.begin(),reseamed.points.begin()+reseamed.points.size()/3,reseamed.points.end());
+    reseamed.points.push_back(reseamed.points.front());
+    const auto shifted=ContinuousFiberFillStrategy::round_outer_contour(reseamed,domain,{radius});
+    REQUIRE(shifted.path);
+    CHECK(shifted.path->points.front()==shifted.path->points.back());
+}
+
 TEST_CASE("sampled smooth outer arcs are not treated as hard corners", "[ContinuousFiber][ContourRounding][outer]")
 {
     Polyline3 circle;
@@ -2869,6 +2933,104 @@ TEST_CASE("fiber straight fill builds fixed returns without changing the scan gr
         const auto again=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point::new_scale(.5,0));
         CHECK(again.paths.front().geometry.points==path.geometry.points);
     }
+}
+
+TEST_CASE("fiber corner stabilization excludes the complete optimized return", "[ContinuousFiber][RoundedInfill]")
+{
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(1.f,.13f,.4f);
+    config.infill_density=100;
+    config.infill_bend_radius_mm=.2;
+    config.corner_stabilization_length_mm=5;
+    const auto generated=ContinuousFiberFillStrategy::generate_rectilinear(
+        {rectangle(0,0,20,10)},config,0,Point(0,0));
+    REQUIRE(generated.paths.size()==1);
+    const auto& arcs=generated.paths.front().arcs;
+    REQUIRE(arcs.size()>=4);
+    REQUIRE(arcs.size()%2==0);
+    for (size_t i=0;i<arcs.size();i+=2) {
+        const double preceding=i==0?arcs[i].begin_mm:arcs[i].begin_mm-arcs[i-1].end_distance_mm;
+        CHECK(preceding>=Catch::Approx(5).margin(.00001));
+        // The small bridge between the two quarter-circles belongs to this
+        // one return and cannot be misread as a separate stabilization span.
+        CHECK(arcs[i+1].begin_mm-arcs[i].end_distance_mm<5);
+    }
+}
+
+TEST_CASE("short pre-return spans disconnect but preserve every fiber scan", "[ContinuousFiber][RoundedInfill]")
+{
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(1.f,.13f,.4f);
+    config.infill_density=100;
+    config.infill_bend_radius_mm=.5;
+    const ExPolygons material{rectangle(0,0,20,4)};
+    const auto original=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+    REQUIRE(original.paths.size()==1);
+    REQUIRE(original.paths.front().arcs.size()>=4);
+    const size_t scan_count=original.paths.front().arcs.size()/2+1;
+    config.corner_stabilization_length_mm=5;
+    const auto disconnected=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+    REQUIRE(disconnected.paths.size()==scan_count);
+    for (const auto& path:disconnected.paths) {
+        CHECK(path.arcs.empty());
+        CHECK(path.geometry.points.size()==2);
+        CHECK(unscale<double>(path.geometry.length())==Catch::Approx(3).margin(.00001));
+    }
+    config.infill_bend_radius_mm=0;
+    const auto no_rounding=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+    config.corner_stabilization_length_mm=0;
+    const auto no_constraint=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+    REQUIRE(no_rounding.paths.size()==no_constraint.paths.size());
+    for (size_t i=0;i<no_rounding.paths.size();++i)
+        CHECK(no_rounding.paths[i].geometry.points==no_constraint.paths[i].geometry.points);
+}
+
+TEST_CASE("stabilized returns respect holes and rotated scan domains", "[ContinuousFiber][RoundedInfill]")
+{
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(.8f,.13f,.4f);
+    config.infill_density=80;
+    config.infill_bend_radius_mm=.5;
+    config.corner_stabilization_length_mm=3;
+    const std::vector<ExPolygons> materials{
+        {rectangle_with_hole(0,0,12,40,4,10,8,30)},
+        diff_ex(ExPolygons{rectangle(0,0,12,40)},ExPolygons{rectangle(5,28,7,41)})};
+    for (const auto& material:materials) for (double angle:{0.,.37}) {
+        const auto generated=ContinuousFiberFillStrategy::generate_rectilinear(material,config,angle,Point(0,0));
+        REQUIRE_FALSE(generated.paths.empty());
+        const auto domain=offset_ex(generated.centerline_domain,scale_(.0001));
+        for (const auto& path:generated.paths) {
+            CHECK(diff_pl(Polylines{path.geometry.to_polyline()},domain).empty());
+            REQUIRE(path.arcs.size()%2==0);
+            for (size_t i=0;i<path.arcs.size();i+=2) {
+                const double gap=i==0?path.arcs[i].begin_mm:
+                    path.arcs[i].begin_mm-path.arcs[i-1].end_distance_mm;
+                CHECK(gap>=3);
+            }
+        }
+    }
+}
+
+TEST_CASE("first optimized return uses the deposited path length threshold", "[ContinuousFiber][RoundedInfill]")
+{
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(1.f,.13f,.4f);
+    config.infill_density=100;
+    config.infill_bend_radius_mm=.5;
+    const ExPolygons material{rectangle(0,0,2.4,12)};
+    const auto baseline=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+    REQUIRE(baseline.paths.size()==1);
+    REQUIRE(baseline.paths.front().arcs.size()==2);
+    const double lead_in=baseline.paths.front().arcs.front().begin_mm;
+    REQUIRE(lead_in>.01);
+    config.corner_stabilization_length_mm=lead_in-.001;
+    const auto accepted=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+    REQUIRE(accepted.paths.size()==1);
+    CHECK(accepted.paths.front().arcs.size()==2);
+    config.corner_stabilization_length_mm=lead_in+.001;
+    const auto split=ContinuousFiberFillStrategy::generate_rectilinear(material,config,0,Point(0,0));
+    REQUIRE(split.paths.size()==2);
+    for (const auto& path:split.paths) CHECK(path.arcs.empty());
 }
 
 TEST_CASE("half circle fiber return fits where its complete disk cannot", "[ContinuousFiber][RoundedInfill]")

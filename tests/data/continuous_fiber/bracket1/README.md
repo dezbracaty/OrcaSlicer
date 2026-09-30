@@ -1,6 +1,7 @@
 # Bracket resin regression boundary
 
 Frozen reproduction input, retained after reverting the experimental resin implementation.
+The mesh is `models/continuous_fiber/bracket1.stl`; `config.json` references it.
 
 `--resin-model` exports effective configuration, G-code, timing and diagnostics.
 `check_fiber_resin.py` independently checks fiber intrusion and (with `--baseline`) fiber coordinate identity. Its exit status does **not** accept coverage completeness, pattern semantics or performance. Coverage metrics are diagnostic (`not_evaluated`); the previous output-tuned percentage thresholds were removed.

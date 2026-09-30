@@ -70,6 +70,7 @@ struct FiberPolicyKey {
     double contour_boundary_clearance_mm { 0.0 };
     double contour_bend_radius_mm { 0.0 };
     double infill_bend_radius_mm { 0.0 };
+    double corner_stabilization_length_mm { 0.0 };
 
     auto values() const
     {
@@ -86,7 +87,7 @@ struct FiberPolicyKey {
             outside_tolerance_mm2, contour_max_speed_mm_s, infill_max_speed_mm_s,
             contour_acceleration_mm_s2, infill_acceleration_mm_s2,
             contour_infill_clearance_mm, resin_overlap_mm,
-            contour_feed_ratio, infill_feed_ratio, contour_min_speed_mm_s, infill_min_speed_mm_s, corner_transition_length_mm, speed_sampling_length_mm, tail_min_speed_mm_s, tail_max_speed_mm_s, tail_speed_step_length_mm, finish_overlap_length_mm, finish_motion_speed_mm_s, contour_feed_correction, infill_feed_correction, contour_boundary_clearance_mm, contour_bend_radius_mm, infill_bend_radius_mm);
+            contour_feed_ratio, infill_feed_ratio, contour_min_speed_mm_s, infill_min_speed_mm_s, corner_transition_length_mm, speed_sampling_length_mm, tail_min_speed_mm_s, tail_max_speed_mm_s, tail_speed_step_length_mm, finish_overlap_length_mm, finish_motion_speed_mm_s, contour_feed_correction, infill_feed_correction, contour_boundary_clearance_mm, contour_bend_radius_mm, infill_bend_radius_mm, corner_stabilization_length_mm);
     }
 
     bool operator<(const FiberPolicyKey& rhs) const { return values() < rhs.values(); }
@@ -154,7 +155,8 @@ inline FiberPolicyKey fiber_policy_key(
         config.infill_feed_correction,
         config.contour_boundary_clearance_mm,
         config.contour_bend_radius_mm,
-        config.infill_bend_radius_mm
+        config.infill_bend_radius_mm,
+        config.corner_stabilization_length_mm
     };
 }
 

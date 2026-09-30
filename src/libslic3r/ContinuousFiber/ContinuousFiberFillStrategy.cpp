@@ -1455,32 +1455,29 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_outer_contour(
                 return result;
             }
         }
-        const auto faithful_to_source=[&](const ContourRoundingResult& candidate) {
-            if (!candidate.path) return false;
-            const Polyline output=candidate.path->to_polyline();
-            for (size_t i=0;i<p.size();++i) {
-                double squared=HUGE_VAL;
-                for (size_t j=1;j<output.points.size();++j)
-                    squared=std::min(squared,point_segment_distance_squared(p[i],
-                        mm_point(output.points[j-1]),mm_point(output.points[j])));
-                // Rounded corners may move within their tangent contact or
-                // one radius. Other source vertices are fixed support.
-                const double allowed=std::max(retreat[i],rounded_turns[i]?options.radius_mm:0.0)+
-                    options.geometry_tolerance_mm+straight_tolerance_mm;
-                if (squared>allowed*allowed) return false;
-            }
-            return true;
-        };
         // With no untouched support to anchor a local window, use the existing
         // closed-ring solver for the complete set of radius-treated turns.
-        if (std::all_of(rounded_turns.begin(),rounded_turns.end(),[](bool value){return value;})) {
-            auto whole_ring=solve_ring(line,comparison_domain,output_domain,options);
-            if (!whole_ring.path || faithful_to_source(whole_ring)) return whole_ring;
-            ContourRoundingResult result;
-            result.issues.push_back({ContourRoundingFailure::LocalConnectionUnavailable,line});
-            return result;
-        }
+        if (std::all_of(rounded_turns.begin(),rounded_turns.end(),[](bool value){return value;}))
+            return solve_ring(line,comparison_domain,output_domain,options);
         OuterWindowState initial{rounded_turns,std::vector<bool>(p.size(),false)};
+        // The contact distance is measured along the source path, not by the
+        // number of sampled vertices. A bend may necessarily consume many
+        // tiny edges before reaching a usable tangent support. Put those
+        // vertices in the mutable window up front; untouched spans are copied
+        // verbatim by assemble_outer().
+        for (size_t i=0;i<p.size();++i) if (rounded_turns[i]) for (bool backward:{true,false}) {
+            double remaining=retreat[i];
+            size_t current=i;
+            for (size_t steps=0;steps<p.size()-1;++steps) {
+                const size_t next=backward?(current+p.size()-1)%p.size():(current+1)%p.size();
+                const double length=(p[next]-p[current]).norm();
+                if (remaining<=length+1e-8) break;
+                remaining-=length;
+                initial.included_vertices[next]=true;
+                initial.joined_edges[backward?next:current]=true;
+                current=next;
+            }
+        }
         // Neighbouring treated corners are independent while their exact-radius
         // tangent contacts fit in order on the shared support. Vertex adjacency
         // alone says nothing about a contact conflict: a long straight edge may
@@ -1490,111 +1487,117 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_outer_contour(
             if (!rounded_turns[i] || !rounded_turns[next]) continue;
             initial.joined_edges[i]=retreat[i]+retreat[next]>(p[next]-p[i]).norm()+1e-8;
         }
-        std::vector<OuterWindowState> pending{initial};
-        std::set<OuterWindowState> seen{initial};
-        size_t revisions=0;
-        while (!pending.empty() && revisions++<2*p.size()) {
-            auto state=std::move(pending.front());pending.erase(pending.begin());
-            const auto groups=outer_windows(state);
-            if (groups.empty()) continue;
-            std::vector<LocalSolutions> pools;
-            size_t unresolved=groups.size();
-            for (size_t i=0;i<groups.size();++i) {
-                const CornerGroup group=groups[i];
-                LocalSolutions local;
-                if (group.count==1)
-                    if (auto exact=outer_corner_circle(p,group.first,options,distances)) local.values.push_back(*exact);
-                if (local.values.empty()) local=solve_group(p,group,options,distances);
-                if (local.values.empty() && unresolved==groups.size()) unresolved=i;
-                std::stable_sort(local.values.begin(),local.values.end(),[&](const auto& a,const auto& b) {
-                    const double x=outer_removed_length(a,p,group),y=outer_removed_length(b,p,group);
-                    return std::abs(x-y)>1e-8?x<y:a.score<b.score;
-                });
-                pools.push_back(std::move(local));
-            }
-            if (unresolved==groups.size()) {
-                std::vector<TangentSolution> chosen(groups.size());
-                size_t combinations=0;
-                size_t support_conflict=groups.size();
-                ContourRoundingResult failure;
-                std::function<bool(size_t)> attempt=[&](size_t i) {
-                    if (i==groups.size()) {
-                        if (++combinations>128) return false;
-                        // Distinct windows may still use the same support if a
-                        // locally valid multi-arc connection reaches farther
-                        // than its nominal single-circle contact. Never stitch
-                        // them in reverse order: that would fold the fiber.
-                        for (size_t k=0;k<groups.size();++k) {
-                            const size_t end=(groups[k].first+groups[k].count-1)%p.size();
-                            const size_t next=(k+1)%groups.size();
-                            if ((end+1)%p.size()==groups[next].first &&
-                                chosen[k].outgoing_consumed>chosen[next].incoming_remaining+1e-8) {
-                                support_conflict=k;
-                                return false;
-                            }
-                        }
-                        auto result=assemble_outer(p,groups,chosen,line,output_domain,options);
-                        if (result.path) {failure=std::move(result);return true;}
-                        failure=std::move(result);return false;
-                    }
-                    for (const auto& value:pools[i].values) {
-                        chosen[i]=value;
-                        if (attempt(i+1)) return true;
-                        if (combinations>128) break;
-                    }
-                    return false;
-                };
-                if (attempt(0)) return failure;
-                if (combinations>128) {
-                    failure.issues.push_back({ContourRoundingFailure::SearchBudgetExceeded,line});
-                    return failure;
+        // Try the analytically indicated side first. If that incomplete
+        // heuristic finds no path, retry without pruning either direction.
+        for (int pass=0;pass<2;++pass) {
+            std::vector<OuterWindowState> pending{initial};
+            std::set<OuterWindowState> seen{initial};
+            size_t revisions=0;
+            while (!pending.empty() && revisions++<2*p.size()) {
+                auto state=std::move(pending.front());pending.erase(pending.begin());
+                const auto groups=outer_windows(state);
+                if (groups.empty()) continue;
+                if (groups.size()==1 && groups.front().count==p.size())
+                    return solve_ring(line,comparison_domain,output_domain,options);
+                std::vector<LocalSolutions> pools;
+                size_t unresolved=groups.size();
+                for (size_t i=0;i<groups.size();++i) {
+                    const CornerGroup group=groups[i];
+                    LocalSolutions local;
+                    if (group.count==1)
+                        if (auto exact=outer_corner_circle(p,group.first,options,distances)) local.values.push_back(*exact);
+                    if (local.values.empty()) local=solve_group(p,group,options,distances);
+                    if (local.values.empty() && unresolved==groups.size()) unresolved=i;
+                    std::stable_sort(local.values.begin(),local.values.end(),[&](const auto& a,const auto& b) {
+                        const double x=outer_removed_length(a,p,group),y=outer_removed_length(b,p,group);
+                        return std::abs(x-y)>1e-8?x<y:a.score<b.score;
+                    });
+                    pools.push_back(std::move(local));
                 }
-                if (support_conflict<groups.size()) {
+                if (unresolved==groups.size()) {
+                    std::vector<TangentSolution> chosen(groups.size());
+                    size_t combinations=0;
+                    size_t support_conflict=groups.size();
+                    ContourRoundingResult failure;
+                    std::function<bool(size_t)> attempt=[&](size_t i) {
+                        if (i==groups.size()) {
+                            if (++combinations>128) return false;
+                            // Distinct windows may still use the same support if a
+                            // locally valid multi-arc connection reaches farther
+                            // than its nominal single-circle contact. Never stitch
+                            // them in reverse order: that would fold the fiber.
+                            for (size_t k=0;k<groups.size();++k) {
+                                const size_t end=(groups[k].first+groups[k].count-1)%p.size();
+                                const size_t next=(k+1)%groups.size();
+                                if ((end+1)%p.size()==groups[next].first &&
+                                    chosen[k].outgoing_consumed>chosen[next].incoming_remaining+1e-8) {
+                                    support_conflict=k;
+                                    return false;
+                                }
+                            }
+                            auto result=assemble_outer(p,groups,chosen,line,output_domain,options);
+                            if (result.path) {failure=std::move(result);return true;}
+                            failure=std::move(result);return false;
+                        }
+                        for (const auto& value:pools[i].values) {
+                            chosen[i]=value;
+                            if (attempt(i+1)) return true;
+                            if (combinations>128) break;
+                        }
+                        return false;
+                    };
+                    if (attempt(0)) return failure;
+                    if (combinations>128) {
+                        if (pass==0) break;
+                        failure.issues.push_back({ContourRoundingFailure::SearchBudgetExceeded,line});
+                        return failure;
+                    }
+                    if (support_conflict<groups.size()) {
+                        auto expanded=state;
+                        const size_t edge=(groups[support_conflict].first+
+                            groups[support_conflict].count-1)%p.size();
+                        expanded.joined_edges[edge]=true;
+                        if (seen.insert(expanded).second)
+                            pending.push_back(std::move(expanded));
+                    }
+                }
+                // Only enlarge the unresolved local window. An untouched long
+                // support is retained up to the new analytic tangent contact.
+                const size_t failing=unresolved==groups.size()?0:unresolved;
+                const CornerGroup group=groups[failing];
+                bool expand_before=true,expand_after=true;
+                if (pass==0) if (const auto support=supports(p,group)) {
+                    const Vec2d contact=support->base+options.radius_mm*support->slope;
+                    const bool before_short=contact.x()<0;
+                    const bool after_short=contact.y()>support->outgoing_length;
+                    if (before_short!=after_short) {
+                        expand_before=before_short;
+                        expand_after=after_short;
+                    }
+                }
+                for (const size_t neighbour:{(group.first+p.size()-1)%p.size(),
+                        (group.first+group.count)%p.size()}) {
+                    if (neighbour==(group.first+p.size()-1)%p.size() && !expand_before) continue;
+                    if (neighbour==(group.first+group.count)%p.size() && !expand_after) continue;
                     auto expanded=state;
-                    const size_t edge=(groups[support_conflict].first+
-                        groups[support_conflict].count-1)%p.size();
+                    expanded.included_vertices[neighbour]=true;
+                    const size_t edge=neighbour==(group.first+p.size()-1)%p.size() ?
+                        neighbour : (group.first+group.count-1)%p.size();
                     expanded.joined_edges[edge]=true;
-                    if (seen.insert(expanded).second)
+                    if (seen.insert(expanded).second &&
+                        std::count(expanded.included_vertices.begin(),expanded.included_vertices.end(),true)<p.size()-1)
                         pending.push_back(std::move(expanded));
                 }
             }
-            // Only enlarge the unresolved local window. An untouched long
-            // support is retained up to the new analytic tangent contact.
-            const size_t failing=unresolved==groups.size()?0:unresolved;
-            const CornerGroup group=groups[failing];
-            bool expand_before=true,expand_after=true;
-            if (const auto support=supports(p,group)) {
-                const Vec2d contact=support->base+options.radius_mm*support->slope;
-                const bool before_short=contact.x()<0;
-                const bool after_short=contact.y()>support->outgoing_length;
-                if (before_short!=after_short) {
-                    expand_before=before_short;
-                    expand_after=after_short;
-                }
-            }
-            for (const size_t neighbour:{(group.first+p.size()-1)%p.size(),
-                    (group.first+group.count)%p.size()}) {
-                if (neighbour==(group.first+p.size()-1)%p.size() && !expand_before) continue;
-                if (neighbour==(group.first+group.count)%p.size() && !expand_after) continue;
-                auto expanded=state;
-                expanded.included_vertices[neighbour]=true;
-                const size_t edge=neighbour==(group.first+p.size()-1)%p.size() ?
-                    neighbour : (group.first+group.count-1)%p.size();
-                expanded.joined_edges[edge]=true;
-                if (seen.insert(expanded).second &&
-                    std::count(expanded.included_vertices.begin(),expanded.included_vertices.end(),true)<p.size()-1)
-                    pending.push_back(std::move(expanded));
+            if (pass==1) {
+                ContourRoundingResult unresolved;
+                unresolved.issues.push_back({pending.empty()?ContourRoundingFailure::LocalConnectionUnavailable:
+                    ContourRoundingFailure::SearchBudgetExceeded,line});
+                return unresolved;
             }
         }
         ContourRoundingResult unresolved;
-        // A cluster of tight turns may have no usable untouched support for
-        // the local windows. Search the complete ring before rejecting it.
-        auto whole_ring=solve_ring(line,comparison_domain,output_domain,options);
-        if (faithful_to_source(whole_ring)) return whole_ring;
-        if (!whole_ring.issues.empty() && whole_ring.issues.front().reason==ContourRoundingFailure::InsufficientSpace)
-            return whole_ring;
-        unresolved.issues.push_back({pending.empty()?ContourRoundingFailure::LocalConnectionUnavailable:
-            ContourRoundingFailure::SearchBudgetExceeded,line});
+        unresolved.issues.push_back({ContourRoundingFailure::SearchBudgetExceeded,line});
         return unresolved;
     } catch (const std::length_error&) {
         invalid.issues.front().reason=ContourRoundingFailure::SamplingLimit;return invalid;

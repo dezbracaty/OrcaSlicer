@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "model": "model.stl",
+  "model": "../../../../models/continuous_fiber/4xiao.stl",
   "model_fnv1a64": "75f709c509cd3724",
   "config": "config.json",
   "layer_count": 32,

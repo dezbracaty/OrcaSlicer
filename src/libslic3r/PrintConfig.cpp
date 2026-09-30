@@ -1039,6 +1039,14 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(0.0));
 
+    def = this->add("fiber_corner_stabilization_length", coFloat);
+    def->label = L("Fiber corner stabilization length");
+    def->tooltip = L("Minimum deposited fiber path length before each radius-optimized rectilinear return. The entire return, including its arcs and connecting segment, is excluded. Zero disables this constraint.");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
     def = this->add("fiber_contour_boundary_clearance", coFloat);
     def->label = L("Fiber contour boundary clearance");
     def->tooltip = L("Additional resin clearance between the fiber footprint and the internal core boundary.");

@@ -6,6 +6,7 @@
 #include <libslicer/Library.hpp>
 
 #include <miniz.h>
+#include <nlohmann/json.hpp>
 #include <png.h>
 
 #include <algorithm>
@@ -2489,19 +2490,42 @@ TEST_CASE("fiber rounding uses preset radii and preserves independent overrides"
     selection.process_preset_id="CCF&CIRON @CFSYS";
     selection.filament_preset_ids={"CFSYS CIRON","CFSYS CCF"};
     selection.filament_physical_tools={0,1};
+    std::ifstream preset_file(std::filesystem::path(LIBSLICER_TEST_RESOURCE_DIR)
+        / "profiles" / "CFSYS" / "process" / (selection.process_preset_id + ".json"));
+    REQUIRE(preset_file.good());
+    const auto preset=nlohmann::json::parse(preset_file);
+    const auto contour_radius=preset.at("fiber_contour_bend_radius").get<std::string>();
+    const auto infill_radius=preset.at("fiber_infill_bend_radius").get<std::string>();
+    const std::string contour_override=contour_radius=="0.7"?"0.8":"0.7";
+    const std::string infill_override=infill_radius=="0"?"1":"0";
     REQUIRE(library->activate_config(selection,{}).success);
-    CHECK(library->active_config_snapshot()->value("fiber_contour_bend_radius")==std::optional<std::string>{"0.3"});
-    CHECK(library->active_config_snapshot()->value("fiber_infill_bend_radius")==std::optional<std::string>{"0.3"});
-    const auto patch=library->apply_active_config_patch({{"fiber_contour_bend_radius","0.5"}});
+    CHECK(library->active_config_snapshot()->value("fiber_contour_bend_radius")==std::optional<std::string>{contour_radius});
+    CHECK(library->active_config_snapshot()->value("fiber_infill_bend_radius")==std::optional<std::string>{infill_radius});
+    const auto patch=library->apply_active_config_patch({{"fiber_contour_bend_radius",contour_override}});
     for (const auto& diagnostic:patch.diagnostics) UNSCOPED_INFO(diagnostic.key << ": " << diagnostic.message);
     REQUIRE(patch.success);
     const auto snapshot=library->active_config_snapshot();
-    CHECK(snapshot->value("fiber_contour_bend_radius")==std::optional<std::string>{"0.5"});
+    CHECK(snapshot->value("fiber_contour_bend_radius")==std::optional<std::string>{contour_override});
     CHECK_FALSE(snapshot->value("fiber_contour_rounding_max_reserve").has_value());
-    CHECK(snapshot->value("fiber_infill_bend_radius")==std::optional<std::string>{"0.3"});
-    REQUIRE(library->apply_active_config_patch({{"fiber_infill_bend_radius","0"}}).success);
-    CHECK(library->active_config_snapshot()->value("fiber_infill_bend_radius")==std::optional<std::string>{"0"});
-    CHECK(library->active_config_snapshot()->value("fiber_contour_bend_radius")==std::optional<std::string>{"0.5"});
+    CHECK(snapshot->value("fiber_infill_bend_radius")==std::optional<std::string>{infill_radius});
+    REQUIRE(library->apply_active_config_patch({{"fiber_infill_bend_radius",infill_override}}).success);
+    CHECK(library->active_config_snapshot()->value("fiber_infill_bend_radius")==std::optional<std::string>{infill_override});
+    CHECK(library->active_config_snapshot()->value("fiber_contour_bend_radius")==std::optional<std::string>{contour_override});
+}
+
+TEST_CASE("fiber corner stabilization setting round trips independently", "[libslicer_api][config][fiber-corner-stability]")
+{
+    auto config=libslicer::Config::defaults();
+    const auto items=config.settings();
+    const auto* item=find_item(items,"fiber_corner_stabilization_length");
+    REQUIRE(item!=nullptr);
+    CHECK(item->group==libslicer::SettingGroup::Process);
+    CHECK(item->category=="Continuous fiber");
+    CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="0");
+    REQUIRE(config.set("fiber_corner_stabilization_length","5").success);
+    CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="5");
+    REQUIRE(config.reset("fiber_corner_stabilization_length").success);
+    CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="0");
 }
 
 
