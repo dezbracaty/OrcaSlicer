@@ -205,6 +205,9 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
         item.enabled = infill_enabled;
     } else if (key_is(item.key, {"fiber_contour_boundary_clearance", "fiber_contour_bend_radius"})) {
         item.enabled = contour_enabled;
+    } else if (item.key == "fiber_infill_angle_sequence") {
+        item.visible = item.enabled = infill_enabled &&
+            config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
     } else if (item.key == "fiber_infill_bend_radius") {
         item.enabled = infill_enabled && config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
     } else if (item.key == "fiber_contour_infill_clearance") {
@@ -416,6 +419,8 @@ SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std:
                 if (!(input >> width) || !(input >> std::ws).eof() || !std::isfinite(width) || width <= 0)
                     return failure(key, "Fiber width must be a positive number in millimeters");
             }
+            if (key == "fiber_infill_angle_sequence")
+                Slic3r::parse_fiber_infill_angle_sequence(serialized_value);
             candidate.set_deserialize_strict(key, serialized_value);
             const auto* option_definition = Slic3r::print_config_def.get(key);
             const auto* option            = candidate.option(key);
@@ -486,6 +491,13 @@ std::vector<ConfigDiagnostic> Config::validate() const
         diagnostics.reserve(errors.size());
         for (const auto& [key, message] : errors) {
             diagnostics.push_back({key, message});
+        }
+        if (const auto* sequence=impl_->current.option<Slic3r::ConfigOptionString>("fiber_infill_angle_sequence")) {
+            try {
+                Slic3r::parse_fiber_infill_angle_sequence(sequence->value);
+            } catch (const std::invalid_argument& error) {
+                diagnostics.push_back({"fiber_infill_angle_sequence", error.what()});
+            }
         }
         Slic3r::GCodeConfig tools;
         tools.apply(impl_->current, true);

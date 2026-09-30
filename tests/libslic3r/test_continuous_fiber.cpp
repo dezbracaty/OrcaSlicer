@@ -2957,6 +2957,31 @@ TEST_CASE("fiber corner stabilization excludes the complete optimized return", "
     }
 }
 
+TEST_CASE("fiber infill angles cycle on scheduled fiber layers", "[ContinuousFiber][FiberAngles]")
+{
+    const auto angles=parse_fiber_infill_angle_sequence(" 0, 45,90,135 ");
+    const std::vector<double> expected{0,45,90,135};
+    REQUIRE(angles==expected);
+    CHECK_THROWS_AS(parse_fiber_infill_angle_sequence(" \t "),std::invalid_argument);
+    for (size_t fiber_layer=0;fiber_layer<9;++fiber_layer) {
+        const auto selected=fiber_infill_angle_for_layer("0,45,90,135",fiber_layer*2,2);
+        REQUIRE(selected);
+        CHECK(*selected==Catch::Approx(angles[fiber_layer%angles.size()]*PI/180));
+    }
+    const auto equivalent=fiber_infill_angle_for_layer("180,225",1,1);
+    REQUIRE(equivalent);
+    CHECK(*equivalent==Catch::Approx(PI/4));
+    const auto standard_first=fiber_infill_angle_for_layer("45,135",0,1);
+    const auto standard_second=fiber_infill_angle_for_layer("45,135",1,1);
+    REQUIRE(standard_first);
+    REQUIRE(standard_second);
+    CHECK(*standard_first==Catch::Approx(PI/4));
+    CHECK(*standard_second==Catch::Approx(3*PI/4));
+    for (const char* invalid:{"0,",",45","0,,90","45deg","nan","inf","-1","360"})
+        CHECK_THROWS_AS(parse_fiber_infill_angle_sequence(invalid),std::invalid_argument);
+    CHECK_THROWS_AS(fiber_infill_angle_for_layer("0,90",0,0),std::invalid_argument);
+}
+
 TEST_CASE("short pre-return spans disconnect but preserve every fiber scan", "[ContinuousFiber][RoundedInfill]")
 {
     ContinuousFiberConfig config;

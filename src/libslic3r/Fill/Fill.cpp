@@ -1216,10 +1216,12 @@ std::vector<SurfaceFill> group_fills(
 						// Merging every solid shell with sparse core changes island
 						// topology, joining separate reference contour loops together.
                         const bool fiber_surface = is_fiber_source_surface(layer, region_config, surface) && !params->bridge;
-						if (fiber_surface) {
-							ContinuousFiberConfig fiber_config = resolve_continuous_fiber_config(layer, layerm);
-							contributor.fiber_policy = fiber_policy_key(fiber_config, params->angle, params->fixed_angle);
-							contributor.fiber_config = std::move(fiber_config);
+                        if (fiber_surface) {
+                            ContinuousFiberConfig fiber_config = resolve_continuous_fiber_config(layer, layerm);
+                            const auto angle=fiber_config.rectilinear_angle_radians;
+                            contributor.fiber_policy = fiber_policy_key(fiber_config,
+                                angle.value_or(params->angle), angle.has_value() || params->fixed_angle);
+                            contributor.fiber_config = std::move(fiber_config);
 						}
 						fill.contributors.emplace_back(std::move(contributor));
 					}

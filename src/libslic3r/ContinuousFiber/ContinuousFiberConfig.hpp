@@ -5,6 +5,10 @@
 #include "FiberSource.hpp"
 #include "../PrintConfig.hpp"
 
+#include <optional>
+#include <string_view>
+#include <vector>
+
 namespace Slic3r {
 
 class Layer;
@@ -18,6 +22,7 @@ struct ContinuousFiberConfig {
     int contour_count { 0 };
     InfillPattern infill_pattern { ipRectilinear };
     double infill_density { 0.0 };
+    std::optional<double> rectilinear_angle_radians;
     Flow contour_flow;
     Flow infill_flow;
     unsigned contour_material { 0 };
@@ -69,6 +74,9 @@ struct ContinuousFiberConfig {
 
 bool continuous_fiber_enabled(const PrintRegionConfig& config);
 bool continuous_fiber_active_on_layer(const PrintRegionConfig& config, size_t layer_id);
+std::vector<double> parse_fiber_infill_angle_sequence(std::string_view serialized);
+std::optional<double> fiber_infill_angle_for_layer(std::string_view serialized,
+    size_t layer_id, size_t layer_interval);
 // Map resin settings to the shared infill generator without inheriting sparse fill controls.
 PrintRegionConfig resolve_resin_fill_config(const PrintRegionConfig& config);
 Flow resin_infill_flow(const LayerRegion& region, double height, bool first_layer);

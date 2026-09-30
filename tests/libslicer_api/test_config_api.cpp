@@ -2521,11 +2521,113 @@ TEST_CASE("fiber corner stabilization setting round trips independently", "[libs
     REQUIRE(item!=nullptr);
     CHECK(item->group==libslicer::SettingGroup::Process);
     CHECK(item->category=="Continuous fiber");
-    CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="0");
-    REQUIRE(config.set("fiber_corner_stabilization_length","5").success);
     CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="5");
+    REQUIRE(config.set("fiber_corner_stabilization_length","3").success);
+    CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="3");
     REQUIRE(config.reset("fiber_corner_stabilization_length").success);
-    CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="0");
+    CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="5");
+}
+
+TEST_CASE("fiber infill angle sequence is an independently validated process setting", "[libslicer_api][config][fiber-angles]")
+{
+    auto config=libslicer::Config::defaults();
+    auto items=config.settings();
+    const auto* item=find_item(items,"fiber_infill_angle_sequence");
+    REQUIRE(item!=nullptr);
+    CHECK(item->group==libslicer::SettingGroup::Process);
+    CHECK(item->category=="Continuous fiber");
+    CHECK(item->type==libslicer::SettingType::String);
+    CHECK_FALSE(item->visible);
+    CHECK_FALSE(item->enabled);
+    CHECK(config.snapshot().value("fiber_infill_angle_sequence")=="45,135");
+    const auto enabled_result=config.set("generate_reinforced_infills","1");
+    REQUIRE(enabled_result.success);
+    REQUIRE(find_item(enabled_result.changed_items,"fiber_infill_angle_sequence")!=nullptr);
+    CHECK(find_item(enabled_result.changed_items,"fiber_infill_angle_sequence")->visible);
+    items=config.settings();
+    REQUIRE(find_item(items,"fiber_infill_angle_sequence")!=nullptr);
+    CHECK(find_item(items,"fiber_infill_angle_sequence")->visible);
+    CHECK(find_item(items,"fiber_infill_angle_sequence")->enabled);
+    REQUIRE(config.set("fiber_infill_angle_sequence","0,45,90,135").success);
+    CHECK(config.snapshot().value("fiber_infill_angle_sequence")=="0,45,90,135");
+    for (const char* invalid:{"","0,","0,,90","45deg","nan","360"}) {
+        const auto result=config.set("fiber_infill_angle_sequence",invalid);
+        CHECK_FALSE(result.success);
+        CHECK(config.snapshot().value("fiber_infill_angle_sequence")=="0,45,90,135");
+    }
+    const auto concentric_result=config.set("reinforced_infill_pattern","concentric");
+    REQUIRE(concentric_result.success);
+    REQUIRE(find_item(concentric_result.changed_items,"fiber_infill_angle_sequence")!=nullptr);
+    CHECK_FALSE(find_item(concentric_result.changed_items,"fiber_infill_angle_sequence")->visible);
+    items=config.settings();
+    CHECK_FALSE(find_item(items,"fiber_infill_angle_sequence")->visible);
+    CHECK_FALSE(find_item(items,"fiber_infill_angle_sequence")->enabled);
+    REQUIRE(config.reset("fiber_infill_angle_sequence").success);
+    CHECK(config.snapshot().value("fiber_infill_angle_sequence")=="45,135");
+}
+
+TEST_CASE("fiber infill angle sequence controls deposited G-code on successive fiber layers", "[libslicer_api][fiber-angles][slice]")
+{
+    const int interval=GENERATE(1,2);
+    const bool use_default=GENERATE(false,true);
+    libslicer::LibraryOptions options;
+    options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id="CFSYS Alpha500 Printer";
+    selection.machine_variant_id="0.4";
+    selection.process_preset_id="CCF&CIRON @CFSYS";
+    selection.filament_preset_ids={"CFSYS CIRON","CFSYS CCF"};
+    selection.filament_physical_tools={0,1};
+    std::vector<std::pair<std::string,std::string>> overrides{
+        {"generate_reinforced_perimeters","0"},
+        {"generate_reinforced_infills","1"},
+        {"reinforced_infill_pattern","rectilinear"},
+        {"reinforced_infill_density","100%"},
+        {"sparse_infill_density","100%"},
+        {"top_shell_layers","0"}, {"bottom_shell_layers","0"},
+        {"fiber_layer_height_ratio",std::to_string(interval)}};
+    if (!use_default)
+        overrides.emplace_back("fiber_infill_angle_sequence","0,45,90,135");
+    REQUIRE(library->activate_config(selection,overrides).success);
+    auto model=fiber_infill_block();
+    for (auto& vertex:model.volumes.front().vertices) if (vertex.z>0)
+        vertex.z=interval==1?1.3f:2.4f;
+    libslicer::SliceRequest request;
+    request.config=*library->active_config_snapshot();
+    request.objects.push_back(std::move(model));
+    const auto sliced=library->slice(request);
+    for (const auto& diagnostic:sliced.diagnostics) INFO(diagnostic.message);
+    REQUIRE(sliced.success);
+    const auto imported=library->load_gcode_preview({sliced.output.path});
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview);
+    constexpr double pi=3.14159265358979323846;
+    const std::vector<double> expected=use_default?
+        std::vector<double>{45,135}:std::vector<double>{0,45,90,135};
+    std::set<unsigned> observed_layers;
+    std::set<size_t> observed_angles;
+    for (const auto& segment:imported.preview->segments) {
+        if (segment.extrusion_role!=libslicer::ToolpathExtrusionRole::ContinuousFiberInfill ||
+            segment.deposition!=libslicer::ToolpathDepositionKind::ContinuousFiberPowered) continue;
+        const double dx=segment.end_mm.x-segment.start_mm.x;
+        const double dy=segment.end_mm.y-segment.start_mm.y;
+        if (std::hypot(dx,dy)<1.0) continue; // Short segments may be rounded returns.
+        const size_t fiber_layer=segment.layer_index/size_t(interval);
+        const size_t slot=fiber_layer%expected.size();
+        double actual=std::fmod(std::atan2(dy,dx)*180/pi+360,180);
+        const double difference=std::abs(actual-expected[slot]);
+        INFO("interval=" << interval << " layer=" << segment.layer_index << " angle=" << actual);
+        CHECK(std::min(difference,180-difference)<0.5);
+        observed_layers.insert(segment.layer_index);
+        observed_angles.insert(slot);
+    }
+    CHECK(observed_layers.size()>=8); // Two complete angle cycles in final G-code.
+    CHECK(observed_angles.size()==expected.size());
+    std::error_code error;
+    std::filesystem::remove(sliced.output.path,error);
+    if (!sliced.gcode_3mf.path.empty()) std::filesystem::remove(sliced.gcode_3mf.path,error);
 }
 
 

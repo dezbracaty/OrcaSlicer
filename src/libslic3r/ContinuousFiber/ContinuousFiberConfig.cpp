@@ -2,9 +2,11 @@
 
 #include "../Layer.hpp"
 #include "../Print.hpp"
+#include "../Geometry.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <locale>
 #include <stdexcept>
 #include <sstream>
 #include <set>
@@ -238,6 +240,45 @@ bool continuous_fiber_active_on_layer(const PrintRegionConfig& config, size_t la
         layer_id % size_t(config.fiber_layer_height_ratio.value) == 0;
 }
 
+std::vector<double> parse_fiber_infill_angle_sequence(std::string_view serialized)
+{
+    const auto trim=[](std::string_view value) {
+        const size_t first=value.find_first_not_of(" \t\r\n");
+        if (first==std::string_view::npos) return std::string_view{};
+        return value.substr(first,value.find_last_not_of(" \t\r\n")-first+1);
+    };
+    serialized=trim(serialized);
+    std::vector<double> angles;
+    if (serialized.empty())
+        throw std::invalid_argument("fiber_infill_angle_sequence must contain comma-separated angles in [0,360)");
+    size_t first=0;
+    while (first<=serialized.size()) {
+        const size_t separator=serialized.find(',',first);
+        const std::string_view token=trim(serialized.substr(first,separator==std::string_view::npos?
+            separator:separator-first));
+        double degrees=0;
+        std::istringstream input{std::string(token)};
+        input.imbue(std::locale::classic());
+        if (token.empty() || !(input>>degrees) || !(input>>std::ws).eof() ||
+            !std::isfinite(degrees) || degrees<0 || degrees>=360)
+            throw std::invalid_argument("fiber_infill_angle_sequence must contain comma-separated angles in [0,360)");
+        angles.push_back(degrees);
+        if (separator==std::string_view::npos) break;
+        first=separator+1;
+    }
+    return angles;
+}
+
+std::optional<double> fiber_infill_angle_for_layer(std::string_view serialized,
+    size_t layer_id, size_t layer_interval)
+{
+    if (layer_interval==0)
+        throw std::invalid_argument("fiber_layer_height_ratio must be positive");
+    const auto angles=parse_fiber_infill_angle_sequence(serialized);
+    const size_t fiber_layer=layer_id/layer_interval;
+    return Geometry::deg2rad(std::fmod(angles[fiber_layer%angles.size()],180.0));
+}
+
 Flow resin_infill_flow(const LayerRegion& region, double height, bool first_layer)
 {
     const PrintObject& object = *region.layer()->object();
@@ -418,6 +459,9 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         result.corner_stabilization_length_mm = source.fiber_corner_stabilization_length.value;
         if (result.infill_pattern != ipRectilinear && result.infill_pattern != ipConcentric)
             throw std::runtime_error("Continuous fiber infill supports only rectilinear and concentric patterns");
+        if (result.infill_pattern==ipRectilinear)
+            result.rectilinear_angle_radians=fiber_infill_angle_for_layer(
+                source.fiber_infill_angle_sequence.value,layer.id(),size_t(result.layer_interval));
         if (!std::isfinite(source.reinforced_infill_density.value))
             throw std::runtime_error("reinforced_infill_density must be finite");
         result.infill_density = std::clamp(source.reinforced_infill_density.value, 0.0, 100.0);

@@ -982,6 +982,12 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels = {L("Rectilinear"), L("Concentric")};
     def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
 
+    def = this->add("fiber_infill_angle_sequence", coString);
+    def->label = L("Fiber infill angle sequence");
+    def->tooltip = L("Comma-separated rectilinear fiber directions in degrees, repeated on successive fiber layers (for example, 0,45,90,135). Angles are relative to the build plate; 180 degrees is the same line direction as 0. The default 45,135 matches the standard alternating infill directions.");
+    def->category = L("Continuous fiber");
+    def->set_default_value(new ConfigOptionString("45,135"));
+
     def = this->add("reinforced_infill_filament", coInt);
     def->label = L("Continuous fiber infill filament");
     def->category = L("Continuous fiber");
@@ -1045,7 +1051,7 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;
-    def->set_default_value(new ConfigOptionFloat(0.0));
+    def->set_default_value(new ConfigOptionFloat(5.0));
 
     def = this->add("fiber_contour_boundary_clearance", coFloat);
     def->label = L("Fiber contour boundary clearance");

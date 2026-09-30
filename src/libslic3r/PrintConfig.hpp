@@ -1085,6 +1085,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                 generate_reinforced_infills))
     ((ConfigOptionPercent,              reinforced_infill_density))
     ((ConfigOptionEnum<InfillPattern>,  reinforced_infill_pattern))
+    ((ConfigOptionString,               fiber_infill_angle_sequence))
     ((ConfigOptionInt,                  reinforced_infill_filament))
     ((ConfigOptionInt,                  reinforced_perimeters_filament))
     ((ConfigOptionFloat,               fiber_width))

@@ -1009,6 +1009,7 @@ static std::vector<std::string> s_Preset_print_options{
     "generate_reinforced_infills",
     "reinforced_infill_density",
     "reinforced_infill_pattern",
+    "fiber_infill_angle_sequence",
     "reinforced_infill_filament",
     "reinforced_perimeters_filament",
     "fiber_width",
