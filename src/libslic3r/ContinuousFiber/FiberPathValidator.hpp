@@ -37,10 +37,17 @@ enum class FiberRejectionReason : uint8_t {
     ContourRoundingUnresolved,
     OccupiedContourRegion,
     UnavailableContourRegion,
-    OpenOuterContour
+    OpenOuterContour,
+    BendStabilizationTooShort
 };
 
 const char* fiber_rejection_reason_name(FiberRejectionReason reason);
+
+// Measure only the paths between explicit radius-treated connections. Ordinary
+// curves count toward the length; arcs/links in each connection do not.
+// No marked bends means there is no stability constraint to check.
+std::optional<double> minimum_closed_loop_stable_length_mm(
+    double loop_length_mm, const std::vector<ContourBend>& bends);
 
 struct FiberFragmentAssignment {
     FiberFragmentId id;
@@ -52,6 +59,7 @@ struct FiberFragmentAssignment {
     std::vector<ContourIssue> contour_issues;
     std::optional<ExtrusionPath> centerline;
     std::shared_ptr<const PreparedFiberPath> prepared;
+    std::optional<FiberPathPurpose> display_purpose;
 };
 
 struct FiberCandidateExtent {
@@ -110,13 +118,16 @@ struct FiberContourPlanResult {
     std::vector<FiberContourPlanNode> nodes;
     std::vector<FiberContourBranchStop> stops;
     bool audit_lineage() const;
+    void set_display_cutoff(size_t contour_depths);
 };
 
 class FiberPathValidator {
 public:
     static FiberContourPlanResult plan_contours(
         const ExPolygons& original_area, const ContinuousFiberConfig& config,
-        const FiberDomainId& domain_id, bool collect_debug = false);
+        const FiberDomainId& domain_id, bool collect_debug = false,
+        size_t fill_start_depth = fiber_contour_depth_limit, double extra_spacing_mm = 0.0,
+        double infill_stabilization_length_mm = 0.0);
 
     static FiberValidationResult validate_infill(
         const FiberInfillCandidates& candidates, const ExPolygons& allowed_domain,
@@ -138,7 +149,8 @@ private:
         ExtrusionRole output_role, const FiberDomainId& domain_id, size_t job_ordinal,
         const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
         const ExPolygons* physical_centerline_domain, bool collect_debug,
-        bool requires_closed_loop = false, const std::vector<ContourArc>* source_arcs = nullptr);
+        bool requires_closed_loop = false, const std::vector<ContourArc>* source_arcs = nullptr,
+        double bend_stabilization_length_mm = 0.0);
 };
 
 } // namespace Slic3r

@@ -1616,15 +1616,6 @@ private:
     std::vector<ExtrusionEntitiesPtr> fiber_entities_by_region;
 };
 
-struct OwnedCandidateEntities {
-    ExtrusionEntityCollection root;
-
-    explicit OwnedCandidateEntities(ExtrusionEntitiesPtr&& entities)
-    {
-        root.append(std::move(entities));
-    }
-};
-
 void apply_fiber_infill_params(SurfaceFillParams& destination,
     const ContinuousFiberConfig& config, const FiberPolicyKey& policy)
 {
@@ -1753,12 +1744,19 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
             context.layer.fiber_fill_diagnostics.push_back(std::move(diagnostic));
         }
     };
+    const bool concentric=config.concentric_infill();
     FiberValidationResult contour_result;
-    if (config.contour_enabled && config.contour_count > 0) {
+    if ((config.contour_enabled && config.contour_count > 0) || concentric) {
         if (collect_debug)
             record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
                            "original_contour_domain_before_candidate_generation");
-        auto plan = FiberPathValidator::plan_contours(original_area, config, domain_id, collect_debug);
+        const auto ring_config=concentric?fiber_ring_reference_config(config):config;
+        const size_t display_depths=config.contour_enabled?size_t(config.contour_count):0;
+        const double extra_spacing=concentric && config.infill_density<100?
+            config.contour_flow.width()*(100/config.infill_density-1):0;
+        auto plan = FiberPathValidator::plan_contours(original_area,ring_config,domain_id,collect_debug,
+            display_depths,extra_spacing,concentric?config.concentric_corner_stabilization_length_mm:0.0);
+        if (concentric) plan.set_display_cutoff(display_depths);
         if (std::none_of(plan.nodes.begin(), plan.nodes.end(),
                 [](const auto& node) { return node.side == FiberContourSide::Outer; }))
             ++context.layer.fiber_outer_contour_failures["no_outer_contour_candidate"];
@@ -1786,7 +1784,16 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
             // Normal rounding differences are not failed deposition regions.
             const ExPolygons compared_coverage=offset_ex(contour_result.physical_footprint,float(SCALED_EPSILON));
             for (const auto& assignment:contour_result.assignments) {
-                if (assignment.kind==FiberAssignmentKind::AcceptedFiber || !assignment.centerline) continue;
+                if (assignment.kind==FiberAssignmentKind::AcceptedFiber) {
+                    if (!assignment.detail.empty() && assignment.centerline)
+                        context.layer.fiber_fill_diagnostics.push_back({assignment.centerline->polyline.to_polyline(),
+                            "concentric_stability_pass; candidate="+std::to_string(assignment.id.parent.job_ordinal)+
+                                "; "+assignment.detail,false,unscale<double>(assignment.centerline->length()),
+                            Layer::FiberDiagnosticKind::RoundedContourCandidate,{},
+                            domain_id.policy_group_id,domain_id.component_id});
+                    continue;
+                }
+                if (!assignment.centerline) continue;
                 Polygons swept; assignment.centerline->polygons_covered_by_width(swept,0.0f);
                 record_regions(diff_ex(intersection_ex(union_ex(swept),original_area),compared_coverage),
                     Layer::FiberDiagnosticKind::MissingContourRegion,
@@ -1796,7 +1803,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     }
 
     FiberValidationResult infill_result;
-    if (config.infill_enabled && config.infill_density > 0.0) {
+    if (!concentric && config.infill_enabled && config.infill_density > 0.0) {
         SurfaceFill infill_job = original_job;
         const ExPolygons infill_allowed_domain = ContinuousFiberFillStrategy::build_infill_domain(
             original_area, contour_result.contour_to_infill_keepout);
@@ -1814,14 +1821,6 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 const auto candidates = ContinuousFiberFillStrategy::generate_rectilinear(
                     infill_allowed_domain, config, orientation.first, orientation.second);
                 infill_result = FiberPathValidator::validate_infill(candidates, infill_allowed_domain, config, domain_id);
-            } else {
-                ExtrusionEntitiesPtr candidates;
-                const FillExecutionPolicy infill_policy { false, false, true };
-                execute_surface_fill_job(context, infill_job, candidates, infill_policy);
-                OwnedCandidateEntities owner(std::move(candidates));
-                infill_result = FiberPathValidator::validate(
-                    owner.root.entities, infill_allowed_domain, config, FiberPathPurpose::Infill,
-                    erContinuousFiberInfill, domain_id);
             }
         }
     }
@@ -1836,18 +1835,40 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     coverage.source_domain = original_area;
     coverage.accepted_contour_exclusion = contour_result.resin_exclusion;
     coverage.accepted_infill_exclusion = infill_result.resin_exclusion;
+    if (concentric) {
+        coverage.accepted_contour_exclusion.clear();
+        for (const auto& assignment:contour_result.assignments) if (assignment.prepared) {
+            auto& bucket=assignment.display_purpose==FiberPathPurpose::Infill?
+                coverage.accepted_infill_exclusion:coverage.accepted_contour_exclusion;
+            append_expolygons(bucket,assignment.prepared->resin_exclusion);
+        }
+        coverage.accepted_contour_exclusion=union_ex(coverage.accepted_contour_exclusion);
+        coverage.accepted_infill_exclusion=union_ex(coverage.accepted_infill_exclusion);
+    }
     coverage.outside_domain = contour_result.outside_domain;
     append_expolygons(coverage.outside_domain, infill_result.outside_domain);
     coverage.outside_domain = union_ex(coverage.outside_domain);
     coverage.resin_domain = resin_area;
     transaction.coverage.add(std::move(coverage));
 
-    const size_t contour_accepted = contour_result.accepted_count();
-    const size_t infill_accepted = infill_result.accepted_count();
+    const size_t concentric_infill_accepted=concentric?std::count_if(contour_result.assignments.begin(),
+        contour_result.assignments.end(),[](const auto& assignment) {
+            return assignment.kind==FiberAssignmentKind::AcceptedFiber && assignment.display_purpose==FiberPathPurpose::Infill;
+        }):0;
+    const size_t contour_accepted = contour_result.accepted_count()-concentric_infill_accepted;
+    const size_t infill_accepted = infill_result.accepted_count()+concentric_infill_accepted;
     auto& statistics = context.layer.fiber_infill_statistics;
     statistics.candidates += infill_result.candidates.size();
+    if (concentric) {
+        std::set<FiberCandidateId> fill_candidates;
+        for (const auto& assignment:contour_result.assignments)
+            if (assignment.display_purpose==FiberPathPurpose::Infill) fill_candidates.insert(assignment.id.parent);
+        statistics.candidates+=fill_candidates.size();
+    }
     statistics.accepted_fragments += infill_accepted;
-    for (const auto& assignment : infill_result.assignments) {
+    const auto& fill_assignments=concentric?contour_result.assignments:infill_result.assignments;
+    for (const auto& assignment : fill_assignments) {
+        if (concentric && assignment.display_purpose!=FiberPathPurpose::Infill) continue;
         if (assignment.id.fragment_ordinal == 1) ++statistics.split_candidates;
         if (assignment.kind == FiberAssignmentKind::Rejected)
             ++statistics.rejected_fragments[fiber_rejection_reason_name(assignment.reason)];
@@ -1867,13 +1888,14 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 context.layer.fiber_fill_diagnostics.push_back({
                     assignment.centerline->polyline.to_polyline(),
                     std::string(fiber_rejection_reason_name(assignment.reason)) + "; " + detail,
-                    assignment.id.parent.purpose == FiberPathPurpose::Contour,
+                    assignment.display_purpose.value_or(assignment.id.parent.purpose) == FiberPathPurpose::Contour,
                     assignment.source_end_mm - assignment.source_begin_mm,
                     Layer::FiberDiagnosticKind::RejectedPath, {},
                     domain_id.policy_group_id, domain_id.component_id});
                 for (const auto& issue : assignment.contour_issues)
                     context.layer.fiber_fill_diagnostics.push_back({
-                        issue.source, contour_rounding_failure_name(issue.reason), true,
+                        issue.source, contour_rounding_failure_name(issue.reason),
+                        assignment.display_purpose.value_or(assignment.id.parent.purpose)==FiberPathPurpose::Contour,
                         unscale<double>(issue.source.length()), Layer::FiberDiagnosticKind::RejectedPath,
                         {}, domain_id.policy_group_id, domain_id.component_id});
             }
@@ -1881,7 +1903,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 << "[FiberRejected] layer=" << context.layer.id()
                 << " policy_group=" << assignment.id.parent.domain.policy_group_id
                 << " component=" << assignment.id.parent.domain.component_id
-                << " purpose=" << (assignment.id.parent.purpose == FiberPathPurpose::Contour ? "contour" : "infill")
+                << " purpose=" << (assignment.display_purpose.value_or(assignment.id.parent.purpose) == FiberPathPurpose::Contour ? "contour" : "infill")
                 << " job=" << assignment.id.parent.job_ordinal
                 << " candidate=" << assignment.id.parent.path_ordinal
                 << " fragment=" << assignment.id.fragment_ordinal

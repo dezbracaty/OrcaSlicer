@@ -792,16 +792,27 @@ ContourRoundingResult validate_cycle(const std::vector<TangentSolution>& values,
         output.points.push_back(p);
         if (output.points.size()>maximum_samples) throw std::length_error("Contour exceeds sampling budget");
     };
-    for (const auto& value:values) for (const auto& piece:connection_primitives(value)) {
-        if (const auto* line=std::get_if<Linef>(&piece)) {
-            append(scaled_point(line->a));append(scaled_point(line->b));
-        } else {
-            auto arc=std::get<ContourArc>(piece);
-            const auto sampled=discretize(arc,options.chord_tolerance_mm);
-            append(sampled.points.front());arc.begin_mm=distance;
-            for (const auto& p:sampled.points) append(p);
-            arc.end_distance_mm=distance;
-            if (arc.end_distance_mm>arc.begin_mm) result.arcs.push_back(arc);
+    for (const auto& value:values) {
+        std::optional<ContourBend> bend;
+        const size_t first_arc=result.arcs.size();
+        for (const auto& piece:connection_primitives(value)) {
+            if (const auto* line=std::get_if<Linef>(&piece)) {
+                append(scaled_point(line->a));
+                if (!bend) bend=ContourBend{distance,distance,output.points.back(),output.points.back()};
+                append(scaled_point(line->b));
+            } else {
+                auto arc=std::get<ContourArc>(piece);
+                const auto sampled=discretize(arc,options.chord_tolerance_mm);
+                append(sampled.points.front());arc.begin_mm=distance;
+                if (!bend) bend=ContourBend{distance,distance,output.points.back(),output.points.back()};
+                for (const auto& p:sampled.points) append(p);
+                arc.end_distance_mm=distance;
+                if (arc.end_distance_mm>arc.begin_mm) result.arcs.push_back(arc);
+            }
+        }
+        if (bend && result.arcs.size()>first_arc) {
+            bend->end_mm=distance;bend->exit_point=output.points.back();
+            result.bends.push_back(*bend);
         }
     }
     if (output.points.back()!=output.points.front()) output.points.push_back(output.points.front());
@@ -834,7 +845,7 @@ ContourRoundingResult validate_cycle(const std::vector<TangentSolution>& values,
             break;
         }
     }
-    if (!result.issues.empty()) { result.arcs.clear(); return result; }
+    if (!result.issues.empty()) { result.arcs.clear(); result.bends.clear(); return result; }
     result.path=Polyline3(output);
     return result;
 }
@@ -1188,6 +1199,12 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
     if (Polygon(original).is_clockwise()) {
         const double length=unscale<double>(output.length());
         output.reverse(); std::reverse(result.arcs.begin(),result.arcs.end());
+        std::reverse(result.bends.begin(),result.bends.end());
+        for (auto& bend:result.bends) {
+            std::swap(bend.entry_point,bend.exit_point);
+            const double begin=length-bend.end_mm;
+            bend.end_mm=length-bend.begin_mm;bend.begin_mm=begin;
+        }
         for (auto& arc:result.arcs) {
             std::swap(arc.start_mm,arc.end_mm); arc.sweep_radians=-arc.sweep_radians;
             const double start=length-arc.end_distance_mm;
@@ -1332,17 +1349,26 @@ ContourRoundingResult assemble_outer(const std::vector<Vec2d>& p,
         if (output.points.size()>maximum_samples) throw std::length_error("Contour exceeds sampling budget");
     };
     for (size_t i=0;i<groups.size();++i) {
+        std::optional<ContourBend> bend;
+        const size_t first_arc=result.arcs.size();
         for (const auto& piece:connection_primitives(chosen[i])) {
             if (const auto* segment=std::get_if<Linef>(&piece)) {
-                append(scaled_point(segment->a));append(scaled_point(segment->b));
+                append(scaled_point(segment->a));
+                if (!bend) bend=ContourBend{length,length,output.points.back(),output.points.back()};
+                append(scaled_point(segment->b));
             } else {
                 ContourArc arc=std::get<ContourArc>(piece);
                 const Polyline sampled=discretize(arc,options.chord_tolerance_mm);
                 append(sampled.points.front());arc.begin_mm=length;
+                if (!bend) bend=ContourBend{length,length,output.points.back(),output.points.back()};
                 for (const Point& point:sampled.points) append(point);
                 arc.end_distance_mm=length;
                 if (arc.end_distance_mm>arc.begin_mm) result.arcs.push_back(arc);
             }
+        }
+        if (bend && result.arcs.size()>first_arc) {
+            bend->end_mm=length;bend->exit_point=output.points.back();
+            result.bends.push_back(*bend);
         }
         const size_t end=(groups[i].first+groups[i].count-1)%p.size();
         const size_t next=groups[(i+1)%groups.size()].first;
@@ -1363,10 +1389,16 @@ ContourRoundingResult assemble_outer(const std::vector<Vec2d>& p,
             result.issues.push_back({ContourRoundingFailure::TopologyChange,source});break;
         }
     }
-    if (!result.issues.empty()) {result.arcs.clear();return result;}
+    if (!result.issues.empty()) {result.arcs.clear();result.bends.clear();return result;}
     if (Polygon(Points(source.points.begin(),source.points.end()-1)).is_clockwise()) {
         const double total=unscale<double>(output.length());
         output.reverse();std::reverse(result.arcs.begin(),result.arcs.end());
+        std::reverse(result.bends.begin(),result.bends.end());
+        for (auto& bend:result.bends) {
+            std::swap(bend.entry_point,bend.exit_point);
+            const double begin=total-bend.end_mm;
+            bend.end_mm=total-bend.begin_mm;bend.begin_mm=begin;
+        }
         for (auto& arc:result.arcs) {
             std::swap(arc.start_mm,arc.end_mm);arc.sweep_radians=-arc.sweep_radians;
             arc.source_sweep_radians=-arc.source_sweep_radians;

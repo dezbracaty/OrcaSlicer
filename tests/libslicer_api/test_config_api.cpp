@@ -2528,6 +2528,47 @@ TEST_CASE("fiber corner stabilization setting round trips independently", "[libs
     CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="5");
 }
 
+TEST_CASE("fiber infill stability settings belong to their selected pattern", "[libslicer_api][config][fiber-corner-stability]")
+{
+    auto config=libslicer::Config::defaults();
+    const char* rectilinear="fiber_corner_stabilization_length";
+    const char* concentric="fiber_concentric_corner_stabilization_length";
+    auto items=config.settings();
+    const auto* item=find_item(items,concentric);
+    REQUIRE(item!=nullptr);
+    CHECK(item->group==libslicer::SettingGroup::Process);
+    CHECK(item->category=="Continuous fiber");
+    CHECK(item->unit=="mm");
+    CHECK(config.snapshot().value(concentric)=="0");
+    CHECK(config.snapshot().value(rectilinear)=="5");
+    CHECK_FALSE(item->visible);CHECK_FALSE(item->enabled);
+    CHECK_FALSE(find_item(items,rectilinear)->visible);
+    REQUIRE(config.set("generate_reinforced_infills","1").success);
+    REQUIRE(config.set("reinforced_infill_pattern","rectilinear").success);
+    items=config.settings();
+    CHECK(find_item(items,rectilinear)->visible);CHECK(find_item(items,rectilinear)->enabled);
+    CHECK_FALSE(find_item(items,concentric)->visible);CHECK_FALSE(find_item(items,concentric)->enabled);
+    REQUIRE(config.set(rectilinear,"3").success);
+    REQUIRE(config.set(concentric,"5").success);
+    const auto switched=config.set("reinforced_infill_pattern","concentric");
+    REQUIRE(switched.success);
+    REQUIRE(find_item(switched.changed_items,rectilinear)!=nullptr);
+    REQUIRE(find_item(switched.changed_items,concentric)!=nullptr);
+    items=config.settings();
+    CHECK_FALSE(find_item(items,rectilinear)->visible);CHECK_FALSE(find_item(items,rectilinear)->enabled);
+    CHECK(find_item(items,concentric)->visible);CHECK(find_item(items,concentric)->enabled);
+    CHECK(config.snapshot().value(concentric)=="5");CHECK(config.snapshot().value(rectilinear)=="3");
+    for(const char* invalid:{"-1","nan","inf"}) {
+        CHECK_FALSE(config.set(concentric,invalid).success);
+        CHECK(config.snapshot().value(concentric)=="5");
+    }
+    REQUIRE(config.reset(concentric).success);
+    CHECK(config.snapshot().value(concentric)=="0");CHECK(config.snapshot().value(rectilinear)=="3");
+    REQUIRE(config.set("generate_reinforced_infills","0").success);
+    items=config.settings();
+    CHECK_FALSE(find_item(items,concentric)->visible);CHECK_FALSE(find_item(items,rectilinear)->visible);
+}
+
 TEST_CASE("fiber infill angle sequence is an independently validated process setting", "[libslicer_api][config][fiber-angles]")
 {
     auto config=libslicer::Config::defaults();
@@ -2866,4 +2907,24 @@ TEST_CASE("independent resin infill preserves fiber and ordinary layers", "[libs
     CHECK_FALSE(segments(*disabled.preview,Role::SparseInfill).empty());
     for (const auto* result : {&low,&high,&off,&no_sparse,&rejected,&changed_sparse,&disabled})
         std::filesystem::remove(result->output.path);
+}
+
+TEST_CASE("concentric shares contour settings while preserving inactive infill values", "[libslicer_api][config][shared-ring]")
+{
+    auto config=libslicer::Config::defaults();
+    REQUIRE(config.apply_patch({{"generate_reinforced_perimeters","0"},{"generate_reinforced_infills","1"},
+        {"reinforced_infill_pattern","concentric"},{"fiber_infill_feed_ratio","1.2"}}).success);
+    const auto items=config.settings();
+    for(const auto* key:{"reinforced_perimeters_filament","fiber_contour_bend_radius","fiber_contour_boundary_clearance",
+        "fiber_contour_feed_ratio","fiber_contour_include_holes"}) {
+        INFO(key);REQUIRE(find_item(items,key));CHECK(find_item(items,key)->enabled);
+    }
+    for(const auto* key:{"reinforced_infill_filament","fiber_infill_bend_radius","fiber_infill_feed_ratio","fiber_infill_min_speed",
+        "fiber_contour_infill_clearance","outer_reinforced_perimeters_counts"}) {
+        INFO(key);REQUIRE(find_item(items,key));CHECK_FALSE(find_item(items,key)->enabled);
+    }
+    CHECK(config.snapshot().value("fiber_infill_feed_ratio")=="1.2");
+    REQUIRE(config.set("reinforced_infill_pattern","rectilinear").success);
+    const auto restored=config.settings();CHECK(find_item(restored,"fiber_infill_feed_ratio")->enabled);
+    CHECK(config.snapshot().value("fiber_infill_feed_ratio")=="1.2");
 }

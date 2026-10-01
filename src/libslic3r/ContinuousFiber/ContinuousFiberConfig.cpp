@@ -378,12 +378,45 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
         check(config.contour_bend_radius_mm, "fiber_contour_bend_radius");
         if (config.contour_count < 0) throw std::invalid_argument("Invalid fiber contour count");
     }
+    if (contour && config.concentric_infill())
+        check(config.concentric_corner_stabilization_length_mm, "fiber_concentric_corner_stabilization_length");
     if (!contour) {
         check(config.infill_bend_radius_mm, "fiber_infill_bend_radius");
         check(config.corner_stabilization_length_mm, "fiber_corner_stabilization_length");
     }
     if (config.contour_enabled && config.infill_enabled)
         check(config.contour_infill_clearance_mm, "fiber_contour_infill_clearance");
+}
+
+bool fiber_concentric_uses_contour_process(const PrintRegionConfig& config)
+{
+    return config.generate_reinforced_infills.value && config.reinforced_infill_pattern.value==ipConcentric;
+}
+
+ContinuousFiberConfig fiber_ring_reference_config(const ContinuousFiberConfig& config)
+{
+    ContinuousFiberConfig result=config;
+    const ContinuousFiberConfig defaults;
+    result.contour_enabled=true;
+    if (config.concentric_infill()) result.contour_count=fiber_contour_depth_limit;
+    result.infill_enabled=false;
+    result.infill_pattern=defaults.infill_pattern;
+    result.infill_density=0;
+    result.rectilinear_angle_radians.reset();
+    result.infill_flow=defaults.infill_flow;
+    result.infill_material=defaults.infill_material;
+    result.infill_min_speed_mm_s=defaults.infill_min_speed_mm_s;
+    result.infill_max_speed_mm_s=defaults.infill_max_speed_mm_s;
+    result.infill_acceleration_mm_s2=defaults.infill_acceleration_mm_s2;
+    result.infill_feed_ratio=defaults.infill_feed_ratio;
+    result.infill_feed_correction=defaults.infill_feed_correction;
+    result.infill_bend_radius_mm=defaults.infill_bend_radius_mm;
+    result.corner_stabilization_length_mm=defaults.corner_stabilization_length_mm;
+    result.concentric_corner_stabilization_length_mm=config.concentric_infill()?
+        config.concentric_corner_stabilization_length_mm:defaults.concentric_corner_stabilization_length_mm;
+    result.contour_infill_clearance_mm=0;
+    // finish_extension remains active: an open hole uses it even for Contour.
+    return result;
 }
 
 ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region)
@@ -412,7 +445,8 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
     result.tail_speed_step_length_mm = source.fiber_tail_speed_step_length.value;
     result.finish_motion_speed_mm_s = source.fiber_finish_motion_speed.value;
     result.finish_extension_length_mm = source.fiber_finish_extension_length.value;
-    if (result.contour_enabled && result.infill_enabled)
+    const bool concentric=fiber_concentric_uses_contour_process(source);
+    if (result.contour_enabled && result.infill_enabled && !concentric)
         result.contour_infill_clearance_mm = source.fiber_contour_infill_clearance.value;
 
     const PrintConfig& print_config = layer.object()->print()->config();
@@ -437,7 +471,7 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         // Width is explicit and shared by both path roles. No nozzle-based auto width.
         return Flow(float(width), float(layer.height), nozzle);
     };
-    if (result.contour_enabled) {
+    if (result.contour_enabled || concentric) {
         result.contour_include_holes = source.fiber_contour_include_holes.value;
         result.contour_count = std::max(0, source.outer_reinforced_perimeters_counts.value);
         result.contour_material = unsigned(std::max(1, source.reinforced_perimeters_filament.value));
@@ -455,8 +489,12 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
     }
     if (result.infill_enabled) {
         result.infill_pattern = source.reinforced_infill_pattern.value;
-        result.infill_bend_radius_mm = source.fiber_infill_bend_radius.value;
-        result.corner_stabilization_length_mm = source.fiber_corner_stabilization_length.value;
+        if (!concentric) result.infill_bend_radius_mm = source.fiber_infill_bend_radius.value;
+        if (concentric) {
+            result.concentric_corner_stabilization_length_mm = source.fiber_concentric_corner_stabilization_length.value;
+        } else {
+            result.corner_stabilization_length_mm = source.fiber_corner_stabilization_length.value;
+        }
         if (result.infill_pattern != ipRectilinear && result.infill_pattern != ipConcentric)
             throw std::runtime_error("Continuous fiber infill supports only rectilinear and concentric patterns");
         if (result.infill_pattern==ipRectilinear)
@@ -465,14 +503,17 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         if (!std::isfinite(source.reinforced_infill_density.value))
             throw std::runtime_error("reinforced_infill_density must be finite");
         result.infill_density = std::clamp(source.reinforced_infill_density.value, 0.0, 100.0);
-        result.infill_material = unsigned(std::max(1, source.reinforced_infill_filament.value));
-        result.infill_min_speed_mm_s = source.fiber_infill_min_speed.value;
-        result.infill_max_speed_mm_s = source.fiber_infill_max_speed.value;
-        result.infill_acceleration_mm_s2 = source.fiber_infill_acceleration.value;
-        result.infill_feed_ratio = source.fiber_infill_feed_ratio.value;
-        result.infill_feed_correction = correction_for(result.infill_material);
-        validate_fiber_process_config(result, FiberPathPurpose::Infill);
-        result.infill_flow = flow_for(result.infill_material);
+        if (concentric) validate_fiber_process_config(result, FiberPathPurpose::Contour);
+        if (!concentric) {
+            result.infill_material = unsigned(std::max(1, source.reinforced_infill_filament.value));
+            result.infill_min_speed_mm_s = source.fiber_infill_min_speed.value;
+            result.infill_max_speed_mm_s = source.fiber_infill_max_speed.value;
+            result.infill_acceleration_mm_s2 = source.fiber_infill_acceleration.value;
+            result.infill_feed_ratio = source.fiber_infill_feed_ratio.value;
+            result.infill_feed_correction = correction_for(result.infill_material);
+            validate_fiber_process_config(result, FiberPathPurpose::Infill);
+            result.infill_flow = flow_for(result.infill_material);
+        }
     }
     return result;
 }

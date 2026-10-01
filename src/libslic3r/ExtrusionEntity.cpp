@@ -16,12 +16,14 @@ namespace Slic3r {
 ExtrusionFiberPath::ExtrusionFiberPath(
     const ExtrusionPath& source,
     ExtrusionRole role,
-    std::shared_ptr<const PreparedFiberPath> prepared)
+    std::shared_ptr<const PreparedFiberPath> prepared,
+    std::optional<FiberPathPurpose> display_purpose)
     : ExtrusionPath(source)
     , m_prepared(std::move(prepared))
 {
     if (!m_prepared)
         throw Slic3r::RuntimeError("Continuous fiber path requires finalized process data");
+    m_display_purpose=display_purpose.value_or(fiber_purpose());
     m_prepared->validate();
     polyline.points.clear();
     for (const auto& span : m_prepared->spans)

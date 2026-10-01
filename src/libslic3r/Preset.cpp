@@ -1021,6 +1021,7 @@ static std::vector<std::string> s_Preset_print_options{
     "fiber_contour_bend_radius",
     "fiber_infill_bend_radius",
     "fiber_corner_stabilization_length",
+    "fiber_concentric_corner_stabilization_length",
     "fiber_contour_infill_clearance",
     "fiber_resin_overlap",
     "fiber_resin_fill_density",

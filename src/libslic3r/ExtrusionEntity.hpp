@@ -10,6 +10,7 @@
 #include <string_view>
 #include <numeric>
 #include <memory>
+#include <optional>
 
 namespace Slic3r {
 
@@ -324,7 +325,8 @@ class ExtrusionFiberPath final : public ExtrusionPath
 {
 public:
     ExtrusionFiberPath() = delete;
-    ExtrusionFiberPath(const ExtrusionPath& source, ExtrusionRole role, std::shared_ptr<const PreparedFiberPath> prepared);
+    ExtrusionFiberPath(const ExtrusionPath& source, ExtrusionRole role, std::shared_ptr<const PreparedFiberPath> prepared,
+        std::optional<FiberPathPurpose> display_purpose = std::nullopt);
 
     ExtrusionEntity* clone() const override { return new ExtrusionFiberPath(*this); }
     ExtrusionEntity* clone_move() override { return new ExtrusionFiberPath(std::move(*this)); }
@@ -338,6 +340,7 @@ public:
     void intersect_expolygons(const ExPolygons&, ExtrusionEntityCollection*) const override { throw std::logic_error("Cannot split finalized fiber geometry"); }
     void subtract_expolygons(const ExPolygons&, ExtrusionEntityCollection*) const override { throw std::logic_error("Cannot split finalized fiber geometry"); }
     FiberPathPurpose fiber_purpose() const { return m_prepared->id.parent.purpose; }
+    FiberPathPurpose display_purpose() const { return m_display_purpose; }
     const std::shared_ptr<const PreparedFiberPath>& prepared_path() const { return m_prepared; }
     Point first_point() const override { return first_point3().to_point(); }
     Point last_point() const override { return last_point3().to_point(); }
@@ -347,6 +350,7 @@ public:
     void validate_derived_view() const;
 private:
     std::shared_ptr<const PreparedFiberPath> m_prepared;
+    FiberPathPurpose m_display_purpose;
 };
 
 class ExtrusionPathContoured : public ExtrusionPath {

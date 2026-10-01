@@ -6334,14 +6334,14 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
         " object=" + std::to_string(prepared.id.parent.domain.object_id) +
         " layer=" + std::to_string(prepared.id.parent.domain.layer_id) +
         " component=" + std::to_string(prepared.id.parent.domain.component_id) +
-        " purpose=" + (prepared.id.parent.purpose == FiberPathPurpose::Contour ? std::string("contour") : std::string("infill")) +
+        " purpose=" + (path.display_purpose() == FiberPathPurpose::Contour ? std::string("contour") : std::string("infill")) +
         " filament=" + std::to_string(bound.logical_filament_id) +
         " extruder=" + std::to_string(bound.logical_extruder_id) +
         " physical=" + std::to_string(bound.physical_tool_id) +
         " width=" + std::to_string(path.width) + " height=" + std::to_string(path.height) +
         " e_units_per_mm=" + std::to_string(bound.e_units_per_mm) + "\n";
     // BEGIN metadata is authoritative even before the first powered move.
-    gcode += ";TYPE:" + std::string(prepared.id.parent.purpose == FiberPathPurpose::Contour ?
+    gcode += ";TYPE:" + std::string(path.display_purpose() == FiberPathPurpose::Contour ?
         "Continuous fiber contour" : "Continuous fiber infill") + "\n";
     const FiberStartProcedure& start = prepared.start_procedure;
     gcode += m_writer.set_print_acceleration(unsigned(std::lround(prepared.acceleration_mm_s2)));

@@ -87,3 +87,21 @@ foreach(_mode IN ITEMS contour_only infill_only no_fiber sparse_resin resin_off 
         set_tests_properties(FiberBracket_${_mode}_Geometry PROPERTIES LABELS "fiber_resin_matrix" TIMEOUT 240 FIXTURES_REQUIRED bracket_${_mode})
     endif()
 endforeach()
+
+# Necessary shared-ring acceptance: both production models, all contour counts,
+# stability on/off, density boundaries and an actual depositing positive case.
+set(FIBER_RING_MODELS 4xiao 7xiao)
+foreach(_model IN LISTS FIBER_RING_MODELS)
+    if(_model STREQUAL "4xiao")
+        set(_layers 32)
+    else()
+        set(_layers 212)
+    endif()
+    add_test(NAME FiberSharedRing_${_model} COMMAND fiber_4xiao_acceptance --ring-model
+        "${FIBER_TEST_MODELS_DIR}/${_model}.stl" ${_layers}
+        "${CMAKE_CURRENT_BINARY_DIR}/shared-ring/${_model}")
+    set_tests_properties(FiberSharedRing_${_model} PROPERTIES LABELS "fiber_shared_ring" TIMEOUT 1800 RUN_SERIAL TRUE)
+endforeach()
+add_test(NAME FiberSharedRingPositive COMMAND fiber_4xiao_acceptance --ring-positive
+    "${CMAKE_CURRENT_BINARY_DIR}/shared-ring/positive")
+set_tests_properties(FiberSharedRingPositive PROPERTIES LABELS "fiber_shared_ring" TIMEOUT 600 RUN_SERIAL TRUE)

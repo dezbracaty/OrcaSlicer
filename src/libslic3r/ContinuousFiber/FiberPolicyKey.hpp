@@ -71,6 +71,7 @@ struct FiberPolicyKey {
     double contour_bend_radius_mm { 0.0 };
     double infill_bend_radius_mm { 0.0 };
     double corner_stabilization_length_mm { 0.0 };
+    double concentric_corner_stabilization_length_mm { 0.0 };
 
     auto values() const
     {
@@ -87,7 +88,7 @@ struct FiberPolicyKey {
             outside_tolerance_mm2, contour_max_speed_mm_s, infill_max_speed_mm_s,
             contour_acceleration_mm_s2, infill_acceleration_mm_s2,
             contour_infill_clearance_mm, resin_overlap_mm,
-            contour_feed_ratio, infill_feed_ratio, contour_min_speed_mm_s, infill_min_speed_mm_s, corner_transition_length_mm, speed_sampling_length_mm, tail_min_speed_mm_s, tail_max_speed_mm_s, tail_speed_step_length_mm, finish_overlap_length_mm, finish_motion_speed_mm_s, contour_feed_correction, infill_feed_correction, contour_boundary_clearance_mm, contour_bend_radius_mm, infill_bend_radius_mm, corner_stabilization_length_mm);
+            contour_feed_ratio, infill_feed_ratio, contour_min_speed_mm_s, infill_min_speed_mm_s, corner_transition_length_mm, speed_sampling_length_mm, tail_min_speed_mm_s, tail_max_speed_mm_s, tail_speed_step_length_mm, finish_overlap_length_mm, finish_motion_speed_mm_s, contour_feed_correction, infill_feed_correction, contour_boundary_clearance_mm, contour_bend_radius_mm, infill_bend_radius_mm, corner_stabilization_length_mm, concentric_corner_stabilization_length_mm);
     }
 
     bool operator<(const FiberPolicyKey& rhs) const { return values() < rhs.values(); }
@@ -95,10 +96,25 @@ struct FiberPolicyKey {
 };
 
 inline FiberPolicyKey fiber_policy_key(
-    const ContinuousFiberConfig& config,
+    const ContinuousFiberConfig& source,
     double infill_direction,
     bool fixed_direction)
 {
+    // Only an all-contour display may share the pure 100-contour policy.
+    // Other cutoffs must survive grouping: a merged domain uses one owner's
+    // configuration for both planning and its contour/infill display labels.
+    const bool reference=(source.concentric_infill() && source.infill_density==100 &&
+        source.concentric_corner_stabilization_length_mm==0 && source.contour_enabled &&
+        source.contour_count==fiber_contour_depth_limit) ||
+        (source.contour_enabled && source.contour_count==fiber_contour_depth_limit && !source.infill_enabled);
+    ContinuousFiberConfig config=reference?fiber_ring_reference_config(source):source;
+    if (reference || source.concentric_infill()) {infill_direction=0;fixed_direction=false;}
+    if (source.concentric_infill() && !reference) {
+        const auto ring=fiber_ring_reference_config(source);
+        config=ring;
+        config.contour_count=source.contour_enabled?source.contour_count:0;
+        config.infill_enabled=true;config.infill_pattern=ipConcentric;config.infill_density=source.infill_density;
+    }
     if (!std::isfinite(infill_direction))
         throw std::runtime_error("Continuous fiber infill direction must be finite");
     return {
@@ -156,7 +172,8 @@ inline FiberPolicyKey fiber_policy_key(
         config.contour_boundary_clearance_mm,
         config.contour_bend_radius_mm,
         config.infill_bend_radius_mm,
-        config.corner_stabilization_length_mm
+        config.corner_stabilization_length_mm,
+        config.concentric_corner_stabilization_length_mm
     };
 }
 

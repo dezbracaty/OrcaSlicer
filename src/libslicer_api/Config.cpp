@@ -192,26 +192,32 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
 {
     const bool contour_enabled = boolean_value(config, "generate_reinforced_perimeters");
     const bool infill_enabled  = boolean_value(config, "generate_reinforced_infills");
+    const bool concentric=infill_enabled && config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern")==Slic3r::ipConcentric;
 
     if (item.key.rfind("fiber_resin_fill_", 0) == 0) {
         item.enabled = contour_enabled || infill_enabled;
     } else if (key_is(item.key, {"fiber_contour_include_holes",
                           "outer_reinforced_perimeters_counts",
                           "reinforced_perimeters_filament"})) {
-        item.enabled = contour_enabled;
+        item.enabled = contour_enabled || (concentric && item.key!="outer_reinforced_perimeters_counts");
     } else if (key_is(item.key, {"reinforced_infill_density",
                                  "reinforced_infill_pattern",
                                  "reinforced_infill_filament"})) {
-        item.enabled = infill_enabled;
+        item.enabled = infill_enabled && !(concentric && item.key=="reinforced_infill_filament");
     } else if (key_is(item.key, {"fiber_contour_boundary_clearance", "fiber_contour_bend_radius"})) {
-        item.enabled = contour_enabled;
+        item.enabled = contour_enabled || concentric;
     } else if (item.key == "fiber_infill_angle_sequence") {
         item.visible = item.enabled = infill_enabled &&
             config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
+    } else if (item.key == "fiber_corner_stabilization_length") {
+        item.visible = item.enabled = infill_enabled &&
+            config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
+    } else if (item.key == "fiber_concentric_corner_stabilization_length") {
+        item.visible = item.enabled = concentric;
     } else if (item.key == "fiber_infill_bend_radius") {
         item.enabled = infill_enabled && config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
     } else if (item.key == "fiber_contour_infill_clearance") {
-        item.enabled = contour_enabled && infill_enabled;
+        item.enabled = contour_enabled && infill_enabled && !concentric;
     } else if (key_is(item.key, {"fiber_width", "fiber_layer_height_ratio",
                                  "fiber_fill_debug",
                                  "fiber_minimum_path_length",
@@ -242,7 +248,8 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
                                  "fiber_contour_acceleration",
                                  "fiber_infill_acceleration",
                                  "fiber_resin_overlap"})) {
-        item.enabled = contour_enabled || infill_enabled;
+        item.enabled = (contour_enabled || infill_enabled) &&
+            !(concentric && item.key.rfind("fiber_infill_",0)==0);
     }
 }
 

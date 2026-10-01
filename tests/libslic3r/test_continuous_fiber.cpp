@@ -3491,3 +3491,195 @@ TEST_CASE("touching deposited fibers leave no internal resin channels", "[Contin
     CHECK(diff_ex(accepted.physical_footprint,accepted.resin_exclusion).empty());
     CHECK(intersection_ex(resin,accepted.physical_footprint).empty());
 }
+
+TEST_CASE("concentric policy preserves display depth and ignores inactive infill process", "[ContinuousFiber][ConcentricReference]")
+{
+    ContinuousFiberConfig config;
+    config.contour_enabled=true;config.contour_count=100;
+    config.contour_flow=Flow(1.f,.2f,.4f);
+    config.contour_material=2;config.contour_bend_radius_mm=.3;
+    const auto reference=fiber_policy_key(config,0,false);
+    std::set<FiberPolicyKey> display_policies;
+    for (int count: {0,1,2,3,4,100}) {
+        auto fill=config;fill.contour_enabled=count>0;fill.contour_count=count;
+        fill.infill_enabled=true;fill.infill_pattern=ipConcentric;fill.infill_density=100;
+        const auto policy=fiber_policy_key(fill,0,false);
+        CHECK(display_policies.insert(policy).second);
+        if (count==100) CHECK(policy==reference);
+        else CHECK_FALSE(policy==reference);
+        fill.infill_material=3;fill.infill_flow=Flow(2.f,.3f,.6f);
+        fill.infill_bend_radius_mm=4;fill.infill_min_speed_mm_s=7;
+        fill.contour_infill_clearance_mm=2;
+        CHECK(fiber_policy_key(fill,1.234,true)==policy);
+        auto different=fill;different.finish_extension_length_mm=3;
+        CHECK_FALSE(fiber_policy_key(different,0,false)==policy);
+        const auto physical=fiber_ring_reference_config(fill);
+        CHECK(physical.contour_count==100);
+        CHECK(physical.contour_flow.width()==config.contour_flow.width());
+        CHECK(physical.contour_material==2);
+        if (count==0) {
+            // A retained count has no effect when displayed contours are off.
+            fill.contour_count=4;
+            CHECK(fiber_policy_key(fill,0,false)==policy);
+        }
+    }
+}
+
+
+TEST_CASE("concentric display cutoff cannot change contour traversal or process", "[ContinuousFiber][SharedRing]")
+{
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.13f,.4f);config.contour_count=100;
+    config.contour_boundary_clearance_mm=.05;config.contour_bend_radius_mm=.3;
+    config.minimum_effective_length_mm=.5;
+    config.landing_length_mm=2;config.cut_to_contact_length_mm=23;config.finish_overlap_length_mm=23;
+    const auto reference=FiberPathValidator::plan_contours({rectangle(0,0,60,40)},config,{},true);
+    REQUIRE(reference.audit_lineage());REQUIRE(reference.validation.accepted_count()>4);
+    for(size_t cutoff=0;cutoff<=4;++cutoff) {
+        auto display=reference;display.set_display_cutoff(cutoff);
+        REQUIRE(display.audit_lineage());
+        REQUIRE(display.validation.assignments.size()==reference.validation.assignments.size());
+        for(size_t i=0;i<display.validation.assignments.size();++i) {
+            const auto& changed=display.validation.assignments[i];const auto& original=reference.validation.assignments[i];
+            CHECK(changed.prepared==original.prepared);CHECK(changed.id==original.id);
+            CHECK(changed.id.parent.purpose==FiberPathPurpose::Contour);
+            const auto node=std::find_if(display.nodes.begin(),display.nodes.end(),[&](const auto& n){return n.id==changed.id.parent;});
+            REQUIRE(node!=display.nodes.end());
+            CHECK(changed.display_purpose==(node->depth<cutoff?FiberPathPurpose::Contour:FiberPathPurpose::Infill));
+        }
+    }
+}
+
+TEST_CASE("sparse shared rings add spacing only beyond the displayed contour cutoff", "[ContinuousFiber][SharedRing]")
+{
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.13f,.4f);config.contour_count=4;
+    config.contour_boundary_clearance_mm=.05;config.contour_bend_radius_mm=0;
+    config.minimum_effective_length_mm=.5;config.landing_length_mm=2;
+    config.cut_to_contact_length_mm=23;config.finish_overlap_length_mm=23;
+    const ExPolygons domain{rectangle(0,0,60,40)};
+    const auto full=FiberPathValidator::plan_contours(domain,config,{},true);
+    const auto sparse=FiberPathValidator::plan_contours(domain,config,{},true,2,1);
+    const auto only_fill=FiberPathValidator::plan_contours(domain,config,{},true,0,1);
+    REQUIRE(full.nodes.size()==4);REQUIRE(sparse.nodes.size()==4);REQUIRE(only_fill.nodes.size()==4);
+    REQUIRE(sparse.audit_lineage());REQUIRE(only_fill.audit_lineage());
+    for(size_t depth=0;depth<=2;++depth) {
+        REQUIRE(full.nodes[depth].source);REQUIRE(sparse.nodes[depth].source);
+        CHECK(full.nodes[depth].source->points==sparse.nodes[depth].source->points);
+    }
+    CHECK(full.nodes[3].source->points!=sparse.nodes[3].source->points);
+    CHECK(full.nodes[0].source->points==only_fill.nodes[0].source->points);
+    CHECK(full.nodes[1].source->points!=only_fill.nodes[1].source->points);
+}
+
+
+TEST_CASE("concentric stability counts only the gaps between marked complete bends", "[ContinuousFiber][ConcentricStability]")
+{
+    std::vector<ContourBend> bends(3);
+    // The first treatment includes two arcs and their 10 mm connector.
+    bends[0].begin_mm=0;bends[0].end_mm=12;
+    bends[1].begin_mm=16;bends[1].end_mm=17;
+    bends[2].begin_mm=23;bends[2].end_mm=24;
+    REQUIRE(minimum_closed_loop_stable_length_mm(30,bends));
+    CHECK(*minimum_closed_loop_stable_length_mm(30,bends)==Catch::Approx(4));
+    bends[1].begin_mm=17;bends[1].end_mm=18;
+    CHECK(*minimum_closed_loop_stable_length_mm(30,bends)==Catch::Approx(5));
+    CHECK(*minimum_closed_loop_stable_length_mm(27,bends)==Catch::Approx(3));
+    CHECK_FALSE(minimum_closed_loop_stable_length_mm(30,{}));
+    bends.resize(1);
+    CHECK(*minimum_closed_loop_stable_length_mm(30,bends)==Catch::Approx(18));
+}
+
+TEST_CASE("rounding records treatment groups without changing contour geometry", "[ContinuousFiber][ConcentricStability]")
+{
+    auto square=path_from_points({{0,0},{10,0},{10,10},{0,10},{0,0}});
+    const ExPolygons domain{rectangle(-1,-1,11,11)};
+    const auto forward=ContinuousFiberFillStrategy::round_outer_contour(square.polyline,domain,{.3});
+    REQUIRE(forward.path);REQUIRE(forward.arcs.size()==4);
+    REQUIRE(forward.bends.size()==4);
+    CHECK(*minimum_closed_loop_stable_length_mm(unscale<double>(forward.path->length()),forward.bends)==Catch::Approx(9.4).margin(.00001));
+    std::vector<continuous_fiber_detail::TangentSolution> connections;
+    for(const auto& arc:forward.arcs) {
+        continuous_fiber_detail::TangentSolution connection;connection.arcs={arc};
+        connections.push_back(std::move(connection));
+    }
+    auto zero=forward.arcs[0];zero.start_mm=zero.end_mm;zero.sweep_radians=0;
+    connections[1].arcs.insert(connections[1].arcs.begin(),zero);
+    const auto linked=continuous_fiber_detail::validate_cycle(connections,square.polyline.to_polyline(),domain,domain,{.3});
+    REQUIRE(linked.path);REQUIRE(linked.bends.size()==4);
+    CHECK(*minimum_closed_loop_stable_length_mm(unscale<double>(linked.path->length()),linked.bends)==Catch::Approx(0).margin(.00001));
+    square.polyline.reverse();
+    const auto reverse=ContinuousFiberFillStrategy::round_outer_contour(square.polyline,domain,{.3});
+    REQUIRE(reverse.path);REQUIRE(reverse.arcs.size()==4);
+    auto reversed=*forward.path;reversed.reverse();
+    CHECK(reverse.path->points==reversed.points);
+    CHECK(*minimum_closed_loop_stable_length_mm(unscale<double>(reverse.path->length()),reverse.bends)==Catch::Approx(9.4).margin(.00001));
+}
+
+TEST_CASE("concentric rejects a whole short-entry ring without changing its outer contour", "[ContinuousFiber][ConcentricStability]")
+{
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.13f,.4f);config.contour_count=100;
+    config.contour_bend_radius_mm=.3;
+    const ExPolygons domain{rectangle(0,0,8,8)};
+    const auto ordinary=FiberPathValidator::plan_contours(domain,config,{},true);
+    const auto constrained=FiberPathValidator::plan_contours(domain,config,{},true,1,0,5);
+    REQUIRE(constrained.audit_lineage());REQUIRE(ordinary.validation.accepted_count()>1);
+    REQUIRE(constrained.validation.accepted_count()==1);
+    REQUIRE(constrained.nodes.size()==2);
+    REQUIRE(constrained.validation.assignments.size()==2);
+    const auto& outer=constrained.validation.assignments[0];const auto& original=ordinary.validation.assignments[0];
+    REQUIRE(outer.prepared);REQUIRE(original.prepared);
+    REQUIRE(outer.prepared->spans.size()==original.prepared->spans.size());
+    for(size_t i=0;i<outer.prepared->spans.size();++i) {
+        CHECK(outer.prepared->spans[i].kind==original.prepared->spans[i].kind);
+        CHECK(outer.prepared->spans[i].geometry.points==original.prepared->spans[i].geometry.points);
+    }
+    const auto& failed=constrained.validation.assignments[1];
+    CHECK(failed.reason==FiberRejectionReason::BendStabilizationTooShort);
+    CHECK(failed.kind==FiberAssignmentKind::Rejected);CHECK_FALSE(failed.prepared);
+    CHECK(constrained.validation.physical_footprint==outer.prepared->physical_coverage);
+    CHECK(constrained.validation.resin_exclusion==outer.prepared->resin_exclusion);
+    CHECK(constrained.stops.back().reason=="candidate_rejected");
+    const auto shorter=FiberPathValidator::plan_contours(domain,config,{},true,1,0,3);
+    CHECK(shorter.validation.accepted_count()>constrained.validation.accepted_count());
+    const auto disabled=FiberPathValidator::plan_contours(domain,config,{},true,1,0,0);
+    CHECK(disabled.validation.accepted_count()==ordinary.validation.accepted_count());
+}
+
+TEST_CASE("concentric accepted ring starts with a stable run and does not inspect ordinary curves", "[ContinuousFiber][ConcentricStability]")
+{
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.13f,.4f);config.contour_count=1;config.contour_bend_radius_mm=.3;
+    const auto ring=FiberPathValidator::plan_contours({rectangle(0,0,10,10)},config,{},true,0,0,5);
+    REQUIRE(ring.validation.accepted_count()==1);
+    const auto& route=ring.validation.assignments.front().centerline->polyline.points;
+    REQUIRE(route.size()>2);CHECK(route.front()==route.back());
+    // The seam is the previous treatment's exit, not the next bend's entry.
+    CHECK(unscale<double>((route[1]-route[0]).cast<double>().norm())>=5);
+    Polygon circle;
+    for(size_t i=0;i<2048;++i)circle.points.push_back(Point::new_scale(10*std::cos(2*PI*i/2048),10*std::sin(2*PI*i/2048)));
+    auto smooth_path=circle.split_at_first_point();
+    const auto smooth=ContinuousFiberFillStrategy::round_outer_contour(Polyline3(smooth_path),{rectangle(-11,-11,11,11)},{.3});
+    REQUIRE(smooth.path);CHECK(smooth.arcs.empty());
+    CHECK_FALSE(minimum_closed_loop_stable_length_mm(unscale<double>(smooth.path->length()),smooth.bends));
+    auto fill=config;fill.contour_enabled=true;fill.infill_enabled=true;fill.infill_pattern=ipConcentric;fill.infill_density=100;
+    fill.corner_stabilization_length_mm=5;
+    fill.concentric_corner_stabilization_length_mm=5;
+    CHECK(fiber_ring_reference_config(fill).corner_stabilization_length_mm==0);
+    CHECK(fiber_ring_reference_config(fill).concentric_corner_stabilization_length_mm==5);
+    const auto key=fiber_policy_key(fill,0,false);
+    fill.corner_stabilization_length_mm=100;
+    CHECK(fiber_policy_key(fill,0,false)==key);
+    fill.concentric_corner_stabilization_length_mm=3;
+    CHECK_FALSE(fiber_policy_key(fill,0,false)==key);
+    fill.concentric_corner_stabilization_length_mm=5;fill.contour_count=2;
+    CHECK_FALSE(fiber_policy_key(fill,0,false)==key);
+    fill.concentric_corner_stabilization_length_mm=0;
+    config.contour_enabled=true;config.contour_count=fiber_contour_depth_limit;
+    CHECK_FALSE(fiber_policy_key(fill,0,false)==fiber_policy_key(config,0,false));
+    config.corner_stabilization_length_mm=100;
+    config.concentric_corner_stabilization_length_mm=100;
+    CHECK(fiber_ring_reference_config(config).corner_stabilization_length_mm==0);
+    CHECK(fiber_ring_reference_config(config).concentric_corner_stabilization_length_mm==0);
+}
