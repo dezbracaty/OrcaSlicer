@@ -82,7 +82,9 @@ void PrintRegion::collect_object_printing_extruders(const PrintConfig &print_con
                 if (region_config.wall_loops.value > 1)
 			emplace_extruder(region_config.inner_wall_filament_id);
     }
-    if (region_config.sparse_infill_density.value > 0)
+    if (region_config.sparse_infill_density.value > 0 ||
+        ((region_config.generate_reinforced_perimeters.value || region_config.generate_reinforced_infills.value) &&
+         region_config.fiber_resin_fill_density.value > 0))
     	emplace_extruder(region_config.sparse_infill_filament_id);
     if (region_config.sparse_infill_density.value > 0 || region_config.top_shell_layers.value > 0 || region_config.bottom_shell_layers.value > 0)
     	emplace_extruder(region_config.internal_solid_filament_id);

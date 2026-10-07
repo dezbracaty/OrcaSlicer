@@ -30,6 +30,7 @@
 
 #include <map>
 #include <optional>
+#include <set>
 #include <tuple>
 
 namespace Slic3r {
@@ -270,6 +271,7 @@ struct SurfaceFillParams
     size_t 			idx = 0;
 	// Infill speed setting for the effective extrusion role.
 	float role_speed = 0;
+    double role_acceleration = 0;
 
     // Params for lattice infill angles
     float lateral_lattice_angle_1 = 0.f;
@@ -309,6 +311,7 @@ struct SurfaceFillParams
 		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, bridge);
 		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, extrusion_role);
 		RETURN_COMPARE_NON_EQUAL(role_speed);
+        RETURN_COMPARE_NON_EQUAL(role_acceleration);
         RETURN_COMPARE_NON_EQUAL(lateral_lattice_angle_1);
 		RETURN_COMPARE_NON_EQUAL(lateral_lattice_angle_2);
 		RETURN_COMPARE_NON_EQUAL(symmetric_infill_y_axis);
@@ -336,6 +339,7 @@ struct SurfaceFillParams
 				this->flow                    == rhs.flow                    &&
 				this->extrusion_role          == rhs.extrusion_role          &&
 				this->role_speed              == rhs.role_speed              &&
+                this->role_acceleration       == rhs.role_acceleration       &&
                 this->lateral_lattice_angle_1 == rhs.lateral_lattice_angle_1 &&
 				this->lateral_lattice_angle_2 == rhs.lateral_lattice_angle_2 &&
 				this->infill_lock_depth       == rhs.infill_lock_depth       &&
@@ -944,7 +948,23 @@ void split_solid_surface(size_t layer_id, const SurfaceFill &fill, ExPolygons &n
 #endif
 }
 
-using FillSurfaceView = std::vector<SurfaceCollection>;
+enum class FillPurpose { Ordinary, FiberResin };
+struct FillSurfaceInputs {
+    SurfaceCollection surfaces;
+    std::vector<FillPurpose> purposes;
+    void append(Surface surface, FillPurpose purpose) {
+        surfaces.surfaces.push_back(std::move(surface));
+        purposes.push_back(purpose);
+    }
+};
+using FillSurfaceView = std::vector<FillSurfaceInputs>;
+
+bool is_fiber_source_surface(const Layer& layer, const PrintRegionConfig& config, const Surface& surface)
+{
+    return continuous_fiber_active_on_layer(config, layer.id()) && !surface.is_bridge() &&
+        (surface.surface_type == stInternal ||
+         (surface.surface_type == stInternalSolid && config.sparse_infill_density.value >= 100.0 - EPSILON));
+}
 
 std::vector<SurfaceFill> group_fills(
     const Layer& layer,
@@ -960,7 +980,7 @@ std::vector<SurfaceFill> group_fills(
     bool 												has_internal_voids = false;
 	const PrintObjectConfig&							object_config = layer.object()->config();
 	const auto& surfaces_for_region = [&](size_t region_id) -> const SurfaceCollection& {
-		return surface_view == nullptr ? layer.regions()[region_id]->fill_surfaces : surface_view->at(region_id);
+		return surface_view == nullptr ? layer.regions()[region_id]->fill_surfaces : surface_view->at(region_id).surfaces;
 	};
 
 	auto append_flow_param = [](std::map<Flow, ExPolygons> &flow_params, Flow flow, const ExPolygon &exp) {
@@ -981,13 +1001,23 @@ std::vector<SurfaceFill> group_fills(
 
 	for (size_t region_id = 0; region_id < layer.regions().size(); ++ region_id) {
 		const LayerRegion  &layerm = *layer.regions()[region_id];
+        std::optional<PrintRegionConfig> resin_config;
 		const SurfaceCollection& region_surfaces = surfaces_for_region(region_id);
 		region_to_surface_params[region_id].assign(region_surfaces.size(), nullptr);
 	    for (const Surface &surface : region_surfaces.surfaces)
 	        if (surface.surface_type == stInternalVoid)
 	        	has_internal_voids = true;
 	        else {
-		        const PrintRegionConfig &region_config = layerm.region().config();
+                const auto& original_config = layerm.region().config();
+                const size_t surface_index = &surface - region_surfaces.surfaces.data();
+                const bool is_resin_fill = surface_view &&
+                    surface_view->at(region_id).purposes.at(surface_index) == FillPurpose::FiberResin;
+                if (is_resin_fill && !resin_config)
+                    resin_config = resolve_resin_fill_config(original_config);
+                const PrintRegionConfig& region_config = is_resin_fill ? *resin_config : original_config;
+                // Every surface starts from defaults; a prior pattern must not
+                // leave state on the next ordinary or resin fill.
+                params = SurfaceFillParams{};
 		        FlowRole extrusion_role = surface.is_top() ? frTopSolidInfill : (surface.is_solid() ? frSolidInfill : frInfill);
 		        bool     is_bridge 	    = layer.id() > 0 && surface.is_bridge();
 		        params.extruder 	 = layerm.region().extruder(extrusion_role);
@@ -1026,7 +1056,8 @@ std::vector<SurfaceFill> group_fills(
                             params.pattern = ipRectilinear;
                         params.density = 100.f;
                     }
-                } else if (params.density <= 0)
+                } else if (params.density <= 0 &&
+                    !(collect_fiber_policy && is_fiber_source_surface(layer, original_config, surface)))
                     continue;
 
 				params.extrusion_role = erInternalInfill;
@@ -1084,7 +1115,9 @@ std::vector<SurfaceFill> group_fills(
 				params.flow   = params.bridge ?
 					//Orca: enable thick bridge based on config
 					layerm.bridging_flow(extrusion_role, is_thick_bridge) :
-					layerm.flow(extrusion_role, (surface.thickness == -1) ? layer.height : surface.thickness);
+                    (is_resin_fill ? resin_infill_flow(layerm,
+                        surface.thickness == -1 ? layer.height : surface.thickness, layer.id() == 0) :
+                        layerm.flow(extrusion_role, surface.thickness == -1 ? layer.height : surface.thickness));
 
 				params.role_speed = 0;
                 if (params.extrusion_role == erBridgeInfill)
@@ -1106,7 +1139,9 @@ std::vector<SurfaceFill> group_fills(
 		        } else {
 					// Internal infill. Calculating infill line spacing independent of the current layer height and 1st layer status,
 					// so that internall infill will be aligned over all layers of the current region.
-		            params.spacing = layerm.region().flow(*layer.object(), frInfill, layer.object()->config().layer_height, false).spacing();
+		            params.spacing = is_resin_fill ?
+                        resin_infill_flow(layerm, layer.object()->config().layer_height, false).spacing() :
+                        layerm.region().flow(*layer.object(), frInfill, layer.object()->config().layer_height, false).spacing();
 		            // Anchor a sparse infill to inner perimeters with the following anchor length:
 			        params.anchor_length = float(region_config.infill_anchor);
 					if (region_config.infill_anchor.percent)
@@ -1137,6 +1172,11 @@ std::vector<SurfaceFill> group_fills(
 
 				}
 
+                if (is_resin_fill) {
+                    params.extrusion_role = erResinInfill;
+                    params.role_acceleration = original_config.fiber_resin_fill_acceleration.get_abs_value(
+                        layer.object()->config().default_acceleration.value);
+                }
                 auto it_params = set_surface_params.find(params);
 
 		        if (it_params == set_surface_params.end())
@@ -1175,16 +1215,13 @@ std::vector<SurfaceFill> group_fills(
 						// At 100% core density Orca represents that core as InternalSolid.
 						// Merging every solid shell with sparse core changes island
 						// topology, joining separate reference contour loops together.
-						const bool fiber_surface =
-							(surface.surface_type == stInternal ||
-							 (surface.surface_type == stInternalSolid && region_config.sparse_infill_density.value >= 100.0 - EPSILON)) &&
-							!params->bridge && continuous_fiber_enabled(region_config) &&
-							region_config.fiber_layer_height_ratio.value > 0 &&
-							layer.id() % size_t(region_config.fiber_layer_height_ratio.value) == 0;
-						if (fiber_surface) {
-							ContinuousFiberConfig fiber_config = resolve_continuous_fiber_config(layer, layerm);
-							contributor.fiber_policy = fiber_policy_key(fiber_config, params->angle, params->fixed_angle);
-							contributor.fiber_config = std::move(fiber_config);
+                        const bool fiber_surface = is_fiber_source_surface(layer, region_config, surface) && !params->bridge;
+                        if (fiber_surface) {
+                            ContinuousFiberConfig fiber_config = resolve_continuous_fiber_config(layer, layerm);
+                            const auto angle=fiber_config.rectilinear_angle_radians;
+                            contributor.fiber_policy = fiber_policy_key(fiber_config,
+                                angle.value_or(params->angle), angle.has_value() || params->fixed_angle);
+                            contributor.fiber_config = std::move(fiber_config);
 						}
 						fill.contributors.emplace_back(std::move(contributor));
 					}
@@ -1379,9 +1416,6 @@ struct FillExecutionPolicy {
     // Continuous fiber is a fixed-width material. Keep the configured Flow
     // width and inset candidate centerlines by at least half that width.
     bool fixed_width = false;
-    size_t max_concentric_loops = 0;
-    // A planner may supply the already inset, fixed-width centerline domain.
-    bool centerline_domain = false;
 };
 
 struct FillExecutionContext {
@@ -1400,6 +1434,7 @@ static void execute_surface_fill_job(
     ExtrusionEntitiesPtr&       destination,
     const FillExecutionPolicy&  policy)
 {
+    if (surface_fill.params.density <= 0) return;
     Layer& layer = context.layer;
     LayerRegion* layerm = layer.regions()[surface_fill.region_id];
 
@@ -1415,16 +1450,11 @@ static void execute_surface_fill_job(
     f->angle = surface_fill.params.angle;
     f->fixed_angle = surface_fill.params.fixed_angle;
 	if (policy.fixed_width) {
-		const double boundary_inset = policy.centerline_domain ? 0.0 : 0.5 * std::max(
+		const double boundary_inset = 0.5 * std::max(
 			double(surface_fill.params.spacing), double(surface_fill.params.flow.width()));
 		// Fill::fill_surface() applies (overlap - spacing / 2). Compensate only
 		// when the physical fiber width is greater than its Flow spacing.
 		f->overlap = 0.5 * surface_fill.params.spacing - boundary_inset;
-		// Rectilinear connects at its outer contour, 0.45 spacing beyond
-		// FillBase's nominal inset. Fiber cannot borrow a plastic wall's
-		// overlap allowance: keep those connectors inside the safe domain.
-		if (surface_fill.params.pattern == ipRectilinear)
-			f->overlap -= 0.45 * surface_fill.params.spacing;
 	}
     f->adapt_fill_octree = surface_fill.params.pattern == ipSupportCubic
         ? context.support_fill_octree
@@ -1466,7 +1496,6 @@ static void execute_surface_fill_job(
     params.use_arachne = policy.enable_arachne &&
         (surface_fill.params.pattern == ipConcentric || surface_fill.params.pattern == ipConcentricInternal);
     params.enable_gap_fill = policy.enable_gap_fill;
-    params.max_concentric_loops = policy.max_concentric_loops;
     params.layer_height = layerm->layer()->height;
     params.lateral_lattice_angle_1 = surface_fill.params.lateral_lattice_angle_1;
     params.lateral_lattice_angle_2 = surface_fill.params.lateral_lattice_angle_2;
@@ -1596,79 +1625,21 @@ struct OwnedCandidateEntities {
     }
 };
 
-enum class FiberCandidateFamily {
-    Contour,
-    Infill
-};
-
-struct FiberFillJobParams {
-    InfillPattern pattern { ipRectilinear };
-    float density { 0.0f };
-    Flow flow;
-    double spacing { 0.0 };
-    double angle { 0.0 };
-    bool fixed_angle { false };
-    unsigned material { 0 };
-    ExtrusionRole role { erNone };
-    float role_speed { 0.0f };
-    float anchor_length { 0.0f };
-    float anchor_length_max { 0.0f };
-    size_t max_concentric_loops { 0 };
-};
-
-FiberFillJobParams resolve_fiber_fill_params(
-    const ContinuousFiberConfig& config,
-    const FiberPolicyKey& policy,
-    FiberCandidateFamily family)
+void apply_fiber_infill_params(SurfaceFillParams& destination,
+    const ContinuousFiberConfig& config, const FiberPolicyKey& policy)
 {
-    if (family == FiberCandidateFamily::Contour) {
-        return {
-            ipConcentric,
-            100.0f,
-            config.contour_flow,
-            config.contour_flow.spacing(),
-            policy.infill_direction,
-            policy.fixed_direction,
-            config.contour_material,
-            erContinuousFiberContour,
-            0.0f,
-            0.0f,
-            0.0f,
-            size_t(config.contour_count)
-        };
-    }
-
-    return {
-        config.infill_pattern,
-        float(config.infill_density),
-        config.infill_flow,
-        config.infill_flow.spacing(),
-        policy.infill_direction,
-        policy.fixed_direction,
-        config.infill_material,
-        erContinuousFiberInfill,
-        0.0f,
-        FillParams{}.anchor_length,
-        FillParams{}.anchor_length_max,
-        0
-    };
-}
-
-void apply_fiber_fill_params(
-    SurfaceFillParams& destination,
-    const FiberFillJobParams& source)
-{
-    destination.pattern = source.pattern;
-    destination.density = source.density;
-    destination.flow = source.flow;
-    destination.spacing = source.spacing;
-    destination.angle = float(source.angle);
-    destination.fixed_angle = source.fixed_angle;
-    destination.extruder = source.material;
-    destination.extrusion_role = source.role;
-    destination.role_speed = source.role_speed;
-    destination.anchor_length = source.anchor_length;
-    destination.anchor_length_max = source.anchor_length_max;
+    destination.pattern = config.infill_pattern;
+    destination.density = float(config.infill_density);
+    destination.flow = config.infill_flow;
+    // Continuous fiber occupies its configured width; plastic bead overlap does not set its pitch.
+    destination.spacing = config.infill_flow.width();
+    destination.angle = float(policy.infill_direction);
+    destination.fixed_angle = policy.fixed_direction;
+    destination.extruder = config.infill_material;
+    destination.extrusion_role = erContinuousFiberInfill;
+    destination.role_speed = 0.0f;
+    destination.anchor_length = FillParams{}.anchor_length;
+    destination.anchor_length_max = FillParams{}.anchor_length_max;
     destination.multiline = 1;
     destination.bridge = false;
 }
@@ -1763,50 +1734,95 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     const ExPolygons original_area = original_job.expolygons;
     const FiberDomainId& domain_id = domain.id;
 
+    const bool collect_debug = context.layer.object()->print()->config().fiber_fill_debug.value;
+    const auto record_regions = [&](const ExPolygons& regions, Layer::FiberDiagnosticKind kind,
+                                    const std::string& reason) {
+        for (const auto& region : regions) {
+            // A residual component thinner than the geometry tolerance cannot
+            // be represented reliably by the float preview coordinates.
+            if (kind == Layer::FiberDiagnosticKind::MissingContourRegion &&
+                offset_ex(ExPolygons{region}, -float(SCALED_EPSILON)).empty())
+                continue;
+            Layer::FiberFillDiagnostic diagnostic;
+            diagnostic.kind = kind;
+            diagnostic.region = region;
+            diagnostic.reason = reason;
+            diagnostic.contour = true;
+            diagnostic.policy_group_id = domain_id.policy_group_id;
+            diagnostic.component_id = domain_id.component_id;
+            context.layer.fiber_fill_diagnostics.push_back(std::move(diagnostic));
+        }
+    };
     FiberValidationResult contour_result;
     if (config.contour_enabled && config.contour_count > 0) {
-        const FiberFillJobParams contour_params = resolve_fiber_fill_params(
-            config, domain.policy, FiberCandidateFamily::Contour);
-        SurfaceFill contour_job = original_job;
-        // Open the centerline domain by half a fiber width before the native
-        // concentric generator. A narrow neck that cannot accommodate the
-        // return turn must not join two independently printable contours.
-        // Coverage/exclusion is still derived only from accepted final paths.
-        const double width = config.contour_flow.width();
-        const ExPolygons centerline_limit = offset_ex(original_area,
-            -float(scale_(0.5 * width + config.contour_boundary_clearance_mm)));
-        contour_job.expolygons = intersection_ex(offset2_ex(original_area,
-            -float(scale_(width + config.contour_boundary_clearance_mm)), float(scale_(0.5 * width))),
-            centerline_limit);
-        apply_fiber_fill_params(contour_job.params, contour_params);
-
-        ExtrusionEntitiesPtr candidates;
-        execute_surface_fill_job(context, contour_job, candidates,
-            {false, false, true, contour_params.max_concentric_loops, true});
-        OwnedCandidateEntities owner(std::move(candidates));
-        contour_result = FiberPathValidator::validate(
-            owner.root.entities, original_area, config, FiberPathPurpose::Contour,
-            erContinuousFiberContour, domain_id);
+        if (collect_debug)
+            record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
+                           "original_contour_domain_before_candidate_generation");
+        auto plan = FiberPathValidator::plan_contours(original_area, config, domain_id, collect_debug);
+        if (std::none_of(plan.nodes.begin(), plan.nodes.end(),
+                [](const auto& node) { return node.side == FiberContourSide::Outer; }))
+            ++context.layer.fiber_outer_contour_failures["no_outer_contour_candidate"];
+        if (collect_debug) for (const auto& node : plan.nodes) {
+            if (!node.source) continue;
+            std::string stop_detail;
+            for (const auto& stop : plan.stops) if (stop.parent && *stop.parent == node.id)
+                stop_detail += "; stop_depth=" + std::to_string(stop.depth) + "; stop_reason=" + stop.reason;
+            context.layer.fiber_fill_diagnostics.push_back({*node.source,
+                std::string(node.side == FiberContourSide::Outer ? "outer" : "hole") +
+                    "; region=" + std::to_string(node.region_id) + "; boundary=" + std::to_string(node.boundary_id) +
+                    "; depth=" + std::to_string(node.depth) + "; part=" + std::to_string(node.part_id) +
+                    "; candidate=" + std::to_string(node.id.job_ordinal) +
+                    "; parent=" + (node.parent ? std::to_string(node.parent->job_ordinal) : "root") + stop_detail,
+                true, unscale<double>(node.source->length()), Layer::FiberDiagnosticKind::ContourCandidate,
+                {}, domain_id.policy_group_id, domain_id.component_id});
+        }
+        contour_result = std::move(plan.validation);
+        if (collect_debug) {
+            for (const auto& reference:contour_result.reference_paths)
+                context.layer.fiber_fill_diagnostics.push_back({reference.polyline.to_polyline(),
+                    "shaped_reference_before_allocation",true,unscale<double>(reference.length()),
+                    Layer::FiberDiagnosticKind::RoundedContourCandidate,{},domain_id.policy_group_id,domain_id.component_id});
+            // Missing coverage comes from explicit clipped/rejected intervals.
+            // Normal rounding differences are not failed deposition regions.
+            const ExPolygons compared_coverage=offset_ex(contour_result.physical_footprint,float(SCALED_EPSILON));
+            for (const auto& assignment:contour_result.assignments) {
+                if (assignment.kind==FiberAssignmentKind::AcceptedFiber || !assignment.centerline) continue;
+                Polygons swept; assignment.centerline->polygons_covered_by_width(swept,0.0f);
+                record_regions(diff_ex(intersection_ex(union_ex(swept),original_area),compared_coverage),
+                    Layer::FiberDiagnosticKind::MissingContourRegion,
+                    std::string(fiber_rejection_reason_name(assignment.reason))+"; "+assignment.detail);
+            }
+        }
     }
 
     FiberValidationResult infill_result;
     if (config.infill_enabled && config.infill_density > 0.0) {
-        const FiberFillJobParams infill_params = resolve_fiber_fill_params(
-            config, domain.policy, FiberCandidateFamily::Infill);
         SurfaceFill infill_job = original_job;
         const ExPolygons infill_allowed_domain = ContinuousFiberFillStrategy::build_infill_domain(
             original_area, contour_result.contour_to_infill_keepout);
         infill_job.expolygons = infill_allowed_domain;
         if (!infill_job.expolygons.empty()) {
-            apply_fiber_fill_params(infill_job.params, infill_params);
+            apply_fiber_infill_params(infill_job.params, config, domain.policy);
 
-            ExtrusionEntitiesPtr candidates;
-            const FillExecutionPolicy infill_policy { false, false, true, 0 };
-            execute_surface_fill_job(context, infill_job, candidates, infill_policy);
-            OwnedCandidateEntities owner(std::move(candidates));
-            infill_result = FiberPathValidator::validate(
-                owner.root.entities, infill_allowed_domain, config, FiberPathPurpose::Infill,
-                erContinuousFiberInfill, domain_id);
+            if (config.infill_pattern == ipRectilinear) {
+                std::unique_ptr<Fill> direction(Fill::new_from_type(ipRectilinear));
+                direction->set_bounding_box(context.object_bbox);
+                direction->layer_id = context.layer.id();
+                direction->angle = infill_job.params.angle;
+                direction->fixed_angle = infill_job.params.fixed_angle;
+                const auto orientation = direction->infill_direction(infill_job.surface);
+                const auto candidates = ContinuousFiberFillStrategy::generate_rectilinear(
+                    infill_allowed_domain, config, orientation.first, orientation.second);
+                infill_result = FiberPathValidator::validate_infill(candidates, infill_allowed_domain, config, domain_id);
+            } else {
+                ExtrusionEntitiesPtr candidates;
+                const FillExecutionPolicy infill_policy { false, false, true };
+                execute_surface_fill_job(context, infill_job, candidates, infill_policy);
+                OwnedCandidateEntities owner(std::move(candidates));
+                infill_result = FiberPathValidator::validate(
+                    owner.root.entities, infill_allowed_domain, config, FiberPathPurpose::Infill,
+                    erContinuousFiberInfill, domain_id);
+            }
         }
     }
 
@@ -1818,9 +1834,6 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     FiberCoverageRecord coverage;
     coverage.source = domain_id;
     coverage.source_domain = original_area;
-    coverage.physical_fiber_coverage = contour_result.physical_footprint;
-    append_expolygons(coverage.physical_fiber_coverage, infill_result.physical_footprint);
-    coverage.physical_fiber_coverage = union_ex(coverage.physical_fiber_coverage);
     coverage.accepted_contour_exclusion = contour_result.resin_exclusion;
     coverage.accepted_infill_exclusion = infill_result.resin_exclusion;
     coverage.outside_domain = contour_result.outside_domain;
@@ -1840,15 +1853,29 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
             ++statistics.rejected_fragments[fiber_rejection_reason_name(assignment.reason)];
     }
     const auto log_rejections = [&](const FiberValidationResult& validation) {
+        std::map<FiberCandidateId, double> source_lengths;
+        for (const auto& candidate : validation.candidates) source_lengths.emplace(candidate.id, candidate.length_mm);
         for (const FiberFragmentAssignment& assignment : validation.assignments) {
             if (assignment.kind != FiberAssignmentKind::Rejected)
                 continue;
+            std::string detail = assignment.detail;
+            const auto extent = std::find_if(validation.candidates.begin(), validation.candidates.end(),
+                [&](const auto& candidate) { return candidate.id == assignment.id.parent; });
+            if (extent != validation.candidates.end() && extent->requires_closed_loop)
+                ++context.layer.fiber_outer_contour_failures[fiber_rejection_reason_name(assignment.reason)];
             if (context.layer.object()->print()->config().fiber_fill_debug.value && assignment.centerline) {
                 context.layer.fiber_fill_diagnostics.push_back({
                     assignment.centerline->polyline.to_polyline(),
-                    fiber_rejection_reason_name(assignment.reason),
+                    std::string(fiber_rejection_reason_name(assignment.reason)) + "; " + detail,
                     assignment.id.parent.purpose == FiberPathPurpose::Contour,
-                    assignment.source_end_mm - assignment.source_begin_mm});
+                    assignment.source_end_mm - assignment.source_begin_mm,
+                    Layer::FiberDiagnosticKind::RejectedPath, {},
+                    domain_id.policy_group_id, domain_id.component_id});
+                for (const auto& issue : assignment.contour_issues)
+                    context.layer.fiber_fill_diagnostics.push_back({
+                        issue.source, contour_rounding_failure_name(issue.reason), true,
+                        unscale<double>(issue.source.length()), Layer::FiberDiagnosticKind::RejectedPath,
+                        {}, domain_id.policy_group_id, domain_id.component_id});
             }
             BOOST_LOG_TRIVIAL(debug)
                 << "[FiberRejected] layer=" << context.layer.id()
@@ -1860,8 +1887,8 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 << " fragment=" << assignment.id.fragment_ordinal
                 << " source_begin_mm=" << assignment.source_begin_mm
                 << " source_end_mm=" << assignment.source_end_mm
-                << " source_length_mm=" << validation.candidates.at(assignment.id.parent.path_ordinal).length_mm
-                << " reason=" << fiber_rejection_reason_name(assignment.reason);
+                << " source_length_mm=" << source_lengths.at(assignment.id.parent)
+                << " reason=" << fiber_rejection_reason_name(assignment.reason) << " detail=" << detail;
         }
     };
     log_rejections(contour_result);
@@ -1892,7 +1919,7 @@ FillSurfaceView build_resin_surface_view(
     for (size_t region_id = 0; region_id < layer.regions().size(); ++region_id)
         for (const Surface& surface : layer.regions()[region_id]->fill_surfaces.surfaces)
             if (surface.surface_type == stInternalVoid)
-                result[region_id].surfaces.push_back(surface);
+                result[region_id].append(surface, FillPurpose::Ordinary);
 
     for (const SurfaceFill& job : original_jobs) {
         for (const FillDomainContributor& contributor : job.contributors) {
@@ -1902,7 +1929,13 @@ FillSurfaceView build_resin_surface_view(
             for (ExPolygon& resin_part : resin_domain) {
                 Surface resin_surface = contributor.original_surface;
                 resin_surface.expolygon = std::move(resin_part);
-                result.at(contributor.id.region_id).surfaces.emplace_back(std::move(resin_surface));
+                const bool fiber_source = contributor.fiber_policy.has_value();
+                // 100% ordinary core density may have classified the source as
+                // InternalSolid. Residual resin fill has its own density.
+                if (fiber_source)
+                    resin_surface.surface_type = stInternal;
+                result.at(contributor.id.region_id).append(std::move(resin_surface),
+                    fiber_source ? FillPurpose::FiberResin : FillPurpose::Ordinary);
             }
         }
     }
@@ -1916,6 +1949,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 {
     fiber_infill_statistics = {};
     fiber_fill_diagnostics.clear();
+    fiber_outer_contour_failures.clear();
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");
@@ -1923,9 +1957,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     const bool fiber_layer_enabled = std::any_of(
         m_regions.begin(), m_regions.end(), [this](const LayerRegion* region) {
             const PrintRegionConfig& config = region->region().config();
-            return continuous_fiber_enabled(config) &&
-                config.fiber_layer_height_ratio.value > 0 &&
-                this->id() % size_t(config.fiber_layer_height_ratio.value) == 0;
+            return continuous_fiber_active_on_layer(config, this->id());
         });
     LockRegionParam lock_param;
     std::vector<SurfaceFill> surface_fills = group_fills(
@@ -1954,13 +1986,11 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 
     const std::vector<FiberIslandDomainPlan> fiber_domains = build_fiber_island_domains(*this, surface_fills);
     std::map<FillDomainContributorId, ExPolygons> contributor_exclusions;
-    bool has_accepted_fiber = false;
     for (const FiberIslandDomainPlan& domain : fiber_domains) {
         FiberDomainExecutionResult fiber_result = execute_continuous_fiber_domain(
             execution_context, domain, transaction);
         if (fiber_result.accepted_exclusion.empty())
             continue;
-        has_accepted_fiber = true;
         for (const FillDomainContributor* contributor : domain.contributors) {
             ExPolygons projected = intersection_ex(
                 fiber_result.accepted_exclusion,
@@ -1974,7 +2004,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         }
     }
 
-    if (has_accepted_fiber) {
+    if (!fiber_domains.empty()) {
         FillSurfaceView resin_surface_view = build_resin_surface_view(
             *this, surface_fills, contributor_exclusions);
         LockRegionParam resin_lock_param;

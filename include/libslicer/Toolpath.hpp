@@ -57,7 +57,8 @@ enum class ToolpathExtrusionRole : std::uint8_t
     Custom,
     Mixed,
     ContinuousFiberContour,
-    ContinuousFiberInfill
+    ContinuousFiberInfill,
+    ResinInfill
 };
 
 enum class ToolpathEventKind : std::uint8_t
@@ -284,6 +285,8 @@ struct ToolpathStatistics
     std::vector<ToolpathFilamentUsage> filament_usage;
 };
 
+enum class FiberDiagnosticKind : std::uint8_t { RejectedPath, OriginalContourRegion, MissingContourRegion, ContourCandidate, RoundedContourCandidate };
+
 struct FiberFillDiagnosticPath
 {
     std::vector<ToolpathPoint> points;
@@ -293,6 +296,13 @@ struct FiberFillDiagnosticPath
     std::size_t object_index{0};
     std::size_t instance_index{0};
     double source_length_mm{0.0};
+    FiberDiagnosticKind kind{FiberDiagnosticKind::RejectedPath};
+    // Each region record has one outer loop followed by its holes; loops are closed.
+    std::vector<std::vector<ToolpathPoint>> boundaries;
+    // Independent triangle vertices for missing-region fill, with holes excluded.
+    std::vector<ToolpathPoint> triangles;
+    std::size_t policy_group_id{0};
+    std::size_t component_id{0};
 };
 
 struct ToolpathPreview
@@ -302,7 +312,7 @@ struct ToolpathPreview
     // Optional structured metadata for non-G-code previews such as an
     // algorithm audit. Renderers ignore it; UI bridges may expose it.
     std::string metadata_json;
-    // Rejected candidates, NOT print moves; excluded from bounds/statistics/G-code.
+    // Fiber diagnostic paths and regions, NOT print moves; excluded from bounds/statistics/G-code.
     std::vector<FiberFillDiagnosticPath> fiber_fill_diagnostics;
     std::vector<ToolpathLayer> layers;
     std::vector<ToolpathSegment> segments;

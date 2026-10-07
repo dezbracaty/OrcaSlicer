@@ -1,0 +1,21 @@
+--- a/src/algs/cobyla/cobyla.c
++++ b/src/algs/cobyla/cobyla.c
+@@ -1259,6 +1259,7 @@
+   double spabs;
+   double temp, step;
+   int icount;
++  unsigned int inner_iterations = 0;
+   int iout, i__, j, k;
+   int isave;
+   int kk;
+@@ -1366,6 +1367,10 @@
+   optold = 0.;
+   icount = 0;
+ L70:
++  /* Degenerate active sets may cycle without evaluating the objective again,
++     so maxeval and maxtime in cobylb cannot interrupt this loop. */
++  if (++inner_iterations > 10000U)
++    return NLOPT_ROUNDOFF_LIMITED;
+   if (mcon == *m) {
+     optnew = resmax;
+   } else {

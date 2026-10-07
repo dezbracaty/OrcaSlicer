@@ -1633,7 +1633,7 @@ bool WipingExtrusions::is_overriddable(const ExtrusionEntityCollection& eec, con
     if (object.config().flush_into_objects)
         return true;
 
-    if (!object.config().flush_into_infill || eec.role() != erInternalInfill)
+    if (!object.config().flush_into_infill || (eec.role() != erInternalInfill && eec.role() != erResinInfill))
         return false;
 
     return true;

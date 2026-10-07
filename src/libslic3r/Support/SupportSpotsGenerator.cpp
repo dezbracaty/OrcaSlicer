@@ -1,4 +1,5 @@
 #include "SupportSpotsGenerator.hpp"
+#include "ContinuousFiber/ContinuousFiberConfig.hpp"
 
 #include "BoundingBox.hpp"
 #include "ExPolygon.hpp"
@@ -93,6 +94,7 @@ float get_flow_width(const LayerRegion *region, ExtrusionRole role)
     if (role == ExtrusionRole::erGapFill) return region->flow(FlowRole::frInfill).width();
     if (role == ExtrusionRole::erPerimeter) return region->flow(FlowRole::frPerimeter).width();
     if (role == ExtrusionRole::erSolidInfill) return region->flow(FlowRole::frSolidInfill).width();
+    if (role == erResinInfill) return resin_infill_flow(*region, region->layer()->height, region->layer()->id() == 0).width();
     if (role == ExtrusionRole::erInternalInfill) return region->flow(FlowRole::frInfill).width();
     if (role == ExtrusionRole::erTopSolidInfill) return region->flow(FlowRole::frTopSolidInfill).width();
     // default

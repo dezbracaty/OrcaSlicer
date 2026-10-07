@@ -14,6 +14,7 @@ namespace Slic3r {
 // process output is identical.
 struct FiberPolicyKey {
     bool contour_enabled { false };
+    bool contour_include_holes { true };
     bool infill_enabled { false };
     int layer_interval { 1 };
     int contour_count { 0 };
@@ -34,8 +35,6 @@ struct FiberPolicyKey {
     unsigned contour_material { 0 };
     unsigned infill_material { 0 };
     double minimum_path_length_mm { 0.0 };
-    double minimum_segment_length_mm { 0.0 };
-    double maximum_turn_angle_degrees { 180.0 };
     double cut_to_contact_length_mm { 0.0 };
     double prefeed_extra_length_mm { 0.0 };
     double prefeed_speed_mm_s { 0.0 };
@@ -69,16 +68,18 @@ struct FiberPolicyKey {
     double contour_feed_correction { 0.0 };
     double infill_feed_correction { 0.0 };
     double contour_boundary_clearance_mm { 0.0 };
+    double contour_bend_radius_mm { 0.0 };
+    double infill_bend_radius_mm { 0.0 };
+    double corner_stabilization_length_mm { 0.0 };
 
     auto values() const
     {
         return std::tie(
-            contour_enabled, infill_enabled, layer_interval, contour_count,
+            contour_enabled, contour_include_holes, infill_enabled, layer_interval, contour_count,
             infill_pattern, infill_density, infill_direction, fixed_direction,
             contour_width, contour_spacing, contour_height, contour_nozzle,
             infill_width, infill_spacing, infill_height, infill_nozzle,
             contour_material, infill_material, minimum_path_length_mm,
-            minimum_segment_length_mm, maximum_turn_angle_degrees,
             cut_to_contact_length_mm, prefeed_extra_length_mm, prefeed_speed_mm_s,
             z_hop_height_mm, landing_length_mm, landing_speed_mm_s, adhesion_dwell_ms,
             start_speed_mm_s, start_stabilization_length_mm,
@@ -86,7 +87,7 @@ struct FiberPolicyKey {
             outside_tolerance_mm2, contour_max_speed_mm_s, infill_max_speed_mm_s,
             contour_acceleration_mm_s2, infill_acceleration_mm_s2,
             contour_infill_clearance_mm, resin_overlap_mm,
-            contour_feed_ratio, infill_feed_ratio, contour_min_speed_mm_s, infill_min_speed_mm_s, corner_transition_length_mm, speed_sampling_length_mm, tail_min_speed_mm_s, tail_max_speed_mm_s, tail_speed_step_length_mm, finish_overlap_length_mm, finish_motion_speed_mm_s, contour_feed_correction, infill_feed_correction, contour_boundary_clearance_mm);
+            contour_feed_ratio, infill_feed_ratio, contour_min_speed_mm_s, infill_min_speed_mm_s, corner_transition_length_mm, speed_sampling_length_mm, tail_min_speed_mm_s, tail_max_speed_mm_s, tail_speed_step_length_mm, finish_overlap_length_mm, finish_motion_speed_mm_s, contour_feed_correction, infill_feed_correction, contour_boundary_clearance_mm, contour_bend_radius_mm, infill_bend_radius_mm, corner_stabilization_length_mm);
     }
 
     bool operator<(const FiberPolicyKey& rhs) const { return values() < rhs.values(); }
@@ -102,6 +103,7 @@ inline FiberPolicyKey fiber_policy_key(
         throw std::runtime_error("Continuous fiber infill direction must be finite");
     return {
         config.contour_enabled,
+        config.contour_include_holes,
         config.infill_enabled,
         config.layer_interval,
         config.contour_count,
@@ -120,8 +122,6 @@ inline FiberPolicyKey fiber_policy_key(
         config.contour_material,
         config.infill_material,
         config.minimum_path_length_mm,
-        config.minimum_segment_length_mm,
-        config.maximum_turn_angle_degrees,
         config.cut_to_contact_length_mm,
         config.prefeed_extra_length_mm,
         config.prefeed_speed_mm_s,
@@ -153,7 +153,10 @@ inline FiberPolicyKey fiber_policy_key(
         config.finish_motion_speed_mm_s,
         config.contour_feed_correction,
         config.infill_feed_correction,
-        config.contour_boundary_clearance_mm
+        config.contour_boundary_clearance_mm,
+        config.contour_bend_radius_mm,
+        config.infill_bend_radius_mm,
+        config.corner_stabilization_length_mm
     };
 }
 

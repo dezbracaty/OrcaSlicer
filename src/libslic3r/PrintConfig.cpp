@@ -1,4 +1,5 @@
 #include "PrintConfig.hpp"
+#include "ContinuousFiber/ContinuousFiberConfig.hpp"
 #include "PrintConfigConstants.hpp"
 #include "ClipperUtils.hpp"
 #include "Config.hpp"
@@ -945,10 +946,16 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("Generate continuous fiber contour paths inside eligible internal fill surfaces.");
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("fiber_contour_include_holes", coBool);
+    def->label = L("Fiber contours around holes");
+    def->category = L("Continuous fiber");
+    def->tooltip = L("Generate fiber contour loops around closed holes in the fiber region. Disabling this option keeps holes excluded from all material paths and does not change fiber infill patterns.");
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("outer_reinforced_perimeters_counts", coInt);
     def->label = L("Continuous fiber contour count");
     def->category = L("Continuous fiber");
-    def->tooltip = L("Maximum concentric offset depth used for continuous fiber contours.");
+    def->tooltip = L("Maximum number of successive continuous fiber contour levels. Each accepted closed contour may produce multiple contours at the next level; rejected contours do not produce deeper levels.");
     def->min = 0;
     def->max = 100;
     def->set_default_value(new ConfigOptionInt(1));
@@ -965,7 +972,7 @@ void PrintConfigDef::init_fff_params()
     def->sidetext = "%";
     def->min = 0;
     def->max = 100;
-    def->set_default_value(new ConfigOptionPercent(40));
+    def->set_default_value(new ConfigOptionPercent(100));
 
     def = this->add("reinforced_infill_pattern", coEnum);
     def->label = L("Continuous fiber infill pattern");
@@ -974,6 +981,12 @@ void PrintConfigDef::init_fff_params()
     def->enum_values = {"rectilinear", "concentric"};
     def->enum_labels = {L("Rectilinear"), L("Concentric")};
     def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
+
+    def = this->add("fiber_infill_angle_sequence", coString);
+    def->label = L("Fiber infill angle sequence");
+    def->tooltip = L("Comma-separated rectilinear fiber directions in degrees, repeated on successive fiber layers (for example, 0,45,90,135). Angles are relative to the build plate; 180 degrees is the same line direction as 0. The default 45,135 matches the standard alternating infill directions.");
+    def->category = L("Continuous fiber");
+    def->set_default_value(new ConfigOptionString("45,135"));
 
     def = this->add("reinforced_infill_filament", coInt);
     def->label = L("Continuous fiber infill filament");
@@ -987,21 +1000,13 @@ void PrintConfigDef::init_fff_params()
     def->min = 1;
     def->set_default_value(new ConfigOptionInt(2));
 
-    def = this->add("reinforced_perimeters_extrusion_width", coFloatOrPercent);
-    def->label = L("Continuous fiber contour width");
+    def = this->add("fiber_width", coFloat);
+    def->label = L("Fiber width");
     def->category = L("Continuous fiber");
-    def->sidetext = L("mm or %");
-    def->ratio_over = "nozzle_diameter";
-    def->min = 0;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0.8, false));
-
-    def = this->add("reinforced_infill_extrusion_width", coFloatOrPercent);
-    def->label = L("Continuous fiber infill width");
-    def->category = L("Continuous fiber");
-    def->sidetext = L("mm or %");
-    def->ratio_over = "nozzle_diameter";
-    def->min = 0;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0.8, false));
+    def->tooltip = L("Physical fiber width shared by continuous fiber contours and infill. Specify a positive width in millimeters.");
+    def->sidetext = "mm";
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(0.8));
 
     def = this->add("fiber_layer_height_ratio", coInt);
     def->label = L("Continuous fiber layer interval");
@@ -1013,7 +1018,7 @@ void PrintConfigDef::init_fff_params()
     def = this->add("fiber_fill_debug", coBool);
     def->label = L("Enable continuous fiber fill debugging");
     def->category = L("Continuous fiber");
-    def->tooltip = L("Collect rejected fiber contour and infill candidate paths for preview diagnostics. Does not change the generated print moves. Regions without candidate paths are not included.");
+    def->tooltip = L("Collect original contour regions, contour candidate coverage not present in the final fiber paths, and rejected candidate paths for preview diagnostics. Does not change print moves. Missing coverage is relative to generated candidates, not the entire resin region.");
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionBool(false));
 
@@ -1024,20 +1029,29 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(10.0));
 
-    def = this->add("fiber_minimum_segment_length", coFloat);
-    def->label = L("Minimum continuous fiber segment length");
+    def = this->add("fiber_contour_bend_radius", coFloat);
+    def->label = L("Fiber contour bend radius");
+    def->tooltip = L("Replace contour corners with tangent arcs of exactly this centerline radius. Zero disables rounding. Regions proven too small for a closed contour at this radius are left for resin infill. Unresolved rounding stops slicing with an error.");
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(0.0));
 
-    def = this->add("fiber_maximum_turn_angle", coFloat);
-    def->label = L("Maximum continuous fiber turn angle");
+    def = this->add("fiber_infill_bend_radius", coFloat);
+    def->label = L("Fiber infill bend radius");
+    def->tooltip = L("Use exactly this centerline radius for rectilinear fiber returns. Zero disables rounded returns. Scanline spacing must be at least twice this radius.");
     def->category = L("Continuous fiber");
-    def->sidetext = L("°");
+    def->sidetext = L("mm");
     def->min = 0;
-    def->max = 180;
-    def->set_default_value(new ConfigOptionFloat(180.0));
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("fiber_corner_stabilization_length", coFloat);
+    def->label = L("Fiber corner stabilization length");
+    def->tooltip = L("Minimum deposited fiber path length before each radius-optimized rectilinear return. The entire return, including its arcs and connecting segment, is excluded. Zero disables this constraint.");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(5.0));
 
     def = this->add("fiber_contour_boundary_clearance", coFloat);
     def->label = L("Fiber contour boundary clearance");
@@ -1045,7 +1059,7 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;
-    def->set_default_value(new ConfigOptionFloat(0.0));
+    def->set_default_value(new ConfigOptionFloat(0.05));
 
     def = this->add("fiber_contour_infill_clearance", coFloat);
     def->label = L("Fiber contour to infill clearance");
@@ -1060,6 +1074,88 @@ void PrintConfigDef::init_fff_params()
     def->sidetext = L("mm");
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(0.05));
+
+    def = this->add("fiber_resin_fill_pattern", coEnum);
+    def->label = L("Resin infill pattern");
+    def->category = L("Continuous fiber resin infill");
+    def->enum_keys_map = &ConfigOptionEnum<InfillPattern>::get_enum_values();
+    def->enum_values = {"rectilinear", "grid", "triangles", "cubic", "gyroid", "concentric"};
+    def->enum_labels = {L("Rectilinear"), L("Grid"), L("Triangles"), L("Cubic"), L("Gyroid"), L("Concentric")};
+    def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
+
+    def = this->add("fiber_resin_fill_density", coPercent);
+    def->label = L("Resin infill density");
+    def->tooltip = L("Density of resin infill in the remaining internal area on fiber layers. Zero disables resin infill without disabling fiber.");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("%");
+    def->min = 0;
+    def->max = 100;
+    def->set_default_value(new ConfigOptionPercent(100));
+
+    def = this->add("fiber_resin_fill_direction", coFloat);
+    def->label = L("Resin infill direction");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("°");
+    def->min = 0;
+    def->max = 360;
+    def->set_default_value(new ConfigOptionFloat(45));
+
+    def = this->add("fiber_resin_fill_rotate_template", coString);
+    def->label = L("Resin infill rotation template");
+    def->category = L("Continuous fiber resin infill");
+    def->set_default_value(new ConfigOptionString(""));
+
+    def = this->add("fiber_resin_fill_align_to_model", coBool);
+    def->label = L("Align resin infill to model");
+    def->category = L("Continuous fiber resin infill");
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("fiber_resin_fill_line_width", coFloatOrPercent);
+    def->label = L("Resin infill line width");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("mm or %");
+    def->min = 0;
+    def->max = 1000;
+    def->ratio_over = "nozzle_diameter";
+    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+
+    def = this->add("fiber_resin_fill_multiline", coInt);
+    def->label = L("Resin infill line multiplier");
+    def->category = L("Continuous fiber resin infill");
+    def->min = 1;
+    def->max = 100;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("fiber_resin_fill_anchor", coFloatOrPercent);
+    def->label = L("Resin infill anchor length");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("mm or %");
+    def->min = 0;
+    def->ratio_over = "fiber_resin_fill_line_width";
+    def->set_default_value(new ConfigOptionFloatOrPercent(400., true));
+
+    def = this->add("fiber_resin_fill_anchor_max", coFloatOrPercent);
+    def->label = L("Maximum resin infill anchor length");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("mm or %");
+    def->min = 0;
+    def->ratio_over = "fiber_resin_fill_line_width";
+    def->set_default_value(new ConfigOptionFloatOrPercent(20., false));
+
+    def = this->add("fiber_resin_fill_speed", coFloat);
+    def->label = L("Resin infill speed");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("mm/s");
+    def->min = 1;
+    def->set_default_value(new ConfigOptionFloat(100.));
+
+    def = this->add("fiber_resin_fill_acceleration", coFloatOrPercent);
+    def->label = L("Resin infill acceleration");
+    def->category = L("Continuous fiber resin infill");
+    def->sidetext = L("mm/s² or %");
+    def->min = 0;
+    def->ratio_over = "default_acceleration";
+    def->set_default_value(new ConfigOptionFloatOrPercent(100., true));
 
     def = this->add("fiber_cut_to_contact_length", coFloat);
     def->label = L("Fiber cutter to contact distance");
@@ -4203,6 +4299,25 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("toolchange_z_lift", coFloat);
+    def->label = L("Tool change clearance lift");
+    def->tooltip = L("Additional Z clearance during a physical tool change. Zero preserves existing behavior. "
+                     "Not supported with prime towers, belt printers, manual tool changes or custom filament-change scripts.");
+    def->category = L("Machine G-code");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("part_cooling_fan_index", coInt);
+    def->label = L("Part cooling fan channel");
+    def->tooltip = L("Explicit M106 P channel for the part cooling fan on Klipper machines with indexed fan commands. "
+                     "Use -1 to preserve the firmware's existing output format.");
+    def->category = L("Machine G-code");
+    def->min = -1;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(-1));
 
     // ORCA: minimum non-zero part cooling fan speed.
     def = this->add("part_cooling_fan_min_pwm", coInt);
@@ -8631,6 +8746,10 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
 
     // Ignore the following obsolete configuration keys:
     static std::set<std::string> ignore = {
+        // Retired whole-path filters: discretized edges are not bend geometry.
+        "fiber_minimum_segment_length", "fiber_maximum_turn_angle",
+        // Local tangent connections replace parallel preparation offsets.
+        "fiber_contour_rounding_max_reserve",
         "acceleration", "scale", "rotate", "duplicate", "duplicate_grid",
         "bed_size",
         "print_center", "g0", "wipe_tower_per_color_wipe", 
@@ -10709,9 +10828,43 @@ void compute_filament_override_value(const std::string& opt_key, const ConfigOpt
 
 //BBS: pass map to recording all invalid valies
 //FIXME localize this function.
+std::map<std::string, std::string> validate_machine_gcode_config(const PrintConfig &cfg)
+{
+    std::map<std::string, std::string> errors;
+    const int channel = cfg.part_cooling_fan_index.value;
+    if (channel < -1 || (channel >= 0 && cfg.gcode_flavor != gcfKlipper))
+        errors.emplace("part_cooling_fan_index", "Explicit part cooling fan channels require Klipper; use -1 for the legacy format.");
+    else if ((channel == 2 && cfg.auxiliary_fan.value) || (channel == 3 && cfg.support_air_filtration.value))
+        errors.emplace("part_cooling_fan_index", "Part cooling fan channel conflicts with an enabled auxiliary or exhaust fan.");
+    const double lift = cfg.toolchange_z_lift.value;
+    if (!std::isfinite(lift) || lift < 0)
+        errors.emplace("toolchange_z_lift", "Tool change clearance lift must be finite and non-negative.");
+    else if (lift > 0) {
+        if (cfg.enable_prime_tower || cfg.printer_structure == psBelt || cfg.manual_filament_change)
+            errors.emplace("toolchange_z_lift", "Tool change clearance lift does not support prime towers, belt printers or manual tool changes.");
+        const auto has_commands = [](const std::string &script) {
+            std::istringstream stream(script);
+            for (std::string line; std::getline(stream, line);) {
+                line = line.substr(0, line.find(';'));
+                if (line.find_first_not_of(" \t\r") != std::string::npos) return true;
+            }
+            return false;
+        };
+        if (has_commands(cfg.change_filament_gcode.value) ||
+            std::any_of(cfg.filament_start_gcode.values.begin(), cfg.filament_start_gcode.values.end(), has_commands) ||
+            std::any_of(cfg.filament_end_gcode.values.begin(), cfg.filament_end_gcode.values.end(), has_commands))
+            errors.emplace("toolchange_z_lift", "Tool change clearance lift cannot be combined with custom filament start, end or change commands.");
+    }
+    return errors;
+}
+
 std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool under_cli)
 {
-    std::map<std::string, std::string> error_message;
+    std::map<std::string, std::string> error_message = validate_machine_gcode_config(cfg);
+    if (continuous_fiber_enabled(cfg)) {
+        try { resolve_resin_fill_config(cfg); }
+        catch (const std::invalid_argument& e) { error_message.emplace("fiber_resin_fill_pattern", e.what()); }
+    }
     // --layer-height
     if (cfg.get_abs_value("layer_height") <= 0) {
         error_message.emplace("layer_height", L("invalid value ") + std::to_string(cfg.get_abs_value("layer_height")));

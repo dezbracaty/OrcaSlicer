@@ -2,7 +2,12 @@
 #define slic3r_ContinuousFiberConfig_hpp_
 
 #include "../Flow.hpp"
+#include "FiberSource.hpp"
 #include "../PrintConfig.hpp"
+
+#include <optional>
+#include <string_view>
+#include <vector>
 
 namespace Slic3r {
 
@@ -11,18 +16,18 @@ class LayerRegion;
 
 struct ContinuousFiberConfig {
     bool contour_enabled { false };
+    bool contour_include_holes { true };
     bool infill_enabled { false };
     int layer_interval { 1 };
     int contour_count { 0 };
     InfillPattern infill_pattern { ipRectilinear };
     double infill_density { 0.0 };
+    std::optional<double> rectilinear_angle_radians;
     Flow contour_flow;
     Flow infill_flow;
     unsigned contour_material { 0 };
     unsigned infill_material { 0 };
     double minimum_path_length_mm { 0.0 };
-    double minimum_segment_length_mm { 0.0 };
-    double maximum_turn_angle_degrees { 180.0 };
     double cut_to_contact_length_mm { 0.0 };
     double prefeed_extra_length_mm { 0.0 };
     double prefeed_speed_mm_s { 10.0 };
@@ -47,6 +52,9 @@ struct ContinuousFiberConfig {
     double contour_feed_correction { 1.0 };
     double infill_feed_correction { 1.0 };
     double contour_boundary_clearance_mm { 0.0 };
+    double contour_bend_radius_mm { 0.0 };
+    double infill_bend_radius_mm { 0.0 };
+    double corner_stabilization_length_mm { 0.0 };
     double contour_min_speed_mm_s { 3.0 };
     double infill_min_speed_mm_s { 3.0 };
     double corner_transition_length_mm { 5.0 };
@@ -65,6 +73,13 @@ struct ContinuousFiberConfig {
 };
 
 bool continuous_fiber_enabled(const PrintRegionConfig& config);
+bool continuous_fiber_active_on_layer(const PrintRegionConfig& config, size_t layer_id);
+std::vector<double> parse_fiber_infill_angle_sequence(std::string_view serialized);
+std::optional<double> fiber_infill_angle_for_layer(std::string_view serialized,
+    size_t layer_id, size_t layer_interval);
+// Map resin settings to the shared infill generator without inheriting sparse fill controls.
+PrintRegionConfig resolve_resin_fill_config(const PrintRegionConfig& config);
+Flow resin_infill_flow(const LayerRegion& region, double height, bool first_layer);
 bool is_fiber_filament(const GCodeConfig& config, unsigned filament);
 // Material indices, logical extruders and physical tool IDs are distinct.
 bool has_fiber_tool(const GCodeConfig& config);
@@ -87,6 +102,8 @@ void require_fiber_safe_script(const std::string& script, const char* name,
     FiberMachineProtocol protocol = FiberMachineProtocol::LinearE, bool expanded = false);
 void validate_fiber_cut_event(const std::string& script,
     FiberMachineProtocol protocol = FiberMachineProtocol::LinearE);
+// Validates common process values and only the requested path family.
+void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose, bool closed_path = true);
 ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region);
 
 } // namespace Slic3r

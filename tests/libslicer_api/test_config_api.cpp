@@ -6,6 +6,7 @@
 #include <libslicer/Library.hpp>
 
 #include <miniz.h>
+#include <nlohmann/json.hpp>
 #include <png.h>
 
 #include <algorithm>
@@ -225,6 +226,34 @@ TEST_CASE("configuration snapshot is independent", "[libslicer_api][config]")
     CHECK_FALSE(snapshot.value("missing_option").has_value());
 }
 
+TEST_CASE("fiber width is one positive millimeter setting", "[libslicer_api][config][fiber-width]")
+{
+    auto config = libslicer::Config::defaults();
+    auto items = config.settings();
+    const auto* width = find_item(items, "fiber_width");
+    REQUIRE(width != nullptr);
+    CHECK(width->type == libslicer::SettingType::Float);
+    CHECK(width->unit == "mm");
+    CHECK(width->group == libslicer::SettingGroup::Process);
+    CHECK(width->level == libslicer::SettingLevel::Simple);
+    CHECK_FALSE(width->enabled);
+    CHECK(find_item(items, "reinforced_perimeters_extrusion_width") == nullptr);
+    CHECK(find_item(items, "reinforced_infill_extrusion_width") == nullptr);
+    REQUIRE(config.set("generate_reinforced_perimeters", "1").success);
+    items = config.settings();
+    CHECK(find_item(items, "fiber_width")->enabled);
+    REQUIRE(config.set("generate_reinforced_perimeters", "0").success);
+    REQUIRE(config.set("generate_reinforced_infills", "1").success);
+    items = config.settings();
+    CHECK(find_item(items, "fiber_width")->enabled);
+    REQUIRE(config.set("fiber_width", "1.2").success);
+    for (const auto* invalid : {"0", "-1", "100%", "1mm", "nan", "inf"}) {
+        INFO(invalid);
+        CHECK_FALSE(config.set("fiber_width", invalid).success);
+        CHECK(config.snapshot().value("fiber_width") == "1.2");
+    }
+}
+
 TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_api][config][fiber]")
 {
     auto config = libslicer::Config::defaults();
@@ -243,22 +272,18 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
     CHECK(fill_debug->visible);
     CHECK(fill_debug->default_value == "0");
     CHECK_FALSE(fill_debug->enabled);
-    const auto* minimum_segment = find_item(items, "fiber_minimum_segment_length");
-    const auto* maximum_turn = find_item(items, "fiber_maximum_turn_angle");
+    CHECK(find_item(items, "fiber_minimum_segment_length") == nullptr);
+    CHECK(find_item(items, "fiber_maximum_turn_angle") == nullptr);
     const auto* contour_infill_clearance = find_item(items, "fiber_contour_infill_clearance");
     REQUIRE(contour_toggle != nullptr);
     REQUIRE(contour_count != nullptr);
     REQUIRE(infill_density != nullptr);
     REQUIRE(layer_interval != nullptr);
-    REQUIRE(minimum_segment != nullptr);
-    REQUIRE(maximum_turn != nullptr);
     REQUIRE(contour_infill_clearance != nullptr);
     CHECK(contour_toggle->enabled);
     CHECK_FALSE(contour_count->enabled);
     CHECK_FALSE(infill_density->enabled);
     CHECK_FALSE(layer_interval->enabled);
-    CHECK_FALSE(minimum_segment->enabled);
-    CHECK_FALSE(maximum_turn->enabled);
     CHECK_FALSE(contour_infill_clearance->enabled);
 
     const auto contour_enabled = config.set("generate_reinforced_perimeters", "1");
@@ -276,8 +301,6 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
     REQUIRE(config.reset("fiber_fill_debug").success);
     CHECK(debug_snapshot.value("fiber_fill_debug") == "1");
     CHECK(config.snapshot().value("fiber_fill_debug") == "0");
-    CHECK(find_item(items, "fiber_minimum_segment_length")->enabled);
-    CHECK(find_item(items, "fiber_maximum_turn_angle")->enabled);
     CHECK_FALSE(find_item(items, "reinforced_infill_density")->enabled);
     CHECK_FALSE(find_item(items, "fiber_contour_infill_clearance")->enabled);
 
@@ -319,8 +342,6 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     const auto landing_speed = config->value("fiber_landing_speed");
     const auto start_speed = config->value("fiber_start_speed");
     const auto minimum_effective = config->value("fiber_minimum_effective_length");
-    const auto minimum_segment = config->value("fiber_minimum_segment_length");
-    const auto maximum_turn = config->value("fiber_maximum_turn_angle");
     const auto contour_speed = config->value("fiber_contour_max_speed");
     const auto infill_speed = config->value("fiber_infill_max_speed");
     const auto contour_acceleration = config->value("fiber_contour_acceleration");
@@ -333,8 +354,6 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     REQUIRE(landing_speed.has_value());
     REQUIRE(start_speed.has_value());
     REQUIRE(minimum_effective.has_value());
-    REQUIRE(minimum_segment.has_value());
-    REQUIRE(maximum_turn.has_value());
     REQUIRE(contour_speed.has_value());
     REQUIRE(infill_speed.has_value());
     REQUIRE(contour_acceleration.has_value());
@@ -350,8 +369,8 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     CHECK(*start_speed == "10");
     CHECK(*minimum_effective == "0.5");
     CHECK(config->value("fiber_minimum_path_length") == std::optional<std::string>{"0"});
-    CHECK(*minimum_segment == "0");
-    CHECK(*maximum_turn == "180");
+    CHECK(config->value("fiber_contour_boundary_clearance") == "0.05");
+    CHECK(config->value("fiber_contour_include_holes") == "0");
     CHECK(*contour_speed == "10");
     CHECK(*infill_speed == "10");
     CHECK(*contour_acceleration == "500");
@@ -617,6 +636,348 @@ libslicer::SliceObjectInput fiber_infill_block()
 }
 }
 
+TEST_CASE("fiber width reaches both path roles and preview independently of resin width", "[libslicer_api][fiber-width][slice]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "1"},
+        {"reinforced_infill_density", "100%"}, {"infill_direction", "0"},
+        {"sparse_infill_rotate_template", "0"}}).success);
+    for (const auto* width : {"0.8", "1.2"}) {
+        std::optional<double> reference_pitch;
+        for (const auto* resin_width : {"0.42", "0.64"}) {
+            INFO("fiber=" << width << " resin=" << resin_width);
+            REQUIRE(library->apply_active_config_patch({{"fiber_width", width},
+                {"line_width", resin_width}, {"sparse_infill_line_width", resin_width},
+                {"fiber_resin_fill_line_width", resin_width}}).success);
+            libslicer::SliceRequest request;
+            request.config = *library->active_config_snapshot();
+            request.objects.push_back(fiber_infill_block());
+            const auto sliced = library->slice(request);
+            for (const auto& d : sliced.diagnostics) INFO(d.message);
+            REQUIRE(sliced.success);
+            REQUIRE(sliced.preview);
+            const auto check_widths = [&](const auto& preview) {
+                size_t contours = 0, infills = 0;
+                for (const auto& segment : preview.segments) {
+                    const auto role = segment.extrusion_role;
+                    if (role != libslicer::ToolpathExtrusionRole::ContinuousFiberContour &&
+                        role != libslicer::ToolpathExtrusionRole::ContinuousFiberInfill) continue;
+                    REQUIRE(segment.width_mm == Catch::Approx(std::stod(width)).margin(1e-5));
+                    if (role == libslicer::ToolpathExtrusionRole::ContinuousFiberContour) ++contours;
+                    else ++infills;
+                }
+                REQUIRE(contours > 0);
+                REQUIRE(infills > 0);
+            };
+            check_widths(*sliced.preview);
+            const auto imported = library->load_gcode_preview({sliced.output.path});
+            REQUIRE(imported.success);
+            REQUIRE(imported.preview);
+            check_widths(*imported.preview);
+            // Sample parallel straight infill runs in each layer. Command subdivision
+            // and process phases may split each run into several preview segments.
+            std::map<std::pair<unsigned, bool>, std::set<long long>> lines;
+            for (const auto& segment : sliced.preview->segments) {
+                if (segment.extrusion_role != libslicer::ToolpathExtrusionRole::ContinuousFiberInfill) continue;
+                const auto& a = segment.start_mm;
+                const auto& b = segment.end_mm;
+                if (std::abs(a.x-b.x) < 1e-4 && std::abs(a.y-b.y) > 1)
+                    lines[{segment.layer_index, true}].insert(std::llround(a.x*10000));
+                if (std::abs(a.y-b.y) < 1e-4 && std::abs(a.x-b.x) > 1)
+                    lines[{segment.layer_index, false}].insert(std::llround(a.y*10000));
+            }
+            size_t measured = 0;
+            for (const auto& [layer, positions] : lines) {
+                if (positions.size() < 10) continue;
+                std::vector<double> pitches;
+                for (auto it = std::next(positions.begin()); it != positions.end(); ++it)
+                    pitches.push_back(double(*it-*std::prev(it))/10000.0);
+                std::sort(pitches.begin(), pitches.end());
+                const double pitch = pitches[pitches.size()/2];
+                CHECK(pitch == Catch::Approx(std::stod(width)).margin(0.002));
+                if (reference_pitch) CHECK(pitch == Catch::Approx(*reference_pitch).margin(0.002));
+                else reference_pitch = pitch;
+                ++measured;
+            }
+            REQUIRE(measured > 0);
+            std::error_code error;
+            std::filesystem::remove(sliced.output.path, error);
+        }
+    }
+}
+
+TEST_CASE("ordinary multi-tool printing uses configured clearance without fiber", "[libslicer_api][machine-gcode][slice]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "Flashforge Creator 5";
+    selection.machine_variant_id = "0.4";
+    auto created = library->create_config(selection);
+    REQUIRE(created.success);
+    REQUIRE(created.config->snapshot().value("toolchange_z_lift") == "0");
+    REQUIRE(created.config->snapshot().value("part_cooling_fan_index") == "-1");
+    REQUIRE(created.config->apply_patch({
+        {"toolchange_z_lift", "7.5"}, {"part_cooling_fan_index", "4"},
+        {"filament_colour", "#FFFFFF;#000000;#FF0000;#0000FF"},
+        {"enable_prime_tower", "0"}, {"change_filament_gcode", ""},
+        {"filament_start_gcode", ";;;"}, {"filament_end_gcode", ";;;"},
+        {"outer_wall_filament_id", "1"}, {"inner_wall_filament_id", "1"},
+        {"sparse_infill_filament_id", "2"}, {"internal_solid_filament_id", "2"}, {"gcode_comments", "1"}}).success);
+    libslicer::SliceRequest request;
+    request.config = created.config->snapshot();
+    request.objects.push_back(fiber_infill_block());
+    const auto sliced = library->slice(request);
+    std::ostringstream diagnostics;
+    for (const auto &d : sliced.diagnostics) diagnostics << d.message << "\n";
+    INFO(diagnostics.str());
+    REQUIRE(sliced.success);
+    std::ifstream input(sliced.output.path);
+    std::string line;
+    double z = 0, layer_z = 0;
+    std::optional<double> restore;
+    size_t protected_changes = 0;
+    while (std::getline(input, line)) {
+        if (line.rfind(";Z:", 0) == 0) layer_z = std::stod(line.substr(3));
+        REQUIRE(line.rfind(";FIBER_BEGIN", 0) != 0);
+        if (line.rfind("G1 Z", 0) == 0) {
+            const double next_z = std::stod(line.substr(4));
+            if (line.find("toolchange clearance") != std::string::npos) {
+                REQUIRE_FALSE(restore.has_value());
+                restore = std::max(z, layer_z);
+                CHECK(next_z - *restore == Catch::Approx(7.5).margin(0.001));
+                ++protected_changes;
+            } else if (line.find("restore Z after toolchange") != std::string::npos) {
+                REQUIRE(restore.has_value());
+                CHECK(next_z == Catch::Approx(*restore).margin(0.001));
+                restore.reset();
+            }
+            z = next_z;
+        }
+    }
+    CHECK(protected_changes > 1);
+    CHECK_FALSE(restore.has_value());
+    std::filesystem::remove(sliced.output.path);
+}
+
+TEST_CASE("machine output settings migrate only missing known preset values", "[libslicer_api][machine-gcode][3mf]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection).success);
+    const auto snapshot = *library->active_config_snapshot();
+    REQUIRE(snapshot.value("toolchange_z_lift") == "10");
+    REQUIRE(snapshot.value("part_cooling_fan_index") == "1");
+
+    const int mode = GENERATE(0, 1, 2, 3);
+    // 0: missing official fields; 1: explicit off; 2: unknown lineage;
+    // 3: explicit customized values survive project serialization.
+    const auto json_string = [](const std::string &value) {
+        std::string result = "\"";
+        for (const unsigned char c : value) {
+            if (c == '\\' || c == '\"') { result += '\\'; result += c; }
+            else if (c < 32) { result += "\\u00"; result += "0123456789abcdef"[c >> 4]; result += "0123456789abcdef"[c & 15]; }
+            else result += c;
+        }
+        return result + "\"";
+    };
+    std::string settings = "{\"name\":\"project_settings\"";
+    for (const auto &[key, value] : snapshot.values()) {
+        std::string saved = value;
+        if (key == "toolchange_z_lift" || key == "part_cooling_fan_index") {
+            if (mode == 0 || mode == 2) continue;
+            saved = key == "toolchange_z_lift" ? (mode == 1 ? "0" : "7.5") : (mode == 1 ? "-1" : "4");
+        } else if (mode == 2 && (key == "printer_settings_id" || key == "inherits_group"))
+            saved = "Unknown custom preset";
+        settings += "," + json_string(key) + ":" + json_string(saved);
+    }
+    settings += "}";
+    const std::string model = R"xml(<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+<metadata name="Application">BambuStudio-2.0.0</metadata>
+<metadata name="BambuStudio:3mfVersion">1</metadata>
+<resources><object id="1" type="model"><mesh><vertices>
+<vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/>
+<vertex x="0" y="10" z="0"/><vertex x="0" y="0" z="10"/>
+</vertices><triangles><triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="1" v3="3"/>
+<triangle v1="0" v2="3" v3="2"/><triangle v1="1" v2="2" v3="3"/>
+</triangles></mesh></object></resources><build><item objectid="1"/></build></model>)xml";
+    const auto path = std::filesystem::temp_directory_path() / ("libslicer-machine-settings-" + std::to_string(mode) + ".3mf");
+    mz_zip_archive archive{};
+    REQUIRE(mz_zip_writer_init_file(&archive, path.string().c_str(), 0));
+    const std::string relationships = R"xml(<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>)xml";
+    const std::string content_types = R"xml(<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>)xml";
+    REQUIRE(mz_zip_writer_add_mem(&archive, "_rels/.rels", relationships.data(), relationships.size(), MZ_DEFAULT_COMPRESSION));
+    REQUIRE(mz_zip_writer_add_mem(&archive, "[Content_Types].xml", content_types.data(), content_types.size(), MZ_DEFAULT_COMPRESSION));
+    REQUIRE(mz_zip_writer_add_mem(&archive, "3D/3dmodel.model", model.data(), model.size(), MZ_DEFAULT_COMPRESSION));
+    REQUIRE(mz_zip_writer_add_mem(&archive, "Metadata/project_settings.config", settings.data(), settings.size(), MZ_DEFAULT_COMPRESSION));
+    REQUIRE(mz_zip_writer_finalize_archive(&archive));
+    REQUIRE(mz_zip_writer_end(&archive));
+    libslicer::ProjectImportRequest request;
+    request.path = path.string();
+    const auto imported = library->import_project(request);
+    std::ostringstream import_diagnostics;
+    for (const auto &diagnostic : imported.diagnostics) import_diagnostics << diagnostic.message << "\n";
+    INFO(import_diagnostics.str());
+    REQUIRE(imported);
+    REQUIRE(library->active_config_snapshot());
+    const auto loaded = *library->active_config_snapshot();
+    CAPTURE(mode, loaded.value("toolchange_z_lift").value_or("missing"), loaded.value("part_cooling_fan_index").value_or("missing"));
+    CHECK(loaded.value("toolchange_z_lift") == (mode == 0 ? "10" : mode == 3 ? "7.5" : "0"));
+    CHECK(loaded.value("part_cooling_fan_index") == (mode == 0 ? "1" : mode == 3 ? "4" : "-1"));
+    const auto patch = library->apply_active_config_patch({{"toolchange_z_lift", "6"}, {"part_cooling_fan_index", "5"}});
+    REQUIRE(patch.success);
+    CHECK(library->active_config_snapshot()->value("toolchange_z_lift") == "6");
+    CHECK(library->active_config_snapshot()->value("part_cooling_fan_index") == "5");
+    // A previous snapshot remains immutable when UI values change.
+    CHECK(snapshot.value("toolchange_z_lift") == "10");
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("CFSYS export restores legacy toolchange clearance and fan channels", "[libslicer_api][fiber][cfsys-output]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"curr_bed_type", "Engineering Plate"},
+        {"generate_reinforced_infills", "0"}}).success);
+    const char* model = std::getenv("LIBSLICER_FIBER_VALIDATION_MODEL");
+    const double clearance = model ? 10.0 : GENERATE(0.0, 7.5, 10.0);
+    const int fan_channel = clearance == 7.5 ? 4 : 1;
+    if (clearance != 10.0)
+        REQUIRE(library->apply_active_config_patch({{"toolchange_z_lift", std::to_string(clearance)},
+            {"part_cooling_fan_index", std::to_string(fan_channel)}}).success);
+    libslicer::SliceRequest request;
+    request.config = *library->active_config_snapshot();
+    request.center_on_build_plate = model != nullptr;
+    request.objects.push_back(model ? binary_stl_on_bed(model) : fiber_infill_block());
+    const char* output = std::getenv("LIBSLICER_CFSYS_REVIEW_OUTPUT");
+    if (output) request.output_gcode_path = output;
+    const auto result = library->slice(request);
+    for (const auto& diagnostic : result.diagnostics) INFO(diagnostic.message);
+    REQUIRE(result.success);
+    std::ifstream input(result.output.path);
+    const std::string gcode((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    REQUIRE(gcode.find(";FIBER_BEGIN") != std::string::npos);
+    CHECK(gcode.find("M190 S100") != std::string::npos);
+    CHECK(gcode.find("M109 S300 T0") != std::string::npos);
+    CHECK(gcode.find("M109 S235 T1") != std::string::npos);
+    CHECK(gcode.find("M106 P" + std::to_string(fan_channel) + " S255") != std::string::npos);
+    CHECK(gcode.find("M106 P2 S255") != std::string::npos);
+
+    std::istringstream stream(gcode);
+    std::string line;
+    bool body = false, last_move_only_z = false;
+    double z = 0, before_last_move_z = 0, layer_z = 0;
+    std::optional<double> restore_z;
+    size_t changes = 0, restored = 0;
+    while (std::getline(stream, line)) {
+        if (line == ";LAYER_CHANGE") body = true;
+        if (line.rfind(";Z:", 0) == 0) layer_z = std::stod(line.substr(3));
+        const auto comment = line.find(';');
+        if (comment != std::string::npos) line.resize(comment);
+        std::istringstream command(line);
+        std::string code;
+        command >> code;
+        if (code == "M106") {
+            CHECK((line.find(" P" + std::to_string(fan_channel) + " ") != std::string::npos ||
+                   line.find(" P2") != std::string::npos || line.find(" P3") != std::string::npos));
+        }
+        if (body && (code == "T0" || code == "T1")) {
+            ++changes;
+            if (clearance == 0) continue;
+            REQUIRE_FALSE(restore_z.has_value());
+            REQUIRE(last_move_only_z);
+            // A deferred layer transition may be combined with the upward
+            // move. Clearance is above the current layer (or an existing hop).
+            restore_z = std::max(before_last_move_z, layer_z);
+            CHECK(z - *restore_z == Catch::Approx(clearance).margin(0.001));
+        }
+        if (code == "G0" || code == "G1") {
+            bool has_z = false, has_xy_or_e = false;
+            double next_z = z;
+            for (std::string parameter; command >> parameter;) {
+                if (parameter[0] == 'Z') { has_z = true; next_z = std::stod(parameter.substr(1)); }
+                if (parameter[0] == 'X' || parameter[0] == 'Y' || parameter[0] == 'E') has_xy_or_e = true;
+            }
+            if (has_z || has_xy_or_e) {
+                if (restore_z) {
+                    CHECK(has_z);
+                    CHECK_FALSE(has_xy_or_e);
+                    CHECK(next_z == Catch::Approx(*restore_z).margin(0.001));
+                    restore_z.reset();
+                    ++restored;
+                }
+                before_last_move_z = z;
+                z = next_z;
+                last_move_only_z = has_z && !has_xy_or_e;
+            }
+        }
+    }
+    REQUIRE(changes > 1);
+    CHECK(restored == (clearance > 0 ? changes : 0));
+    CHECK_FALSE(restore_z.has_value());
+    if (!output) std::filesystem::remove(result.output.path);
+}
+
+namespace {
+libslicer::SliceObjectInput fiber_debug_ring()
+{
+    libslicer::SliceObjectInput object;
+    object.name = "fiber-debug-ring";
+    libslicer::SliceVolumeInput volume;
+    // Extruded rectangular annulus: includes a through hole and non-zero XY placement.
+    volume.vertices = {{100,100,0},{160,100,0},{160,140,0},{100,140,0},
+                       {120,110,0},{140,110,0},{140,130,0},{120,130,0},
+                       {100,100,3},{160,100,3},{160,140,3},{100,140,3},
+                       {120,110,3},{140,110,3},{140,130,3},{120,130,3}};
+    const auto quad = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        volume.triangles.push_back({a,b,c}); volume.triangles.push_back({a,c,d});
+    };
+    for (std::uint32_t i=0;i<4;++i) {
+        const auto j=(i+1)%4;
+        quad(i,j,j+8,i+8); // outer wall
+        quad(i+4,i+12,j+12,j+4); // inner wall
+        quad(i+8,j+8,j+12,i+12); // top
+        quad(i,i+4,j+4,j); // bottom
+    }
+    object.volumes.push_back(std::move(volume));
+    return object;
+}
+}
+
 TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libslicer_api][fiber-fill-debug]")
 {
     libslicer::LibraryOptions options;
@@ -638,12 +999,14 @@ TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libsl
     libslicer::SliceRequest request;
     request.config = *library->active_config_snapshot();
     request.center_on_build_plate = model != nullptr;
-    request.objects.push_back(model ? binary_stl_on_bed(model) : fiber_infill_block());
+    request.objects.push_back(model ? binary_stl_on_bed(model) : fiber_debug_ring());
     const auto normal = library->slice(request);
     for (const auto& d : normal.diagnostics) INFO(d.message);
     REQUIRE(normal.success);
     REQUIRE(normal.preview);
     CHECK(normal.preview->fiber_fill_diagnostics.empty());
+    if (!model) CHECK(std::any_of(normal.diagnostics.begin(), normal.diagnostics.end(),
+        [](const auto& d) { return d.code == "fiber_outer_contour_rejected"; }));
     REQUIRE(request.config.value("fiber_fill_debug") == "0");
     REQUIRE(library->apply_active_config_patch({{"fiber_fill_debug", "1"}}).success);
     request.config = *library->active_config_snapshot();
@@ -655,16 +1018,84 @@ TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libsl
     REQUIRE(debug.success);
     REQUIRE(debug.preview);
     REQUIRE_FALSE(debug.preview->fiber_fill_diagnostics.empty());
-    size_t contour_count = 0, infill_count = 0;
+    size_t contour_count = 0, infill_count = 0, original_count = 0, missing_count = 0;
+    bool original_has_holes = false, missing_has_holes = false;
+    double original_area = 0, missing_area = 0;
+    const auto loop_area = [](const std::vector<libslicer::ToolpathPoint>& loop) {
+        double result = 0;
+        for (size_t i=1;i<loop.size();++i)
+            result += double(loop[i-1].x)*loop[i].y-double(loop[i].x)*loop[i-1].y;
+        return result*.5;
+    };
     for (const auto& path : debug.preview->fiber_fill_diagnostics) {
-        REQUIRE(path.points.size() >= 2);
+        INFO("diagnostic kind=" << unsigned(path.kind) << " layer=" << path.layer_index
+             << " component=" << path.component_id);
         CHECK_FALSE(path.reason.empty());
-        CHECK(path.source_length_mm > 0);
+        if (path.kind == libslicer::FiberDiagnosticKind::ContourCandidate ||
+            path.kind == libslicer::FiberDiagnosticKind::RoundedContourCandidate) {
+            REQUIRE(path.points.size() >= 2);
+            CHECK(path.contour);
+            CHECK(path.source_length_mm > 0);
+            CHECK(path.boundaries.empty());
+            CHECK(path.triangles.empty());
+        } else if (path.kind == libslicer::FiberDiagnosticKind::RejectedPath) {
+            REQUIRE(path.points.size() >= 2);
+            CHECK(path.source_length_mm > 0);
+            path.contour ? ++contour_count : ++infill_count;
+        } else {
+            REQUIRE_FALSE(path.boundaries.empty());
+            double area = 0;
+            for (const auto& loop : path.boundaries) {
+                REQUIRE(loop.size() >= 4);
+                CHECK(loop.front().x == loop.back().x);
+                CHECK(loop.front().y == loop.back().y);
+                area += loop_area(loop);
+            }
+            if (path.kind == libslicer::FiberDiagnosticKind::OriginalContourRegion) {
+                // Preserve even sub-resolution original domains. Quantizing their
+                // world coordinates to float can flip their tiny signed area.
+                // Bound the possible area change by coordinate ULP and perimeter.
+                double area_roundoff = 0;
+                for (const auto& loop : path.boundaries) {
+                    double coordinate_scale = 1;
+                    for (const auto& point : loop)
+                        coordinate_scale = std::max({coordinate_scale, std::abs(double(point.x)), std::abs(double(point.y))});
+                    const double ulp = coordinate_scale * std::numeric_limits<float>::epsilon();
+                    for (size_t i=1;i<loop.size();++i)
+                        area_roundoff += ulp*(std::abs(double(loop[i].x)-loop[i-1].x) +
+                                              std::abs(double(loop[i].y)-loop[i-1].y)) + 2*ulp*ulp;
+                }
+                CHECK(area >= -area_roundoff);
+                ++original_count;
+                original_has_holes |= path.boundaries.size() > 1;
+                original_area += area;
+                CHECK(path.triangles.empty());
+            } else {
+                CHECK(area > 0);
+                ++missing_count;
+                missing_has_holes |= path.boundaries.size() > 1;
+                missing_area += area;
+                REQUIRE_FALSE(path.triangles.empty());
+                REQUIRE(path.triangles.size()%3 == 0);
+                double triangle_area = 0;
+                for (size_t i=0;i<path.triangles.size();i+=3) {
+                    const auto a=path.triangles[i], b=path.triangles[i+1], c=path.triangles[i+2];
+                    triangle_area += std::abs((double(b.x)-a.x)*(double(c.y)-a.y)-(double(b.y)-a.y)*(double(c.x)-a.x))*.5;
+                    if (!model) {
+                        const double x=(double(a.x)+b.x+c.x)/3, y=(double(a.y)+b.y+c.y)/3;
+                        CHECK_FALSE((x>120 && x<140 && y>110 && y<130));
+                    }
+                }
+                CHECK(triangle_area == Catch::Approx(area).margin(0.005));
+            }
+        }
         REQUIRE(path.layer_index < debug.preview->layers.size());
         CHECK(path.object_index == 0);
         CHECK(path.instance_index == 0);
-        path.contour ? ++contour_count : ++infill_count;
-        for (const auto& p : path.points) {
+        std::vector<libslicer::ToolpathPoint> all_points = path.points;
+        for (const auto& loop : path.boundaries) all_points.insert(all_points.end(), loop.begin(), loop.end());
+        all_points.insert(all_points.end(), path.triangles.begin(), path.triangles.end());
+        for (const auto& p : all_points) {
             CHECK(std::isfinite(p.x)); CHECK(std::isfinite(p.y));
             CHECK(p.z == Catch::Approx(debug.preview->layers[path.layer_index].print_z_mm));
             if (!model) {
@@ -673,6 +1104,12 @@ TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libsl
             }
         }
     }
+    CHECK(original_count > 0);
+    CHECK(missing_count > 0);
+    CHECK(original_has_holes);
+    CHECK(missing_has_holes);
+    // Candidate bands occupy only a fraction of the domain, even when all candidates fail.
+    CHECK(missing_area < original_area*.5);
     CHECK(contour_count > 0);
     CHECK(infill_count > 0);
     CHECK(debug.preview->segments.size() == normal.preview->segments.size());
@@ -1024,7 +1461,7 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
             ++contour_segments;
         else if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::ContinuousFiberInfill)
             ++infill_segments;
-        else if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::SparseInfill)
+        else if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::ResinInfill)
             ++resin_segments;
     }
     INFO("contour_segments=" << contour_segments
@@ -1484,6 +1921,10 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     REQUIRE(original_relative.has_value());
     REQUIRE(original_before_layer.has_value());
     REQUIRE(original_layer.has_value());
+    // Missing per-layer E resets are invalid for Marlin, not this preset's Klipper flavor.
+    const auto original_flavor = created.config->snapshot().value("gcode_flavor");
+    REQUIRE(original_flavor.has_value());
+    REQUIRE(created.config->set("gcode_flavor", "marlin").success);
     REQUIRE(created.config->set("use_relative_e_distances", "1").success);
     REQUIRE(created.config->set("before_layer_change_gcode", "").success);
     REQUIRE(created.config->set("layer_change_gcode", "").success);
@@ -1498,6 +1939,7 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     REQUIRE(validation != invalid.diagnostics.end());
     CHECK(validation->option_key == "before_layer_change_gcode");
 
+    REQUIRE(created.config->set("gcode_flavor", *original_flavor).success);
     REQUIRE(created.config->set("use_relative_e_distances", *original_relative).success);
     REQUIRE(created.config->set("before_layer_change_gcode", *original_before_layer).success);
     REQUIRE(created.config->set("layer_change_gcode", *original_layer).success);
@@ -2001,4 +2443,427 @@ TEST_CASE("painted model thumbnails preserve filament colors", "[libslicer_api][
 
     std::filesystem::remove(output, remove_error);
     std::filesystem::remove(packaged_output, remove_error);
+}
+
+TEST_CASE("inactive fiber infill settings do not prevent contour slicing", "[libslicer_api][cleanup]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"generate_reinforced_infills", "0"},
+        {"fiber_infill_max_speed", "0"},
+        {"fiber_resin_overlap", "0.05"}}).success);
+    libslicer::SliceRequest request;
+    request.config = *library->active_config_snapshot();
+    request.objects.push_back(fiber_infill_block());
+    const auto result = library->slice(request);
+    for (const auto& diagnostic : result.diagnostics) INFO(diagnostic.message);
+    REQUIRE(result.success);
+    std::ifstream input(result.output.path);
+    const std::string gcode((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    CHECK(gcode.find(";FIBER_BEGIN") != std::string::npos);
+    CHECK(gcode.find("purpose=contour") != std::string::npos);
+    CHECK(gcode.find("fiber_minimum_segment_length =") == std::string::npos);
+    CHECK(gcode.find("fiber_maximum_turn_angle =") == std::string::npos);
+    std::filesystem::remove(result.output.path);
+    if (!result.gcode_3mf.path.empty()) std::filesystem::remove(result.gcode_3mf.path);
+}
+
+TEST_CASE("fiber rounding uses preset radii and preserves independent overrides", "[libslicer_api][fiber-rounding]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id="CFSYS Alpha500 Printer";
+    selection.machine_variant_id="0.4";
+    selection.process_preset_id="CCF&CIRON @CFSYS";
+    selection.filament_preset_ids={"CFSYS CIRON","CFSYS CCF"};
+    selection.filament_physical_tools={0,1};
+    std::ifstream preset_file(std::filesystem::path(LIBSLICER_TEST_RESOURCE_DIR)
+        / "profiles" / "CFSYS" / "process" / (selection.process_preset_id + ".json"));
+    REQUIRE(preset_file.good());
+    const auto preset=nlohmann::json::parse(preset_file);
+    const auto contour_radius=preset.at("fiber_contour_bend_radius").get<std::string>();
+    const auto infill_radius=preset.at("fiber_infill_bend_radius").get<std::string>();
+    const std::string contour_override=contour_radius=="0.7"?"0.8":"0.7";
+    const std::string infill_override=infill_radius=="0"?"1":"0";
+    REQUIRE(library->activate_config(selection,{}).success);
+    CHECK(library->active_config_snapshot()->value("fiber_contour_bend_radius")==std::optional<std::string>{contour_radius});
+    CHECK(library->active_config_snapshot()->value("fiber_infill_bend_radius")==std::optional<std::string>{infill_radius});
+    const auto patch=library->apply_active_config_patch({{"fiber_contour_bend_radius",contour_override}});
+    for (const auto& diagnostic:patch.diagnostics) UNSCOPED_INFO(diagnostic.key << ": " << diagnostic.message);
+    REQUIRE(patch.success);
+    const auto snapshot=library->active_config_snapshot();
+    CHECK(snapshot->value("fiber_contour_bend_radius")==std::optional<std::string>{contour_override});
+    CHECK_FALSE(snapshot->value("fiber_contour_rounding_max_reserve").has_value());
+    CHECK(snapshot->value("fiber_infill_bend_radius")==std::optional<std::string>{infill_radius});
+    REQUIRE(library->apply_active_config_patch({{"fiber_infill_bend_radius",infill_override}}).success);
+    CHECK(library->active_config_snapshot()->value("fiber_infill_bend_radius")==std::optional<std::string>{infill_override});
+    CHECK(library->active_config_snapshot()->value("fiber_contour_bend_radius")==std::optional<std::string>{contour_override});
+}
+
+TEST_CASE("fiber corner stabilization setting round trips independently", "[libslicer_api][config][fiber-corner-stability]")
+{
+    auto config=libslicer::Config::defaults();
+    const auto items=config.settings();
+    const auto* item=find_item(items,"fiber_corner_stabilization_length");
+    REQUIRE(item!=nullptr);
+    CHECK(item->group==libslicer::SettingGroup::Process);
+    CHECK(item->category=="Continuous fiber");
+    CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="5");
+    REQUIRE(config.set("fiber_corner_stabilization_length","3").success);
+    CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="3");
+    REQUIRE(config.reset("fiber_corner_stabilization_length").success);
+    CHECK(config.snapshot().value("fiber_corner_stabilization_length")=="5");
+}
+
+TEST_CASE("fiber infill angle sequence is an independently validated process setting", "[libslicer_api][config][fiber-angles]")
+{
+    auto config=libslicer::Config::defaults();
+    auto items=config.settings();
+    const auto* item=find_item(items,"fiber_infill_angle_sequence");
+    REQUIRE(item!=nullptr);
+    CHECK(item->group==libslicer::SettingGroup::Process);
+    CHECK(item->category=="Continuous fiber");
+    CHECK(item->type==libslicer::SettingType::String);
+    CHECK_FALSE(item->visible);
+    CHECK_FALSE(item->enabled);
+    CHECK(config.snapshot().value("fiber_infill_angle_sequence")=="45,135");
+    const auto enabled_result=config.set("generate_reinforced_infills","1");
+    REQUIRE(enabled_result.success);
+    REQUIRE(find_item(enabled_result.changed_items,"fiber_infill_angle_sequence")!=nullptr);
+    CHECK(find_item(enabled_result.changed_items,"fiber_infill_angle_sequence")->visible);
+    items=config.settings();
+    REQUIRE(find_item(items,"fiber_infill_angle_sequence")!=nullptr);
+    CHECK(find_item(items,"fiber_infill_angle_sequence")->visible);
+    CHECK(find_item(items,"fiber_infill_angle_sequence")->enabled);
+    REQUIRE(config.set("fiber_infill_angle_sequence","0,45,90,135").success);
+    CHECK(config.snapshot().value("fiber_infill_angle_sequence")=="0,45,90,135");
+    for (const char* invalid:{"","0,","0,,90","45deg","nan","360"}) {
+        const auto result=config.set("fiber_infill_angle_sequence",invalid);
+        CHECK_FALSE(result.success);
+        CHECK(config.snapshot().value("fiber_infill_angle_sequence")=="0,45,90,135");
+    }
+    const auto concentric_result=config.set("reinforced_infill_pattern","concentric");
+    REQUIRE(concentric_result.success);
+    REQUIRE(find_item(concentric_result.changed_items,"fiber_infill_angle_sequence")!=nullptr);
+    CHECK_FALSE(find_item(concentric_result.changed_items,"fiber_infill_angle_sequence")->visible);
+    items=config.settings();
+    CHECK_FALSE(find_item(items,"fiber_infill_angle_sequence")->visible);
+    CHECK_FALSE(find_item(items,"fiber_infill_angle_sequence")->enabled);
+    REQUIRE(config.reset("fiber_infill_angle_sequence").success);
+    CHECK(config.snapshot().value("fiber_infill_angle_sequence")=="45,135");
+}
+
+TEST_CASE("fiber infill angle sequence controls deposited G-code on successive fiber layers", "[libslicer_api][fiber-angles][slice]")
+{
+    const int interval=GENERATE(1,2);
+    const bool use_default=GENERATE(false,true);
+    libslicer::LibraryOptions options;
+    options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id="CFSYS Alpha500 Printer";
+    selection.machine_variant_id="0.4";
+    selection.process_preset_id="CCF&CIRON @CFSYS";
+    selection.filament_preset_ids={"CFSYS CIRON","CFSYS CCF"};
+    selection.filament_physical_tools={0,1};
+    std::vector<std::pair<std::string,std::string>> overrides{
+        {"generate_reinforced_perimeters","0"},
+        {"generate_reinforced_infills","1"},
+        {"reinforced_infill_pattern","rectilinear"},
+        {"reinforced_infill_density","100%"},
+        {"sparse_infill_density","100%"},
+        {"top_shell_layers","0"}, {"bottom_shell_layers","0"},
+        {"fiber_layer_height_ratio",std::to_string(interval)}};
+    if (!use_default)
+        overrides.emplace_back("fiber_infill_angle_sequence","0,45,90,135");
+    REQUIRE(library->activate_config(selection,overrides).success);
+    auto model=fiber_infill_block();
+    for (auto& vertex:model.volumes.front().vertices) if (vertex.z>0)
+        vertex.z=interval==1?1.3f:2.4f;
+    libslicer::SliceRequest request;
+    request.config=*library->active_config_snapshot();
+    request.objects.push_back(std::move(model));
+    const auto sliced=library->slice(request);
+    for (const auto& diagnostic:sliced.diagnostics) INFO(diagnostic.message);
+    REQUIRE(sliced.success);
+    const auto imported=library->load_gcode_preview({sliced.output.path});
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview);
+    constexpr double pi=3.14159265358979323846;
+    const std::vector<double> expected=use_default?
+        std::vector<double>{45,135}:std::vector<double>{0,45,90,135};
+    std::set<unsigned> observed_layers;
+    std::set<size_t> observed_angles;
+    for (const auto& segment:imported.preview->segments) {
+        if (segment.extrusion_role!=libslicer::ToolpathExtrusionRole::ContinuousFiberInfill ||
+            segment.deposition!=libslicer::ToolpathDepositionKind::ContinuousFiberPowered) continue;
+        const double dx=segment.end_mm.x-segment.start_mm.x;
+        const double dy=segment.end_mm.y-segment.start_mm.y;
+        if (std::hypot(dx,dy)<1.0) continue; // Short segments may be rounded returns.
+        const size_t fiber_layer=segment.layer_index/size_t(interval);
+        const size_t slot=fiber_layer%expected.size();
+        double actual=std::fmod(std::atan2(dy,dx)*180/pi+360,180);
+        const double difference=std::abs(actual-expected[slot]);
+        INFO("interval=" << interval << " layer=" << segment.layer_index << " angle=" << actual);
+        CHECK(std::min(difference,180-difference)<0.5);
+        observed_layers.insert(segment.layer_index);
+        observed_angles.insert(slot);
+    }
+    CHECK(observed_layers.size()>=8); // Two complete angle cycles in final G-code.
+    CHECK(observed_angles.size()==expected.size());
+    std::error_code error;
+    std::filesystem::remove(sliced.output.path,error);
+    if (!sliced.gcode_3mf.path.empty()) std::filesystem::remove(sliced.gcode_3mf.path,error);
+}
+
+
+TEST_CASE("hole contour setting retains default and round trips through configuration", "[libslicer_api][config][fiber][hole-contours]")
+{
+    auto config = libslicer::Config::defaults();
+    auto items = config.settings();
+    const auto* item = find_item(items, "fiber_contour_include_holes");
+    REQUIRE(item != nullptr);
+    CHECK(item->type == libslicer::SettingType::Boolean);
+    CHECK(item->group == libslicer::SettingGroup::Process);
+    CHECK(item->category == "Continuous fiber");
+    CHECK(item->default_value == "0");
+    CHECK(config.snapshot().value("fiber_contour_boundary_clearance") == "0.05");
+    CHECK_FALSE(item->enabled);
+    REQUIRE(config.set("generate_reinforced_perimeters", "1").success);
+    items = config.settings();
+    CHECK(find_item(items, "fiber_contour_include_holes")->enabled);
+    REQUIRE(config.set("fiber_contour_include_holes", "1").success);
+    const auto saved = config.snapshot().value("fiber_contour_include_holes");
+    REQUIRE(saved == "1");
+    auto restored = libslicer::Config::defaults();
+    REQUIRE(restored.set("fiber_contour_include_holes", *saved).success);
+    CHECK(restored.snapshot().value("fiber_contour_include_holes") == "1");
+    REQUIRE(config.reset("fiber_contour_include_holes").success);
+    CHECK(config.snapshot().value("fiber_contour_include_holes") == "0");
+}
+
+
+TEST_CASE("fiber outer contours do not open a printable bridge next to a hole", "[libslicer_api][fiber][hole-contours]")
+{
+    const auto radius = GENERATE("0", "0.3");
+    CAPTURE(radius);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"fiber_contour_include_holes", "0"}, {"fiber_contour_bend_radius", radius},
+        {"fiber_fill_debug", "1"}, {"generate_reinforced_infills", "0"},
+        {"outer_reinforced_perimeters_counts", "1"}, {"wall_loops", "3"},
+        {"top_shell_layers", "0"}, {"bottom_shell_layers", "0"}
+    }).success);
+    auto object = fiber_debug_ring();
+    // After resin walls this bridge fits a fiber centerline, but the removed
+    // extra erosion/dilation opened the hole and replaced the outer contour.
+    for (auto& vertex : object.volumes.front().vertices)
+        if (vertex.x == 120) vertex.x = 104.6f;
+    libslicer::SliceRequest request;
+    request.config = *library->active_config_snapshot();
+    request.objects.push_back(std::move(object));
+    const auto result = library->slice(request);
+    for (const auto& d : result.diagnostics) UNSCOPED_INFO(d.message);
+    REQUIRE(result.success);
+    REQUIRE(result.preview);
+    REQUIRE(std::any_of(result.preview->fiber_fill_diagnostics.begin(), result.preview->fiber_fill_diagnostics.end(),
+        [](const auto& d) { return d.layer_index == 4 && d.kind == libslicer::FiberDiagnosticKind::OriginalContourRegion && d.boundaries.size() == 2; }));
+    std::set<std::uint64_t> occurrences;
+    for (const auto& segment : result.preview->segments) {
+        if (segment.layer_index != 4 || segment.extrusion_role != libslicer::ToolpathExtrusionRole::ContinuousFiberContour ||
+            segment.deposition == libslicer::ToolpathDepositionKind::None) continue;
+        occurrences.insert(segment.fiber_occurrence);
+        for (const auto& p : {segment.start_mm, segment.end_mm}) {
+            // The outer rectangle lies outside this inset box. Following the
+            // inner hole after a topology-changing opening would enter it.
+            CHECK_FALSE((p.x > 104 && p.x < 156 && p.y > 104 && p.y < 136));
+        }
+    }
+    CHECK(occurrences.size() == 1);
+    std::error_code error;
+    std::filesystem::remove(result.output.path, error);
+}
+
+TEST_CASE("resin infill settings expose independent values and validate unsupported patterns", "[libslicer_api][fiber][resin-fill]")
+{
+    auto config = libslicer::Config::defaults();
+    auto items = config.settings();
+    CHECK(find_item(items, "fiber_resin_fill_mode") == nullptr);
+    for (const auto& item : items)
+        if (item.key.rfind("fiber_resin_fill_", 0) == 0) CHECK_FALSE(item.enabled);
+    REQUIRE(config.set("generate_reinforced_perimeters", "1").success);
+    for (const auto& item : config.settings())
+        if (item.key.rfind("fiber_resin_fill_", 0) == 0) CHECK(item.enabled);
+    REQUIRE(config.set("generate_reinforced_perimeters", "0").success);
+    REQUIRE(config.set("generate_reinforced_infills", "1").success);
+    for (const auto& item : config.settings())
+        if (item.key.rfind("fiber_resin_fill_", 0) == 0) CHECK(item.enabled);
+    const auto ordinary = config.snapshot().value("sparse_infill_density");
+    REQUIRE(config.set("fiber_resin_fill_density", "60%").success);
+    CHECK(config.snapshot().value("sparse_infill_density") == ordinary);
+    REQUIRE(config.set("fiber_resin_fill_pattern", "lightning").success);
+    const auto errors = config.validate();
+    CHECK(std::any_of(errors.begin(), errors.end(), [](const auto& error) {
+        return error.message == "Unsupported independent resin infill pattern";
+    }));
+    REQUIRE(config.reset("fiber_resin_fill_pattern").success);
+    CHECK_FALSE(config.set("fiber_resin_fill_density", "101%").success);
+    const auto snapshot = config.snapshot();
+    REQUIRE(config.set("generate_reinforced_infills", "0").success);
+    for (const auto& item : config.settings())
+        if (item.key.rfind("fiber_resin_fill_", 0) == 0) CHECK_FALSE(item.enabled);
+    CHECK(snapshot.value("fiber_resin_fill_density") == "60%");
+    CHECK(config.snapshot().value("fiber_resin_fill_density") == "60%");
+}
+
+TEST_CASE("independent resin infill preserves fiber and ordinary layers", "[libslicer_api][fiber][resin-fill][slice]")
+{
+    using Role = libslicer::ToolpathExtrusionRole;
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"},
+        {"top_shell_layers", "2"}, {"bottom_shell_layers", "2"},
+        {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "0"},
+        {"fiber_contour_bend_radius", "0"}, {"fiber_layer_height_ratio", "2"},
+        {"sparse_infill_density", "15%"}, {"sparse_infill_pattern", "grid"},
+        {"fiber_resin_fill_pattern", "rectilinear"},
+        {"fiber_resin_fill_density", "30%"}, {"fiber_resin_fill_line_width", "0.5"},
+        {"fiber_resin_fill_speed", "17"}, {"fiber_resin_fill_acceleration", "123"},
+        {"enable_support", "0"}, {"slow_down_for_layer_cooling", "0,0"}}).success);
+    auto model = fiber_infill_block();
+    for (auto& vertex : model.volumes.front().vertices) vertex.z *= .25f;
+    const auto slice = [&]() {
+        libslicer::SliceRequest request;
+        request.objects = {model};
+        request.config = *library->active_config_snapshot();
+        auto result = library->slice(request);
+        for (const auto& d : result.diagnostics) INFO(d.message);
+        REQUIRE(result.success); REQUIRE(result.preview);
+        return result;
+    };
+    const auto segments = [](const libslicer::ToolpathPreview& preview, Role role) {
+        std::vector<std::tuple<unsigned,float,float,float,float,float,float>> result;
+        for (const auto& s : preview.segments)
+            if (s.extrusion_role == role && s.deposition != libslicer::ToolpathDepositionKind::None)
+                result.emplace_back(s.layer_index, s.start_mm.x, s.start_mm.y, s.start_mm.z,
+                    s.end_mm.x, s.end_mm.y, s.end_mm.z);
+        std::sort(result.begin(),result.end());
+        return result;
+    };
+    const auto reference_config = *library->active_config_snapshot();
+    const auto low = slice();
+    const auto fiber = segments(*low.preview,Role::ContinuousFiberContour);
+    REQUIRE_FALSE(fiber.empty());
+    const auto ordinary = segments(*low.preview,Role::SparseInfill);
+    REQUIRE_FALSE(ordinary.empty());
+    size_t resin_count = 0;
+    for (const auto& s : low.preview->segments) if (s.extrusion_role == Role::ResinInfill) {
+        ++resin_count;
+        CHECK(s.layer_index % 2 == 0);
+        CHECK(s.deposition == libslicer::ToolpathDepositionKind::Thermoplastic);
+        CHECK(s.tool_id == 0);
+        CHECK(s.width_mm == Catch::Approx(.5).margin(.001));
+        CHECK(s.nominal_speed_mm_s <= 17.001);
+        CHECK(s.acceleration_mm_s2 == Catch::Approx(123).margin(.1));
+    }
+    REQUIRE(resin_count > 0);
+    const auto imported = library->load_gcode_preview({low.output.path});
+    REQUIRE(imported.success); REQUIRE(imported.preview);
+    CHECK(segments(*imported.preview,Role::ResinInfill) == segments(*low.preview,Role::ResinInfill));
+    // Ordinary sparse controls must not leak into resin jobs on fiber layers.
+    REQUIRE(library->apply_active_config_patch({{"sparse_infill_density", "40%"},
+        {"sparse_infill_pattern", "triangles"}, {"infill_direction", "70"},
+        {"sparse_infill_rotate_template", "10,30"}, {"align_infill_direction_to_model", "1"},
+        {"sparse_infill_line_width", "0.65"}, {"fill_multiline", "2"},
+        {"infill_anchor", "0"}, {"infill_anchor_max", "0"},
+        {"sparse_infill_speed", "80"}, {"sparse_infill_acceleration", "456"}}).success);
+    const auto changed_sparse = slice();
+    CHECK(segments(*changed_sparse.preview,Role::ResinInfill) == segments(*low.preview,Role::ResinInfill));
+    CHECK(segments(*changed_sparse.preview,Role::SparseInfill) != ordinary);
+    for (const auto& segment : changed_sparse.preview->segments) if (segment.extrusion_role == Role::ResinInfill) {
+        CHECK(segment.width_mm == Catch::Approx(.5).margin(.001));
+        CHECK(segment.nominal_speed_mm_s <= 17.001);
+        CHECK(segment.acceleration_mm_s2 == Catch::Approx(123).margin(.1));
+    }
+    std::vector<std::pair<std::string, std::string>> restore_sparse;
+    for (const auto* key : {"sparse_infill_density", "sparse_infill_pattern", "infill_direction",
+        "sparse_infill_rotate_template", "align_infill_direction_to_model", "sparse_infill_line_width",
+        "fill_multiline", "infill_anchor", "infill_anchor_max", "sparse_infill_speed", "sparse_infill_acceleration"})
+        restore_sparse.emplace_back(key, *reference_config.value(key));
+    REQUIRE(library->apply_active_config_patch(restore_sparse).success);
+    REQUIRE(library->apply_active_config_patch({{"fiber_resin_fill_density", "60%"}}).success);
+    const auto high = slice();
+    CHECK(segments(*high.preview,Role::ContinuousFiberContour) == fiber);
+    CHECK(segments(*high.preview,Role::SparseInfill) == ordinary);
+    CHECK(segments(*high.preview,Role::TopSurface) == segments(*low.preview,Role::TopSurface));
+    CHECK(segments(*high.preview,Role::ResinInfill).size() > segments(*low.preview,Role::ResinInfill).size());
+    REQUIRE(library->apply_active_config_patch({{"fiber_resin_fill_density", "0%"}}).success);
+    const auto off = slice();
+    CHECK(segments(*off.preview,Role::ResinInfill).empty());
+    CHECK(segments(*off.preview,Role::ContinuousFiberContour) == fiber);
+    CHECK(segments(*off.preview,Role::SparseInfill) == ordinary);
+    REQUIRE(library->apply_active_config_patch({{"sparse_infill_density", "0%"}, {"fiber_resin_fill_density", "30%"}}).success);
+    const auto no_sparse = slice();
+    CHECK_FALSE(segments(*no_sparse.preview,Role::ResinInfill).empty());
+    CHECK_FALSE(segments(*no_sparse.preview,Role::ContinuousFiberContour).empty());
+    CHECK(segments(*no_sparse.preview,Role::SparseInfill).empty());
+    // Geometrically rejected fiber still leaves an explicitly configured resin job.
+    REQUIRE(library->apply_active_config_patch({{"fiber_minimum_path_length", "10000"}}).success);
+    const auto rejected = slice();
+    CHECK(segments(*rejected.preview,Role::ContinuousFiberContour).empty());
+    CHECK_FALSE(segments(*rejected.preview,Role::ResinInfill).empty());
+    // Every exposed pattern must work with both sparse and full resin density.
+    REQUIRE(library->apply_active_config_patch({{"fiber_minimum_path_length", "0"},
+        {"sparse_infill_density", "100%"}}).success);
+    for (const auto* pattern : {"rectilinear", "grid", "triangles", "cubic", "gyroid", "concentric"}) {
+        for (const auto* density : {"30%", "100%"}) {
+            INFO(pattern); INFO(density);
+            REQUIRE(library->apply_active_config_patch({{"fiber_resin_fill_pattern", pattern},
+                {"fiber_resin_fill_density", density}}).success);
+            const auto patterned = slice();
+            CHECK_FALSE(segments(*patterned.preview,Role::ResinInfill).empty());
+            CHECK_FALSE(segments(*patterned.preview,Role::ContinuousFiberContour).empty());
+            std::filesystem::remove(patterned.output.path);
+        }
+    }
+    REQUIRE(library->apply_active_config_patch({{"sparse_infill_density", "15%"},
+        {"generate_reinforced_perimeters", "0"}, {"fiber_resin_fill_density", "60%"}}).success);
+    const auto disabled = slice();
+    CHECK(segments(*disabled.preview,Role::ResinInfill).empty());
+    CHECK(segments(*disabled.preview,Role::ContinuousFiberContour).empty());
+    CHECK_FALSE(segments(*disabled.preview,Role::SparseInfill).empty());
+    for (const auto* result : {&low,&high,&off,&no_sparse,&rejected,&changed_sparse,&disabled})
+        std::filesystem::remove(result->output.path);
 }

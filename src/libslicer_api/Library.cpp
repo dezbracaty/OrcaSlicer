@@ -1,4 +1,3 @@
-#define NANOSVG_IMPLEMENTATION
 #include <nanosvg/nanosvg.h>
 
 #include <libslicer/Library.hpp>
@@ -7,6 +6,7 @@
 #include <libslic3r/Model.hpp>
 #include <libslic3r/Print.hpp>
 #include <libslic3r/Layer.hpp>
+#include <libslic3r/Tesselate.hpp>
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/ContinuousFiber/ContinuousFiberConfig.hpp>
 #include <libslic3r/GCode/GCodeProcessor.hpp>
@@ -1468,6 +1468,7 @@ ToolpathExtrusionRole to_extrusion_role(Slic3r::ExtrusionRole role)
     case Slic3r::erMixed:                    return ToolpathExtrusionRole::Mixed;
     case Slic3r::erContinuousFiberContour:   return ToolpathExtrusionRole::ContinuousFiberContour;
     case Slic3r::erContinuousFiberInfill:    return ToolpathExtrusionRole::ContinuousFiberInfill;
+    case Slic3r::erResinInfill:              return ToolpathExtrusionRole::ResinInfill;
     default:                                 return ToolpathExtrusionRole::None;
     }
 }
@@ -3231,10 +3232,18 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         }
         // Keep planner statistics internal; diagnostics are the existing public
         // channel. Candidates and accepted/rejected fragments are distinct units.
-        size_t fiber_candidates = 0, fiber_accepted = 0, fiber_split = 0;
         std::map<std::string, size_t> fiber_rejections;
+        size_t fiber_candidates = 0, fiber_accepted = 0, fiber_split = 0;
         for (const auto* object : print.objects())
             for (const auto* layer : object->layers()) {
+                if (!layer->fiber_outer_contour_failures.empty()) {
+                    std::string message = "Some complete fiber outer loops were omitted on layer " +
+                        std::to_string(layer->id() + 1) + "; partial outer strands were not emitted. Reasons:";
+                    for (const auto& failure : layer->fiber_outer_contour_failures)
+                        message += " " + failure.first + "=" + std::to_string(failure.second);
+                    result.diagnostics.push_back({"fiber_outer_contour_rejected", std::move(message), true,
+                        "generate_reinforced_perimeters"});
+                }
                 const auto& stats = layer->fiber_infill_statistics;
                 fiber_candidates += stats.candidates;
                 fiber_accepted += stats.accepted_fragments;
@@ -3439,14 +3448,43 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                                 path.layer_index = preview_layer->index;
                                 path.object_index = oi;
                                 path.instance_index = ii;
-                                for (const auto& point : source.geometry.points) {
-                                    Slic3r::Vec3d position(Slic3r::unscale<double>(point.x() + shift.x()),
-                                        Slic3r::unscale<double>(point.y() + shift.y()), layer->print_z);
+                                switch (source.kind) {
+                                case Slic3r::Layer::FiberDiagnosticKind::RejectedPath:
+                                    path.kind = FiberDiagnosticKind::RejectedPath; break;
+                                case Slic3r::Layer::FiberDiagnosticKind::OriginalContourRegion:
+                                    path.kind = FiberDiagnosticKind::OriginalContourRegion; break;
+                                case Slic3r::Layer::FiberDiagnosticKind::ContourCandidate:
+                                    path.kind = FiberDiagnosticKind::ContourCandidate; break;
+                                case Slic3r::Layer::FiberDiagnosticKind::RoundedContourCandidate:
+                                    path.kind = FiberDiagnosticKind::RoundedContourCandidate; break;
+                                case Slic3r::Layer::FiberDiagnosticKind::MissingContourRegion:
+                                    path.kind = FiberDiagnosticKind::MissingContourRegion; break;
+                                }
+                                path.policy_group_id = source.policy_group_id;
+                                path.component_id = source.component_id;
+                                const auto world_point = [&](double x, double y) {
+                                    Slic3r::Vec3d position(x + Slic3r::unscale<double>(shift.x()),
+                                                         y + Slic3r::unscale<double>(shift.y()), layer->print_z);
                                     if (const auto* belt = print.belt_coordinate_system())
                                         position = belt->oriented_to_world(position);
-                                    path.points.push_back({float(position.x()), float(position.y()), float(position.z())});
-                                }
-                                if (path.points.size() >= 2)
+                                    return ToolpathPoint{float(position.x()), float(position.y()), float(position.z())};
+                                };
+                                for (const auto& point : source.geometry.points)
+                                    path.points.push_back(world_point(Slic3r::unscale<double>(point.x()), Slic3r::unscale<double>(point.y())));
+                                const auto append_loop = [&](const Slic3r::Polygon& polygon) {
+                                    if (polygon.points.size() < 3) return;
+                                    std::vector<ToolpathPoint> loop;
+                                    for (const auto& point : polygon.points)
+                                        loop.push_back(world_point(Slic3r::unscale<double>(point.x()), Slic3r::unscale<double>(point.y())));
+                                    loop.push_back(loop.front());
+                                    path.boundaries.push_back(std::move(loop));
+                                };
+                                append_loop(source.region.contour);
+                                for (const auto& hole : source.region.holes) append_loop(hole);
+                                if (path.kind == FiberDiagnosticKind::MissingContourRegion)
+                                    for (const auto& point : Slic3r::triangulate_expolygon_2d(source.region))
+                                        path.triangles.push_back(world_point(point.x(), point.y()));
+                                if (path.points.size() >= 2 || !path.boundaries.empty())
                                     preview->fiber_fill_diagnostics.push_back(std::move(path));
                             }
                         }
@@ -3826,6 +3864,27 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
             } else {
                 try {
                     auto candidate_bundle = *preset_bundle;
+                    // Migrate only absent machine-output options, before defaults erase
+                    // the distinction between missing and explicitly disabled values.
+                    const auto *official = candidate_bundle.printers.find_system_preset_by_model_and_variant(
+                        machine->id, variant->id);
+                    const bool known_lineage = official && official->is_system &&
+                        (printer_preset == official->name ||
+                         std::find(inherited_presets.begin(), inherited_presets.end(), official->name) != inherited_presets.end()) &&
+                        (printer_model.empty() || printer_model == machine->id) &&
+                        (printer_variant.empty() || printer_variant == variant->id);
+                    for (const char *key : {"toolchange_z_lift", "part_cooling_fan_index"}) {
+                        if (config.has(key)) continue;
+                        if (known_lineage) {
+                            if (const auto *value = official->config.option(key)) {
+                                config.set_key_value(key, value->clone());
+                                result.diagnostics.push_back({"config", std::string("Inherited missing machine setting from installed preset: ") + key, true});
+                            }
+                        } else {
+                            result.diagnostics.push_back({"config", std::string("Machine preset origin is unknown; keeping the legacy default for ") + key +
+                                ". Select an updated machine preset to enable its configured behavior.", true});
+                        }
+                    }
                     Slic3r::DynamicPrintConfig resolved_config;
                     resolved_config.apply(Slic3r::FullPrintConfig::defaults());
                     resolved_config.apply(config);
@@ -3837,8 +3896,15 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                             Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
                     }
 
+                    // The preset loader may refresh non-dirty values from a newer
+                    // system preset. These resolved machine options are authoritative,
+                    // including an explicitly disabled value in the project.
+                    Slic3r::DynamicPrintConfig machine_output_options;
+                    machine_output_options.apply_only(resolved_config,
+                        {"toolchange_z_lift", "part_cooling_fan_index"}, true);
                     candidate_bundle.load_config_model(
                         request.path, std::move(resolved_config), file_version);
+                    candidate_bundle.printers.get_edited_preset().config.apply(machine_output_options);
 
                     auto active = std::unique_ptr<Config>(
                         new Config(serialized_values(candidate_bundle.full_config())));

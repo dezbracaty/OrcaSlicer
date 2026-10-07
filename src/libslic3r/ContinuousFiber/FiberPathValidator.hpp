@@ -3,6 +3,7 @@
 
 #include "ContinuousFiberConfig.hpp"
 #include "FiberPathFinalizer.hpp"
+#include "ContinuousFiberFillStrategy.hpp"
 #include "../ExtrusionEntityCollection.hpp"
 #include "../ExPolygon.hpp"
 
@@ -25,14 +26,18 @@ enum class FiberRejectionReason : uint8_t {
     InvalidParameter,
     InvalidGeometry,
     DegenerateSegment,
-    SegmentTooShort,
     SelfIntersection,
     DuplicateSegment,
-    TurnLimitExceeded,
     OutsideDomain,
     ProcessBudgetTooShort,
     FinalizedPathOutsideDomain,
-    IntervalMappingFailure
+    IntervalMappingFailure,
+    FinishUnavailable,
+    SamplingLimit,
+    ContourRoundingUnresolved,
+    OccupiedContourRegion,
+    UnavailableContourRegion,
+    OpenOuterContour
 };
 
 const char* fiber_rejection_reason_name(FiberRejectionReason reason);
@@ -43,6 +48,8 @@ struct FiberFragmentAssignment {
     double source_end_mm { 0.0 };
     FiberAssignmentKind kind { FiberAssignmentKind::Rejected };
     FiberRejectionReason reason { FiberRejectionReason::None };
+    std::string detail;
+    std::vector<ContourIssue> contour_issues;
     std::optional<ExtrusionPath> centerline;
     std::shared_ptr<const PreparedFiberPath> prepared;
 };
@@ -50,6 +57,7 @@ struct FiberFragmentAssignment {
 struct FiberCandidateExtent {
     FiberCandidateId id;
     double length_mm { 0.0 };
+    bool requires_closed_loop { false };
 };
 
 struct FiberAssignmentAudit {
@@ -67,6 +75,7 @@ struct FiberAssignmentAudit {
 
 struct FiberValidationResult {
     std::vector<FiberCandidateExtent> candidates;
+    std::vector<ExtrusionPath> reference_paths; // Populated only for fiber debug.
     std::vector<FiberFragmentAssignment> assignments;
     ExPolygons physical_footprint;
     ExPolygons resin_exclusion;
@@ -80,8 +89,39 @@ struct FiberValidationResult {
     void release_to(ExtrusionEntitiesPtr& destination);
 };
 
+struct FiberContourPlanNode {
+    FiberCandidateId id;
+    std::optional<FiberCandidateId> parent;
+    size_t depth {0};
+    FiberContourSide side {FiberContourSide::Outer};
+    size_t region_id {0}, boundary_id {0}, part_id {0};
+    std::optional<Polyline> source; // Debug only; never used for allocation.
+};
+
+struct FiberContourBranchStop {
+    std::optional<FiberCandidateId> parent;
+    size_t depth {0};
+    FiberContourSide side {FiberContourSide::Outer};
+    std::string reason; // A stop is not a material void or rejected path.
+};
+
+struct FiberContourPlanResult {
+    FiberValidationResult validation;
+    std::vector<FiberContourPlanNode> nodes;
+    std::vector<FiberContourBranchStop> stops;
+    bool audit_lineage() const;
+};
+
 class FiberPathValidator {
 public:
+    static FiberContourPlanResult plan_contours(
+        const ExPolygons& original_area, const ContinuousFiberConfig& config,
+        const FiberDomainId& domain_id, bool collect_debug = false);
+
+    static FiberValidationResult validate_infill(
+        const FiberInfillCandidates& candidates, const ExPolygons& allowed_domain,
+        const ContinuousFiberConfig& config, const FiberDomainId& domain_id);
+
     static FiberValidationResult validate(
         const ExtrusionEntitiesPtr& candidates,
         const ExPolygons& allowed_domain,
@@ -90,6 +130,15 @@ public:
         ExtrusionRole output_role,
         const FiberDomainId& domain_id,
         size_t job_ordinal = 0);
+
+private:
+    static FiberValidationResult validate_impl(
+        const ExtrusionEntitiesPtr& candidates, const ExPolygons& allowed_domain,
+        const ContinuousFiberConfig& config, FiberPathPurpose purpose,
+        ExtrusionRole output_role, const FiberDomainId& domain_id, size_t job_ordinal,
+        const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
+        const ExPolygons* physical_centerline_domain, bool collect_debug,
+        bool requires_closed_loop = false, const std::vector<ContourArc>* source_arcs = nullptr);
 };
 
 } // namespace Slic3r

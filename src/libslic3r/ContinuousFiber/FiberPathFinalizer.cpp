@@ -1,6 +1,8 @@
 #include "FiberPathFinalizer.hpp"
+#include "ContinuousFiberFillStrategy.hpp"
 
 #include "../ClipperUtils.hpp"
+#include "../BoundingBox.hpp"
 #include "../ExtrusionEntity.hpp"
 
 #include <algorithm>
@@ -17,50 +19,87 @@ namespace {
 // Normalize before coverage/validation, never while emitting. Two microns is
 // above the diagonal of the G-code coordinate grid and below Fill resolution.
 constexpr double command_resolution_mm = 0.002;
+constexpr double normalization_error_mm = command_resolution_mm;
 
 double area_mm2(const ExPolygons& polygons)
 {
     return unscaled<double>(unscaled<double>(std::abs(area(polygons))));
 }
 
-void append_coverage(const ExtrusionPath& source, const FiberMotionSpan& span, Polygons& physical, Polygons& exclusion,
-                     Polygons& keepout, const ContinuousFiberConfig& config)
-{
-    if (!span.deposits_fiber() || span.geometry.points.size() < 2)
-        return;
-
-    ExtrusionPath path(span.geometry, source);
-    path.polygons_covered_by_width(physical, 0.0f);
-    path.polygons_covered_by_width(exclusion, -float(scale_(config.resin_overlap_mm)));
-    path.polygons_covered_by_width(keepout, float(scale_(config.contour_infill_clearance_mm)));
-}
-
-
-Polyline3 normalized_xy(const Polyline3& input)
+// Preserve endpoints and bound the deviation of EVERY removed source knot.
+// The optional map relates retained points to their original arc length, so
+// command cleanup cannot shift a bend's speed interval or a process boundary.
+Polyline3 normalized_xy(const Polyline3& input, std::vector<double>* source_positions = nullptr,
+                        double error_mm = normalization_error_mm, const ExPolygons* centerline_domain = nullptr)
 {
     Polyline3 result;
-    for (size_t index = 0; index < input.points.size(); ++index) {
-        const Point3& point = input.points[index];
-        if (point.z() != 0)
-            throw std::invalid_argument("Fiber LayerXY geometry has nonzero Z");
-        if (!result.points.empty() &&
-            (result.points.back()-point).cast<double>().norm() <= scale_(command_resolution_mm)) {
-            // Preserve the original endpoint (and closed-loop seam). Replacing
-            // its near neighbour also keeps neighbouring process spans joined.
-            if (index + 1 != input.points.size()) continue;
-            while (result.points.size() > 1 &&
-                (result.points.back()-point).cast<double>().norm() <= scale_(command_resolution_mm))
-                result.points.pop_back();
-            if (result.points.back() == point) continue;
+    // Collapse exact straight runs first. Their endpoints bound the distance of
+    // every interior point to any later chord (distance to a segment is convex).
+    // The tolerance pass therefore never needs to rescan discarded straight knots.
+    std::vector<size_t> knots;
+    std::vector<double> positions;
+    if (source_positions) positions.resize(input.points.size(),0.0);
+    for (size_t i=0;i<input.points.size();++i) {
+        const auto& point=input.points[i];
+        if (point.z()!=0) throw std::invalid_argument("Fiber LayerXY geometry has nonzero Z");
+        if (source_positions && i) positions[i]=positions[i-1]+
+            unscale<double>((point-input.points[i-1]).cast<double>().norm());
+        if (!knots.empty() && point==input.points[knots.back()]) continue;
+        while (knots.size()>=2) {
+            const Vec2d a=(input.points[knots.back()]-input.points[knots[knots.size()-2]]).head<2>().cast<double>();
+            const Vec2d b=(point-input.points[knots.back()]).head<2>().cast<double>();
+            if (a.dot(b)<=0 || a.x()*b.y()!=a.y()*b.x()) break;
+            knots.pop_back();
         }
-        while (result.points.size() >= 2) {
-            const Vec2d a = (result.points.back() - result.points[result.points.size() - 2]).head<2>().cast<double>();
-            const Vec2d b = (point - result.points.back()).head<2>().cast<double>();
-            if (a.dot(b) <= 0 || std::abs(a.x()*b.y() - a.y()*b.x()) > 1e-12*a.norm()*b.norm())
-                break;
-            result.points.pop_back();
+        knots.push_back(i);
+    }
+    std::vector<size_t> retained;
+    const BoundingBox domain_bounds = centerline_domain ? get_extents(*centerline_domain) : BoundingBox{};
+    std::optional<BoundingBox> clip_window;
+    Polygons local_domain;
+    const auto chord_inside_domain = [&](const Point& from, const Point& to) {
+        if (!clip_window || !clip_window->contains(from) || !clip_window->contains(to)) {
+            clip_window = BoundingBox(Points{from, to});
+            // Reuse a horizontal slab. Keep its full X extent so Clipper sees
+            // every scanbeam event between the chord endpoints, including
+            // distant vertices at the same Y. A small XY crop can change
+            // integer rounding decisions on nearly collinear boundary edges.
+            // The margin controls cache reuse only, not geometric tolerance.
+            clip_window->offset(scale_(0.25));
+            clip_window->min.x() = std::min(clip_window->min.x(), domain_bounds.min.x());
+            clip_window->max.x() = std::max(clip_window->max.x(), domain_bounds.max.x());
+            local_domain = ClipperUtils::clip_clipper_polygons_with_subject_bbox(*centerline_domain, *clip_window);
         }
-        result.points.push_back(point);
+        return diff_pl(Polyline(Points{from, to}), local_domain).empty();
+    };
+    for (size_t index=0;index<knots.size();++index) {
+        const auto& point=input.points[knots[index]];
+        while (result.points.size()>=2) {
+            const Vec2d a=(result.points.back()-result.points[result.points.size()-2]).head<2>().cast<double>();
+            const Vec2d b=(point-result.points.back()).head<2>().cast<double>();
+            if (std::min(a.norm(),b.norm())>scale_(command_resolution_mm)) break;
+            const Vec2d begin=result.points[result.points.size()-2].head<2>().cast<double>();
+            const Vec2d delta=point.head<2>().cast<double>()-begin;
+            if (delta.squaredNorm()==0) break;
+            bool within=true;
+            for (size_t i=retained[retained.size()-2]+1;i<index;++i) {
+                const Vec2d v=input.points[knots[i]].head<2>().cast<double>()-begin;
+                const double t=std::clamp(v.dot(delta)/delta.squaredNorm(),0.0,1.0);
+                if ((v-t*delta).norm()>scale_(error_mm)) { within=false;break; }
+            }
+            if (!within) break;
+            // A short chord may satisfy the error bound yet cut across a concave
+            // domain edge. Geometry cleanup must preserve the planned domain.
+            if (centerline_domain && !chord_inside_domain(
+                    Point(result.points[result.points.size()-2].x(), result.points[result.points.size()-2].y()),
+                    Point(point.x(), point.y()))) break;
+            result.points.pop_back();retained.pop_back();
+        }
+        result.points.push_back(point);retained.push_back(index);
+    }
+    if (source_positions) {
+        source_positions->clear();
+        for (size_t index:retained) source_positions->push_back(positions[knots[index]]);
     }
     return result;
 }
@@ -87,13 +126,20 @@ struct ArcGeometry {
 // A speed field on the complete normalized path, including the cyclic seam.
 // No source vertex number or input edge length enters the speed formula.
 struct FiberSpeedPlanner {
-    std::vector<std::pair<double, double>> corners;
+    struct Bend { double begin, end, angle; };
+    std::vector<Bend> bends;
     double length, minimum, maximum, transition;
     bool closed;
-    FiberSpeedPlanner(const Polyline3& path, double vmin, double vmax, double distance)
+    FiberSpeedPlanner(const Polyline3& path, double vmin, double vmax, double distance,
+                      const std::vector<ContourArc>& arcs)
         : length(unscale<double>(path.length())), minimum(vmin), maximum(vmax), transition(distance),
           closed(path.points.front() == path.points.back())
     {
+        if (!arcs.empty()) {
+            for (const auto& arc:arcs)
+                bends.push_back({arc.begin_mm,arc.end_distance_mm,std::abs(arc.source_sweep_radians != 0 ? arc.source_sweep_radians : arc.sweep_radians)});
+            return;
+        }
         const ArcGeometry arc(path);
         const size_t n = path.points.size();
         for (size_t i = 0; i + 1 < n; ++i) {
@@ -102,26 +148,27 @@ struct FiberSpeedPlanner {
             const Vec2d incoming = (path.points[i]-prev).head<2>().cast<double>().normalized();
             const Vec2d outgoing = (path.points[i+1]-path.points[i]).head<2>().cast<double>().normalized();
             const double angle = std::acos(std::clamp(incoming.dot(outgoing), -1.0, 1.0));
-            if (angle > 1e-12) corners.emplace_back(arc.positions[i], angle);
+            if (angle > 1e-12) bends.push_back({arc.positions[i],arc.positions[i],angle});
         }
     }
     double limit(double begin, double end) const
     {
         double result = maximum;
-        for (const auto& corner : corners) {
+        for (const auto& bend : bends) {
             double distance = std::numeric_limits<double>::max();
             for (int lap = closed ? -1 : 0; lap <= (closed ? 1 : 0); ++lap) {
-                const double s = corner.first + lap*length;
-                distance = std::min(distance, s < begin ? begin-s : s > end ? s-end : 0.0);
+                const double b=bend.begin+lap*length,e=bend.end+lap*length;
+                distance=std::min(distance,e<begin?begin-e:b>end?b-end:0.0);
             }
-            const double corner_speed = maximum - (maximum-minimum)*corner.second/PI;
+            const double corner_speed = maximum - (maximum-minimum)*std::min(PI,bend.angle)/PI;
             result = std::min(result, corner_speed + (maximum-corner_speed)*std::min(1.0, distance/transition));
         }
         return result;
     }
 };
 
-void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const ContinuousFiberConfig& config)
+void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const ContinuousFiberConfig& config,
+                const std::vector<ContourArc>& arcs, const ExPolygons* centerline_domain)
 {
     const bool contour = prepared.id.parent.purpose == FiberPathPurpose::Contour;
     const double ratio = contour ? config.contour_feed_ratio*config.contour_feed_correction :
@@ -129,17 +176,30 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
     FiberSpeedPlanner speeds(depositing,
         contour ? config.contour_min_speed_mm_s : config.infill_min_speed_mm_s,
         contour ? config.contour_max_speed_mm_s : config.infill_max_speed_mm_s,
-        config.corner_transition_length_mm);
+        config.corner_transition_length_mm, arcs);
+    const FiberSpeedPlanner tail_limits(depositing, config.tail_min_speed_mm_s,
+                                       config.tail_max_speed_mm_s, config.corner_transition_length_mm, arcs);
     double offset = 0.0;
     for (FiberMotionSpan& span : prepared.spans) {
-        span.geometry = normalized_xy(span.geometry);
+        const double source_length=unscale<double>(span.geometry.length());
+        std::vector<double> source_positions;
+        span.geometry = normalized_xy(span.geometry,&source_positions,
+            arcs.empty() ? normalization_error_mm : ContourRoundingOptions{}.chord_tolerance_mm,
+            span.deposits_fiber() ? centerline_domain : nullptr);
         const ArcGeometry arc(span.geometry);
         const double length = arc.positions.back();
+        const auto source_at = [&](double s) {
+            if (s<=0) return 0.0;
+            if (s>=length) return source_length;
+            const size_t i=size_t(std::upper_bound(arc.positions.begin(),arc.positions.end(),s)-arc.positions.begin());
+            const double t=(s-arc.positions[i-1])/(arc.positions[i]-arc.positions[i-1]);
+            return source_positions[i-1]+t*(source_positions[i]-source_positions[i-1]);
+        };
         std::vector<double> cuts = arc.positions;
         const bool tail = span.kind == FiberMotionKind::PassiveDepositingAfterCut;
         const size_t cells = tail ? std::max(size_t(2), size_t(std::ceil(length/config.tail_speed_step_length_mm))) : 0;
         if (cells > 1000000 || length/config.speed_sampling_length_mm > 1000000)
-            throw std::invalid_argument("Fiber command sampling exceeds the supported budget");
+            throw std::length_error("Fiber command sampling exceeds the supported budget");
         const auto add_sample = [&](double s) {
             const auto next = std::lower_bound(arc.positions.begin(), arc.positions.end(), s);
             if (next == arc.positions.end() || next == arc.positions.begin()) return;
@@ -166,25 +226,45 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
         for (size_t i = 1; i < cuts.size(); ++i) {
             double speed = config.finish_motion_speed_mm_s;
             if (span.actively_feeds_fiber()) {
-                speed = speeds.limit(offset+cuts[i-1], offset+cuts[i]);
+                speed = speeds.limit(offset+source_at(cuts[i-1]), offset+source_at(cuts[i]));
                 if (span.kind == FiberMotionKind::PoweredStart) speed = std::min(speed, config.start_speed_mm_s);
             } else if (span.kind == FiberMotionKind::PrefedLanding) {
                 speed = config.landing_speed_mm_s;
             } else if (tail) {
                 const size_t cell = std::min(cells-1, size_t(std::floor((cuts[i-1]+cuts[i])*0.5/length*cells)));
                 speed = config.tail_min_speed_mm_s + (config.tail_max_speed_mm_s-config.tail_min_speed_mm_s)*double(cell)/double(cells-1);
-                // Tail has its own speed range; turns obey the same angular safety model.
-                FiberSpeedPlanner tail_limits(depositing, config.tail_min_speed_mm_s,
-                                             config.tail_max_speed_mm_s, config.corner_transition_length_mm);
-                if (speed > tail_limits.limit(offset+cuts[i-1], offset+cuts[i]) + EPSILON)
-                    throw std::invalid_argument("Fiber tail ramp exceeds the corner speed limit");
+                // The requested ramp is capped by the path's corner limits.
+                // A speed conflict does not invalidate an otherwise printable path.
+                speed = std::min(speed, tail_limits.limit(offset+source_at(cuts[i-1]), offset+source_at(cuts[i])));
             }
             edges.push_back({speed, span.actively_feeds_fiber() ? ratio : 0.0});
         }
         span.geometry = std::move(sampled);
         span.edges = std::move(edges);
-        if (span.deposits_fiber()) offset += length;
+        if (span.deposits_fiber()) offset += source_length;
     }
+}
+
+// Process boundaries must not create a command edge below coordinate resolution.
+// Reuse a nearby interior geometry knot within the existing 2 micron command
+// budget instead of replacing a bend by a chord. Endpoints are never moved.
+bool split_process_span(const Polyline3& source, double distance, Polyline3& before, Polyline3& after)
+{
+    double station = 0.0;
+    size_t nearest = 0;
+    double error = scale_(command_resolution_mm);
+    for (size_t i = 1; i + 1 < source.points.size(); ++i) {
+        station += (source.points[i] - source.points[i-1]).cast<double>().norm();
+        const double delta = std::abs(station-distance);
+        if (delta < error) { nearest = i; error = delta; }
+        if (station > distance + scale_(command_resolution_mm)) break;
+    }
+    if (nearest) {
+        before.points.assign(source.points.begin(), source.points.begin()+nearest+1);
+        after.points.assign(source.points.begin()+nearest, source.points.end());
+        return true;
+    }
+    return source.split_at_length(distance, &before, &after);
 }
 
 // Finish is a tool motion after the depositing tail, not another material path.
@@ -193,8 +273,7 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
 bool plan_finish(PreparedFiberPath& prepared, const ExtrusionPath& candidate,
                  const ContinuousFiberConfig& config)
 {
-    const bool tangent = prepared.id.parent.purpose == FiberPathPurpose::Infill ||
-        (config.infill_enabled && config.infill_pattern == ipConcentric);
+    const bool tangent = !candidate.is_closed() || prepared.id.parent.purpose == FiberPathPurpose::Infill;
     const double length = tangent ? config.finish_extension_length_mm : config.finish_overlap_length_mm;
     if (length <= 0) return true;
     Polyline3 finish;
@@ -221,67 +300,40 @@ bool plan_finish(PreparedFiberPath& prepared, const ExtrusionPath& candidate,
 
 } // namespace
 
-Polyline3 normalize_fiber_geometry(const Polyline3& input) { return normalized_xy(input); }
+Polyline3 normalize_fiber_geometry(const Polyline3& input, const ExPolygons* centerline_domain)
+{
+    return normalized_xy(input, nullptr, normalization_error_mm, centerline_domain);
+}
 
 FiberFinalizationResult FiberPathFinalizer::finalize(
     const ExtrusionPath& input,
     const ExPolygons& allowed_domain,
     const ContinuousFiberConfig& config,
-    const FiberFragmentId& id)
+    const FiberFragmentId& id,
+    const std::vector<ContourArc>& arcs, const ExPolygons* planned_centerline_domain)
 {
     FiberFinalizationResult result;
-    ExtrusionPath candidate(input);
-    try { candidate.polyline = normalized_xy(input.polyline); }
-    catch (const std::invalid_argument&) {
+    // The validator owns source normalization, before geometry checks and
+    // interval mapping. Splitting below may introduce short end edges, so each
+    // process span still preserves its endpoints when preparing command samples.
+    const ExtrusionPath& candidate = input;
+    if (candidate.polyline.points.size() < 2 || allowed_domain.empty() ||
+        std::any_of(candidate.polyline.points.begin(), candidate.polyline.points.end(),
+                    [](const Point3& point) { return point.z() != 0; })) {
         result.failure = FiberFinalizationFailure::InvalidGeometry;
+        result.detail = "Fiber finalization requires a normalized planar path and nonempty domain";
         return result;
     }
     result.length_mm = unscale<double>(candidate.length());
-
-    const double process_values[] = {
-        result.length_mm,
-        config.minimum_path_length_mm,
-        config.landing_length_mm,
-        config.start_stabilization_length_mm,
-        config.minimum_effective_length_mm,
-        config.cut_to_contact_length_mm,
-        config.prefeed_extra_length_mm,
-        config.prefeed_speed_mm_s,
-        config.z_hop_height_mm,
-        config.landing_speed_mm_s,
-        config.start_speed_mm_s,
-        config.finish_extension_length_mm,
-        config.finish_overlap_length_mm,
-        config.outside_tolerance_mm2,
-        config.resin_overlap_mm,
-        config.contour_infill_clearance_mm
-    };
-    if (!std::all_of(std::begin(process_values), std::end(process_values), [](double value) {
-            return std::isfinite(value) && value >= 0.0;
-        })) {
-        result.failure = FiberFinalizationFailure::InvalidParameter;
+    if (!std::isfinite(result.length_mm)) {
+        result.failure = FiberFinalizationFailure::InvalidGeometry;
+        result.detail = "Non-finite fiber path length";
         return result;
     }
-    if ((config.cut_to_contact_length_mm + config.prefeed_extra_length_mm > 0.0 && config.prefeed_speed_mm_s <= 0.0) ||
-        (config.landing_length_mm > 0.0 && config.landing_speed_mm_s <= 0.0) ||
-        (config.start_stabilization_length_mm > 0.0 && config.start_speed_mm_s <= 0.0)) {
+    try { validate_fiber_process_config(config, id.parent.purpose, candidate.is_closed()); }
+    catch (const std::invalid_argument& error) {
         result.failure = FiberFinalizationFailure::InvalidParameter;
-        return result;
-    }
-
-    const double positive_values[] = {
-        config.contour_feed_ratio, config.infill_feed_ratio, config.contour_feed_correction,
-        config.infill_feed_correction, config.contour_min_speed_mm_s, config.contour_max_speed_mm_s,
-        config.infill_min_speed_mm_s, config.infill_max_speed_mm_s, config.corner_transition_length_mm,
-        config.speed_sampling_length_mm, config.tail_min_speed_mm_s, config.tail_max_speed_mm_s,
-        config.tail_speed_step_length_mm, config.finish_motion_speed_mm_s
-    };
-    if (!std::all_of(std::begin(positive_values), std::end(positive_values),
-                    [](double v){return std::isfinite(v) && v > 0;}) ||
-        config.contour_min_speed_mm_s > config.contour_max_speed_mm_s ||
-        config.infill_min_speed_mm_s > config.infill_max_speed_mm_s ||
-        config.tail_min_speed_mm_s > config.tail_max_speed_mm_s) {
-        result.failure = FiberFinalizationFailure::InvalidParameter;
+        result.detail = error.what();
         return result;
     }
     const double required_length = std::max(
@@ -290,10 +342,6 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
             config.minimum_effective_length_mm + config.cut_to_contact_length_mm);
     if (result.length_mm + EPSILON < required_length) {
         result.failure = FiberFinalizationFailure::TooShort;
-        return result;
-    }
-    if (candidate.polyline.points.size() < 2 || allowed_domain.empty()) {
-        result.failure = FiberFinalizationFailure::InvalidGeometry;
         return result;
     }
 
@@ -320,7 +368,7 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     if (tail_scaled > 0.0) {
         const double split_distance = candidate.length() - tail_scaled;
         if (split_distance <= 0.0 ||
-            !candidate.polyline.split_at_length(split_distance, &before_tail, &passive) ||
+            !split_process_span(candidate.polyline, split_distance, before_tail, passive) ||
             before_tail.points.size() < 2 || passive.points.size() < 2) {
             result.failure = FiberFinalizationFailure::TooShort;
             return result;
@@ -332,7 +380,7 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     if (landing_scaled > 0.0) {
         Polyline3 landing;
         Polyline3 remaining;
-        if (!after_landing.split_at_length(landing_scaled, &landing, &remaining) ||
+        if (!split_process_span(after_landing, landing_scaled, landing, remaining) ||
             landing.points.size() < 2 || remaining.points.size() < 2) {
             result.failure = FiberFinalizationFailure::TooShort;
             return result;
@@ -345,7 +393,7 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     if (stabilization_scaled > 0.0) {
         Polyline3 powered_start;
         Polyline3 remaining;
-        if (!after_landing.split_at_length(stabilization_scaled, &powered_start, &remaining) ||
+        if (!split_process_span(after_landing, stabilization_scaled, powered_start, remaining) ||
             powered_start.points.size() < 2 || remaining.points.size() < 2) {
             result.failure = FiberFinalizationFailure::TooShort;
             return result;
@@ -363,26 +411,65 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     if (!passive.empty())
         prepared->spans.push_back({std::move(passive), FiberMotionKind::PassiveDepositingAfterCut});
 
-    if (!plan_finish(*prepared, candidate, config))
-        throw std::runtime_error("Invalid fiber finish geometry at layer " + std::to_string(id.parent.domain.layer_id) +
-            ": loop overlap requires a closed path at least as long as its configured finish");
+    if (!plan_finish(*prepared, candidate, config)) {
+        result.failure = FiberFinalizationFailure::FinishUnavailable;
+        result.detail = "Loop overlap requires a closed path at least as long as its configured finish";
+        return result;
+    }
+    const bool check_centerline = planned_centerline_domain || !arcs.empty();
+    const ExPolygons centerline_domain = planned_centerline_domain ?
+        offset_ex(*planned_centerline_domain, float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm))) :
+        check_centerline ? offset_ex(allowed_domain, -float(scale_(0.5*candidate.width +
+            (contour ? config.contour_boundary_clearance_mm : 0.0) - ContourRoundingOptions{}.geometry_tolerance_mm))) : ExPolygons{};
     try {
-        plan_edges(*prepared, candidate.polyline, config);
-    } catch (const std::invalid_argument&) {
-        result.failure = FiberFinalizationFailure::InvalidParameter;
+        plan_edges(*prepared, candidate.polyline, config, arcs, check_centerline ? &centerline_domain : nullptr);
+    } catch (const std::length_error& error) {
+        result.failure = FiberFinalizationFailure::SamplingLimit;
+        result.detail = error.what();
         return result;
     }
     try { prepared->finalize_actions(); prepared->validate(); }
-    catch (const std::invalid_argument&) {
+    catch (const std::invalid_argument& error) {
+        result.detail = error.what();
         result.failure = FiberFinalizationFailure::InvalidGeometry;
         return result;
     }
 
+    if (check_centerline) {
+        // Validate the actual command geometry, including the boundary clearance.
+        for (const auto& span:prepared->spans) if (span.deposits_fiber() &&
+            !diff_pl(Polylines{span.geometry.to_polyline()},centerline_domain).empty()) {
+            result.failure=FiberFinalizationFailure::OutsideDomain;
+            result.detail="Fiber path left its planned centerline domain during command preparation";
+            return result;
+        }
+    }
     Polygons physical;
-    Polygons exclusion;
     Polygons keepout;
-    for (const FiberMotionSpan& span : prepared->spans)
-        append_coverage(candidate, span, physical, exclusion, keepout, config);
+    {
+        // All fiber uses the circular material envelope used to construct its
+        // centerline domain, including infill without explicit return arcs.
+        // Process boundaries do not introduce physical end caps in a continuous
+        // strand. Sweep connected deposition once, including the cyclic seam.
+        Polyline depositing;
+        const auto flush = [&] {
+            const double physical_radius = 0.5 * candidate.width;
+            const double keepout_radius = physical_radius + config.contour_infill_clearance_mm;
+            auto footprint = to_polygons(fiber_contour_coverage(depositing, physical_radius));
+            if (contour) append(keepout, keepout_radius == physical_radius ? footprint :
+                to_polygons(fiber_contour_coverage(depositing, keepout_radius)));
+            append(physical, std::move(footprint));
+            depositing.points.clear();
+        };
+        for (const auto& span : prepared->spans) if (span.deposits_fiber()) {
+            const auto points = span.geometry.to_polyline().points;
+            if (points.empty()) continue;
+            if (!depositing.points.empty() && depositing.points.back() != points.front()) flush();
+            depositing.points.insert(depositing.points.end(),
+                points.begin() + (depositing.points.empty() ? 0 : 1), points.end());
+        }
+        flush();
+    }
 
     prepared->physical_coverage = union_ex(physical);
     prepared->outside_domain = diff_ex(prepared->physical_coverage, allowed_domain, ApplySafetyOffset::Yes);
@@ -393,8 +480,13 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         return result;
     }
 
-    prepared->resin_exclusion = intersection_ex(union_ex(exclusion), allowed_domain, ApplySafetyOffset::Yes);
-    prepared->contour_to_infill_keepout = intersection_ex(union_ex(keepout), allowed_domain, ApplySafetyOffset::Yes);
+    // Resin may only occupy material not actually deposited by fiber. Shrinking
+    // individual strands creates artificial channels between touching strands.
+    // Keep the existing field as the material-allocation result, not a second
+    // (overlap-reduced) representation of strand width.
+    prepared->resin_exclusion = intersection_ex(prepared->physical_coverage, allowed_domain);
+    if (contour)
+        prepared->contour_to_infill_keepout = intersection_ex(union_ex(keepout), allowed_domain, ApplySafetyOffset::Yes);
     result.prepared = std::move(prepared);
     return result;
 }

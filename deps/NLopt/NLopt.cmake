@@ -28,7 +28,11 @@ endif()
 
 # 设置路径 - 使用 file(TO_CMAKE_PATH) 确保在 Windows 上正确处理反斜杠
 file(TO_CMAKE_PATH "$ENV{CMAKE_FETCH_CACHE}" FETCH_CACHE_DIR)
-set(NLOPT_CACHE_DIR "${FETCH_CACHE_DIR}/nlopt-v${NLOPT_VERSION}")
+# A patched source/build must not reuse the unpatched shared dependency cache.
+set(NLOPT_PATCH "${CMAKE_CURRENT_LIST_DIR}/0001-bound-cobyla-inner-iterations.patch")
+file(SHA256 "${NLOPT_PATCH}" NLOPT_PATCH_HASH)
+string(SUBSTRING "${NLOPT_PATCH_HASH}" 0 12 NLOPT_PATCH_HASH)
+set(NLOPT_CACHE_DIR "${FETCH_CACHE_DIR}/nlopt-v${NLOPT_VERSION}-${NLOPT_PATCH_HASH}")
 
 # NLopt构建类型配置 - 可以独立于主项目设置
 if(DEFINED NLOPT_BUILD_TYPE)
@@ -221,6 +225,20 @@ elseif(NLOPT_STATUS STREQUAL "BUILT_NOT_INSTALLED")
 elseif(NLOPT_STATUS STREQUAL "SOURCE_ONLY")
     # 需要构建和安装
     message(STATUS "🔨 开始构建 NLopt...")
+
+    if(NOT EXISTS "${NLOPT_SOURCE_DIR}/.orca_cobyla_patched")
+        find_package(Git REQUIRED)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply "${NLOPT_PATCH}"
+            WORKING_DIRECTORY "${NLOPT_SOURCE_DIR}"
+            RESULT_VARIABLE _nlopt_patch_result
+            ERROR_VARIABLE _nlopt_patch_error
+        )
+        if(NOT _nlopt_patch_result EQUAL 0)
+            message(FATAL_ERROR "NLopt COBYLA patch failed: ${_nlopt_patch_error}")
+        endif()
+        file(WRITE "${NLOPT_SOURCE_DIR}/.orca_cobyla_patched" "${NLOPT_PATCH_HASH}\n")
+    endif()
 
     # 检测可用的生成器
     set(NLOPT_GENERATOR "")

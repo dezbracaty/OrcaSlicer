@@ -10,6 +10,7 @@
 #include <cmath>
 #include <initializer_list>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -192,24 +193,28 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
     const bool contour_enabled = boolean_value(config, "generate_reinforced_perimeters");
     const bool infill_enabled  = boolean_value(config, "generate_reinforced_infills");
 
-    if (key_is(item.key, {"outer_reinforced_perimeters_counts",
-                          "reinforced_perimeters_filament",
-                          "reinforced_perimeters_extrusion_width"})) {
+    if (item.key.rfind("fiber_resin_fill_", 0) == 0) {
+        item.enabled = contour_enabled || infill_enabled;
+    } else if (key_is(item.key, {"fiber_contour_include_holes",
+                          "outer_reinforced_perimeters_counts",
+                          "reinforced_perimeters_filament"})) {
         item.enabled = contour_enabled;
     } else if (key_is(item.key, {"reinforced_infill_density",
                                  "reinforced_infill_pattern",
-                                 "reinforced_infill_filament",
-                                 "reinforced_infill_extrusion_width"})) {
+                                 "reinforced_infill_filament"})) {
         item.enabled = infill_enabled;
-    } else if (item.key == "fiber_contour_boundary_clearance") {
+    } else if (key_is(item.key, {"fiber_contour_boundary_clearance", "fiber_contour_bend_radius"})) {
         item.enabled = contour_enabled;
+    } else if (item.key == "fiber_infill_angle_sequence") {
+        item.visible = item.enabled = infill_enabled &&
+            config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
+    } else if (item.key == "fiber_infill_bend_radius") {
+        item.enabled = infill_enabled && config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
     } else if (item.key == "fiber_contour_infill_clearance") {
         item.enabled = contour_enabled && infill_enabled;
-    } else if (key_is(item.key, {"fiber_layer_height_ratio",
+    } else if (key_is(item.key, {"fiber_width", "fiber_layer_height_ratio",
                                  "fiber_fill_debug",
                                  "fiber_minimum_path_length",
-                                 "fiber_minimum_segment_length",
-                                 "fiber_maximum_turn_angle",
                                  "fiber_minimum_effective_length",
                                  "fiber_prefeed_extra_length",
                                  "fiber_prefeed_speed",
@@ -407,6 +412,15 @@ SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std:
                 return failure(key, "Configuration option is read-only");
             }
 
+            if (key == "fiber_width") {
+                // Scalar float deserialization accepts trailing text; fiber width must be millimeters.
+                std::istringstream input(serialized_value);
+                double width = 0.0;
+                if (!(input >> width) || !(input >> std::ws).eof() || !std::isfinite(width) || width <= 0)
+                    return failure(key, "Fiber width must be a positive number in millimeters");
+            }
+            if (key == "fiber_infill_angle_sequence")
+                Slic3r::parse_fiber_infill_angle_sequence(serialized_value);
             candidate.set_deserialize_strict(key, serialized_value);
             const auto* option_definition = Slic3r::print_config_def.get(key);
             const auto* option            = candidate.option(key);
@@ -477,6 +491,13 @@ std::vector<ConfigDiagnostic> Config::validate() const
         diagnostics.reserve(errors.size());
         for (const auto& [key, message] : errors) {
             diagnostics.push_back({key, message});
+        }
+        if (const auto* sequence=impl_->current.option<Slic3r::ConfigOptionString>("fiber_infill_angle_sequence")) {
+            try {
+                Slic3r::parse_fiber_infill_angle_sequence(sequence->value);
+            } catch (const std::invalid_argument& error) {
+                diagnostics.push_back({"fiber_infill_angle_sequence", error.what()});
+            }
         }
         Slic3r::GCodeConfig tools;
         tools.apply(impl_->current, true);

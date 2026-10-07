@@ -79,9 +79,6 @@ struct FillParams
     // Candidate-only callers may disable Orca's residual gap-fill pass while
     // still using the same fill implementation as ordinary material jobs.
     bool        enable_gap_fill{ true };
-    // Limit classic concentric generation by offset depth. Zero preserves the
-    // ordinary Orca behavior and generates all loops that fit.
-    size_t      max_concentric_loops{ 0 };
     // Layer height for Concentric infill with Arachne.
     coordf_t    layer_height    { 0.f };
 
@@ -118,6 +115,9 @@ static_assert(IsTriviallyCopyable<FillParams>::value, "FillParams class is not P
 class Fill
 {
 public:
+    // Shared orientation for generators that retain analytic curve metadata.
+    std::pair<float, Point> infill_direction(const Surface& surface) const { return _infill_direction(&surface); }
+
     // Index of the layer.
     size_t      layer_id;
     // Z coordinate of the top print surface, in unscaled coordinates

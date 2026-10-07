@@ -1079,7 +1079,7 @@ void LayerRegion::simplify_path(ExtrusionPath* path)
 
     if (enable_arc_fitting &&
         !spiral_mode) {
-        if (path->role() == erInternalInfill)
+        if (path->role() == erInternalInfill || path->role() == erResinInfill)
             path->simplify_by_fitting_arc(SCALED_SPARSE_INFILL_RESOLUTION);
         else
             path->simplify_by_fitting_arc(scaled_resolution);
@@ -1098,7 +1098,7 @@ void LayerRegion::simplify_multi_path(ExtrusionMultiPath* multipath)
     for (size_t i = 0; i < multipath->paths.size(); ++i) {
         if (enable_arc_fitting &&
             !spiral_mode) {
-            if (multipath->paths[i].role() == erInternalInfill)
+            if (multipath->paths[i].role() == erInternalInfill || multipath->paths[i].role() == erResinInfill)
                 multipath->paths[i].simplify_by_fitting_arc(SCALED_SPARSE_INFILL_RESOLUTION);
             else
                 multipath->paths[i].simplify_by_fitting_arc(scaled_resolution);
@@ -1118,7 +1118,7 @@ void LayerRegion::simplify_loop(ExtrusionLoop* loop)
     for (size_t i = 0; i < loop->paths.size(); ++i) {
         if (enable_arc_fitting &&
             !spiral_mode) {
-            if (loop->paths[i].role() == erInternalInfill)
+            if (loop->paths[i].role() == erInternalInfill || loop->paths[i].role() == erResinInfill)
                 loop->paths[i].simplify_by_fitting_arc(SCALED_SPARSE_INFILL_RESOLUTION);
             else
                 loop->paths[i].simplify_by_fitting_arc(scaled_resolution);

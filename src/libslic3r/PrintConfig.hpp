@@ -84,6 +84,7 @@ enum AuthorizationType {
     atKeyPassword, atUserPassword
 };
 
+
 enum InfillPattern : int {
     ipMonotonic, ipMonotonicLine,
     ipRectilinear, ipAlignedRectilinear, ipZigZag, ipCrossZag, ipLockedZag,
@@ -1080,21 +1081,34 @@ PRINT_CONFIG_CLASS_DEFINE(
     // FiberContour paths; obsolete CFSYS process keys are not runtime aliases.
     ((ConfigOptionBool,                 generate_reinforced_perimeters))
     ((ConfigOptionInt,                  outer_reinforced_perimeters_counts))
+    ((ConfigOptionBool,                 fiber_contour_include_holes))
     ((ConfigOptionBool,                 generate_reinforced_infills))
     ((ConfigOptionPercent,              reinforced_infill_density))
     ((ConfigOptionEnum<InfillPattern>,  reinforced_infill_pattern))
+    ((ConfigOptionString,               fiber_infill_angle_sequence))
     ((ConfigOptionInt,                  reinforced_infill_filament))
     ((ConfigOptionInt,                  reinforced_perimeters_filament))
-    ((ConfigOptionFloatOrPercent,       reinforced_perimeters_extrusion_width))
-    ((ConfigOptionFloatOrPercent,       reinforced_infill_extrusion_width))
+    ((ConfigOptionFloat,               fiber_width))
     ((ConfigOptionInt,                  fiber_layer_height_ratio))
     ((ConfigOptionFloat,                fiber_minimum_path_length))
-    ((ConfigOptionFloat,                fiber_minimum_segment_length))
-    ((ConfigOptionFloat,                fiber_maximum_turn_angle))
     ((ConfigOptionFloat,                fiber_minimum_effective_length))
     ((ConfigOptionFloat,                fiber_contour_infill_clearance))
     ((ConfigOptionFloat,                fiber_contour_boundary_clearance))
+    ((ConfigOptionFloat,                fiber_contour_bend_radius))
+    ((ConfigOptionFloat,                fiber_infill_bend_radius))
+    ((ConfigOptionFloat,                fiber_corner_stabilization_length))
     ((ConfigOptionFloat,                fiber_resin_overlap))
+    ((ConfigOptionPercent, fiber_resin_fill_density))
+    ((ConfigOptionEnum<InfillPattern>, fiber_resin_fill_pattern))
+    ((ConfigOptionFloat, fiber_resin_fill_direction))
+    ((ConfigOptionString, fiber_resin_fill_rotate_template))
+    ((ConfigOptionBool, fiber_resin_fill_align_to_model))
+    ((ConfigOptionFloatOrPercent, fiber_resin_fill_line_width))
+    ((ConfigOptionInt, fiber_resin_fill_multiline))
+    ((ConfigOptionFloatOrPercent, fiber_resin_fill_anchor))
+    ((ConfigOptionFloatOrPercent, fiber_resin_fill_anchor_max))
+    ((ConfigOptionFloat, fiber_resin_fill_speed))
+    ((ConfigOptionFloatOrPercent, fiber_resin_fill_acceleration))
     ((ConfigOptionFloat,                fiber_prefeed_extra_length))
     ((ConfigOptionFloat,                fiber_prefeed_speed))
     ((ConfigOptionFloat,                fiber_z_hop_height))
@@ -1375,6 +1389,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     // Used to overcome the PWM start-up threshold on fans that cannot spool below a certain duty cycle.
     // A value of 0 (the default) leaves behaviour unchanged. A fan command of 0 (off) is always honoured.
     ((ConfigOptionInt,                 part_cooling_fan_min_pwm))
+    ((ConfigOptionInt,                 part_cooling_fan_index))
+    ((ConfigOptionFloat,               toolchange_z_lift))
     ((ConfigOptionFloats,              filament_diameter))
     ((ConfigOptionBoolsNullable,       filament_adaptive_volumetric_speed))
     ((ConfigOptionStrings,             volumetric_speed_coefficients))
@@ -1728,6 +1744,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE0(
 
 // Validate the FullPrintConfig. Returns an empty string on success, otherwise an error message is returned.
 std::map<std::string, std::string> validate(const FullPrintConfig &config, bool under_cli = false);
+std::map<std::string, std::string> validate_machine_gcode_config(const PrintConfig &config);
 
 PRINT_CONFIG_CLASS_DEFINE(
     SLAPrintConfig,
