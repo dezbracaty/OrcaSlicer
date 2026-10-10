@@ -77,6 +77,11 @@ struct FiberStartProcedure {
     int adhesion_dwell_ms { 0 };
 };
 
+struct FiberPolicyBoundary {
+    ExPolygons forbidden_core;
+    bool requires_resin_first { false };
+};
+
 struct PreparedFiberPath {
     FiberFragmentId id;
     unsigned logical_filament_id { 0 };
@@ -92,6 +97,8 @@ struct PreparedFiberPath {
     ExPolygons resin_exclusion;
     ExPolygons outside_domain;
     ExPolygons contour_to_infill_keepout;
+
+    std::shared_ptr<const FiberPolicyBoundary> policy_boundary;
 
     double total_depositing_length_mm() const;
     double passive_tail_length_mm() const;

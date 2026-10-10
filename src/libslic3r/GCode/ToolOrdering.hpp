@@ -6,6 +6,7 @@
 #include "../libslic3r.h"
 
 #include <utility>
+#include <set>
 
 #include <boost/container/small_vector.hpp>
 #include "../FilamentGroup.hpp"
@@ -203,6 +204,7 @@ public:
 
     void    clear() {
         m_layer_tools.clear();
+        m_applied_first_layer_order = {};
         m_stats_by_single_extruder.clear();
         m_stats_by_multi_extruder_best.clear();
         m_stats_by_multi_extruder_curr.clear();
@@ -255,19 +257,24 @@ public:
     bool                has_non_support_filament(const PrintConfig &config);
 
 private:
+    static std::vector<unsigned int> apply_first_layer_order(
+        const DynamicPrintConfig* config, std::vector<unsigned int>& tool_order);
     void				initialize_layers(std::vector<coordf_t> &zs);
     void 				collect_extruders(const PrintObject &object, const std::vector<std::pair<double, unsigned int>> &per_layer_extruder_switches);
     void 				fill_wipe_tower_partitions(const PrintConfig &config, coordf_t object_bottom_z, coordf_t max_layer_height);
     bool                insert_wipe_tower_extruder();
     void                mark_skirt_layers(const PrintConfig &config, coordf_t max_layer_height);
     void 				collect_extruder_statistics(bool prime_multi_material);
-    void                reorder_extruders_for_minimum_flush_volume(bool reorder_first_layer);
+    void                reorder_extruders_for_minimum_flush_volume(
+        bool reorder_first_layer, const std::set<coordf_t>& resin_first_layers);
 
     // BBS
     std::vector<unsigned int> generate_first_layer_tool_order(const Print& print);
     std::vector<unsigned int> generate_first_layer_tool_order(const PrintObject& object);
 
     std::vector<LayerTools>    m_layer_tools;
+    // Zero-based tools actually ranked by the native first-layer rule.
+    std::vector<unsigned int> m_applied_first_layer_order;
     // First printing extruder, including the multi-material priming sequence.
     unsigned int               m_first_printing_extruder = (unsigned int)-1;
     // Final printing extruder.

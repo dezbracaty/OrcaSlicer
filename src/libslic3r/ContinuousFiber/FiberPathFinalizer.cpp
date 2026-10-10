@@ -347,6 +347,7 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
 
     auto prepared = std::make_shared<PreparedFiberPath>();
     prepared->id = id;
+    prepared->policy_boundary = config.policy_boundary;
     prepared->geometric_mm3_per_mm = candidate.mm3_per_mm;
     prepared->width_mm = candidate.width;
     prepared->height_mm = candidate.height;
@@ -472,6 +473,17 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     }
 
     prepared->physical_coverage = union_ex(physical);
+    if (config.enforce_policy_boundary && config.policy_boundary &&
+        !config.policy_boundary->forbidden_core.empty()) {
+        // Only a foreign process domain adds a mask boundary. Preserve the
+        // existing model-edge tolerance below; allow four grids of clip noise.
+        const auto numeric_foreign = offset_ex(config.policy_boundary->forbidden_core, -4.0f);
+        if (!intersection_ex(prepared->physical_coverage, numeric_foreign, ApplySafetyOffset::No).empty()) {
+            result.failure = FiberFinalizationFailure::PolicyBoundaryRejected;
+            result.detail = "Depositing footprint crosses its fiber policy boundary";
+            return result;
+        }
+    }
     prepared->outside_domain = diff_ex(prepared->physical_coverage, allowed_domain, ApplySafetyOffset::Yes);
     if (area_mm2(prepared->outside_domain) > config.outside_tolerance_mm2) {
         BOOST_LOG_TRIVIAL(debug) << "[FiberCoverageRejected] layer=" << prepared->id.parent.domain.layer_id

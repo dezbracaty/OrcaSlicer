@@ -150,7 +150,8 @@ private:
         const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
         const ExPolygons* physical_centerline_domain, bool collect_debug,
         bool requires_closed_loop = false, const std::vector<ContourArc>* source_arcs = nullptr,
-        double bend_stabilization_length_mm = 0.0);
+        double bend_stabilization_length_mm = 0.0,
+        std::vector<FiberFragmentId>* policy_rejected = nullptr);
 };
 
 } // namespace Slic3r

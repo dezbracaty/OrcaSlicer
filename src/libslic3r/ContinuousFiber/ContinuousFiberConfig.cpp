@@ -13,6 +13,59 @@
 
 namespace Slic3r {
 
+const std::array<std::string_view, 39>& fiber_mask_parameter_keys()
+{
+    static constexpr std::array<std::string_view, 39> keys{{
+        "generate_reinforced_perimeters",
+        "fiber_contour_include_holes",
+        "outer_reinforced_perimeters_counts",
+        "reinforced_perimeters_filament",
+        "fiber_contour_boundary_clearance",
+        "fiber_contour_bend_radius",
+        "generate_reinforced_infills",
+        "reinforced_infill_pattern",
+        "reinforced_infill_density",
+        "reinforced_infill_filament",
+        "fiber_infill_angle_sequence",
+        "fiber_infill_bend_radius",
+        "fiber_corner_stabilization_length",
+        "fiber_concentric_corner_stabilization_length",
+        "fiber_width",
+        "fiber_layer_height_ratio",
+        "fiber_minimum_path_length",
+        "fiber_minimum_effective_length",
+        "fiber_contour_infill_clearance",
+        "fiber_resin_overlap",
+        "fiber_contour_max_speed",
+        "fiber_infill_max_speed",
+        "fiber_contour_min_speed",
+        "fiber_infill_min_speed",
+        "fiber_contour_feed_ratio",
+        "fiber_infill_feed_ratio",
+        "fiber_contour_acceleration",
+        "fiber_infill_acceleration",
+        "fiber_resin_fill_pattern",
+        "fiber_resin_fill_density",
+        "fiber_resin_fill_direction",
+        "fiber_resin_fill_rotate_template",
+        "fiber_resin_fill_align_to_model",
+        "fiber_resin_fill_line_width",
+        "fiber_resin_fill_multiline",
+        "fiber_resin_fill_anchor",
+        "fiber_resin_fill_anchor_max",
+        "fiber_resin_fill_speed",
+        "fiber_resin_fill_acceleration",
+    }};
+    return keys;
+}
+
+bool is_fiber_mask_parameter(std::string_view key)
+{
+    const auto& keys = fiber_mask_parameter_keys();
+    return std::find(keys.begin(), keys.end(), key) != keys.end();
+}
+
+
 FiberMachineProtocol fiber_machine_protocol(const GCodeConfig& config)
 {
     return std::find(config.toolhead_fiber_protocol_id.values.begin(),
@@ -419,9 +472,9 @@ ContinuousFiberConfig fiber_ring_reference_config(const ContinuousFiberConfig& c
     return result;
 }
 
-ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region)
+static ContinuousFiberConfig resolve_region_fiber_config(
+    const PrintConfig& print_config, const PrintRegionConfig& source, double layer_height, size_t layer_id)
 {
-    const PrintRegionConfig& source = region.region().config();
     ContinuousFiberConfig result;
     result.contour_enabled = source.generate_reinforced_perimeters.value;
     result.infill_enabled = source.generate_reinforced_infills.value;
@@ -449,7 +502,6 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
     if (result.contour_enabled && result.infill_enabled && !concentric)
         result.contour_infill_clearance_mm = source.fiber_contour_infill_clearance.value;
 
-    const PrintConfig& print_config = layer.object()->print()->config();
     if (print_config.fiber_cut_gcode.value.find_first_not_of(" \t\r\n") == std::string::npos)
         throw std::runtime_error("Continuous fiber is enabled, but the selected machine has no fiber cut command");
     result.cut_to_contact_length_mm = print_config.fiber_cut_to_contact_length.value;
@@ -469,7 +521,7 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
             throw std::runtime_error("Continuous fiber extruder is outside the configured nozzle set");
         const float nozzle = float(print_config.nozzle_diameter.values[extruder]);
         // Width is explicit and shared by both path roles. No nozzle-based auto width.
-        return Flow(float(width), float(layer.height), nozzle);
+        return Flow(float(width), float(layer_height), nozzle);
     };
     if (result.contour_enabled || concentric) {
         result.contour_include_holes = source.fiber_contour_include_holes.value;
@@ -499,7 +551,7 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
             throw std::runtime_error("Continuous fiber infill supports only rectilinear and concentric patterns");
         if (result.infill_pattern==ipRectilinear)
             result.rectilinear_angle_radians=fiber_infill_angle_for_layer(
-                source.fiber_infill_angle_sequence.value,layer.id(),size_t(result.layer_interval));
+                source.fiber_infill_angle_sequence.value,layer_id,size_t(result.layer_interval));
         if (!std::isfinite(source.reinforced_infill_density.value))
             throw std::runtime_error("reinforced_infill_density must be finite");
         result.infill_density = std::clamp(source.reinforced_infill_density.value, 0.0, 100.0);
@@ -516,6 +568,19 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         }
     }
     return result;
+}
+
+void validate_continuous_fiber_region_config(const PrintConfig& print_config,
+    const PrintRegionConfig& region_config, double layer_height)
+{
+    if (continuous_fiber_enabled(region_config))
+        resolve_region_fiber_config(print_config, region_config, layer_height, 0);
+}
+
+ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region)
+{
+    return resolve_region_fiber_config(layer.object()->print()->config(), region.region().config(),
+        layer.height, layer.id());
 }
 
 } // namespace Slic3r

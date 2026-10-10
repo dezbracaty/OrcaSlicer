@@ -4,6 +4,7 @@
 #include <libslic3r/Preset.hpp>
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/ContinuousFiber/ContinuousFiberConfig.hpp>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cfloat>
@@ -188,14 +189,15 @@ bool key_is(std::string_view key, std::initializer_list<std::string_view> candid
     return std::find(candidates.begin(), candidates.end(), key) != candidates.end();
 }
 
-void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintConfig& config)
+void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintConfig& config,
+                                ConfigScope scope = ConfigScope::Full)
 {
     const bool contour_enabled = boolean_value(config, "generate_reinforced_perimeters");
     const bool infill_enabled  = boolean_value(config, "generate_reinforced_infills");
     const bool concentric=infill_enabled && config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern")==Slic3r::ipConcentric;
 
     if (item.key.rfind("fiber_resin_fill_", 0) == 0) {
-        item.enabled = contour_enabled || infill_enabled;
+        item.enabled = scope == ConfigScope::FiberMask || contour_enabled || infill_enabled;
     } else if (key_is(item.key, {"fiber_contour_include_holes",
                           "outer_reinforced_perimeters_counts",
                           "reinforced_perimeters_filament"})) {
@@ -316,6 +318,8 @@ public:
 
     Slic3r::DynamicPrintConfig defaults;
     Slic3r::DynamicPrintConfig current;
+    std::optional<ConfigScope> override_scope;
+    std::set<std::string> overridden_keys;
 };
 
 Config::Config() : impl_(std::make_unique<Impl>()) {}
@@ -323,6 +327,14 @@ Config::Config(std::vector<std::pair<std::string, std::string>> baseline)
     : impl_(std::make_unique<Impl>(baseline))
 {}
 Config Config::defaults() { return Config(); }
+Config Config::for_overrides(const ConfigSnapshot& base, ConfigScope scope)
+{
+    if (!base.valid())
+        throw std::invalid_argument("Override baseline is unavailable");
+    Config result(base.values());
+    result.impl_->override_scope = scope;
+    return result;
+}
 Config::Config(const Config& other) : impl_(std::make_unique<Impl>(*other.impl_)) {}
 Config::Config(Config&&) noexcept = default;
 Config& Config::operator=(const Config& other)
@@ -337,20 +349,36 @@ Config::~Config()                            = default;
 
 std::vector<SettingItem> Config::settings() const
 {
+    return settings(impl_->override_scope.value_or(ConfigScope::Full));
+}
+
+std::vector<SettingItem> Config::settings(ConfigScope scope) const
+{
+    scope = impl_->override_scope.value_or(scope);
     std::vector<SettingItem> result;
     result.reserve(catalog().items.size());
     for (const SettingItem& definition : catalog().items) {
+        if (scope == ConfigScope::FiberMask && !Slic3r::is_fiber_mask_parameter(definition.key))
+            continue;
         const auto* option = impl_->current.option(definition.key);
         if (option == nullptr) {
             continue;
         }
         SettingItem item = definition;
+        item.overridden = impl_->overridden_keys.count(definition.key) != 0;
         item.value       = option->serialize();
         if (const auto* baseline = impl_->defaults.option(definition.key)) {
             item.default_value = baseline->serialize();
         }
-        apply_dynamic_presentation(item, impl_->current);
+        apply_dynamic_presentation(item, impl_->current, scope);
         result.push_back(std::move(item));
+    }
+    if (scope == ConfigScope::FiberMask) {
+        const auto& order = Slic3r::fiber_mask_parameter_keys();
+        std::sort(result.begin(), result.end(), [&](const auto& left, const auto& right) {
+            return std::find(order.begin(), order.end(), left.key) <
+                   std::find(order.begin(), order.end(), right.key);
+        });
     }
     return result;
 }
@@ -365,8 +393,10 @@ SettingsResult failure(std::string key, std::string message)
 
 std::optional<SettingItem> current_item(const Slic3r::DynamicPrintConfig& config,
                                         const Slic3r::DynamicPrintConfig& defaults,
-                                        std::string_view key)
+                                        std::string_view key, ConfigScope scope = ConfigScope::Full)
 {
+    if (scope == ConfigScope::FiberMask && !Slic3r::is_fiber_mask_parameter(key))
+        return std::nullopt;
     const SettingItem* definition = catalog().find(key);
     const auto* option            = definition == nullptr ? nullptr : config.option(definition->key);
     if (option == nullptr) {
@@ -377,19 +407,22 @@ std::optional<SettingItem> current_item(const Slic3r::DynamicPrintConfig& config
     if (const auto* baseline = defaults.option(definition->key)) {
         item.default_value = baseline->serialize();
     }
-    apply_dynamic_presentation(item, config);
+    apply_dynamic_presentation(item, config, scope);
     return item;
 }
 
 void append_presentation_changes(std::vector<std::string>& changed_keys,
                                  const Slic3r::DynamicPrintConfig& before,
-                                 const Slic3r::DynamicPrintConfig& after)
+                                 const Slic3r::DynamicPrintConfig& after,
+                                 ConfigScope scope = ConfigScope::Full)
 {
     for (const SettingItem& definition : catalog().items) {
+        if (scope == ConfigScope::FiberMask && !Slic3r::is_fiber_mask_parameter(definition.key))
+            continue;
         SettingItem previous = definition;
         SettingItem current  = definition;
-        apply_dynamic_presentation(previous, before);
-        apply_dynamic_presentation(current, after);
+        apply_dynamic_presentation(previous, before, scope);
+        apply_dynamic_presentation(current, after, scope);
         if ((previous.enabled != current.enabled || previous.visible != current.visible) &&
             std::find(changed_keys.begin(), changed_keys.end(), definition.key) == changed_keys.end()) {
             changed_keys.push_back(definition.key);
@@ -400,17 +433,31 @@ void append_presentation_changes(std::vector<std::string>& changed_keys,
 
 SettingsResult Config::set(std::string_view key, std::string_view serialized_value)
 {
-    return apply_patch({{std::string(key), std::string(serialized_value)}});
+    return set(ConfigScope::Full, key, serialized_value);
+}
+
+SettingsResult Config::set(ConfigScope scope, std::string_view key, std::string_view serialized_value)
+{
+    return apply_patch(scope, {{std::string(key), std::string(serialized_value)}});
 }
 
 SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std::string>>& patch)
 {
+    return apply_patch(ConfigScope::Full, patch);
+}
+
+SettingsResult Config::apply_patch(ConfigScope scope,
+    const std::vector<std::pair<std::string, std::string>>& patch)
+{
+    scope = impl_->override_scope.value_or(scope);
     const Slic3r::DynamicPrintConfig before = impl_->current;
     Slic3r::DynamicPrintConfig candidate = before;
     std::string last_key;
     try {
         for (const auto& [key, serialized_value] : patch) {
-            last_key                      = key;
+            last_key = key;
+            if (scope == ConfigScope::FiberMask && !Slic3r::is_fiber_mask_parameter(key))
+                return failure(key, "Configuration option cannot be overridden by a fiber mask");
             const SettingItem* definition = catalog().find(key);
             if (definition == nullptr) {
                 return failure(key, "Unknown configuration option");
@@ -450,13 +497,21 @@ SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std:
     }
 
     auto changed_keys = candidate.diff(before);
-    append_presentation_changes(changed_keys, before, candidate);
+    append_presentation_changes(changed_keys, before, candidate, scope);
+    if (impl_->override_scope) {
+        for (const auto& [key, value] : patch) {
+            if (impl_->overridden_keys.insert(key).second &&
+                std::find(changed_keys.begin(), changed_keys.end(), key) == changed_keys.end())
+                changed_keys.push_back(key);
+        }
+    }
     impl_->current          = std::move(candidate);
     SettingsResult result;
     result.success = true;
     result.changed_items.reserve(changed_keys.size());
     for (const std::string& key : changed_keys) {
-        if (auto item = current_item(impl_->current, impl_->defaults, key)) {
+        if (auto item = current_item(impl_->current, impl_->defaults, key, scope)) {
+            item->overridden = impl_->overridden_keys.count(key) != 0;
             result.changed_items.push_back(std::move(*item));
         }
     }
@@ -466,6 +521,9 @@ SettingsResult Config::apply_patch(const std::vector<std::pair<std::string, std:
 SettingsResult Config::reset(std::string_view key)
 {
     const std::string owned_key(key);
+    const auto scope = impl_->override_scope.value_or(ConfigScope::Full);
+    if (scope == ConfigScope::FiberMask && !Slic3r::is_fiber_mask_parameter(key))
+        return failure(owned_key, "Configuration option cannot be overridden by a fiber mask");
     const SettingItem* definition = catalog().find(owned_key);
     if (definition == nullptr || impl_->defaults.option(owned_key) == nullptr) {
         return failure(owned_key, "Unknown configuration option");
@@ -475,19 +533,81 @@ SettingsResult Config::reset(std::string_view key)
     }
     const Slic3r::DynamicPrintConfig before = impl_->current;
     const bool changed = before.opt_serialize(owned_key) != impl_->defaults.opt_serialize(owned_key);
+    const bool was_overridden = impl_->overridden_keys.erase(owned_key) != 0;
     impl_->current.apply_only(impl_->defaults, {owned_key});
     SettingsResult result;
     result.success = true;
     std::vector<std::string> changed_keys;
-    if (changed)
+    if (changed || was_overridden)
         changed_keys.push_back(owned_key);
-    append_presentation_changes(changed_keys, before, impl_->current);
+    append_presentation_changes(changed_keys, before, impl_->current, scope);
     for (const std::string& changed_key : changed_keys) {
-        if (auto item = current_item(impl_->current, impl_->defaults, changed_key)) {
+        if (auto item = current_item(impl_->current, impl_->defaults, changed_key, scope)) {
+            item->overridden = impl_->overridden_keys.count(changed_key) != 0;
             result.changed_items.push_back(std::move(*item));
         }
     }
     return result;
+}
+
+SettingsResult Config::load_overrides(std::string_view payload)
+{
+    if (!impl_->override_scope)
+        return failure({}, "Configuration is not an override context");
+    std::vector<std::pair<std::string, std::string>> patch;
+    try {
+        const auto document = nlohmann::json::parse(payload);
+        if (!document.is_object())
+            return failure({}, "Override data must be a JSON object");
+        for (auto it = document.begin(); it != document.end(); ++it) {
+            if (!it.value().is_string())
+                return failure(it.key(), "Override values must be serialized strings");
+            patch.emplace_back(it.key(), it.value().get<std::string>());
+        }
+    } catch (const std::exception& error) {
+        return failure({}, error.what());
+    }
+    Config candidate(*this);
+    candidate.impl_->current = candidate.impl_->defaults;
+    candidate.impl_->overridden_keys.clear();
+    auto result = candidate.apply_patch(*impl_->override_scope, patch);
+    if (!result) return result;
+    auto changed_keys = candidate.impl_->current.diff(impl_->current);
+    append_presentation_changes(changed_keys, impl_->current, candidate.impl_->current,
+                                *impl_->override_scope);
+    for (const auto& definition : catalog().items) {
+        if (impl_->overridden_keys.count(definition.key) != candidate.impl_->overridden_keys.count(definition.key) &&
+            std::find(changed_keys.begin(), changed_keys.end(), definition.key) == changed_keys.end())
+            changed_keys.push_back(definition.key);
+    }
+    *this = std::move(candidate);
+    result.changed_items.clear();
+    for (const auto& key : changed_keys) {
+        if (auto item = current_item(impl_->current, impl_->defaults, key, *impl_->override_scope)) {
+            item->overridden = impl_->overridden_keys.count(key) != 0;
+            result.changed_items.push_back(std::move(*item));
+        }
+    }
+    return result;
+}
+
+std::vector<std::pair<std::string, std::string>> Config::overrides() const
+{
+    if (!impl_->override_scope)
+        throw std::logic_error("Configuration is not an override context");
+    std::vector<std::pair<std::string, std::string>> result;
+    result.reserve(impl_->overridden_keys.size());
+    for (const auto& key : impl_->overridden_keys)
+        result.emplace_back(key, impl_->current.opt_serialize(key));
+    return result;
+}
+
+std::string Config::serialize_overrides() const
+{
+    auto document = nlohmann::json::object();
+    for (const auto& [key, value] : overrides())
+        document[key] = value;
+    return document.dump();
 }
 
 std::vector<ConfigDiagnostic> Config::validate() const
@@ -521,6 +641,8 @@ ConfigSnapshot Config::snapshot() const
     const auto keys = impl_->current.keys();
     values.reserve(keys.size());
     for (const std::string& key : keys) {
+        if (key == "fiber_mask_process")
+            continue;
         values.emplace_back(key, impl_->current.opt_serialize(key));
     }
     return ConfigSnapshot(std::move(values));

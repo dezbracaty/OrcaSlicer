@@ -18,6 +18,8 @@ enum class SettingLevel { Simple, Advanced, Expert, Developer };
 
 enum class SettingGroup { Process, Filament, Printer };
 
+enum class ConfigScope { Full, FiberMask };
+
 struct EnumItem
 {
     std::string value;
@@ -52,6 +54,7 @@ struct SettingItem
     bool enabled{true};
     bool read_only{false};
     bool multiline{false};
+    bool overridden{false};
 };
 
 struct ConfigDiagnostic
@@ -96,6 +99,15 @@ class LIBSLICER_API Config final
 public:
     static Config defaults();
 
+    // Edit a scoped patch over an immutable baseline. Unedited values inherit;
+    // setting a value explicitly records it even when it equals the baseline.
+    static Config for_overrides(const ConfigSnapshot& base, ConfigScope scope);
+    // Replace the patch atomically. The JSON object uses serialized string values
+    // and remains compatible with existing App mask documents.
+    SettingsResult load_overrides(std::string_view payload);
+    std::string serialize_overrides() const;
+    std::vector<std::pair<std::string, std::string>> overrides() const;
+
     Config(const Config&);
     Config(Config&&) noexcept;
     Config& operator=(const Config&);
@@ -104,10 +116,15 @@ public:
 
     // Full display snapshot. Call once when initializing or rebuilding a view.
     std::vector<SettingItem> settings() const;
+    std::vector<SettingItem> settings(ConfigScope scope) const;
 
     // Successful edits return only items whose current display state changed.
     SettingsResult set(std::string_view key, std::string_view serialized_value);
+    SettingsResult set(ConfigScope scope, std::string_view key, std::string_view serialized_value);
     SettingsResult apply_patch(const std::vector<std::pair<std::string, std::string>>& patch);
+    SettingsResult apply_patch(ConfigScope scope,
+        const std::vector<std::pair<std::string, std::string>>& patch);
+    // In an override context, remove the override and inherit the baseline.
     SettingsResult reset(std::string_view key);
     std::vector<ConfigDiagnostic> validate() const;
     ConfigSnapshot snapshot() const;

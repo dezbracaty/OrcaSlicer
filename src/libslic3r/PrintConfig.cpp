@@ -940,6 +940,11 @@ void PrintConfigDef::init_fff_params()
     // Maximum extruder temperature, bumped to 1500 to support printing of glass.
     const int max_temp = 1500;
 
+    // Job-internal modifier semantics. Never offered as an editable setting.
+    def = this->add("fiber_mask_process", coBool);
+    def->readonly = true;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("generate_reinforced_perimeters", coBool);
     def->label = L("Continuous fiber contours");
     def->category = L("Continuous fiber");

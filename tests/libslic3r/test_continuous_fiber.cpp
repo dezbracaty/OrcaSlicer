@@ -9,12 +9,16 @@
 #include "libslic3r/GCode/FiberGCodeBlockParser.hpp"
 #include "libslic3r/GCodeWriter.hpp"
 #include "libslic3r/GCode.hpp"
+#include "libslic3r/Print.hpp"
+#include "libslic3r/GCode/ToolOrdering.hpp"
 #include "libslic3r/GCode/FanMover.hpp"
 
 #include <set>
 #include <limits>
 #include <random>
 #include <nlopt.hpp>
+#include <filesystem>
+#include <fstream>
 
 using namespace Slic3r;
 
@@ -3682,4 +3686,776 @@ TEST_CASE("concentric accepted ring starts with a stable run and does not inspec
     config.concentric_corner_stabilization_length_mm=100;
     CHECK(fiber_ring_reference_config(config).corner_stabilization_length_mm==0);
     CHECK(fiber_ring_reference_config(config).concentric_corner_stabilization_length_mm==0);
+}
+
+
+TEST_CASE("strict policy boundary rejects physical protrusion without changing baseline tolerance", "[ContinuousFiber][fiber-mask]")
+{
+    const ExPolygons domain {rectangle(0, 0, 50, 20)};
+    ContinuousFiberConfig config;
+    config.cut_to_contact_length_mm = 2;
+    config.outside_tolerance_mm2 = 1.0;
+    const auto candidate = straight_path(5, 0.399, 45, 0.399);
+    REQUIRE(FiberPathFinalizer::finalize(candidate, domain, config, test_id()).prepared);
+    config.enforce_policy_boundary = true;
+    auto context = std::make_shared<FiberPolicyBoundary>();
+    context->forbidden_core = {rectangle(0, -10, 50, 0)};
+    config.policy_boundary = context;
+    const auto rejected = FiberPathFinalizer::finalize(candidate, domain, config, test_id());
+    CHECK_FALSE(rejected.prepared);
+    CHECK(rejected.failure == FiberFinalizationFailure::PolicyBoundaryRejected);
+    const auto accepted = FiberPathFinalizer::finalize(straight_path(5, 0.41, 45, 0.41), domain, config, test_id());
+    REQUIRE(accepted.prepared);
+    CHECK(accepted.prepared->policy_boundary == context);
+    // With identical policy and planning domains, the accepted footprint is inside both.
+    CHECK(accepted.prepared->outside_domain.empty());
+}
+
+TEST_CASE("strict policy boundary distinguishes planning reserve from the effective domain", "[ContinuousFiber][fiber-mask]")
+{
+    const ExPolygons policy{rectangle(0, 0, 50, 20)};
+    const auto planning = offset_ex(policy, -float(scale_(0.01)));
+    ContinuousFiberConfig config;
+    config.cut_to_contact_length_mm = 2;
+    config.outside_tolerance_mm2 = 1.0;
+    config.enforce_policy_boundary = true;
+    auto context = std::make_shared<FiberPolicyBoundary>();
+    context->forbidden_core = {rectangle(0, -10, 50, 0)};
+    config.policy_boundary = context;
+    const auto candidate = straight_path(5, 0.4095, 45, 0.4095);
+    const auto accepted = FiberPathFinalizer::finalize(candidate, planning, config, test_id(), {}, &planning);
+    REQUIRE(accepted.prepared);
+    CHECK(accepted.prepared->policy_boundary == context);
+    CHECK_FALSE(diff_ex(accepted.prepared->physical_coverage, offset_ex(planning, 4.f),
+                        ApplySafetyOffset::No).empty());
+    CHECK(diff_ex(accepted.prepared->physical_coverage, offset_ex(policy, 4.f),
+                  ApplySafetyOffset::No).empty());
+
+    SECTION("true policy protrusion remains rejected") {
+        const auto result = FiberPathFinalizer::finalize(straight_path(5, 0.399, 45, 0.399),
+                                                       planning, config, test_id(), {}, &planning);
+        CHECK_FALSE(result.prepared);
+        CHECK(result.failure == FiberFinalizationFailure::PolicyBoundaryRejected);
+    }
+    SECTION("missing context preserves the original model-edge tolerance") {
+        config.policy_boundary.reset();
+        const auto result = FiberPathFinalizer::finalize(candidate, planning, config, test_id());
+        CHECK(result.prepared);
+    }
+    SECTION("empty foreign domain preserves the original model-edge tolerance") {
+        context->forbidden_core.clear();
+        const auto result = FiberPathFinalizer::finalize(candidate, planning, config, test_id());
+        CHECK(result.prepared);
+    }
+}
+
+TEST_CASE("strict policy boundary preserves real holes even with a permissive planning domain", "[ContinuousFiber][fiber-mask]")
+{
+    const ExPolygons planning{rectangle(0, 0, 50, 20)};
+    ContinuousFiberConfig config;
+    config.cut_to_contact_length_mm = 2;
+    config.outside_tolerance_mm2 = 1.0;
+    config.enforce_policy_boundary = true;
+    auto context = std::make_shared<FiberPolicyBoundary>();
+    context->forbidden_core = {rectangle(20, 5, 30, 15)};
+    config.policy_boundary = context;
+    REQUIRE(FiberPathFinalizer::finalize(straight_path(5, 4.59, 45, 4.59),
+                                        planning, config, test_id()).prepared);
+    const auto rejected = FiberPathFinalizer::finalize(straight_path(5, 4.601, 45, 4.601),
+                                                     planning, config, test_id());
+    CHECK_FALSE(rejected.prepared);
+    CHECK(rejected.failure == FiberFinalizationFailure::PolicyBoundaryRejected);
+}
+
+
+namespace {
+DynamicPrintConfig masked_print_config()
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    const std::vector<std::pair<std::string,std::string>> values {
+        {"generate_reinforced_infills","1"}, {"generate_reinforced_perimeters","0"},
+        {"reinforced_infill_filament","2"}, {"reinforced_infill_density","40%"},
+        {"filament_map","1,2"}, {"filament_map_mode","Manual"}, {"single_extruder_multi_material","0"},
+        {"flush_volumes_matrix","0,0,0,0"},
+        {"filament_colour","#FFFFFF;#000000"},
+        {"fiber_cut_gcode","M400\nM42 P4 S255\nG4 P100\n; MASK_TEST_CUT"},
+        {"filament_diameter","1.75,1.75"}, {"nozzle_diameter","0.4,0.4"},
+        {"filament_process_type","thermoplastic;continuous_fiber"},
+        {"toolhead_process_capabilities","thermoplastic;continuous_fiber"},
+        {"toolhead_fiber_protocol_id",";linear-e-v1"}, {"physical_extruder_map","0,1"},
+        {"toolhead_fiber_e_units_per_mm","1,1"}, {"filament_fiber_feed_correction","1,1"},
+        {"fiber_width","0.8"}, {"fiber_minimum_path_length","1"},
+        {"fiber_cut_to_contact_length","2"}, {"fiber_minimum_effective_length","0"},
+        {"fiber_contour_bend_radius","0"}, {"fiber_infill_bend_radius","0"},
+        {"fiber_finish_extension_length","0"}, {"fiber_finish_overlap_length","0"},
+        {"enable_prime_tower","0"}, {"sparse_infill_density","15%"},
+        {"top_shell_layers","1"}, {"bottom_shell_layers","1"}, {"layer_height","0.2"},
+        {"initial_layer_print_height","0.2"}
+    };
+    for (const auto& [key,value]:values) config.set_deserialize_strict(key,value);
+    // An explicit command-only test machine; production profiles retain their scripts.
+    for (const auto& key : config.keys())
+        if (key.size() >= 6 && key.compare(key.size()-6,6,"_gcode") == 0 &&
+            key != "fiber_cut_gcode" && key != "emit_machine_limits_to_gcode")
+            config.set_deserialize_strict(key, "");
+    return config;
+}
+}
+
+TEST_CASE("resin-only SDK provenance preserves native bridge surface classification", "[ContinuousFiber][fiber-mask]")
+{
+    auto config = masked_print_config();
+    const int interval = GENERATE(1, 2);
+    for (const auto& value : std::vector<std::pair<std::string, std::string>> {
+        {"generate_reinforced_perimeters", "1"}, {"reinforced_perimeters_filament", "2"},
+        {"fiber_resin_fill_density", "0%"}, {"sparse_infill_density", "0%"},
+        {"wall_loops", "2"}, {"top_shell_layers", "1"}, {"top_shell_thickness", "1"},
+        {"bottom_shell_layers", "1"}, {"bottom_shell_thickness", "0"},
+        {"ensure_vertical_shell_thickness", "ensure_all"}, {"fiber_contour_bend_radius", "0.3"},
+        {"fiber_infill_bend_radius", "0.3"}})
+        config.set_deserialize_strict(value.first, value.second);
+    config.set_deserialize_strict("fiber_layer_height_ratio", std::to_string(interval));
+
+    // Keep every native surface attribute, grouping only geometrically equivalent
+    // fragments. Runtime model IDs and polygon vertex starting points may differ.
+    using SurfaceKey = std::tuple<int, double, unsigned short, double, unsigned short>;
+    using ClassifiedRegion = std::map<SurfaceKey, ExPolygons>;
+    struct Snapshot {
+        std::vector<std::vector<ClassifiedRegion>> layers;
+        std::vector<ExPolygons> eligible_cores;
+    };
+    const auto run = [&](int source) {
+        Model model;
+        auto* object = model.add_object();
+        object->add_volume(make_cube(60, 40, 2), ModelVolumeType::MODEL_PART, false);
+        if (source >= 0) {
+            auto mesh = make_cube(28, 24, 2);
+            mesh.translate(Vec3f(16, 8, 0));
+            auto* modifier = object->add_volume(std::move(mesh), ModelVolumeType::PARAMETER_MODIFIER, false);
+            modifier->config.set("fiber_mask_process", source == 1);
+            modifier->config.set_key_value("fiber_resin_fill_density", new ConfigOptionPercent(50));
+            modifier->config.set("fiber_resin_fill_speed", 17.0);
+        }
+        object->add_instance()->set_offset(Vec3d(100, 100, 0));
+        Print print;
+        print.set_plate_origin(Vec3d::Zero());
+        print.is_BBL_printer() = false;
+        print.apply(model, config);
+        print.process();
+        Snapshot result;
+        size_t eligible_surfaces = 0, prepared_paths = 0, boundaries = 0, resin_first = 0;
+        bool bridge_surface = false;
+        std::function<void(const ExtrusionEntity*)> inspect = [&](const ExtrusionEntity* entity) {
+            if (const auto* collection = dynamic_cast<const ExtrusionEntityCollection*>(entity)) {
+                for (const auto* child : collection->entities) inspect(child);
+            } else if (const auto* fiber = dynamic_cast<const ExtrusionFiberPath*>(entity)) {
+                ++prepared_paths;
+                const auto& path = *fiber->prepared_path();
+                if (path.policy_boundary) {
+                    ++boundaries;
+                    // This is the exact predicate that enables policy clipping
+                    // in Fill and finalization; an empty foreign core stays tolerant.
+                    CHECK(path.policy_boundary->forbidden_core.empty());
+                    resin_first += path.policy_boundary->requires_resin_first;
+                }
+            }
+        };
+        for (const auto* layer : print.objects().front()->layers()) {
+            result.layers.emplace_back();
+            ExPolygons core;
+            for (const auto* region : layer->regions()) {
+                result.layers.back().emplace_back();
+                auto& classified = result.layers.back().back();
+                for (const auto& surface : region->fill_surfaces.surfaces) {
+                    classified[{int(surface.surface_type), surface.thickness, surface.thickness_layers,
+                        surface.bridge_angle, surface.extra_perimeters}].push_back(surface.expolygon);
+                    if (surface.surface_type == stInternal) {
+                        core.push_back(surface.expolygon);
+                        ++eligible_surfaces;
+                    }
+                    bridge_surface |= surface.surface_type == stInternalBridge;
+                }
+                inspect(&region->fills);
+            }
+            result.eligible_cores.push_back(union_ex(core));
+        }
+        REQUIRE(eligible_surfaces > 0);
+        REQUIRE(prepared_paths > 0);
+        REQUIRE(bridge_surface);
+        if (source == 1) {
+            REQUIRE(boundaries > 0);
+            REQUIRE(resin_first > 0);
+        } else CHECK(boundaries == 0);
+        return result;
+    };
+    const auto baseline = run(-1);
+    const auto native = run(0);
+    const auto sdk = run(1);
+    REQUIRE(native.layers.size() == sdk.layers.size());
+    REQUIRE(baseline.eligible_cores.size() == native.eligible_cores.size());
+    bool native_modifier_changes_core = false;
+    for (size_t layer = 0; layer < native.layers.size(); ++layer) {
+        INFO("layer=" << layer << " interval=" << interval);
+        REQUIRE(native.layers[layer].size() == sdk.layers[layer].size());
+        for (size_t region = 0; region < native.layers[layer].size(); ++region) {
+            const auto& expected = native.layers[layer][region];
+            const auto& actual = sdk.layers[layer][region];
+            REQUIRE(actual.size() == expected.size());
+            for (const auto& [key, polygons] : expected) {
+                const auto found = actual.find(key);
+                REQUIRE(found != actual.end());
+                CHECK(diff_ex(polygons, found->second, ApplySafetyOffset::No).empty());
+                CHECK(diff_ex(found->second, polygons, ApplySafetyOffset::No).empty());
+            }
+        }
+        const auto& before = baseline.eligible_cores[layer];
+        const auto& after = native.eligible_cores[layer];
+        native_modifier_changes_core |= before.size() != after.size() ||
+            std::abs(area(before) - area(after)) > double(scale_(1.0)) * scale_(0.1);
+    }
+    // Native bridge anchoring really changed the eligible core. The SDK source
+    // marker must preserve this classification rather than erase solid supports.
+    REQUIRE(native_modifier_changes_core);
+}
+
+TEST_CASE("masked material order validates only the effective native rule", "[ContinuousFiber][fiber-mask]")
+{
+    auto config = masked_print_config();
+    config.set_deserialize_strict("extruder_offset", GENERATE("0x0,0x0", "0x0,0.1734x0.2876"));
+    config.set_deserialize_strict("other_layers_print_sequence_nums", "2");
+    const bool conflict = GENERATE(false,true);
+    config.set_deserialize_strict("other_layers_print_sequence",
+        conflict ? "1,10,1,2,1,10,2,1" : "1,10,2,1,1,10,1,2");
+    Model model;
+    auto* object=model.add_object();
+    object->add_volume(make_cube(60,40,2),ModelVolumeType::MODEL_PART,false);
+    auto mesh=make_cube(28,24,2); mesh.translate(Vec3f(16,8,0));
+    auto* modifier=object->add_volume(std::move(mesh),ModelVolumeType::PARAMETER_MODIFIER,false);
+    modifier->config.set("fiber_mask_process",true);
+    modifier->config.set("fiber_width",1.0);
+    object->add_instance()->set_offset(Vec3d(100,100,0));
+    Print print;
+    print.set_plate_origin(Vec3d::Zero());
+    print.is_BBL_printer() = false;
+    print.apply(model,config);
+    if (conflict) {
+        REQUIRE_THROWS_WITH(print.process(),
+            "Explicit material order conflicts with masked resin-before-fiber execution");
+    } else {
+        print.process();
+        const auto& tools = print.tool_ordering();
+        bool checked=false;
+        for (const auto& layer:tools)
+            if (layer.extruders.size()>1 && layer.has_extruder(1)) {
+                CHECK(layer.extruders.back()==1); checked=true;
+            }
+        REQUIRE(checked);
+        // Independent analytic capsule oracle, using the actual forbidden policy
+        // attached to each path. Reconstruct the 0.001-mm command rounding with
+        // this instance/nozzle phase; test segment distance, not clipper coverage.
+        const auto point_distance=[](const Vec2d& p,const Vec2d& a,const Vec2d& b) {
+            const Vec2d d=b-a;
+            const double length2=d.squaredNorm();
+            const double t=length2==0?0:std::clamp((p-a).dot(d)/length2,0.0,1.0);
+            return (p-(a+t*d)).norm();
+        };
+        const auto capsule_clear=[&](const Vec2d& a,const Vec2d& b,double radius,const ExPolygons& forbidden) {
+            for(const auto& polygon:forbidden) {
+                if(polygon.contains(Point::new_scale(a.x(),a.y())) ||
+                   polygon.contains(Point::new_scale(b.x(),b.y()))) return false;
+                const auto clear_loop=[&](const Polygon& loop) {
+                    for(size_t i=0;i<loop.points.size();++i) {
+                        const Vec2d c=unscaled(loop.points[i]);
+                        const Vec2d d=unscaled(loop.points[(i+1)%loop.points.size()]);
+                        const auto cross=[](const Vec2d& u,const Vec2d& v) {return u.x()*v.y()-u.y()*v.x();};
+                        if(cross(b-a,c-a)*cross(b-a,d-a)<0 &&
+                           cross(d-c,a-c)*cross(d-c,b-c)<0) return false;
+                        const double distance=std::min({point_distance(a,c,d),point_distance(b,c,d),
+                            point_distance(c,a,b),point_distance(d,a,b)});
+                        if(distance+1e-9<radius) return false;
+                    }
+                    return true;
+                };
+                if(!clear_loop(polygon.contour)) return false;
+                for(const auto& hole:polygon.holes) if(!clear_loop(hole)) return false;
+            }
+            return true;
+        };
+        const Vec2d origin=unscaled(print.objects().front()->instances().front().shift);
+        size_t strict_paths=0,rounded_edges=0;
+        bool negative_control=false;
+        std::function<void(const ExtrusionEntity*)> check_policy=[&](const ExtrusionEntity* entity) {
+            if(const auto* collection=dynamic_cast<const ExtrusionEntityCollection*>(entity)) {
+                for(const auto* child:collection->entities) check_policy(child);
+            } else if(const auto* fiber=dynamic_cast<const ExtrusionFiberPath*>(entity)) {
+                const auto& prepared=*fiber->prepared_path();
+                if(!prepared.policy_boundary || prepared.policy_boundary->forbidden_core.empty()) return;
+                ++strict_paths;
+                const auto forbidden=offset_ex(prepared.policy_boundary->forbidden_core,-4.f);
+                const size_t tool=size_t(print.config().filament_map.get_at(prepared.logical_filament_id)-1);
+                const Vec2d phase=origin-print.config().extruder_offset.get_at(tool);
+                const auto rounded=[&](const Point3& point) {
+                    const Vec2d local=unscaled(point.to_point());
+                    return Vec2d(std::round((local.x()+phase.x())*1000)/1000-phase.x(),
+                                 std::round((local.y()+phase.y())*1000)/1000-phase.y());
+                };
+                for(const auto& span:prepared.spans) if(span.deposits_fiber())
+                    for(size_t i=1;i<span.geometry.points.size();++i) {
+                        CHECK(capsule_clear(rounded(span.geometry.points[i-1]),rounded(span.geometry.points[i]),
+                                            .5*prepared.width_mm,forbidden));
+                        ++rounded_edges;
+                    }
+                if(!negative_control && !forbidden.empty()) {
+                    const auto box=get_extents(forbidden);
+                    const double y=unscale<double>(forbidden.front().contour.points.front().y());
+                    const Vec2d a(unscale<double>(box.min.x())-1,y);
+                    const Vec2d b(unscale<double>(box.max.x())+1,y);
+                    for(const auto& polygon:forbidden) {
+                        REQUIRE_FALSE(polygon.contains(Point::new_scale(a.x(),a.y())));
+                        REQUIRE_FALSE(polygon.contains(Point::new_scale(b.x(),b.y())));
+                    }
+                    CHECK_FALSE(capsule_clear(a,b,.5*prepared.width_mm,forbidden));
+                    negative_control=true;
+                }
+            }
+        };
+        for(const auto* layer:print.objects().front()->layers())
+            for(const auto* region:layer->regions())
+                for(const auto* entity:region->fills.entities) check_policy(entity);
+        REQUIRE(strict_paths>0);
+        REQUIRE(rounded_edges>0);
+        REQUIRE(negative_control);
+        SECTION("emitter rejects an invalid published policy boundary") {
+            bool replaced = false;
+            std::function<void(ExtrusionEntity*&)> corrupt = [&](ExtrusionEntity*& entity) {
+                if (replaced) return;
+                if (auto* collection = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
+                    for (auto*& child : collection->entities) corrupt(child);
+                } else if (const auto* fiber = dynamic_cast<const ExtrusionFiberPath*>(entity)) {
+                    auto prepared = std::make_shared<PreparedFiberPath>(*fiber->prepared_path());
+                    auto boundary = std::make_shared<FiberPolicyBoundary>();
+                    boundary->forbidden_core = {rectangle(-1000,-1000,1000,1000)};
+                    prepared->policy_boundary = boundary;
+                    auto replacement = std::make_unique<ExtrusionFiberPath>(*fiber, fiber->role(), prepared, fiber->display_purpose());
+                    delete entity;
+                    entity = replacement.release();
+                    replaced = true;
+                }
+            };
+            for (auto* layer : print.objects().front()->layers())
+                for (auto* region : layer->regions())
+                    for (auto*& entity : region->fills.entities) corrupt(entity);
+            REQUIRE(replaced);
+            const auto path = std::filesystem::temp_directory_path() / "fiber-mask-invalid-boundary.gcode";
+            REQUIRE_THROWS_WITH(print.export_gcode(path.string(), nullptr),
+                "Machine-rounded fiber deposition crosses its policy boundary");
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            std::filesystem::remove(path.string() + ".tmp", error);
+        }
+    }
+}
+
+
+TEST_CASE("strict infill policy rejection remains a nonfatal resin fallback", "[ContinuousFiber][fiber-mask]")
+{
+    const ExPolygons domain{rectangle(0,0,50,20)};
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(.8f,.2f,.4f);
+    config.cut_to_contact_length_mm=2;
+    config.outside_tolerance_mm2=1;
+    FiberInfillCandidates candidates;
+    candidates.centerline_domain=domain;
+    candidates.paths.push_back({straight_path(5,.399,45,.399).polyline,{}});
+    const FiberDomainId id{7,62,4,1};
+    REQUIRE(FiberPathValidator::validate_infill(candidates,domain,config,id).accepted_count()==1);
+    config.enforce_policy_boundary=true;
+    auto boundary=std::make_shared<FiberPolicyBoundary>();
+    boundary->forbidden_core={rectangle(0,-10,50,0)};
+    config.policy_boundary=boundary;
+    const auto result=FiberPathValidator::validate_infill(candidates,domain,config,id);
+    CHECK(result.accepted_count()==0);
+    REQUIRE(result.rejected_count()==1);
+    CHECK(result.assignments.front().reason==FiberRejectionReason::OutsideDomain);
+    CHECK(result.resin_exclusion.empty());
+    CHECK(ContinuousFiberFillStrategy::build_resin_area(domain,result.resin_exclusion)==domain);
+    SECTION("an unrelated outside-domain failure remains fatal") {
+        config.outside_tolerance_mm2=0;
+        candidates.paths.push_back({straight_path(5,19.601,45,19.601).polyline,{}});
+        REQUIRE_THROWS_WITH(FiberPathValidator::validate_infill(candidates,domain,config,id),
+            "Generated fiber infill failed preparation: finalized_path_outside_domain; ");
+    }
+    SECTION("policy failure retains exact-ID fallback even with zero outside tolerance") {
+        config.outside_tolerance_mm2=0;
+        const auto rejected=FiberPathValidator::validate_infill(candidates,domain,config,id);
+        CHECK(rejected.accepted_count()==0);
+        CHECK(rejected.rejected_count()==1);
+        CHECK(rejected.resin_exclusion.empty());
+    }
+}
+
+
+TEST_CASE("nested masked fiber groups emit the prepared materials rather than region defaults", "[ContinuousFiber][fiber-mask]")
+{
+    auto config = masked_print_config();
+    for (const auto& [key,value] : std::vector<std::pair<std::string,std::string>>{
+        {"filament_map","1,2,3"}, {"filament_colour","#FFFFFF;#000000;#FF0000"},
+        {"flush_volumes_matrix","0,0,0,0,0,0,0,0,0"},
+        {"filament_diameter","1.75,1.75,1.75"}, {"nozzle_diameter","0.4,0.4,0.4"},
+        {"filament_process_type","thermoplastic;continuous_fiber;continuous_fiber"},
+        {"toolhead_process_capabilities","thermoplastic;continuous_fiber;continuous_fiber"},
+        {"toolhead_fiber_protocol_id",";linear-e-v1;linear-e-v1"}, {"physical_extruder_map","0,1,2"},
+        {"toolhead_fiber_e_units_per_mm","1,1,1"}, {"filament_fiber_feed_correction","1,1,1"}})
+        config.set_deserialize_strict(key,value);
+    Model model;
+    auto* object=model.add_object();
+    object->add_volume(make_cube(60,40,2),ModelVolumeType::MODEL_PART,false);
+    auto mesh=make_cube(28,24,2); mesh.translate(Vec3f(16,8,0));
+    auto* modifier=object->add_volume(std::move(mesh),ModelVolumeType::PARAMETER_MODIFIER,false);
+    modifier->config.set("fiber_mask_process",true);
+    modifier->config.set("reinforced_infill_filament",3);
+    object->add_instance()->set_offset(Vec3d(100,100,0));
+    Print print;
+    print.set_plate_origin(Vec3d::Zero());
+    print.is_BBL_printer() = false;
+    print.apply(model,config);
+    print.process();
+    bool nested=false;
+    size_t expected_fibers=0;
+    for(auto* layer:print.objects().front()->layers()) {
+        std::set<unsigned> materials;
+        std::function<void(const ExtrusionEntity&)> collect=[&](const ExtrusionEntity& entity) {
+            if(const auto* group=dynamic_cast<const ExtrusionEntityCollection*>(&entity)) {
+                for(const auto* child:group->entities) collect(*child);
+            } else if(const auto* fiber=dynamic_cast<const ExtrusionFiberPath*>(&entity)) {
+                materials.insert(fiber->prepared_path()->logical_filament_id);
+                ++expected_fibers;
+            }
+        };
+        for(auto* region:layer->regions()) for(const auto* entity:region->fills.entities) collect(*entity);
+        if(nested || materials!=std::set<unsigned>{1,2}) continue;
+        // Move the real generated fiber leaves into a deliberately nested mixed
+        // collection, preserving their immutable prepared data and ownership.
+        auto mixed=std::make_unique<ExtrusionEntityCollection>();
+        auto branch=std::make_unique<ExtrusionEntityCollection>();
+        branch->no_sort=true;
+        std::function<void(ExtrusionEntityCollection&)> extract=[&](ExtrusionEntityCollection& group) {
+            for(auto it=group.entities.begin();it!=group.entities.end();) {
+                if(dynamic_cast<ExtrusionFiberPath*>(*it)) {
+                    branch->entities.push_back(*it);
+                    it=group.entities.erase(it);
+                } else {
+                    if(auto* child=dynamic_cast<ExtrusionEntityCollection*>(*it)) {
+                        extract(*child);
+                        if(child->entities.empty()) {
+                            delete child;
+                            it=group.entities.erase(it);
+                            continue;
+                        }
+                    }
+                    ++it;
+                }
+            }
+        };
+        for(auto* region:layer->regions()) extract(region->fills);
+        mixed->entities.push_back(branch.release());
+        layer->regions().front()->fills.entities.push_back(mixed.release());
+        nested=true;
+        const auto& tools=print.tool_ordering().tools_for_layer(layer->print_z);
+        CHECK(tools.has_extruder(1)); CHECK(tools.has_extruder(2));
+        bool fiber_seen=false;
+        for(unsigned material:tools.extruders) {
+            if(material==1 || material==2) fiber_seen=true;
+            else CHECK_FALSE(fiber_seen);
+        }
+    }
+    REQUIRE(nested);
+    const auto output=std::filesystem::temp_directory_path()/"fiber-mask-nested-materials.gcode";
+    REQUIRE_NOTHROW(print.export_gcode(output.string(),nullptr));
+    std::ifstream file(output); REQUIRE(file.good());
+    std::string line;
+    std::set<unsigned> emitted;
+    size_t actual_fibers=0;
+    while(std::getline(file,line)) if(line.rfind(";FIBER_BEGIN ",0)==0) {
+        const auto pos=line.find(" filament="); REQUIRE(pos!=std::string::npos);
+        emitted.insert(unsigned(std::stoul(line.substr(pos+10)))); ++actual_fibers;
+    }
+    CHECK(emitted==std::set<unsigned>{1,2});
+    CHECK(actual_fibers==expected_fibers);
+    std::error_code error; std::filesystem::remove(output,error);
+}
+
+TEST_CASE("nested masked groups preserve ordinary role materials and ordered branches", "[ContinuousFiber][fiber-mask]")
+{
+    auto config = masked_print_config();
+    for (const auto& [key, value] : std::vector<std::pair<std::string, std::string>>{
+        {"filament_map", "1,2,3,4"}, {"filament_colour", "#FFFFFF;#00FF00;#FF0000;#000000"},
+        {"flush_volumes_matrix", "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"},
+        {"filament_diameter", "1.75,1.75,1.75,1.75"}, {"nozzle_diameter", "0.4,0.4,0.4,0.4"},
+        {"filament_process_type", "thermoplastic;thermoplastic;thermoplastic;continuous_fiber"},
+        {"toolhead_process_capabilities", "thermoplastic;thermoplastic;thermoplastic;continuous_fiber"},
+        {"toolhead_fiber_protocol_id", ";;;linear-e-v1"}, {"physical_extruder_map", "0,1,2,3"},
+        {"toolhead_fiber_e_units_per_mm", "1,1,1,1"}, {"filament_fiber_feed_correction", "1,1,1,1"},
+        {"reinforced_infill_filament", "4"}, {"sparse_infill_filament_id", "1"},
+        {"internal_solid_filament_id", "2"}, {"top_surface_filament_id", "3"}})
+        config.set_deserialize_strict(key, value);
+    Model model;
+    auto* object = model.add_object();
+    object->add_volume(make_cube(60, 40, 2), ModelVolumeType::MODEL_PART, false);
+    auto mesh = make_cube(28, 24, 2);
+    mesh.translate(Vec3f(16, 8, 0));
+    auto* modifier = object->add_volume(std::move(mesh), ModelVolumeType::PARAMETER_MODIFIER, false);
+    modifier->config.set("fiber_mask_process", true);
+    object->add_instance()->set_offset(Vec3d(100, 100, 0));
+    Print print;
+    print.set_plate_origin(Vec3d::Zero());
+    print.is_BBL_printer() = false;
+    print.apply(model, config);
+    print.process();
+    Layer* selected = nullptr;
+    ExtrusionFiberPath* picked = nullptr;
+    std::function<void(ExtrusionEntityCollection&)> extract_one = [&](ExtrusionEntityCollection& group) {
+        for (auto it = group.entities.begin(); it != group.entities.end() && !picked;) {
+            if (auto* fiber = dynamic_cast<ExtrusionFiberPath*>(*it)) {
+                picked = fiber;
+                it = group.entities.erase(it);
+            } else if (auto* child = dynamic_cast<ExtrusionEntityCollection*>(*it)) {
+                extract_one(*child);
+                if (child->empty()) {
+                    delete child;
+                    it = group.entities.erase(it);
+                } else {
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
+    };
+    for (auto* layer : print.objects().front()->layers()) {
+        if (layer->id() != 3) continue;
+        for (auto* region : layer->regions()) extract_one(region->fills);
+        if (picked) selected = layer;
+    }
+    REQUIRE(selected);
+    auto mixed = std::make_unique<ExtrusionEntityCollection>();
+    auto ordered = std::make_unique<ExtrusionEntityCollection>();
+    ordered->no_sort = true;
+    ordered->set_reverse();
+    auto directed = std::make_unique<ExtrusionEntityCollection>();
+    directed->set_reverse(); // Independent of no_sort: this nested branch cannot reverse.
+    const auto add_path = [](ExtrusionEntityCollection& group, ExtrusionRole role,
+                             double x0, double y0, double x1, double y1) {
+        ExtrusionPath path(role, 0.08, 0.4f, 0.2f);
+        path.polyline = Polyline3(Polyline({Point::new_scale(x0, y0), Point::new_scale(x1, y1)}));
+        group.append(std::move(path));
+    };
+    // This order deliberately differs from geometric chaining order.
+    add_path(*ordered, erTopSolidInfill, 10, 12, 20, 12);
+    add_path(*ordered, erResinInfill, 10, 10, 20, 10);
+    add_path(*directed, erTopSolidInfill, 20, 11, 10, 11);
+    ordered->entities.push_back(directed.release());
+    ordered->entities.push_back(picked);
+    mixed->entities.push_back(ordered.release());
+    auto* owner = selected->regions().front();
+    owner->fills.entities.push_back(mixed.release());
+    const Vec2f emitted_origin = unscale(print.objects().front()->instances().front().shift).cast<float>();
+    auto& tools = const_cast<LayerTools&>(print.tool_ordering().tools_for_layer(selected->print_z));
+    CHECK_FALSE(tools.wiping_extrusions().is_overriddable(
+        *static_cast<const ExtrusionEntityCollection*>(owner->fills.entities.back()),
+        print.config(), *print.objects().front(), owner->region()));
+    // The old merge incorrectly chose tool 1; cover both its presence and absence.
+    const bool internal_tool_present = GENERATE(false, true);
+    const bool required_tool_missing = GENERATE(false, true);
+    tools.extruders = internal_tool_present ? std::vector<unsigned>{0, 1, 2, 3} : std::vector<unsigned>{0, 2, 3};
+    if (required_tool_missing)
+        tools.extruders.erase(std::find(tools.extruders.begin(), tools.extruders.end(), 2));
+    const auto output = std::filesystem::temp_directory_path() /
+        ("fiber-mask-role-materials-" + std::to_string(std::random_device{}()) + ".gcode");
+    GCodeProcessorResult result;
+    if (required_tool_missing) {
+        REQUIRE_THROWS_WITH(print.export_gcode(output.string(), &result),
+                            "Selected extrusion material is missing from layer tools");
+    } else {
+        REQUIRE_NOTHROW(print.export_gcode(output.string(), &result));
+        std::vector<Vec2f> top_endpoints;
+        std::size_t resin = 0, fibers = 0;
+        for (const auto& move : result.moves) {
+            if (std::abs(move.print_z - selected->print_z) > 1e-4) continue;
+            if (move.extrusion_role == erTopSolidInfill && move.type == EMoveType::Extrude) {
+                CHECK(move.extruder_id == 2);
+                // Native speed ramps can split a single straight path into
+                // several moves. Retain its final endpoint without assuming
+                // a particular number of ramp segments.
+                if (!top_endpoints.empty() && std::abs(top_endpoints.back().y() - move.position.y()) < 1e-4)
+                    top_endpoints.back() = move.position.head<2>();
+                else
+                    top_endpoints.emplace_back(move.position.head<2>());
+            } else if (move.extrusion_role == erResinInfill && move.type == EMoveType::Extrude &&
+                       std::abs(move.position.y() - (emitted_origin.y() + 10.0f)) < 1e-4) {
+                CHECK(move.extruder_id == 0);
+                ++resin;
+            } else if (move.deposition == ToolpathDeposition::ContinuousFiberPowered ||
+                       move.deposition == ToolpathDeposition::ContinuousFiberPassive) {
+                CHECK(move.extruder_id == 3);
+                ++fibers;
+            }
+        }
+        REQUIRE(top_endpoints.size() == 2);
+        INFO("first=" << top_endpoints[0].transpose() << " second=" << top_endpoints[1].transpose());
+        CHECK(top_endpoints[0].isApprox(emitted_origin + Vec2f(20, 12), 1e-5f));
+        CHECK(top_endpoints[1].isApprox(emitted_origin + Vec2f(10, 11), 1e-5f));
+        CHECK(resin > 0);
+        CHECK(fibers > 0);
+    }
+    std::error_code error;
+    std::filesystem::remove(output, error);
+    std::filesystem::remove(output.string() + ".tmp", error);
+}
+
+
+TEST_CASE("masked first-layer constraints use the native adopted subset", "[ContinuousFiber][fiber-mask][tool-order]")
+{
+    auto config = masked_print_config();
+    config.set_deserialize_strict("bottom_shell_layers", "0");
+    for (const auto& [key,value] : std::vector<std::pair<std::string,std::string>>{
+        {"filament_map", "1,2,1"}, {"filament_colour", "#FFFFFF;#000000;#FF0000"},
+        {"filament_diameter", "1.75,1.75,1.75"},
+        {"filament_process_type", "thermoplastic;continuous_fiber;thermoplastic"},
+        {"filament_fiber_feed_correction", "1,1,1"},
+        {"flush_volumes_matrix", "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"}})
+        config.set_deserialize_strict(key,value);
+    Model model;
+    auto* object=model.add_object();
+    object->add_volume(make_cube(60,40,2),ModelVolumeType::MODEL_PART,false);
+    auto mesh=make_cube(28,24,2); mesh.translate(Vec3f(16,8,0));
+    auto* modifier=object->add_volume(std::move(mesh),ModelVolumeType::PARAMETER_MODIFIER,false);
+    modifier->config.set("fiber_mask_process",true);
+    modifier->config.set("fiber_width",1.0);
+    object->add_instance()->set_offset(Vec3d(100,100,0));
+    Print print;
+    print.set_plate_origin(Vec3d::Zero()); print.is_BBL_printer()=false;
+    print.apply(model,config); print.process();
+    auto& full=const_cast<DynamicPrintConfig&>(print.full_print_config());
+    full.set_deserialize_strict("first_layer_print_sequence", "2,1");
+    ToolOrdering order(print,unsigned(-1));
+    REQUIRE_FALSE(order.empty());
+    // Exercise the existing full-layer native entry using one-based material
+    // IDs, including an automatically available third thermoplastic material.
+    for (auto& layer:order.layer_tools()) layer.extruders={1,2,3};
+    SECTION("two configured values do not sort a three-material first layer") {
+        order.handle_dontcare_extruder(unsigned(-1));
+        REQUIRE_NOTHROW(order.sort_and_build_data(print,unsigned(-1)));
+        CHECK(order.front().extruders.back()==1);
+    }
+    SECTION("an adopted fiber-before-resin subset is an explicit conflict") {
+        full.set_deserialize_strict("first_layer_print_sequence", "2,1,3");
+        order.handle_dontcare_extruder(unsigned(-1));
+        REQUIRE_THROWS_WITH(order.sort_and_build_data(print,unsigned(-1)),
+            "Explicit material order conflicts with masked resin-before-fiber execution");
+    }
+    SECTION("an appended unranked material is not an explicit conflict") {
+        full.set_deserialize_strict("first_layer_print_sequence", "2,9,8");
+        order.handle_dontcare_extruder(unsigned(-1));
+        REQUIRE_NOTHROW(order.sort_and_build_data(print,unsigned(-1)));
+        CHECK(order.front().extruders.back()==1);
+    }
+}
+
+TEST_CASE("masked flush statistics describe the published constrained sequences", "[ContinuousFiber][fiber-mask][tool-order]")
+{
+    auto config=masked_print_config();
+    config.set_deserialize_strict("single_extruder_multi_material","1");
+    config.set_deserialize_strict("purge_in_prime_tower","1");
+    config.set_deserialize_strict("flush_volumes_matrix","0,800,120,0,0,400,90,0");
+    config.set_deserialize_strict("filament_density","1.25,2.0");
+    config.set_deserialize_strict("flush_multiplier","1,1");
+    Model model;
+    auto* object=model.add_object();
+    object->add_volume(make_cube(60,40,2),ModelVolumeType::MODEL_PART,false);
+    auto mesh=make_cube(28,24,2); mesh.translate(Vec3f(16,8,0));
+    auto* modifier=object->add_volume(std::move(mesh),ModelVolumeType::PARAMETER_MODIFIER,false);
+    modifier->config.set("fiber_mask_process",true);
+    modifier->config.set("fiber_width",1.0);
+    object->add_instance()->set_offset(Vec3d(100,100,0));
+    Print print;
+    print.set_plate_origin(Vec3d::Zero()); print.is_BBL_printer()=false;
+    print.apply(model,config); print.process();
+    ToolOrdering order(print,unsigned(-1));
+    // Construction only collects native tools. Optimization/statistics require
+    // the same explicit sort entry that Print's normal pipeline calls.
+    order.sort_and_build_data(print,unsigned(-1));
+    std::set<coordf_t> resin_first_layers;
+    const std::function<bool(const ExtrusionEntity*)> needs_resin_first=[&](const ExtrusionEntity* entity) {
+        if(const auto* collection=dynamic_cast<const ExtrusionEntityCollection*>(entity))
+            return std::any_of(collection->entities.begin(),collection->entities.end(),needs_resin_first);
+        if(const auto* fiber=dynamic_cast<const ExtrusionFiberPath*>(entity)) {
+            const auto& boundary=fiber->prepared_path()->policy_boundary;
+            return boundary && boundary->requires_resin_first;
+        }
+        return false;
+    };
+    for(const auto* layer:print.objects().front()->layers())
+        for(const auto* region:layer->regions())
+            if(std::any_of(region->fills.entities.begin(),region->fills.entities.end(),needs_resin_first))
+                resin_first_layers.insert(layer->print_z);
+    REQUIRE_FALSE(resin_first_layers.empty());
+    const auto check_stats=[&] {
+        int last=-1, changes=0;
+        int volume_by_destination[2]={0,0};
+        for(const auto& layer:order) {
+            if(resin_first_layers.count(layer.print_z) && layer.extruders.size()==2)
+                CHECK(layer.extruders.back()==1);
+            for(const unsigned material:layer.extruders) {
+                REQUIRE(material<2);
+                if(last>=0 && unsigned(last)!=material) {
+                    ++changes;
+                    volume_by_destination[material]+=material==1?800:120;
+                }
+                last=int(material);
+            }
+        }
+        REQUIRE(changes>0);
+        const int weight=int(float(volume_by_destination[0])*.001f*1.25f+
+                             float(volume_by_destination[1])*.001f*2.0f);
+        const auto single=order.get_filament_change_stats(ToolOrdering::SingleExt);
+        CHECK(single.filament_change_count==changes);
+        CHECK(single.filament_flush_weight==weight);
+        for(const auto mode:{ToolOrdering::MultiExtCurr,ToolOrdering::MultiExtBest}) {
+            const auto separate=order.get_filament_change_stats(mode);
+            CHECK(separate.filament_change_count==0);
+            CHECK(separate.filament_flush_weight==0);
+        }
+    };
+    check_stats();
+    // A second optimization uses the same Print and must replace its stats.
+    order.sort_and_build_data(print,unsigned(-1));
+    check_stats();
+    auto& mutable_config=const_cast<PrintConfig&>(print.config());
+    // The prime-tower tool is absent from the initial solid first layer.
+    // Insertion forces the existing second reorder, which must republish stats.
+    REQUIRE_FALSE(order.front().has_extruder(1));
+    mutable_config.enable_prime_tower.value=true;
+    mutable_config.wipe_tower_filament.value=2;
+    order.sort_and_build_data(print,unsigned(-1));
+    REQUIRE(order.front().has_extruder(1));
+    check_stats();
+    // Mapping failure takes the existing early return, after policy constraints.
+    mutable_config.filament_map.values.clear();
+    for(auto& layer:order.layer_tools())
+        if(resin_first_layers.count(layer.print_z) && layer.extruders.size()==2)
+            layer.extruders={1,0};
+    REQUIRE_NOTHROW(order.sort_and_build_data(print,unsigned(-1)));
+    for(const auto& layer:order)
+        if(resin_first_layers.count(layer.print_z) && layer.extruders.size()==2)
+            CHECK(layer.extruders.back()==1);
+    for(const auto mode:{ToolOrdering::SingleExt,ToolOrdering::MultiExtCurr,ToolOrdering::MultiExtBest}) {
+        const auto empty=order.get_filament_change_stats(mode);
+        CHECK(empty.filament_change_count==0);
+        CHECK(empty.filament_flush_weight==0);
+    }
+    mutable_config.other_layers_print_sequence_nums.value=1;
+    mutable_config.other_layers_print_sequence.values={1,10,2,1};
+    REQUIRE_THROWS_WITH(order.sort_and_build_data(print,unsigned(-1)),
+        "Explicit material order conflicts with masked resin-before-fiber execution");
 }

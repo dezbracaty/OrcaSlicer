@@ -322,6 +322,8 @@ FiberRejectionReason finalization_reason(FiberFinalizationFailure failure)
     switch (failure) {
     case FiberFinalizationFailure::TooShort:
         return FiberRejectionReason::ProcessBudgetTooShort;
+    case FiberFinalizationFailure::PolicyBoundaryRejected:
+        return FiberRejectionReason::OutsideDomain;
     case FiberFinalizationFailure::OutsideDomain:
         return FiberRejectionReason::FinalizedPathOutsideDomain;
     case FiberFinalizationFailure::InvalidParameter:
@@ -507,7 +509,9 @@ FiberValidationResult FiberPathValidator::validate_impl(
     ExtrusionRole output_role,
     const FiberDomainId& domain_id,
     size_t job_ordinal, const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
-    const ExPolygons* physical_centerline_domain, bool collect_debug, bool requires_closed_loop, const std::vector<ContourArc>* source_arcs, double bend_stabilization_length_mm)
+    const ExPolygons* physical_centerline_domain, bool collect_debug, bool requires_closed_loop,
+    const std::vector<ContourArc>* source_arcs, double bend_stabilization_length_mm,
+    std::vector<FiberFragmentId>* policy_rejected)
 {
     FiberValidationResult result;
     result.output_role = output_role;
@@ -729,6 +733,8 @@ FiberValidationResult FiberPathValidator::validate_impl(
                     assignment.kind=FiberAssignmentKind::Rejected;
                     assignment.reason=finalization_reason(finalized.failure);
                     assignment.detail=finalized.detail;
+                    if (policy_rejected && finalized.failure == FiberFinalizationFailure::PolicyBoundaryRejected)
+                        policy_rejected->push_back(assignment.id);
                 } else {
                     assignment.prepared=finalized.prepared;
                     append_coverage(result,*assignment.prepared);
@@ -841,13 +847,15 @@ FiberValidationResult FiberPathValidator::validate_infill(
         ExtrusionPath path(erContinuousFiberInfill, config.infill_flow.mm3_per_mm(),
             config.infill_flow.width(), config.infill_flow.height());
         path.polyline = candidate.geometry;
+        std::vector<FiberFragmentId> policy_rejected;
         auto validated = validate_impl({&path}, allowed_domain, config, FiberPathPurpose::Infill,
             erContinuousFiberInfill, domain_id, i, &candidates.centerline_domain, nullptr, &comparison_domain,
-            false, false, &candidate.arcs);
+            false, false, &candidate.arcs, 0.0, &policy_rejected);
         for (const auto& assignment : validated.assignments)
             if (assignment.kind == FiberAssignmentKind::Rejected &&
                 assignment.reason != FiberRejectionReason::TooShort &&
-                assignment.reason != FiberRejectionReason::ProcessBudgetTooShort)
+                assignment.reason != FiberRejectionReason::ProcessBudgetTooShort &&
+                std::find(policy_rejected.begin(), policy_rejected.end(), assignment.id) == policy_rejected.end())
                 throw std::runtime_error(std::string("Generated fiber infill failed preparation: ") +
                     fiber_rejection_reason_name(assignment.reason) + "; " + assignment.detail);
         merge_validation(result, std::move(validated));
