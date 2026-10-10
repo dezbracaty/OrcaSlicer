@@ -441,10 +441,10 @@ struct DashesParam{
     }
 };
 
-Polylines to_dashes(const Polyline &polyline, const DashesParam& param)
+Polylines to_dashes(const Slic3r::Polyline &polyline, const DashesParam& param)
 {
     Polylines dashes;
-    Polyline dash; // cache for one dash in dashed line
+    Slic3r::Polyline dash; // cache for one dash in dashed line
     Point prev_point;        
     
     bool is_line = param.is_line;
@@ -531,9 +531,9 @@ HealedExPolygons stroke_to_expolygons(const LinesPath &lines_path, const NSVGsha
     if (shape.strokeDashCount > 0) {
         DashesParam params(shape, param.scale);
         Polylines dashes;
-        for (const Polyline &polyline : lines_path.polylines)
+        for (const Slic3r::Polyline &polyline : lines_path.polylines)
             polylines_append(dashes, to_dashes(polyline, params));
-        for (const Polygon &polygon : lines_path.polygons)
+        for (const Slic3r::Polygon &polygon : lines_path.polygons)
             polylines_append(dashes, to_dashes(to_polyline(polygon), params));
         result = offset(dashes, stroke_width / 2, join_type, mitter, end_type);
     } else {
