@@ -2038,6 +2038,11 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 {
     m_has_fiber_execution = false;
     m_fiber_path_occurrence = 0;
+    m_fiber_pa_zero_established = false;
+    m_fiber_first_approach_pending = true;
+    const double approach_speed = print->config().fiber_toolchange_approach_speed.value;
+    if (!std::isfinite(approach_speed) || approach_speed < 0)
+        throw std::runtime_error("Fiber first approach speed must be finite and non-negative (mm/s)");
     // Whole-plan validation before export/writer state is touched. Rejected
     // geometry was already returned to ResinRemaining by the layer planner.
     bool has_fiber = false;
@@ -2045,6 +2050,12 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         if (const auto* fiber = dynamic_cast<const ExtrusionFiberPath*>(&entity)) {
             fiber->validate_derived_view();
             const auto tool = resolve_fiber_tool(print->config(), fiber->prepared_path()->logical_filament_id);
+            if (print->config().toolhead_fiber_protocol_id.values[tool.physical_tool_id] == "cfsys-v1" &&
+                print->config().enable_pressure_advance.get_at(tool.logical_filament_id) &&
+                print->config().pressure_advance.get_at(tool.logical_filament_id) != 0.0)
+                throw std::runtime_error("CFSYS fiber requires pressure_advance=0 for used filament " +
+                    std::to_string(tool.logical_filament_id) + " on physical tool " +
+                    std::to_string(tool.physical_tool_id));
             const auto bound = bind_fiber_execution(fiber->prepared_path(), tool.logical_filament_id,
                 tool.logical_extruder_id, tool.physical_tool_id, tool.e_units_per_mm,
                 print->config().fiber_cut_gcode.value);
@@ -6341,6 +6352,22 @@ std::string GCode::extrude_path(const ExtrusionPath& path, const std::string& de
     return gcode;
 }
 
+std::string GCode::ensure_fiber_pressure_advance_zero()
+{
+    if (m_fiber_pa_zero_established || !m_writer.filament())
+        return {};
+    const auto tool = resolve_fiber_tool(m_config, m_writer.filament()->id());
+    if (m_config.toolhead_fiber_protocol_id.values[tool.physical_tool_id] != "cfsys-v1")
+        return {};
+    // SET_PRESSURE_ADVANCE targets Klipper's active hotend. The CFSYS T1
+    // macro must activate the bound fiber extruder before this command.
+    std::string gcode = m_writer.set_pressure_advance(0.0);
+    if (m_pa_processor)
+        m_pa_processor->resetPreviousPA(0.0);
+    m_fiber_pa_zero_established = true;
+    return gcode;
+}
+
 std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::string& description, double /*speed*/)
 {
     if (!m_writer.filament())
@@ -6462,6 +6489,8 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     gcode += ";TYPE:" + std::string(path.display_purpose() == FiberPathPurpose::Contour ?
         "Continuous fiber contour" : "Continuous fiber infill") + "\n";
     const FiberStartProcedure& start = prepared.start_procedure;
+    // Also covers an initial fiber tool already selected before set_extruder().
+    gcode += ensure_fiber_pressure_advance_zero();
     gcode += m_writer.set_print_acceleration(unsigned(std::lround(prepared.acceleration_mm_s2)));
     gcode += m_writer.set_travel_acceleration(unsigned(std::lround(prepared.acceleration_mm_s2)));
     for (const auto& action : prepared.actions) {
@@ -6469,10 +6498,16 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
         case FiberActionType::Begin:
             break; // occurrence metadata emitted above; validated first action
         case FiberActionType::Approach: {
+            const std::optional<double> speed_limit = m_fiber_first_approach_pending &&
+                m_config.fiber_toolchange_approach_speed.value > 0 ?
+                std::optional<double>(m_config.fiber_toolchange_approach_speed.value) : std::nullopt;
+            // Consume even when already at the start; the next path is not
+            // the first process segment of this tool activation.
+            m_fiber_first_approach_pending = false;
             gcode += m_writer.unlift();
             const Point first = prepared.spans.front().geometry.points.front().to_point();
             if (!m_last_pos_defined || m_last_pos.to_point() != first || m_need_change_layer_lift_z)
-                gcode += travel_to(first, path.role(), "move to first continuous fiber point");
+                gcode += travel_to(first, path.role(), "move to first continuous fiber point", DBL_MAX, speed_limit);
             gcode += m_writer.unlift();
             if (GCodeFormatter::quantize_xyzf(m_writer.get_position().z()) != GCodeFormatter::quantize_xyzf(m_nominal_z))
                 gcode += m_writer.travel_to_z(m_nominal_z, "continuous fiber layer Z", true);
@@ -7825,7 +7860,8 @@ std::string GCode::_encode_label_ids_to_base64(std::vector<size_t> ids)
 }
 
 // This method accepts &point in print coordinates.
-std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string comment, double z/* = DBL_MAX*/)
+std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string comment, double z/* = DBL_MAX*/,
+                            std::optional<double> speed_limit_mm_s)
 {
     /*  Define the travel move as a line between current position and the taget point.
         This is expressed in print coordinates, so it will need to be translated by
@@ -7950,14 +7986,14 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
         if (false/*m_spiral_vase*/) {
             // No lazy z lift for spiral vase mode
             for (size_t i = 1; i < travel.size(); ++i) {
-                gcode += m_writer.travel_to_xy(this->point_to_gcode(travel.points[i]), comment);
+                gcode += m_writer.travel_to_xy(this->point_to_gcode(travel.points[i]), comment, speed_limit_mm_s);
             }
         } else {
             if (travel.size() == 2) {
                 // No extra movements emitted by avoid_crossing_perimeters, simply move to the end point with z change
                 const auto& dest2d = this->point_to_gcode(travel.points.back());
                 Vec3d dest3d(dest2d(0), dest2d(1), z == DBL_MAX ? m_nominal_z : z);
-                gcode += m_writer.travel_to_xyz(dest3d, comment, m_need_change_layer_lift_z);
+                gcode += m_writer.travel_to_xyz(dest3d, comment, m_need_change_layer_lift_z, speed_limit_mm_s);
                 m_need_change_layer_lift_z = false;
             } else {
                 // Extra movements emitted by avoid_crossing_perimeters, lift the z to normal height at the beginning, then apply the z
@@ -7967,16 +8003,16 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
                         // Lift to normal z at beginning
                         Vec2d dest2d = this->point_to_gcode(travel.points[i]);
                         Vec3d dest3d(dest2d(0), dest2d(1), m_nominal_z);
-                        gcode += m_writer.travel_to_xyz(dest3d, comment, m_need_change_layer_lift_z);
+                        gcode += m_writer.travel_to_xyz(dest3d, comment, m_need_change_layer_lift_z, speed_limit_mm_s);
                         m_need_change_layer_lift_z = false;
                     } else if (z != DBL_MAX && i == travel.size() - 1) {
                         // Apply z_ratio for the very last point
                         Vec2d dest2d = this->point_to_gcode(travel.points[i]);
                         Vec3d dest3d(dest2d(0), dest2d(1), z);
-                        gcode += m_writer.travel_to_xyz(dest3d, comment);
+                        gcode += m_writer.travel_to_xyz(dest3d, comment, false, speed_limit_mm_s);
                     } else {
                         // For all points in between, no z change
-                        gcode += m_writer.travel_to_xy(this->point_to_gcode(travel.points[i]), comment);
+                        gcode += m_writer.travel_to_xy(this->point_to_gcode(travel.points[i]), comment, speed_limit_mm_s);
                     }
                 }
             }
@@ -8214,9 +8250,13 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
             gcode += m_writer.travel_to_z_for_toolchange(original_z + m_config.toolchange_z_lift.value, m_config.printable_height.value);
         if (by_object) m_writer.add_object_change_labels(gcode);
         gcode += m_writer.toolchange(new_filament_id);
+        m_fiber_pa_zero_established = false;
+        m_fiber_first_approach_pending = destination_fiber;
         placeholder_parser().set("current_extruder", new_filament_id);
         placeholder_parser().set("current_hotend", hotend_id_for_gcode_placeholder(m_config, new_extruder_id));
         if (m_ooze_prevention.enable) gcode += m_ooze_prevention.post_toolchange(*this);
+        if (destination_fiber)
+            gcode += ensure_fiber_pressure_advance_zero();
         if (!destination_fiber && m_config.enable_pressure_advance.get_at(new_filament_id)) {
             gcode += m_writer.set_pressure_advance(m_config.pressure_advance.get_at(new_filament_id));
             m_pa_processor->resetPreviousPA(m_config.pressure_advance.get_at(new_filament_id));

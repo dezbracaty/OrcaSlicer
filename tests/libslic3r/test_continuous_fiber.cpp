@@ -19,6 +19,7 @@
 #include <nlopt.hpp>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 
 using namespace Slic3r;
 
@@ -917,6 +918,124 @@ TEST_CASE("CFSYS toolchange clearance preserves existing and pending travel lift
     writer.set_position(Vec3d(100, 100, 500));
     CHECK_THROWS(writer.travel_to_z_for_toolchange(510, 508));
     CHECK(writer.get_position().z() == 500);
+}
+
+TEST_CASE("per-call travel limits cover XY XYZ lifts and belt motion", "[ContinuousFiber][fiber-approach][writer]")
+{
+    const int branch = GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8);
+    const auto move = [&](std::optional<double> cap, double baseline = 350.0) {
+        PrintConfig config;
+        config.travel_speed.value = baseline;
+        config.travel_speed_z.value = 120;
+        config.z_hop.values = {2};
+        config.travel_slope.values = {30};
+        config.enable_arc_fitting.value = branch == 6;
+        GCodeWriter writer;
+        writer.apply_print_config(config);
+        writer.set_extruders({0});
+        writer.toolchange(0);
+        writer.set_is_first_layer(false);
+        writer.set_position(Vec3d(100, 100, 5));
+        writer.set_current_position_clear(branch != 3);
+        if (branch == 0) return writer.travel_to_xy(Vec2d(110, 100), "approach", cap);
+        if (branch == 1) return writer.travel_to_xyz(Vec3d(110, 100, 5), "approach", false, cap);
+        if (branch == 2 || branch == 3)
+            return writer.travel_to_xyz(Vec3d(110, 100, 6), "approach", true, cap);
+        if (branch == 8) {
+            const auto belt = BeltCoordinateSystem::create(45, 250);
+            writer.set_belt_coordinate_system(&belt);
+            return writer.travel_to_xyz(Vec3d(110, 105, 6), "approach", true, cap);
+        }
+        writer.lazy_lift(branch == 4 ? LiftType::NormalLift : branch == 5 ?
+            LiftType::SlopeLift : LiftType::SpiralLift);
+        return writer.travel_to_xyz(Vec3d(140, 100, 5), "approach", false, cap);
+    };
+    CHECK(move(std::nullopt) == move(0.0));
+    const auto gcode = move(60.0);
+    INFO(gcode);
+    std::istringstream lines(gcode);
+    std::string line;
+    double feedrate = 0;
+    size_t capped_moves = 0;
+    const std::regex f("(?:^| )F([0-9.]+)");
+    std::smatch match;
+    while (std::getline(lines, line)) {
+        line = line.substr(0, line.find(';'));
+        if (line.rfind("G1 ", 0) != 0 && line.rfind("G2 ", 0) != 0 && line.rfind("G3 ", 0) != 0)
+            continue;
+        if (std::regex_search(line, match, f)) feedrate = std::stod(match[1]);
+        if (line.find('X') != std::string::npos || line.find('Y') != std::string::npos ||
+            line.find("G3") == 0 || line.find("G2") == 0) {
+            CHECK(feedrate > 0);
+            CHECK(feedrate <= 3600);
+            ++capped_moves;
+        } else if (line.find('Z') != std::string::npos) {
+            CHECK(feedrate == Catch::Approx(7200));
+        }
+    }
+    CHECK(capped_moves > 0);
+    if (branch <= 2 || branch == 8) {
+        const auto slower = move(60.0, 40.0);
+        CHECK(slower.find("F2400") != std::string::npos);
+        CHECK(slower.find("F3600") == std::string::npos);
+    }
+}
+
+TEST_CASE("travel caps preserve pure Z and legacy first-layer speed choices", "[ContinuousFiber][fiber-approach][writer]")
+{
+    PrintConfig config;
+    config.travel_speed.value = 350;
+    config.travel_speed_z.value = 120;
+    config.initial_layer_travel_speed = ConfigOptionFloatOrPercent(40, false);
+    GCodeWriter writer;
+    writer.apply_print_config(config);
+    writer.set_position(Vec3d(100, 100, 5));
+    writer.set_current_position_clear(true);
+    CHECK(writer.travel_to_xy(Vec2d(110, 100), "", 60).find("F2400") != std::string::npos);
+    // The old final XYZ branch uses travel_speed rather than first-layer speed.
+    CHECK(writer.travel_to_xyz(Vec3d(120, 100, 6), "", true, 60).find("F3600") != std::string::npos);
+    CHECK(writer.travel_to_xyz(Vec3d(120, 100, 7), "", true, 60).find("F21000") != std::string::npos);
+    CHECK(writer.travel_to_z(8, "", true).find("F7200") != std::string::npos);
+    CHECK_THROWS(writer.travel_to_xy(Vec2d(130, 100), "", -1));
+    CHECK_THROWS(writer.travel_to_xy(Vec2d(140, 100), "", std::numeric_limits<double>::infinity()));
+}
+
+TEST_CASE("CFSYS fiber activation establishes zero PA after tool selection", "[ContinuousFiber][fiber-approach][cfsys]")
+{
+    PrintConfig config;
+    config.gcode_flavor.value = gcfKlipper;
+    config.single_extruder_multi_material.value = false;
+    config.filament_process_type.values = {"thermoplastic", "continuous_fiber"};
+    config.filament_map.values = {1, 2};
+    config.physical_extruder_map.values = {0, 1};
+    config.toolhead_process_capabilities.values = {"thermoplastic", "continuous_fiber"};
+    config.toolhead_fiber_protocol_id.values = {"", "cfsys-v1"};
+    config.toolhead_fiber_e_units_per_mm.values = {1, 1};
+    config.enable_pressure_advance.values = {false, false};
+    config.change_filament_gcode.value.clear();
+    config.filament_start_gcode.values = {"", ""};
+    config.filament_end_gcode.values = {"", ""};
+    GCode generator;
+    generator.apply_print_config(config);
+    generator.writer().set_extruders({0, 1});
+    generator.writer().toolchange(0);
+    const auto first = generator.set_extruder(1, 0.2);
+    INFO(first);
+    const auto t1 = first.find("T1");
+    const auto pa = first.find("SET_PRESSURE_ADVANCE ADVANCE=0");
+    REQUIRE(t1 != std::string::npos);
+    REQUIRE(pa != std::string::npos);
+    CHECK(t1 < pa);
+    CHECK(generator.set_extruder(1, 0.4).empty());
+    CHECK(generator.set_extruder(0, 0.4).find("SET_PRESSURE_ADVANCE") == std::string::npos);
+    CHECK(generator.set_extruder(1, 0.4).find("SET_PRESSURE_ADVANCE ADVANCE=0") != std::string::npos);
+
+    config.toolhead_fiber_protocol_id.values[1] = "linear-e-v1";
+    GCode other_protocol;
+    other_protocol.apply_print_config(config);
+    other_protocol.writer().set_extruders({0, 1});
+    other_protocol.writer().toolchange(0);
+    CHECK(other_protocol.set_extruder(1, 0.2).find("SET_PRESSURE_ADVANCE") == std::string::npos);
 }
 
 TEST_CASE("default fan configuration preserves all legacy firmware formats", "[ContinuousFiber][cooling][compatibility]")
@@ -3800,6 +3919,166 @@ DynamicPrintConfig masked_print_config()
             config.set_deserialize_strict(key, "");
     return config;
 }
+}
+
+TEST_CASE("CFSYS final export limits only first approaches and restores material PA", "[ContinuousFiber][fiber-approach][cfsys]")
+{
+    auto config = masked_print_config();
+    for (const auto& [key, value] : std::vector<std::pair<std::string, std::string>>{
+        {"gcode_flavor", "klipper"}, {"toolhead_fiber_protocol_id", ";cfsys-v1"},
+        {"fiber_cut_gcode", "M400\nS0\nM400\n"}, {"travel_speed", "350"},
+        {"enable_pressure_advance", "1,1"}, {"pressure_advance", "0.05,0"},
+        {"fiber_layer_height_ratio", "1"}, {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
+        {"fiber_toolchange_approach_speed", "0"}})
+        config.set_deserialize_strict(key, value);
+    Model model;
+    auto* object = model.add_object();
+    object->add_volume(make_cube(60, 40, 2), ModelVolumeType::MODEL_PART, false);
+    object->add_instance()->set_offset(Vec3d(100, 100, 0));
+    Print print;
+    print.set_plate_origin(Vec3d::Zero());
+    print.is_BBL_printer() = false;
+    print.apply(model, config);
+    print.process();
+    const auto output = std::filesystem::temp_directory_path() /
+        ("fiber-approach-" + std::to_string(std::random_device{}()) + ".gcode");
+    GCode generator; // Reuse the same exporter across all effective settings.
+    GCodeProcessorResult result;
+    size_t baseline_paths = 0;
+    const std::regex feed("(?:^| )F([0-9.]+)");
+    const std::regex advance("ADVANCE=([0-9.]+)");
+    for (const double cap : {0.0, 60.0, 40.0}) {
+        config.set_deserialize_strict("fiber_toolchange_approach_speed", std::to_string(cap));
+        print.apply(model, config);
+        // A speed-only change must leave planning and simplification complete.
+        for (const auto* planned : print.objects()) {
+            CHECK(planned->is_step_done(posInfill));
+            CHECK(planned->is_step_done(posSimplifyInfill));
+        }
+        print.set_gcode_file_invalidated();
+        REQUIRE_NOTHROW(generator.do_export(&print, output.string().c_str(), &result));
+        std::ifstream input(output);
+        REQUIRE(input.good());
+        std::string line;
+        std::smatch match;
+        int tool = -1;
+        double pa = -1, f = 0;
+        size_t paths = 0, activations = 0, zeros = 0;
+        bool first_pending = false, first_approach = false, in_approach = false;
+        bool saw_fast_later = false, saw_restore = false;
+        while (std::getline(input, line)) {
+            if (line == "T1" || line.find("T1 ;") == 0) {
+                if (tool != 1) { ++activations; first_pending = true; pa = -1; }
+                tool = 1;
+            } else if (line == "T0" || line.find("T0 ;") == 0) {
+                tool = 0;
+            }
+            if (line.find("SET_PRESSURE_ADVANCE ") == 0 && std::regex_search(line, match, advance)) {
+                pa = std::stod(match[1]);
+                if (tool == 1) { CHECK(pa == 0); ++zeros; }
+                if (tool == 0 && pa == Catch::Approx(0.05)) saw_restore = true;
+            }
+            if (line.find(";FIBER_BEGIN ") == 0) {
+                REQUIRE(tool == 1);
+                CHECK(pa == 0);
+                ++paths;
+                first_approach = first_pending;
+                first_pending = false;
+                in_approach = true;
+            }
+            if (std::regex_search(line, match, feed)) f = std::stod(match[1]);
+            if (in_approach && line.find("G1 ") == 0 &&
+                (line.find('X') != std::string::npos || line.find('Y') != std::string::npos)) {
+                if (first_approach && cap > 0) CHECK(f <= cap * 60.0);
+                if (!first_approach && f > 3600) saw_fast_later = true;
+            }
+            if (line == ";FIBER_PREFEED_BEGIN") { CHECK(pa == 0); in_approach = false; }
+        }
+        REQUIRE(paths > 0);
+        CHECK(zeros == activations);
+        CHECK(saw_restore);
+        CHECK(saw_fast_later);
+        if (cap == 0) baseline_paths = paths;
+        else CHECK(paths == baseline_paths);
+    }
+    // End a resin path exactly at the first fiber start. The first Approach
+    // then has no XY command, but must still consume the activation limit.
+    std::unique_ptr<ExtrusionEntity> first_fiber;
+    Layer* first_fiber_layer = nullptr;
+    std::function<void(const ExtrusionEntity*)> find_first = [&](const ExtrusionEntity* entity) {
+        if (first_fiber) return;
+        if (const auto* collection = dynamic_cast<const ExtrusionEntityCollection*>(entity)) {
+            for (const auto* child : collection->entities) find_first(child);
+        } else if (dynamic_cast<const ExtrusionFiberPath*>(entity)) {
+            first_fiber.reset(entity->clone());
+        }
+    };
+    for (auto* layer : print.objects().front()->layers()) {
+        for (const auto* region : layer->regions()) find_first(&region->fills);
+        if (first_fiber) { first_fiber_layer = layer; break; }
+    }
+    REQUIRE(first_fiber_layer);
+    config.set_deserialize_strict("fiber_toolchange_approach_speed", "60");
+    print.apply(model, config);
+    for (auto* region : first_fiber_layer->regions()) {
+        region->perimeters.clear();
+        region->fills.clear();
+    }
+    auto* ordered = new ExtrusionEntityCollection;
+    ordered->no_sort = true;
+    auto* resin = new ExtrusionPath(erResinInfill, 0.08, 0.4f, 0.2f);
+    const Point start = first_fiber->first_point();
+    resin->polyline.points = {
+        Point3(int64_t(start.x() - scale_(1.0)), int64_t(start.y()), int64_t(0)),
+        Point3(int64_t(start.x()), int64_t(start.y()), int64_t(0))};
+    ordered->entities = {resin, first_fiber->clone(), first_fiber->clone()};
+    first_fiber_layer->regions().front()->fills.entities.push_back(ordered);
+    print.set_gcode_file_invalidated();
+    REQUIRE_NOTHROW(generator.do_export(&print, output.string().c_str(), &result));
+    {
+        std::ifstream input(output);
+        std::string line;
+        std::smatch match;
+        size_t paths = 0;
+        bool in_approach = false, second_moves = false;
+        double f = 0;
+        while (std::getline(input, line)) {
+            if (line.find(";FIBER_BEGIN ") == 0) { ++paths; in_approach = true; }
+            if (std::regex_search(line, match, feed)) f = std::stod(match[1]);
+            if (in_approach && line.find("G1 ") == 0 &&
+                (line.find('X') != std::string::npos || line.find('Y') != std::string::npos)) {
+                CHECK(paths != 1);
+                if (paths == 2) { CHECK(f == Catch::Approx(21000)); second_moves = true; }
+            }
+            if (line == ";FIBER_PREFEED_BEGIN") in_approach = false;
+            if (paths == 2 && line == ";FIBER_PREFEED_BEGIN") break;
+        }
+        REQUIRE(paths == 2);
+        CHECK(second_moves);
+    }
+    config.set_deserialize_strict("pressure_advance", "0.05,0.2");
+    print.apply(model, config);
+    print.set_gcode_file_invalidated();
+    REQUIRE_THROWS_WITH(generator.do_export(&print, output.string().c_str(), &result),
+        "CFSYS fiber requires pressure_advance=0 for used filament 1 on physical tool 1");
+    // A disabled setting with a saved nonzero value must not block export.
+    config.set_deserialize_strict("enable_pressure_advance", "1,0");
+    print.apply(model, config);
+    print.set_gcode_file_invalidated();
+    REQUIRE_NOTHROW(generator.do_export(&print, output.string().c_str(), &result));
+    // Nonzero enabled PA on an inventory slot that is never used for fiber
+    // must not be rejected by the whole-plan preflight.
+    config.set_deserialize_strict("enable_pressure_advance", "1,1");
+    config.set_deserialize_strict("generate_reinforced_infills", "0");
+    print.apply(model, config);
+    print.process();
+    print.set_gcode_file_invalidated();
+    REQUIRE_NOTHROW(generator.do_export(&print, output.string().c_str(), &result));
+    std::ifstream resin_only(output);
+    const std::string resin_gcode((std::istreambuf_iterator<char>(resin_only)), {});
+    CHECK(resin_gcode.find(";FIBER_BEGIN ") == std::string::npos);
+    std::error_code error;
+    std::filesystem::remove(output, error);
 }
 
 TEST_CASE("resin-only SDK provenance preserves native bridge surface classification", "[ContinuousFiber][fiber-mask]")

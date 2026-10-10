@@ -81,8 +81,11 @@ public:
     std::string set_speed(double F, const std::string &comment = std::string(), const std::string &cooling_marker = std::string());
     // SoftFever NOTE: the returned speed is mm/minute
     double      get_current_speed() const { return m_current_speed;}
-    std::string travel_to_xy(const Vec2d &point, const std::string &comment = std::string());
-    std::string travel_to_xyz(const Vec3d &point, const std::string &comment = std::string(), bool force_z = false);
+    // A per-call cap in mm/s; zero or no cap preserves the normal travel speed.
+    std::string travel_to_xy(const Vec2d &point, const std::string &comment = std::string(),
+                             std::optional<double> speed_limit_mm_s = std::nullopt);
+    std::string travel_to_xyz(const Vec3d &point, const std::string &comment = std::string(), bool force_z = false,
+                              std::optional<double> speed_limit_mm_s = std::nullopt);
     std::string travel_to_z(double z, const std::string &comment = std::string(), bool force = false);
     bool        will_move_z(double z) const;
     std::string extrude_to_xy(const Vec2d &point, double dE, const std::string &comment = std::string(), bool force_no_extrusion = false);
@@ -202,7 +205,8 @@ public:
     };
 
     std::string _travel_to_z(double z, const std::string &comment);
-    std::string _spiral_travel_to_z(double z, const Vec2d &ij_offset, const std::string &comment);
+    std::string _spiral_travel_to_z(double z, const Vec2d &ij_offset, const std::string &comment,
+                                   std::optional<double> speed_limit_mm_s = std::nullopt);
     std::string _retract(double length, double restart_extra, const std::string &comment);
     std::string set_acceleration_internal(Acceleration type, unsigned int acceleration);
     Vec3d       machine_position(const Vec3d &oriented_position) const;

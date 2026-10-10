@@ -1361,6 +1361,7 @@ PRINT_CONFIG_CLASS_DEFINE(
 PRINT_CONFIG_CLASS_DEFINE(
     GCodeConfig,
 
+    ((ConfigOptionFloat,               fiber_toolchange_approach_speed))
     ((ConfigOptionFloat,               fiber_cut_to_contact_length))
     ((ConfigOptionString,              fiber_cut_gcode))
     ((ConfigOptionString,              before_layer_change_gcode))

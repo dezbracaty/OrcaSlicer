@@ -1170,6 +1170,16 @@ void PrintConfigDef::init_fff_params()
     def->ratio_over = "default_acceleration";
     def->set_default_value(new ConfigOptionFloatOrPercent(100., true));
 
+    def = this->add("fiber_toolchange_approach_speed", coFloat);
+    def->label = L("Fiber first approach speed limit");
+    def->tooltip = L("Maximum speed of XY travel in the first fiber approach after activating the fiber tool. "
+                     "Use a finite, non-negative value. Zero inherits the normal travel speed. "
+                     "Later approaches with the same active tool are not limited by this setting.");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
     def = this->add("fiber_cut_to_contact_length", coFloat);
     def->label = L("Fiber cutter to contact distance");
     def->category = L("Continuous fiber");

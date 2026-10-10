@@ -221,6 +221,7 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
     } else if (item.key == "fiber_contour_infill_clearance") {
         item.enabled = contour_enabled && infill_enabled && !concentric;
     } else if (key_is(item.key, {"fiber_width", "fiber_layer_height_ratio",
+                                 "fiber_toolchange_approach_speed",
                                  "fiber_fill_debug",
                                  "fiber_minimum_path_length",
                                  "fiber_minimum_effective_length",
@@ -466,6 +467,12 @@ SettingsResult Config::apply_patch(ConfigScope scope,
                 return failure(key, "Configuration option is read-only");
             }
 
+            if (key == "fiber_toolchange_approach_speed") {
+                std::istringstream input(serialized_value);
+                double speed = 0.0;
+                if (!(input >> speed) || !(input >> std::ws).eof() || !std::isfinite(speed) || speed < 0)
+                    return failure(key, "Fiber first approach speed must be a finite, non-negative number in mm/s");
+            }
             if (key == "fiber_width") {
                 // Scalar float deserialization accepts trailing text; fiber width must be millimeters.
                 std::istringstream input(serialized_value);

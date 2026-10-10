@@ -19,6 +19,15 @@
 
 namespace Slic3r {
 
+namespace {
+double limited_travel_speed(double speed, std::optional<double> limit, bool has_xy_motion = true)
+{
+    if (limit && (!std::isfinite(*limit) || *limit < 0))
+        throw std::invalid_argument("Travel speed limit must be finite and non-negative (mm/s)");
+    return has_xy_motion && limit && *limit > 0 ? std::min(speed, *limit) : speed;
+}
+}
+
 bool GCodeWriter::full_gcode_comment = true;
 
 bool GCodeWriter::supports_separate_travel_acceleration(GCodeFlavor flavor)
@@ -628,8 +637,11 @@ std::string GCodeWriter::set_speed(double F, const std::string &comment, const s
     return w.string();
 }
 
-std::string GCodeWriter::travel_to_xy(const Vec2d &point, const std::string &comment)
+std::string GCodeWriter::travel_to_xy(const Vec2d &point, const std::string &comment,
+                                     std::optional<double> speed_limit_mm_s)
 {
+    const Vec3d previous_machine = machine_position(m_pos);
+    const bool position_unknown = !this->is_current_position_clear();
     m_pos(0) = point(0);
     m_pos(1) = point(1);
 
@@ -641,6 +653,8 @@ std::string GCodeWriter::travel_to_xy(const Vec2d &point, const std::string &com
     w.emit_xy(machine.head<2>());
     auto speed = m_is_first_layer
         ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value;
+    speed = limited_travel_speed(speed, speed_limit_mm_s,
+        position_unknown || (machine.head<2>() - previous_machine.head<2>()).squaredNorm() > 0);
     w.emit_f(speed * 60.0);
     //BBS
     w.emit_comment(GCodeWriter::full_gcode_comment, comment);
@@ -739,7 +753,8 @@ std::string GCodeWriter::travel_to_z_for_toolchange(double target_z, double maxi
     return _travel_to_z(target_z, target_z > m_pos.z() ? "toolchange clearance" : "restore Z after toolchange");
 }
 
-std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &comment, bool force_z)
+std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &comment, bool force_z,
+                                      std::optional<double> speed_limit_mm_s)
 {
     // FIXME: This function was not being used when travel_speed_z was separated (bd6badf).
     // Calculation of feedrate was not updated accordingly. If you want to use
@@ -754,6 +769,9 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
     Vec3d dest_point = point;
     auto travel_speed =
         m_is_first_layer ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value;
+    const bool has_xy_motion = !this->is_current_position_clear() ||
+        (machine_position(point).head<2>() - machine_position(m_pos).head<2>()).squaredNorm() > 0;
+    travel_speed = limited_travel_speed(travel_speed, speed_limit_mm_s, has_xy_motion);
 
     // Belt profiles disable Z hop. In belt mode the internal position remains in
     // the oriented slicing frame; only the coordinates emitted to G-code are
@@ -798,7 +816,7 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
                 double radius = delta(2) / (2 * PI * atan(this->filament()->travel_slope()));
                 Vec2d ij_offset = radius * delta_no_z.normalized();
                 ij_offset = { -ij_offset(1), ij_offset(0) };
-                slop_move = this->_spiral_travel_to_z(target(2), ij_offset, "spiral lift Z");
+                slop_move = this->_spiral_travel_to_z(target(2), ij_offset, "spiral lift Z", speed_limit_mm_s);
             }
             //BBS: SlopeLift
             else if (m_to_lift_type == LiftType::SlopeLift &&
@@ -849,8 +867,7 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
         if (std::abs(m_lifted) < EPSILON)
             m_lifted = 0.;
         //BBS
-        this->set_current_position_clear(true);
-        return this->travel_to_xy(to_2d(point));
+        return this->travel_to_xy(to_2d(point), std::string(), speed_limit_mm_s);
     }
     else {
         /*  In all the other cases, we perform an actual XYZ move and cancel
@@ -866,13 +883,13 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
     {
         //force to move xy first then z after filament change
         w.emit_xy(Vec2d(point_on_plate.x(), point_on_plate.y()));
-        w.emit_f(this->config.travel_speed.value * 60.0);
+        w.emit_f(limited_travel_speed(this->config.travel_speed.value, speed_limit_mm_s, has_xy_motion) * 60.0);
         w.emit_comment(GCodeWriter::full_gcode_comment, comment);
         out_string = w.string() + _travel_to_z(point_on_plate.z(), comment);
     } else {
         GCodeG1Formatter w;
         w.emit_xyz(point_on_plate);
-        w.emit_f(this->config.travel_speed.value * 60.0);
+        w.emit_f(limited_travel_speed(this->config.travel_speed.value, speed_limit_mm_s, has_xy_motion) * 60.0);
         w.emit_comment(GCodeWriter::full_gcode_comment, comment);
         out_string = w.string();
     }
@@ -925,7 +942,8 @@ std::string GCodeWriter::_travel_to_z(double z, const std::string &comment)
     return w.string();
 }
 
-std::string GCodeWriter::_spiral_travel_to_z(double z, const Vec2d &ij_offset, const std::string &comment)
+std::string GCodeWriter::_spiral_travel_to_z(double z, const Vec2d &ij_offset, const std::string &comment,
+                                          std::optional<double> speed_limit_mm_s)
 {
     std::string output;
     double speed = this->config.travel_speed_z.value;
@@ -934,6 +952,8 @@ std::string GCodeWriter::_spiral_travel_to_z(double z, const Vec2d &ij_offset, c
         speed = m_is_first_layer ? this->config.get_abs_value("initial_layer_travel_speed")
                                  : this->config.travel_speed.value;
     }
+
+    speed = limited_travel_speed(speed, speed_limit_mm_s, ij_offset.squaredNorm() > 0);
 
     if (!this->config.enable_arc_fitting) { // Orca: if arc fitting is disabled, approximate the arc with small linear segments
         std::ostringstream oss;

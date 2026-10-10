@@ -257,6 +257,50 @@ TEST_CASE("fiber width is one positive millimeter setting", "[libslicer_api][con
     }
 }
 
+TEST_CASE("fiber first approach speed is a global export setting", "[libslicer_api][config][fiber-approach]")
+{
+    auto config = libslicer::Config::defaults();
+    auto items = config.settings();
+    const auto* speed = find_item(items, "fiber_toolchange_approach_speed");
+    REQUIRE(speed);
+    CHECK(speed->type == libslicer::SettingType::Float);
+    CHECK(speed->unit == "mm/s");
+    CHECK(speed->group == libslicer::SettingGroup::Process);
+    CHECK_FALSE(speed->enabled);
+    CHECK(config.snapshot().value("fiber_toolchange_approach_speed") == "0");
+    REQUIRE(config.set("generate_reinforced_infills", "1").success);
+    items = config.settings();
+    CHECK(find_item(items, "fiber_toolchange_approach_speed")->enabled);
+    REQUIRE(config.set("fiber_toolchange_approach_speed", "60").success);
+    for (const auto* invalid : {"-1", "nan", "inf", "60mm/s", "60%"}) {
+        CAPTURE(invalid);
+        CHECK_FALSE(config.set("fiber_toolchange_approach_speed", invalid).success);
+        CHECK(config.snapshot().value("fiber_toolchange_approach_speed") == "60");
+    }
+    auto mask = libslicer::Config::for_overrides(config.snapshot(), libslicer::ConfigScope::FiberMask);
+    CHECK_FALSE(mask.set("fiber_toolchange_approach_speed", "40").success);
+    REQUIRE(config.set("fiber_toolchange_approach_speed", "0").success);
+}
+
+TEST_CASE("CFSYS process inheritance retains the first approach speed", "[libslicer_api][config][fiber-approach]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF", "CFSYS CIRON", "CFSYS CIRON", "CFSYS CIRON"};
+    selection.filament_physical_tools = {0, 1, 0, 0, 0};
+    auto created = library->create_config(selection);
+    REQUIRE(created);
+    CHECK(created.config->snapshot().value("fiber_toolchange_approach_speed") == "60");
+    REQUIRE(created.config->set("fiber_toolchange_approach_speed", "0").success);
+    CHECK(created.config->snapshot().value("fiber_toolchange_approach_speed") == "0");
+}
+
 TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_api][config][fiber]")
 {
     auto config = libslicer::Config::defaults();

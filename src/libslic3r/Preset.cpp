@@ -1037,6 +1037,7 @@ static std::vector<std::string> s_Preset_print_options{
     "fiber_resin_fill_acceleration",
     "fiber_prefeed_extra_length",
     "fiber_prefeed_speed",
+    "fiber_toolchange_approach_speed",
     "fiber_z_hop_height",
     "fiber_landing_length",
     "fiber_landing_speed",
