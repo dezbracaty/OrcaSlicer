@@ -1,5 +1,6 @@
 #include "Exception.hpp"
 #include "Print.hpp"
+#include "ContinuousFiber/ContinuousFiberConfig.hpp"
 
 namespace Slic3r {
 
@@ -92,9 +93,10 @@ void PrintRegion::collect_object_printing_extruders(const PrintConfig &print_con
     	emplace_extruder(region_config.top_surface_filament_id);
     if (region_config.bottom_shell_layers.value > 0)
     	emplace_extruder(region_config.bottom_surface_filament_id);
-    if (region_config.generate_reinforced_perimeters.value)
+    const bool concentric=fiber_concentric_uses_contour_process(region_config);
+    if (region_config.generate_reinforced_perimeters.value || concentric)
         emplace_extruder(region_config.reinforced_perimeters_filament);
-    if (region_config.generate_reinforced_infills.value)
+    if (region_config.generate_reinforced_infills.value && !concentric)
         emplace_extruder(region_config.reinforced_infill_filament);
 }
 

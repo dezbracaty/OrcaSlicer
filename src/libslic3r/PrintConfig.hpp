@@ -1097,6 +1097,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                fiber_contour_bend_radius))
     ((ConfigOptionFloat,                fiber_infill_bend_radius))
     ((ConfigOptionFloat,                fiber_corner_stabilization_length))
+    ((ConfigOptionFloat,                fiber_concentric_corner_stabilization_length))
     ((ConfigOptionFloat,                fiber_resin_overlap))
     ((ConfigOptionPercent, fiber_resin_fill_density))
     ((ConfigOptionEnum<InfillPattern>, fiber_resin_fill_pattern))
@@ -1360,6 +1361,7 @@ PRINT_CONFIG_CLASS_DEFINE(
 PRINT_CONFIG_CLASS_DEFINE(
     GCodeConfig,
 
+    ((ConfigOptionFloat,               fiber_toolchange_approach_speed))
     ((ConfigOptionFloat,               fiber_cut_to_contact_length))
     ((ConfigOptionString,              fiber_cut_gcode))
     ((ConfigOptionString,              before_layer_change_gcode))

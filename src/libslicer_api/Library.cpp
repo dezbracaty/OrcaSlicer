@@ -17,6 +17,7 @@
 #include <libslic3r/TriangleMeshSlicer.hpp>
 #include <libslic3r/Utils.hpp>
 #include <libslic3r/libslic3r.h>
+#include <Eigen/SVD>
 #include <libslic3r/miniz_extension.hpp>
 
 #include <nlohmann/json.hpp>
@@ -384,6 +385,171 @@ Slic3r::DynamicPrintConfig dynamic_config(const ConfigSnapshot& snapshot)
         }
     }
     return config;
+}
+
+Slic3r::Transform3d mask_matrix(const std::array<double, 16>& values)
+{
+    Slic3r::Transform3d matrix = Slic3r::Transform3d::Identity();
+    for (int row = 0; row != 4; ++row)
+        for (int column = 0; column != 4; ++column)
+            matrix(row, column) = values[std::size_t(row * 4 + column)];
+    if (!matrix.matrix().allFinite() ||
+        !matrix.matrix().row(3).isApprox(Eigen::RowVector4d(0, 0, 0, 1), 1e-7))
+        throw std::invalid_argument("Transform must be a finite affine matrix");
+    return matrix;
+}
+
+void validate_mask_geometry(const SliceFiberMaskInput& mask)
+{
+    if (mask.id.empty()) throw std::invalid_argument("Mask ID must not be empty");
+    for (double size : mask.dimensions_mm)
+        if (!std::isfinite(size) || size <= 0 || size > 1000000.0)
+            throw std::invalid_argument("Mask dimensions must be positive finite millimeters within coordinate limits");
+    const auto pose = mask_matrix(mask.mask_to_object);
+    const Eigen::Matrix3d rotation = pose.linear();
+    if (!(rotation.transpose() * rotation).isApprox(Eigen::Matrix3d::Identity(), 1e-5) ||
+        std::abs(rotation.determinant() - 1.0) > 1e-5)
+        throw std::invalid_argument("Mask pose must be rigid; dimensions carry the scale");
+    const auto equal_size = [&](int a, int b) {
+        return std::abs(mask.dimensions_mm[a] - mask.dimensions_mm[b]) <=
+            1e-6 * std::max(mask.dimensions_mm[a], mask.dimensions_mm[b]);
+    };
+    switch (mask.shape) {
+    case FiberMaskShape::Box: break;
+    case FiberMaskShape::Cylinder:
+        if (!equal_size(0, 1)) throw std::invalid_argument("Cylinder XY diameters must match");
+        break;
+    case FiberMaskShape::Sphere:
+        if (!equal_size(0, 1) || !equal_size(0, 2))
+            throw std::invalid_argument("Sphere XYZ diameters must match");
+        break;
+    default: throw std::invalid_argument("Unknown mask shape");
+    }
+}
+
+Slic3r::DynamicPrintConfig mask_process_patch(const SliceFiberMaskInput& mask,
+    const Slic3r::DynamicPrintConfig& active)
+{
+    Config validator = Config::defaults();
+    const auto checked = validator.apply_patch(ConfigScope::FiberMask, mask.settings);
+    if (!checked) {
+        const auto& error = checked.diagnostics.front();
+        throw std::invalid_argument(error.key + ": " + error.message);
+    }
+    const auto normalized = validator.snapshot();
+    const auto tools = tool_config(active);
+    Slic3r::DynamicPrintConfig patch;
+    for (const auto& [key, value] : mask.settings) {
+        patch.set_deserialize_strict(key, normalized.value(key).value());
+        if (key == "reinforced_perimeters_filament" || key == "reinforced_infill_filament") {
+            const int material = patch.opt_int(key);
+            if (material <= 0 || std::size_t(material) > tools.filament_diameter.size())
+                throw std::invalid_argument(key + ": material is outside the configured slots");
+        }
+    }
+    return patch;
+}
+
+Slic3r::TriangleMesh make_mask_mesh(const SliceFiberMaskInput& mask,
+    const Slic3r::Transform3d& parent, double resolution)
+{
+    const Eigen::Matrix3d linear = parent.linear();
+    const auto singular = Eigen::JacobiSVD<Eigen::Matrix3d>(linear).singularValues();
+    if (!singular.allFinite() || singular.minCoeff() <= 1e-12)
+        throw std::invalid_argument("Mask parent transform must be invertible");
+    const double scale = singular.maxCoeff();
+    if (*std::max_element(mask.dimensions_mm.begin(), mask.dimensions_mm.end()) * scale > 1000000.0)
+        throw std::invalid_argument("Transformed mask exceeds coordinate limits");
+    double angle = 2.0 * PI / 32.0;
+    if (mask.shape != FiberMaskShape::Box) {
+        // The sphere has two angular directions. A factor of four bounds both
+        // directions conservatively; the cylinder needs only the radial one.
+        const double radius = 0.5 * mask.dimensions_mm[0] * scale;
+        const double tolerance = std::max(1e-5, resolution);
+        angle = std::min(angle, 2.0 * std::acos(std::clamp(
+            1.0 - tolerance / (4.0 * radius), -1.0, 1.0)));
+        if (!std::isfinite(angle) || angle < 2.0 * PI / 1024.0)
+            throw std::invalid_argument("Mask tessellation exceeds the angular resource limit");
+    }
+    Slic3r::TriangleMesh mesh;
+    switch (mask.shape) {
+    case FiberMaskShape::Box:
+        mesh = Slic3r::make_cube(mask.dimensions_mm[0], mask.dimensions_mm[1], mask.dimensions_mm[2]);
+        break;
+    case FiberMaskShape::Cylinder:
+        mesh = Slic3r::make_cylinder(0.5 * mask.dimensions_mm[0], mask.dimensions_mm[2], angle);
+        break;
+    case FiberMaskShape::Sphere:
+        mesh = Slic3r::make_sphere(0.5 * mask.dimensions_mm[0], angle);
+        break;
+    }
+    if (mesh.its.indices.size() > 1000000)
+        throw std::invalid_argument("Mask tessellation exceeds the triangle resource limit");
+    // Primitive origins are known analytically. A tessellated circle with an
+    // odd sector count has an asymmetric bounding box; recentering that box
+    // would move the requested cylinder/sphere and violate its true boundary.
+    if (mask.shape == FiberMaskShape::Box)
+        mesh.translate(Slic3r::Vec3f(-0.5 * mask.dimensions_mm[0], -0.5 * mask.dimensions_mm[1],
+                                   -0.5 * mask.dimensions_mm[2]));
+    else if (mask.shape == FiberMaskShape::Cylinder)
+        mesh.translate(Slic3r::Vec3f(0, 0, -0.5 * mask.dimensions_mm[2]));
+    const auto world = parent * mask_matrix(mask.mask_to_object);
+    for (const auto& vertex : mesh.its.vertices)
+        if ((world * vertex.cast<double>()).cwiseAbs().maxCoeff() > 1000000.0)
+            throw std::invalid_argument("Mask position exceeds coordinate limits");
+    return mesh;
+}
+
+void validate_effective_mask_regions(Slic3r::Print& print, const std::set<size_t>& mask_volume_ids)
+{
+    for (auto* object : print.objects()) {
+        const auto* regions = object->shared_regions();
+        if (!regions) continue;
+        std::set<const Slic3r::PrintRegion*> checked;
+        for (const auto& range : regions->layer_ranges)
+            for (const auto& entry : range.volume_regions) {
+                if (!entry.region || !entry.model_volume ||
+                    mask_volume_ids.count(entry.model_volume->id().id) == 0) continue;
+                const auto* root = &entry;
+                while (root->parent >= 0)
+                    root = &range.volume_regions.at(size_t(root->parent));
+                if (!root->region || !root->model_volume->is_model_part()) continue;
+                // Native modifier merging has already applied all overlapping patches.
+                // A restored or identical projection needs no mask-specific process validation.
+                const auto& keys = Slic3r::fiber_mask_parameter_keys();
+                const bool same = std::all_of(keys.begin(), keys.end(), [&](std::string_view key) {
+                    return entry.region->config().option(std::string(key))->serialize() ==
+                           root->region->config().option(std::string(key))->serialize();
+                });
+                if (same || !checked.insert(entry.region).second) continue;
+                const auto& config = entry.region->config();
+                const std::string owner = "object=" + object->model_object()->name +
+                    " mask=" + entry.model_volume->name + ": ";
+                try {
+                    if (config.infill_combination.value || object->config().interface_shells.value ||
+                        Slic3r::PrintObject::infill_only_where_needed)
+                        throw std::invalid_argument("Masks do not support infill_combination, interface_shells or infill_only_where_needed");
+                    Slic3r::resolve_resin_fill_config(config);
+                    if (config.fiber_resin_fill_density.value > 0) {
+                        const int resin = config.sparse_infill_filament_id.value;
+                        if (resin <= 0 || std::size_t(resin) > print.config().filament_diameter.size() ||
+                            Slic3r::is_fiber_filament(print.config(), unsigned(resin - 1)))
+                            throw std::invalid_argument("Residual resin material is not a valid thermoplastic slot");
+                    }
+                    if (Slic3r::continuous_fiber_enabled(config)) {
+                        Slic3r::validate_continuous_fiber_region_config(
+                            print.config(), config, object->config().layer_height.value);
+                        const bool concentric = Slic3r::fiber_concentric_uses_contour_process(config);
+                        if (config.generate_reinforced_perimeters.value || concentric)
+                            Slic3r::resolve_fiber_tool(print.config(), unsigned(config.reinforced_perimeters_filament.value - 1));
+                        if (config.generate_reinforced_infills.value && !concentric)
+                            Slic3r::resolve_fiber_tool(print.config(), unsigned(config.reinforced_infill_filament.value - 1));
+                    }
+                } catch (const std::exception& error) {
+                    throw std::invalid_argument(owner + error.what());
+                }
+            }
+    }
 }
 
 std::vector<std::string> config_vector_values(const Config& config, const std::string& key)
@@ -2990,6 +3156,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
         report_progress(callbacks, 0.02f, "Loading models");
         Slic3r::Model plate_model;
+        std::set<size_t> mask_volume_ids;
         for (const SliceObjectInput& input : request.objects) {
             const bool has_file_input = !input.model_path.empty();
             const bool has_memory_input = !input.volumes.empty();
@@ -3000,6 +3167,8 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                     false});
                 return result;
             }
+            if (has_file_input && !input.fiber_masks.empty())
+                throw std::invalid_argument("object=" + input.name + ": masks require in-memory volumes");
             Slic3r::ModelObject* support_target = nullptr;
 
             if (has_memory_input) {
@@ -3089,6 +3258,29 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
                         transform(row, column) = input.transform[static_cast<std::size_t>(row * 4 + column)];
                     }
                 }
+                std::set<std::string> mask_ids;
+                for (const auto& mask : input.fiber_masks) {
+                    try {
+                        validate_mask_geometry(mask);
+                        if (!mask_ids.insert(mask.id).second)
+                            throw std::invalid_argument("Duplicate mask ID");
+                        if (!mask.enabled) continue;
+                        const auto patch = mask_process_patch(mask, config);
+                        const auto parent = mask_matrix(input.transform);
+                        auto mesh = make_mask_mesh(mask, parent, config.opt_float("resolution"));
+                        // SDK volumes carry vertices in the common object frame. Native region
+                        // broad-phase discards volume XY offsets, so bake the rigid local pose.
+                        mesh.transform(mask_matrix(mask.mask_to_object));
+                        auto* volume = object->add_volume(std::move(mesh),
+                            Slic3r::ModelVolumeType::PARAMETER_MODIFIER, false);
+                        volume->name = mask.id;
+                        volume->config.apply(patch);
+                        volume->config.set("fiber_mask_process", true);
+                        mask_volume_ids.insert(volume->id().id);
+                    } catch (const std::exception& error) {
+                        throw std::invalid_argument("object=" + input.name + " mask=" + mask.id + ": " + error.what());
+                    }
+                }
                 object->add_instance()->set_transformation(
                     Slic3r::Geometry::Transformation(transform));
                 support_target = object;
@@ -3168,6 +3360,9 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
         report_progress(callbacks, 0.08f, "Validating print");
         Slic3r::Print print;
+        // The SDK has one plate in request coordinates; native Print does not
+        // initialize its plate origin, which validation and export both read.
+        print.set_plate_origin(Slic3r::Vec3d::Zero());
         if (belt_printer) {
             const ModelWorldBounds belt_bounds = model_world_bounds(plate_model);
             if (!belt_bounds.valid) {
@@ -3194,6 +3389,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             report_progress(callbacks, 0.08f + engine_progress * 0.78f, status.text);
         });
         print.apply(plate_model, config);
+        validate_effective_mask_regions(print, mask_volume_ids);
 
         Slic3r::StringObjectException warning;
         const Slic3r::StringObjectException validation_error = print.validate(&warning);

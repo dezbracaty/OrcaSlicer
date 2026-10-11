@@ -10,6 +10,7 @@
 #include "../ContinuousFiber/FiberPolicyKey.hpp"
 #include "../ContinuousFiber/FiberPathValidator.hpp"
 #include "../Geometry.hpp"
+#include "../GCodeWriter.hpp"
 #include "../Layer.hpp"
 #include "../Print.hpp"
 #include "../PrintConfig.hpp"
@@ -371,6 +372,7 @@ struct FillDomainContributor {
     ExPolygons no_overlap_domain;
     std::optional<FiberPolicyKey> fiber_policy;
     std::optional<ContinuousFiberConfig> fiber_config;
+    bool residual_fiber_resin { false };
 };
 
 struct SurfaceFill {
@@ -421,8 +423,13 @@ void audit_surface_fill_contributors(const SurfaceFill& fill)
     }
 }
 
-void finalize_surface_fill_contributors(const Layer& layer, std::vector<SurfaceFill>& fills)
+void finalize_surface_fill_contributors(const Layer& layer, std::vector<SurfaceFill>& fills,
+    bool exact_partition = false)
 {
+    // A safety-expanded subtraction drops a strip between adjacent owners.
+    // Real SDK process changes need a complete partition to preserve same-policy
+    // connectivity; native jobs and no-op SDK overrides keep their old behavior.
+    const auto safety = exact_partition ? ApplySafetyOffset::No : ApplySafetyOffset::Yes;
     for (size_t job_id = 0; job_id < fills.size(); ++job_id) {
         SurfaceFill& fill = fills[job_id];
         if (fill.expolygons.empty())
@@ -446,12 +453,12 @@ void finalize_surface_fill_contributors(const Layer& layer, std::vector<SurfaceF
             contributor.id.resin_job_id = job_id;
             const ExPolygons source_domain {contributor.original_surface.expolygon};
             contributor.effective_domain = intersection_ex(
-                remaining, source_domain, ApplySafetyOffset::Yes);
-            remaining = diff_ex(remaining, contributor.effective_domain, ApplySafetyOffset::Yes);
+                remaining, source_domain, safety);
+            remaining = diff_ex(remaining, contributor.effective_domain, safety);
             contributor.no_overlap_domain = intersection_ex(
                 contributor.no_overlap_domain,
                 contributor.effective_domain,
-                ApplySafetyOffset::Yes);
+                safety);
         }
 
         // Orca may create a small extension while recovering collapsed fill.
@@ -959,18 +966,142 @@ struct FillSurfaceInputs {
 };
 using FillSurfaceView = std::vector<FillSurfaceInputs>;
 
-bool is_fiber_source_surface(const Layer& layer, const PrintRegionConfig& config, const Surface& surface)
+bool eligible_fiber_core(const PrintRegionConfig& config, const Surface& surface)
 {
-    return continuous_fiber_active_on_layer(config, layer.id()) && !surface.is_bridge() &&
+    return !surface.is_bridge() &&
         (surface.surface_type == stInternal ||
          (surface.surface_type == stInternalSolid && config.sparse_infill_density.value >= 100.0 - EPSILON));
+}
+
+bool is_fiber_source_surface(const Layer& layer, const PrintRegionConfig& config, const Surface& surface)
+{
+    return continuous_fiber_active_on_layer(config, layer.id()) && eligible_fiber_core(config, surface);
+}
+
+// The current SDK input gives all model parts one process configuration;
+// per-part material and painting only change ordinary filament fields. Keep
+// this runtime comparison separate from native modifier region identity.
+struct SdkMaskLayerContext {
+    bool has_source { false };
+    std::vector<bool> changed_regions;
+    ExPolygons core;
+    ExPolygons changed_core;
+    ExPolygons residual_core;
+
+    bool changed(size_t region_id) const {
+        return has_source && changed_regions.at(region_id);
+    }
+};
+
+std::optional<FiberPolicyKey> configured_fiber_policy(const Layer& layer, const LayerRegion& region)
+{
+    if (!continuous_fiber_enabled(region.region().config()))
+        return std::nullopt;
+    const auto config = resolve_continuous_fiber_config(layer, region);
+    const auto angle = config.rectilinear_angle_radians;
+    return fiber_policy_key(config, angle.value_or(0.0), angle.has_value());
+}
+
+std::vector<std::string> configured_resin_policy(const PrintRegionConfig& config)
+{
+    std::vector<std::string> result;
+    constexpr std::string_view prefix{"fiber_resin_fill_"};
+    for (const auto key : fiber_mask_parameter_keys())
+        if (key.substr(0, prefix.size()) == prefix)
+            result.push_back(config.option(std::string(key))->serialize());
+    return result;
+}
+
+SdkMaskLayerContext sdk_mask_layer_context(const Layer& layer)
+{
+    SdkMaskLayerContext result;
+    const auto* shared = layer.object()->shared_regions();
+    if (!shared) return result;
+    const auto range = std::find_if(shared->layer_ranges.begin(), shared->layer_ranges.end(),
+        [&](const auto& range) {
+            return layer.slice_z >= range.layer_height_range.first &&
+                   layer.slice_z < range.layer_height_range.second;
+        });
+    if (range == shared->layer_ranges.end()) return result;
+    result.has_source = std::any_of(range->volume_regions.begin(), range->volume_regions.end(),
+        [](const auto& entry) {
+            if (!entry.model_volume || !entry.model_volume->is_modifier()) return false;
+            const auto* marker = entry.model_volume->config.get().template option<ConfigOptionBool>("fiber_mask_process");
+            return marker && marker->value;
+        });
+    if (!result.has_source) return result;
+
+    const LayerRegion* baseline = nullptr;
+    for (const auto& entry : range->volume_regions) {
+        if (entry.parent >= 0 || !entry.region || !entry.model_volume->is_model_part()) continue;
+        const auto* root = layer.regions().at(size_t(entry.region->print_object_region_id()));
+        if (!baseline) baseline = root;
+        else {
+            const auto& keys = fiber_mask_parameter_keys();
+            const bool same = std::all_of(keys.begin(), keys.end(), [&](std::string_view key) {
+                return baseline->region().config().option(std::string(key))->serialize() ==
+                       root->region().config().option(std::string(key))->serialize();
+            });
+            if (!same)
+                throw RuntimeError("SDK model parts must share one fiber/resin process baseline");
+        }
+    }
+    if (!baseline) throw RuntimeError("SDK mask has no model-part process baseline");
+    const auto baseline_fiber = configured_fiber_policy(layer, *baseline);
+    const auto baseline_resin = configured_resin_policy(baseline->region().config());
+    result.changed_regions.resize(layer.regions().size(), false);
+    for (size_t region_id = 0; region_id < layer.regions().size(); ++region_id) {
+        const auto& region = *layer.regions()[region_id];
+        const bool changed = !(configured_fiber_policy(layer, region) == baseline_fiber) ||
+            configured_resin_policy(region.region().config()) != baseline_resin;
+        result.changed_regions[region_id] = changed;
+        for (const auto& surface : region.fill_surfaces.surfaces)
+            if (eligible_fiber_core(region.region().config(), surface)) {
+                result.core.push_back(surface.expolygon);
+                if (changed) result.changed_core.push_back(surface.expolygon);
+                if ((changed || continuous_fiber_active_on_layer(region.region().config(), layer.id())) &&
+                    region.region().config().fiber_resin_fill_density.value > 0)
+                    result.residual_core.push_back(surface.expolygon);
+            }
+    }
+    result.core = union_ex(result.core);
+    result.changed_core = union_ex(result.changed_core);
+    result.residual_core = union_ex(result.residual_core);
+    return result;
+}
+
+// Inverse of the actual belt command map, applied to a rounding displacement.
+// Translation, plate origin and nozzle offsets cancel in this displacement;
+// the emitter still verifies their actual phases before writing each path.
+double policy_rounding_margin(const Layer& layer)
+{
+    const double half_cell = 0.5 * std::pow(10.0, -GCodeFormatter::XYZF_EXPORT_DIGITS);
+    double rounding = std::sqrt(2.0) * half_cell;
+    if (const auto* belt = layer.object()->print()->belt_coordinate_system()) {
+        const auto inverse = [&](const Vec3d& p) {
+            return belt->world_to_oriented(belt->machine_to_world(p));
+        };
+        const Vec3d origin = inverse(Vec3d::Zero());
+        for (int corner = 0; corner != 8; ++corner) {
+            const Vec3d delta((corner & 1) ? half_cell : -half_cell,
+                              (corner & 2) ? half_cell : -half_cell,
+                              (corner & 4) ? half_cell : -half_cell);
+            rounding = std::max(rounding, (inverse(delta) - origin).head<2>().norm());
+        }
+    }
+    const ContourRoundingOptions geometry;
+    // Geometry/arc approximations plus four safety offsets and eight grid
+    // roundings. This is a length bound; it is not the old leakage-area limit.
+    return rounding + geometry.geometry_tolerance_mm + geometry.chord_tolerance_mm +
+        (4.0 * ClipperSafetyOffset + 8.0) * SCALING_FACTOR;
 }
 
 std::vector<SurfaceFill> group_fills(
     const Layer& layer,
     LockRegionParam& lock_param,
     const FillSurfaceView* surface_view = nullptr,
-    bool collect_fiber_policy = false)
+    bool collect_fiber_policy = false,
+    const SdkMaskLayerContext* mask_context = nullptr)
 {
 	std::vector<SurfaceFill> surface_fills;
 	// Fill in a map of a region & surface to SurfaceFillParams.
@@ -1057,7 +1188,9 @@ std::vector<SurfaceFill> group_fills(
                         params.density = 100.f;
                     }
                 } else if (params.density <= 0 &&
-                    !(collect_fiber_policy && is_fiber_source_surface(layer, original_config, surface)))
+                    !(collect_fiber_policy && eligible_fiber_core(original_config, surface) &&
+                      ((mask_context && mask_context->changed(region_id)) ||
+                       continuous_fiber_active_on_layer(original_config, layer.id()))))
                     continue;
 
 				params.extrusion_role = erInternalInfill;
@@ -1216,6 +1349,8 @@ std::vector<SurfaceFill> group_fills(
 						// Merging every solid shell with sparse core changes island
 						// topology, joining separate reference contour loops together.
                         const bool fiber_surface = is_fiber_source_surface(layer, region_config, surface) && !params->bridge;
+                        contributor.residual_fiber_resin = fiber_surface ||
+                            (mask_context && mask_context->changed(region_id) && eligible_fiber_core(region_config, surface));
                         if (fiber_surface) {
                             ContinuousFiberConfig fiber_config = resolve_continuous_fiber_config(layer, layerm);
                             const auto angle=fiber_config.rectilinear_angle_radians;
@@ -1384,7 +1519,8 @@ std::vector<SurfaceFill> group_fills(
 	}
 
 	if (collect_fiber_policy)
-		finalize_surface_fill_contributors(layer, surface_fills);
+		finalize_surface_fill_contributors(layer, surface_fills,
+            mask_context && !mask_context->changed_core.empty());
 
 	return surface_fills;
 }
@@ -1616,15 +1752,6 @@ private:
     std::vector<ExtrusionEntitiesPtr> fiber_entities_by_region;
 };
 
-struct OwnedCandidateEntities {
-    ExtrusionEntityCollection root;
-
-    explicit OwnedCandidateEntities(ExtrusionEntitiesPtr&& entities)
-    {
-        root.append(std::move(entities));
-    }
-};
-
 void apply_fiber_infill_params(SurfaceFillParams& destination,
     const ContinuousFiberConfig& config, const FiberPolicyKey& policy)
 {
@@ -1661,14 +1788,21 @@ struct FiberIslandDomainPlan {
 
 std::vector<FiberIslandDomainPlan> build_fiber_island_domains(
     const Layer& layer,
-    const std::vector<SurfaceFill>& surface_fills)
+    const std::vector<SurfaceFill>& surface_fills,
+    const SdkMaskLayerContext& mask_context)
 {
     std::map<FiberPolicyKey, std::vector<const FillDomainContributor*>> policy_groups;
+    std::map<FiberPolicyKey, ExPolygons> policy_cores;
     for (const SurfaceFill& fill : surface_fills)
         for (const FillDomainContributor& contributor : fill.contributors)
-            if (contributor.fiber_policy && contributor.fiber_config && !contributor.effective_domain.empty())
-                policy_groups[*contributor.fiber_policy].push_back(&contributor);
+            if (contributor.fiber_policy && contributor.fiber_config) {
+                policy_cores[*contributor.fiber_policy].push_back(contributor.original_surface.expolygon);
+                if (!contributor.effective_domain.empty())
+                    policy_groups[*contributor.fiber_policy].push_back(&contributor);
+            }
 
+    const bool has_changes = !mask_context.changed_core.empty();
+    const double margin = has_changes ? policy_rounding_margin(layer) : 0.0;
     std::vector<FiberIslandDomainPlan> result;
     size_t policy_group_id = 0;
     for (const auto& [policy, contributors] : policy_groups) {
@@ -1677,6 +1811,13 @@ std::vector<FiberIslandDomainPlan> build_fiber_island_domains(
         for (size_t contributor_index = 0; contributor_index < contributors.size(); ++contributor_index)
             domain_sources.push_back({contributor_index, contributors[contributor_index]->effective_domain});
         std::vector<FiberDomainComponent> components = merge_connected_fiber_domains(domain_sources);
+        ExPolygons foreign;
+        if (has_changes) {
+            // C and Dp both use the final eligible surfaces, before the native
+            // grouping partition assigns resin jobs. Never turn clip remnants
+            // or model exterior into foreign process domains.
+            foreign = diff_ex(mask_context.core, union_ex(policy_cores.at(policy)), ApplySafetyOffset::No);
+        }
 
         for (size_t component_id = 0; component_id < components.size(); ++component_id) {
             FiberDomainComponent& component = components[component_id];
@@ -1707,6 +1848,25 @@ std::vector<FiberIslandDomainPlan> build_fiber_island_domains(
             domain.candidate_job.region_id = owner_region;
             domain.candidate_job.surface = source.original_surface;
             domain.candidate_job.expolygons = {std::move(component.merged_domain)};
+            if (has_changes) {
+                // Every same-policy component belongs to Dp, including remote
+                // islands. Off and interval-skipped eligible cores remain in C.
+                const bool affected = !intersection_ex(
+                    offset_ex(domain.candidate_job.expolygons, float(scale_(margin))),
+                    mask_context.changed_core).empty();
+                if (affected) {
+                    auto boundary = std::make_shared<FiberPolicyBoundary>();
+                    boundary->forbidden_core = foreign;
+                    // Adjacent disabled/skipped domains can own residual resin
+                    // without appearing among this fiber domain's contributors.
+                    boundary->requires_resin_first = !intersection_ex(
+                        offset_ex(domain.candidate_job.expolygons, float(scale_(margin))),
+                        mask_context.residual_core).empty();
+                    domain.config.enforce_policy_boundary = !foreign.empty();
+                    domain.config.policy_rounding_margin_mm = margin;
+                    domain.config.policy_boundary = std::move(boundary);
+                }
+            }
             domain.candidate_job.params.angle = float(policy.infill_direction);
             domain.candidate_job.params.fixed_angle = policy.fixed_direction;
             Polygons no_overlap;
@@ -1732,6 +1892,9 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     const SurfaceFill& original_job = domain.candidate_job;
     const ContinuousFiberConfig& config = domain.config;
     const ExPolygons original_area = original_job.expolygons;
+    const ExPolygons planning_area = config.enforce_policy_boundary ?
+        diff_ex(original_area, offset_ex(config.policy_boundary->forbidden_core,
+            float(scale_(config.policy_rounding_margin_mm)))) : original_area;
     const FiberDomainId& domain_id = domain.id;
 
     const bool collect_debug = context.layer.object()->print()->config().fiber_fill_debug.value;
@@ -1753,12 +1916,19 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
             context.layer.fiber_fill_diagnostics.push_back(std::move(diagnostic));
         }
     };
+    const bool concentric=config.concentric_infill();
     FiberValidationResult contour_result;
-    if (config.contour_enabled && config.contour_count > 0) {
+    if ((config.contour_enabled && config.contour_count > 0) || concentric) {
         if (collect_debug)
             record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
                            "original_contour_domain_before_candidate_generation");
-        auto plan = FiberPathValidator::plan_contours(original_area, config, domain_id, collect_debug);
+        const auto ring_config=concentric?fiber_ring_reference_config(config):config;
+        const size_t display_depths=config.contour_enabled?size_t(config.contour_count):0;
+        const double extra_spacing=concentric && config.infill_density<100?
+            config.contour_flow.width()*(100/config.infill_density-1):0;
+        auto plan = FiberPathValidator::plan_contours(planning_area,ring_config,domain_id,collect_debug,
+            display_depths,extra_spacing,concentric?config.concentric_corner_stabilization_length_mm:0.0);
+        if (concentric) plan.set_display_cutoff(display_depths);
         if (std::none_of(plan.nodes.begin(), plan.nodes.end(),
                 [](const auto& node) { return node.side == FiberContourSide::Outer; }))
             ++context.layer.fiber_outer_contour_failures["no_outer_contour_candidate"];
@@ -1786,7 +1956,16 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
             // Normal rounding differences are not failed deposition regions.
             const ExPolygons compared_coverage=offset_ex(contour_result.physical_footprint,float(SCALED_EPSILON));
             for (const auto& assignment:contour_result.assignments) {
-                if (assignment.kind==FiberAssignmentKind::AcceptedFiber || !assignment.centerline) continue;
+                if (assignment.kind==FiberAssignmentKind::AcceptedFiber) {
+                    if (!assignment.detail.empty() && assignment.centerline)
+                        context.layer.fiber_fill_diagnostics.push_back({assignment.centerline->polyline.to_polyline(),
+                            "concentric_stability_pass; candidate="+std::to_string(assignment.id.parent.job_ordinal)+
+                                "; "+assignment.detail,false,unscale<double>(assignment.centerline->length()),
+                            Layer::FiberDiagnosticKind::RoundedContourCandidate,{},
+                            domain_id.policy_group_id,domain_id.component_id});
+                    continue;
+                }
+                if (!assignment.centerline) continue;
                 Polygons swept; assignment.centerline->polygons_covered_by_width(swept,0.0f);
                 record_regions(diff_ex(intersection_ex(union_ex(swept),original_area),compared_coverage),
                     Layer::FiberDiagnosticKind::MissingContourRegion,
@@ -1796,10 +1975,10 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     }
 
     FiberValidationResult infill_result;
-    if (config.infill_enabled && config.infill_density > 0.0) {
+    if (!concentric && config.infill_enabled && config.infill_density > 0.0) {
         SurfaceFill infill_job = original_job;
         const ExPolygons infill_allowed_domain = ContinuousFiberFillStrategy::build_infill_domain(
-            original_area, contour_result.contour_to_infill_keepout);
+            planning_area, contour_result.contour_to_infill_keepout);
         infill_job.expolygons = infill_allowed_domain;
         if (!infill_job.expolygons.empty()) {
             apply_fiber_infill_params(infill_job.params, config, domain.policy);
@@ -1814,14 +1993,6 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 const auto candidates = ContinuousFiberFillStrategy::generate_rectilinear(
                     infill_allowed_domain, config, orientation.first, orientation.second);
                 infill_result = FiberPathValidator::validate_infill(candidates, infill_allowed_domain, config, domain_id);
-            } else {
-                ExtrusionEntitiesPtr candidates;
-                const FillExecutionPolicy infill_policy { false, false, true };
-                execute_surface_fill_job(context, infill_job, candidates, infill_policy);
-                OwnedCandidateEntities owner(std::move(candidates));
-                infill_result = FiberPathValidator::validate(
-                    owner.root.entities, infill_allowed_domain, config, FiberPathPurpose::Infill,
-                    erContinuousFiberInfill, domain_id);
             }
         }
     }
@@ -1836,18 +2007,51 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     coverage.source_domain = original_area;
     coverage.accepted_contour_exclusion = contour_result.resin_exclusion;
     coverage.accepted_infill_exclusion = infill_result.resin_exclusion;
+    if (concentric) {
+        coverage.accepted_contour_exclusion.clear();
+        for (const auto& assignment:contour_result.assignments) if (assignment.prepared) {
+            auto& bucket=assignment.display_purpose==FiberPathPurpose::Infill?
+                coverage.accepted_infill_exclusion:coverage.accepted_contour_exclusion;
+            append_expolygons(bucket,assignment.prepared->resin_exclusion);
+        }
+        coverage.accepted_contour_exclusion=union_ex(coverage.accepted_contour_exclusion);
+        coverage.accepted_infill_exclusion=union_ex(coverage.accepted_infill_exclusion);
+    }
     coverage.outside_domain = contour_result.outside_domain;
     append_expolygons(coverage.outside_domain, infill_result.outside_domain);
     coverage.outside_domain = union_ex(coverage.outside_domain);
-    coverage.resin_domain = resin_area;
+    if (config.policy_boundary) {
+        for (const auto* contributor : domain.contributors) {
+            auto part = intersection_ex(resin_area, contributor->effective_domain);
+            const auto& source = context.layer.regions()[contributor->id.region_id]->region().config();
+            append(source.fiber_resin_fill_density.value > 0 ? coverage.resin_domain : coverage.intentional_void,
+                   std::move(part));
+        }
+        coverage.resin_domain = union_ex(coverage.resin_domain);
+        coverage.intentional_void = union_ex(coverage.intentional_void);
+    } else {
+        coverage.resin_domain = resin_area;
+    }
     transaction.coverage.add(std::move(coverage));
 
-    const size_t contour_accepted = contour_result.accepted_count();
-    const size_t infill_accepted = infill_result.accepted_count();
+    const size_t concentric_infill_accepted=concentric?std::count_if(contour_result.assignments.begin(),
+        contour_result.assignments.end(),[](const auto& assignment) {
+            return assignment.kind==FiberAssignmentKind::AcceptedFiber && assignment.display_purpose==FiberPathPurpose::Infill;
+        }):0;
+    const size_t contour_accepted = contour_result.accepted_count()-concentric_infill_accepted;
+    const size_t infill_accepted = infill_result.accepted_count()+concentric_infill_accepted;
     auto& statistics = context.layer.fiber_infill_statistics;
     statistics.candidates += infill_result.candidates.size();
+    if (concentric) {
+        std::set<FiberCandidateId> fill_candidates;
+        for (const auto& assignment:contour_result.assignments)
+            if (assignment.display_purpose==FiberPathPurpose::Infill) fill_candidates.insert(assignment.id.parent);
+        statistics.candidates+=fill_candidates.size();
+    }
     statistics.accepted_fragments += infill_accepted;
-    for (const auto& assignment : infill_result.assignments) {
+    const auto& fill_assignments=concentric?contour_result.assignments:infill_result.assignments;
+    for (const auto& assignment : fill_assignments) {
+        if (concentric && assignment.display_purpose!=FiberPathPurpose::Infill) continue;
         if (assignment.id.fragment_ordinal == 1) ++statistics.split_candidates;
         if (assignment.kind == FiberAssignmentKind::Rejected)
             ++statistics.rejected_fragments[fiber_rejection_reason_name(assignment.reason)];
@@ -1867,13 +2071,14 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 context.layer.fiber_fill_diagnostics.push_back({
                     assignment.centerline->polyline.to_polyline(),
                     std::string(fiber_rejection_reason_name(assignment.reason)) + "; " + detail,
-                    assignment.id.parent.purpose == FiberPathPurpose::Contour,
+                    assignment.display_purpose.value_or(assignment.id.parent.purpose) == FiberPathPurpose::Contour,
                     assignment.source_end_mm - assignment.source_begin_mm,
                     Layer::FiberDiagnosticKind::RejectedPath, {},
                     domain_id.policy_group_id, domain_id.component_id});
                 for (const auto& issue : assignment.contour_issues)
                     context.layer.fiber_fill_diagnostics.push_back({
-                        issue.source, contour_rounding_failure_name(issue.reason), true,
+                        issue.source, contour_rounding_failure_name(issue.reason),
+                        assignment.display_purpose.value_or(assignment.id.parent.purpose)==FiberPathPurpose::Contour,
                         unscale<double>(issue.source.length()), Layer::FiberDiagnosticKind::RejectedPath,
                         {}, domain_id.policy_group_id, domain_id.component_id});
             }
@@ -1881,7 +2086,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 << "[FiberRejected] layer=" << context.layer.id()
                 << " policy_group=" << assignment.id.parent.domain.policy_group_id
                 << " component=" << assignment.id.parent.domain.component_id
-                << " purpose=" << (assignment.id.parent.purpose == FiberPathPurpose::Contour ? "contour" : "infill")
+                << " purpose=" << (assignment.display_purpose.value_or(assignment.id.parent.purpose) == FiberPathPurpose::Contour ? "contour" : "infill")
                 << " job=" << assignment.id.parent.job_ordinal
                 << " candidate=" << assignment.id.parent.path_ordinal
                 << " fragment=" << assignment.id.fragment_ordinal
@@ -1929,7 +2134,7 @@ FillSurfaceView build_resin_surface_view(
             for (ExPolygon& resin_part : resin_domain) {
                 Surface resin_surface = contributor.original_surface;
                 resin_surface.expolygon = std::move(resin_part);
-                const bool fiber_source = contributor.fiber_policy.has_value();
+                const bool fiber_source = contributor.residual_fiber_resin;
                 // 100% ordinary core density may have classified the source as
                 // InternalSolid. Residual resin fill has its own density.
                 if (fiber_source)
@@ -1959,9 +2164,11 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
             const PrintRegionConfig& config = region->region().config();
             return continuous_fiber_active_on_layer(config, this->id());
         });
+    const SdkMaskLayerContext mask_context = sdk_mask_layer_context(*this);
+    const bool mask_layer_enabled = !mask_context.changed_core.empty();
     LockRegionParam lock_param;
     std::vector<SurfaceFill> surface_fills = group_fills(
-        *this, lock_param, nullptr, fiber_layer_enabled);
+        *this, lock_param, nullptr, fiber_layer_enabled || mask_layer_enabled, &mask_context);
 	const Slic3r::BoundingBox bbox 			= this->object()->bounding_box();
 	const auto                resolution 	= this->object()->print()->config().resolution.value;
 
@@ -1984,7 +2191,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     const FillExecutionPolicy ordinary_fill_policy {};
     LayerFillTransaction transaction(m_regions.size());
 
-    const std::vector<FiberIslandDomainPlan> fiber_domains = build_fiber_island_domains(*this, surface_fills);
+    const std::vector<FiberIslandDomainPlan> fiber_domains = build_fiber_island_domains(*this, surface_fills, mask_context);
     std::map<FillDomainContributorId, ExPolygons> contributor_exclusions;
     for (const FiberIslandDomainPlan& domain : fiber_domains) {
         FiberDomainExecutionResult fiber_result = execute_continuous_fiber_domain(
@@ -2004,7 +2211,20 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         }
     }
 
-    if (!fiber_domains.empty()) {
+    if (!fiber_domains.empty() || mask_layer_enabled) {
+        // Residual-only contributors have no fiber domain coverage record.
+        // Record their native source independently, including intentional void.
+        for (const auto& fill : surface_fills)
+            for (const auto& contributor : fill.contributors)
+                if (contributor.residual_fiber_resin && !contributor.fiber_policy) {
+                    FiberCoverageRecord record;
+                    record.source = {this->object()->id().id, this->id(), contributor.id.region_id, contributor.id.surface_id};
+                    record.source_domain = contributor.effective_domain;
+                    const auto& source = m_regions[contributor.id.region_id]->region().config();
+                    (source.fiber_resin_fill_density.value > 0 ? record.resin_domain : record.intentional_void) =
+                        contributor.effective_domain;
+                    transaction.coverage.add(std::move(record));
+                }
         FillSurfaceView resin_surface_view = build_resin_surface_view(
             *this, surface_fills, contributor_exclusions);
         LockRegionParam resin_lock_param;

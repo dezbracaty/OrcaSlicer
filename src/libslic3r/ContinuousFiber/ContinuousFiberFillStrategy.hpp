@@ -32,9 +32,17 @@ struct ContourIssue {
     ContourRoundingFailure reason;
     Polyline source;
 };
+// Interval and exact contacts of one complete radius-treated connection,
+// including its arcs and internal straight links. Recorded during assembly.
+struct ContourBend {
+    double begin_mm {0.0}, end_mm {0.0};
+    Point entry_point, exit_point;
+};
+
 struct ContourRoundingResult {
     std::optional<Polyline3> path;
     std::vector<ContourArc> arcs;
+    std::vector<ContourBend> bends;
     std::vector<ContourIssue> issues;
 };
 

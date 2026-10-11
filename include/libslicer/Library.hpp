@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace libslicer {
@@ -232,6 +233,41 @@ struct PlaneCutResult
 LIBSLICER_API PlaneCutResult cut_mesh_with_plane(
     const PlaneCutRequest& request);
 
+enum class FiberMaskShape { Box, Cylinder, Sphere };
+
+// A centered primitive in its local frame, attached to one SliceObjectInput.
+// Only in-memory volume inputs support masks. File inputs with masks are rejected.
+// Regions use native modifier precedence: later masks override earlier masks
+// where they intersect; unspecified settings inherit the underlying region.
+struct SliceFiberMaskInput
+{
+    // Nonempty and unique within the owning object, including disabled masks.
+    std::string id;
+    FiberMaskShape shape{FiberMaskShape::Box};
+    // Box: XYZ lengths. Cylinder: matching XY diameters and Z height.
+    // Sphere: matching XYZ diameters. All sizes are positive finite millimeters.
+    std::array<double, 3> dimensions_mm{1.0, 1.0, 1.0};
+    // Row-major rigid affine transform from mask-local to object coordinates.
+    // Scale belongs in dimensions_mm; the object's parent transform may scale
+    // or mirror both the model and masks together.
+    std::array<double, 16> mask_to_object{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0};
+    // Disabled masks still validate ID, shape, dimensions and local pose, but
+    // do not validate settings or produce a native modifier.
+    bool enabled{true};
+    // Partial serialized patch restricted to ConfigScope::FiberMask parameters.
+    std::vector<std::pair<std::string, std::string>> settings;
+};
+
+// Dimensions and transformed coordinates are limited to 1,000,000 mm.
+// Curved masks use the configured resolution and reject tessellation finer
+// than 2*pi/1024 radians or meshes exceeding 1,000,000 triangles.
+// Effective mask regions currently reject infill_combination, interface_shells
+// and infill_only_where_needed; invalid inputs return slice diagnostics.
+
 struct SliceObjectInput
 {
     // File input remains available for compatibility. New document slicing
@@ -247,6 +283,7 @@ struct SliceObjectInput
         0.0, 0.0, 1.0, 0.0,
         0.0, 0.0, 0.0, 1.0};
     std::vector<SliceVolumeInput> volumes;
+    std::vector<SliceFiberMaskInput> fiber_masks;
 };
 
 enum class OutputArtifactOwnership

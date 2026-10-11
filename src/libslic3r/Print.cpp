@@ -253,7 +253,9 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
     bool invalidated = false;
 
     for (const t_config_option_key &opt_key : opt_keys) {
-        if (opt_key.rfind("fiber_", 0) == 0 || opt_key == "filament_fiber_feed_correction" ||
+        if (opt_key == "fiber_toolchange_approach_speed") {
+            steps.emplace_back(psGCodeExport);
+        } else if (opt_key.rfind("fiber_", 0) == 0 || opt_key == "filament_fiber_feed_correction" ||
             opt_key == "filament_process_type" || opt_key == "toolhead_process_capabilities") {
             osteps.emplace_back(posInfill);
             osteps.emplace_back(posSimplifyInfill);

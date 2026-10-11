@@ -250,7 +250,8 @@ public:
     void            set_layer_count(unsigned int value) { m_layer_count = value; }
     void            apply_print_config(const PrintConfig &print_config);
 
-    std::string     travel_to(const Point& point, ExtrusionRole role, std::string comment, double z = DBL_MAX);
+    std::string     travel_to(const Point& point, ExtrusionRole role, std::string comment, double z = DBL_MAX,
+                             std::optional<double> speed_limit_mm_s = std::nullopt);
     bool            needs_retraction(const Polyline& travel, ExtrusionRole role, LiftType& lift_type);
     std::string     retract(bool toolchange = false, bool is_last_retraction = false, LiftType lift_type = LiftType::NormalLift, bool apply_instantly = false, ExtrusionRole role = erNone);
     std::string     unretract() { return m_writer.unlift() + m_writer.unretract(); }
@@ -419,6 +420,9 @@ private:
                              const Point*                start_point       = nullptr);
     std::string extrude_multi_path(const ExtrusionMultiPath& multipath, const std::string& description = "", double speed = -1.);
     std::string extrude_path(const ExtrusionPath& path, const std::string& description = "", double speed = -1.);
+    bool m_fiber_pa_zero_established { false };
+    bool m_fiber_first_approach_pending { true };
+    std::string ensure_fiber_pressure_advance_zero();
     std::string extrude_fiber(const ExtrusionFiberPath& path, const std::string& description = "", double speed = -1.);
 
     // Orca: Adaptive PA variables

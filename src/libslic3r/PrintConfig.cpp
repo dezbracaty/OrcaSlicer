@@ -940,6 +940,11 @@ void PrintConfigDef::init_fff_params()
     // Maximum extruder temperature, bumped to 1500 to support printing of glass.
     const int max_temp = 1500;
 
+    // Job-internal modifier semantics. Never offered as an editable setting.
+    def = this->add("fiber_mask_process", coBool);
+    def->readonly = true;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("generate_reinforced_perimeters", coBool);
     def->label = L("Continuous fiber contours");
     def->category = L("Continuous fiber");
@@ -957,7 +962,7 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Continuous fiber");
     def->tooltip = L("Maximum number of successive continuous fiber contour levels. Each accepted closed contour may produce multiple contours at the next level; rejected contours do not produce deeper levels.");
     def->min = 0;
-    def->max = 100;
+    def->max = fiber_contour_depth_limit;
     def->set_default_value(new ConfigOptionInt(1));
 
     def = this->add("generate_reinforced_infills", coBool);
@@ -1047,11 +1052,19 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("fiber_corner_stabilization_length", coFloat);
     def->label = L("Fiber corner stabilization length");
-    def->tooltip = L("Minimum deposited fiber path length before each radius-optimized rectilinear return. The entire return, including its arcs and connecting segment, is excluded. Zero disables this constraint.");
+    def->tooltip = L("Minimum deposited fiber path length before each radius-optimized bend in rectilinear fiber infill. The entire bend, including its arcs and connecting segments, is excluded. Zero disables this constraint.");
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(5.0));
+
+    def = this->add("fiber_concentric_corner_stabilization_length", coFloat);
+    def->label = L("Fiber concentric corner stabilization length");
+    def->tooltip = L("Minimum deposited fiber path length before each radius-optimized bend in concentric fiber infill. The entire bend, including its arcs and connecting segments, is excluded. A loop that fails this constraint is rejected entirely. Zero disables this constraint.");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
 
     def = this->add("fiber_contour_boundary_clearance", coFloat);
     def->label = L("Fiber contour boundary clearance");
@@ -1156,6 +1169,16 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->ratio_over = "default_acceleration";
     def->set_default_value(new ConfigOptionFloatOrPercent(100., true));
+
+    def = this->add("fiber_toolchange_approach_speed", coFloat);
+    def->label = L("Fiber first approach speed limit");
+    def->tooltip = L("Maximum speed of XY travel in the first fiber approach after activating the fiber tool. "
+                     "Use a finite, non-negative value. Zero inherits the normal travel speed. "
+                     "Later approaches with the same active tool are not limited by this setting.");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("mm/s");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
 
     def = this->add("fiber_cut_to_contact_length", coFloat);
     def->label = L("Fiber cutter to contact distance");

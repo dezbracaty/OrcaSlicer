@@ -21,6 +21,7 @@ enum class FiberFinalizationFailure : uint8_t {
     InvalidParameter,
     InvalidGeometry,
     OutsideDomain,
+    PolicyBoundaryRejected,
     FinishUnavailable,
     SamplingLimit
 };

@@ -5,14 +5,21 @@
 #include "FiberSource.hpp"
 #include "../PrintConfig.hpp"
 
+#include <array>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <vector>
 
 namespace Slic3r {
+inline constexpr int fiber_contour_depth_limit = 100;
 
 class Layer;
 class LayerRegion;
+struct FiberPolicyBoundary;
+
+const std::array<std::string_view, 39>& fiber_mask_parameter_keys();
+bool is_fiber_mask_parameter(std::string_view key);
 
 struct ContinuousFiberConfig {
     bool contour_enabled { false };
@@ -54,7 +61,8 @@ struct ContinuousFiberConfig {
     double contour_boundary_clearance_mm { 0.0 };
     double contour_bend_radius_mm { 0.0 };
     double infill_bend_radius_mm { 0.0 };
-    double corner_stabilization_length_mm { 0.0 };
+    double corner_stabilization_length_mm { 0.0 }; // Rectilinear only.
+    double concentric_corner_stabilization_length_mm { 0.0 };
     double contour_min_speed_mm_s { 3.0 };
     double infill_min_speed_mm_s { 3.0 };
     double corner_transition_length_mm { 5.0 };
@@ -65,12 +73,22 @@ struct ContinuousFiberConfig {
     double finish_overlap_length_mm { 0.0 };
     double finish_motion_speed_mm_s { 3.0 };
 
+    bool enforce_policy_boundary { false };
+    double policy_rounding_margin_mm { 0.0 };
+    std::shared_ptr<const FiberPolicyBoundary> policy_boundary;
+
     bool enabled() const { return contour_enabled || infill_enabled; }
+    bool concentric_infill() const { return infill_enabled && infill_pattern==ipConcentric && infill_density>0; }
     bool active_on_layer(size_t layer_id) const
     {
         return enabled() && layer_interval > 0 && layer_id % size_t(layer_interval) == 0;
     }
 };
+
+bool fiber_concentric_uses_contour_process(const PrintRegionConfig& config);
+// The returned configuration owns geometry/process only. Display cutoff N is
+// retained by the caller. Concentric stability is applied only beyond that cutoff.
+ContinuousFiberConfig fiber_ring_reference_config(const ContinuousFiberConfig& config);
 
 bool continuous_fiber_enabled(const PrintRegionConfig& config);
 bool continuous_fiber_active_on_layer(const PrintRegionConfig& config, size_t layer_id);
@@ -104,6 +122,8 @@ void validate_fiber_cut_event(const std::string& script,
     FiberMachineProtocol protocol = FiberMachineProtocol::LinearE);
 // Validates common process values and only the requested path family.
 void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose, bool closed_path = true);
+void validate_continuous_fiber_region_config(const PrintConfig& print_config,
+    const PrintRegionConfig& region_config, double layer_height);
 ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region);
 
 } // namespace Slic3r

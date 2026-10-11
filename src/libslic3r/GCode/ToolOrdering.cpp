@@ -2,6 +2,7 @@
 #include "Print.hpp"
 #include "ToolOrdering.hpp"
 #include "Layer.hpp"
+#include "ContinuousFiber/ContinuousFiberConfig.hpp"
 #include "ClipperUtils.hpp"
 #include "ParameterUtils.hpp"
 #include "GCode/ToolOrderUtils.hpp"
@@ -21,6 +22,8 @@
 #include <limits>
 #include <algorithm>
 #include <unordered_map>
+#include <optional>
+#include <set>
 
 #include <libslic3r.h>
 
@@ -99,14 +102,93 @@ unsigned int LayerTools::internal_solid_filament_id(const PrintRegion &region) c
 }
 
 // Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
+namespace {
+// Collection nesting cannot change the material of a finalized fiber path.
+template<class Visitor>
+void visit_fiber_leaves(const ExtrusionEntity& entity, const Visitor& visitor)
+{
+    if (const auto* collection = dynamic_cast<const ExtrusionEntityCollection*>(&entity)) {
+        for (const auto* child : collection->entities) visit_fiber_leaves(*child, visitor);
+    } else {
+        visitor(entity);
+    }
+}
+
+std::set<coordf_t> strict_fiber_layers(const PrintObject& object)
+{
+    std::set<coordf_t> result;
+    for (const auto* layer : object.layers())
+        for (const auto* region : layer->regions())
+            for (const auto* entity : region->fills.entities)
+                visit_fiber_leaves(*entity, [&](const ExtrusionEntity& leaf) {
+                    if (const auto* fiber = dynamic_cast<const ExtrusionFiberPath*>(&leaf))
+                        if (const auto& boundary = fiber->prepared_path()->policy_boundary;
+                            boundary && boundary->requires_resin_first) result.insert(layer->print_z);
+                });
+    return result;
+}
+
+template <class GetCustomSequence>
+void enforce_fiber_suffix(std::vector<std::vector<unsigned int>>& sequences,
+    const std::vector<bool>& affected, const PrintConfig& config,
+    const std::vector<unsigned int>& adopted_first_layer, bool reorder_first_layer,
+    const GetCustomSequence& get_custom_seq)
+{
+    assert(sequences.size() == affected.size());
+    for (std::size_t index = 0; index < sequences.size(); ++index) {
+        auto& sequence = sequences[index];
+        if (!affected[index]) continue;
+        const auto check_sequence = [&](const auto& explicit_sequence) {
+            bool fiber_seen = false;
+            for (unsigned int tool : explicit_sequence) {
+                if (std::find(sequence.begin(), sequence.end(), tool) == sequence.end()) continue;
+                if (is_fiber_filament(config, tool)) fiber_seen = true;
+                else if (fiber_seen)
+                    throw std::runtime_error("Explicit material order conflicts with masked resin-before-fiber execution");
+            }
+        };
+        if (!reorder_first_layer && index == 0) {
+            // Appended materials and an automatically fixed first layer are not explicit rules.
+            check_sequence(adopted_first_layer);
+        } else {
+            std::vector<int> native_sequence;
+            if (get_custom_seq(int(index), native_sequence)) {
+                std::vector<unsigned int> adopted;
+                // Use the optimizer's filtering and one-based to zero-based conversion.
+                for (int tool : native_sequence) {
+                    const auto id = static_cast<unsigned int>(tool) - 1;
+                    if (std::find(sequence.begin(), sequence.end(), id) != sequence.end())
+                        adopted.push_back(id);
+                }
+                check_sequence(adopted);
+            }
+        }
+        std::stable_partition(sequence.begin(), sequence.end(),
+            [&](unsigned tool) { return !is_fiber_filament(config, tool); });
+    }
+}
+} // namespace
+
 unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, const PrintRegion &region) const
 {
     // A finalized fiber entity owns its material; layer wiping overrides must
     // not replace it even when the remainder of the layer uses one extruder.
-    if (extrusions.role() == erContinuousFiberContour)
-        return unsigned(region.config().reinforced_perimeters_filament.value - 1);
-    if (extrusions.role() == erContinuousFiberInfill)
-        return unsigned(region.config().reinforced_infill_filament.value - 1);
+    std::optional<unsigned> fiber_material;
+    bool ordinary = false;
+    visit_fiber_leaves(extrusions, [&](const ExtrusionEntity& leaf) {
+        if (const auto* fiber = dynamic_cast<const ExtrusionFiberPath*>(&leaf)) {
+            const auto material = fiber->prepared_path()->logical_filament_id;
+            if (fiber_material && *fiber_material != material)
+                throw std::runtime_error("Fiber export group contains multiple materials");
+            fiber_material = material;
+        } else {
+            ordinary = true;
+        }
+    });
+    if (fiber_material) {
+        if (ordinary) throw std::runtime_error("Fiber export group also contains ordinary material");
+        return *fiber_material;
+    }
 	assert(region.config().outer_wall_filament_id.value > 0);
 	assert(region.config().sparse_infill_filament_id.value > 0);
 	assert(region.config().internal_solid_filament_id.value > 0);
@@ -194,8 +276,6 @@ static FilamentChangeStats calc_filament_change_info_by_toolorder(const PrintCon
     return ret;
 }
 
-static void apply_first_layer_order(const DynamicPrintConfig* config, std::vector<unsigned int>& tool_order);
-
 void ToolOrdering::handle_dontcare_extruder(const std::vector<unsigned int>& tool_order_layer0)
 {
     if(m_layer_tools.empty() || tool_order_layer0.empty())
@@ -263,6 +343,7 @@ void ToolOrdering::handle_dontcare_extruder(const std::vector<unsigned int>& too
 
 void ToolOrdering::handle_dontcare_extruder(unsigned int last_extruder_id)
 {
+    m_applied_first_layer_order = {};
     if(m_layer_tools.empty())
         return;
     if(last_extruder_id == (unsigned int)-1){
@@ -315,7 +396,7 @@ void ToolOrdering::handle_dontcare_extruder(unsigned int last_extruder_id)
                 }
 
                 // Then, if we specified the tool order, apply it now
-                apply_first_layer_order(m_print_full_config, lt.extruders);
+                m_applied_first_layer_order = apply_first_layer_order(m_print_full_config, lt.extruders);
             }
 
         }
@@ -355,8 +436,13 @@ void ToolOrdering::sort_and_build_data(const Print& print, unsigned int first_ex
 {
     // if first extruder is -1, we can decide the first layer tool order before doing reorder function
     // so we shouldn't reorder first layer in reorder function
+    std::set<coordf_t> affected;
+    for (const auto* object : print.objects()) {
+        auto current = strict_fiber_layers(*object);
+        affected.insert(current.begin(), current.end());
+    }
     bool reorder_first_layer = (first_extruder != (unsigned int)(-1));
-    reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
+    reorder_extruders_for_minimum_flush_volume(reorder_first_layer, affected);
     m_sorted = true;
 
     double max_layer_height = 0.;
@@ -375,7 +461,7 @@ void ToolOrdering::sort_and_build_data(const Print& print, unsigned int first_ex
 
     this->fill_wipe_tower_partitions(print.config(), object_bottom_z, max_layer_height);
     if (this->insert_wipe_tower_extruder()) {
-        reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
+        reorder_extruders_for_minimum_flush_volume(reorder_first_layer, affected);
         this->fill_wipe_tower_partitions(print.config(), object_bottom_z, max_layer_height);
     }
 
@@ -386,15 +472,16 @@ void ToolOrdering::sort_and_build_data(const PrintObject& object , unsigned int 
 {
     // if first extruder is -1, we can decide the first layer tool order before doing reorder function
     // so we shouldn't reorder first layer in reorder function
+    const auto affected = strict_fiber_layers(object);
     bool reorder_first_layer = (first_extruder != (unsigned int)(-1));
-    reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
+    reorder_extruders_for_minimum_flush_volume(reorder_first_layer, affected);
     m_sorted = true;
 
     double max_layer_height = calc_max_layer_height(object.print()->config(), object.config().layer_height);
 
     this->fill_wipe_tower_partitions(object.print()->config(), object.layers().front()->print_z - object.layers().front()->height, max_layer_height);
     if (this->insert_wipe_tower_extruder()) {
-        reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
+        reorder_extruders_for_minimum_flush_volume(reorder_first_layer, affected);
         this->fill_wipe_tower_partitions(object.print()->config(), object.layers().front()->print_z - object.layers().front()->height, max_layer_height);
     }
 
@@ -506,7 +593,10 @@ ToolOrdering::ToolOrdering(const Print &print, unsigned int first_extruder, bool
     this->mark_skirt_layers(print.config(), max_layer_height);
 }
 
-static void apply_first_layer_order(const DynamicPrintConfig* config, std::vector<unsigned int>& tool_order) {
+std::vector<unsigned int> ToolOrdering::apply_first_layer_order(
+    const DynamicPrintConfig* config, std::vector<unsigned int>& tool_order) {
+    std::vector<unsigned int> applied;
+    if (!config) return applied;
     const ConfigOptionInts* first_layer_print_sequence_op = config->option<ConfigOptionInts>("first_layer_print_sequence");
     if (first_layer_print_sequence_op) {
         const std::vector<int>& print_sequence_1st = first_layer_print_sequence_op->values;
@@ -520,13 +610,18 @@ static void apply_first_layer_order(const DynamicPrintConfig* config, std::vecto
 
                 return lh_it < rh_it;
             });
+            for (unsigned int tool : tool_order)
+                if (tool > 0 && std::find(print_sequence_1st.begin(), print_sequence_1st.end(), int(tool)) != print_sequence_1st.end())
+                    applied.push_back(tool - 1);
         }
     }
+    return applied;
 }
 
 // BBS
 std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Print& print)
 {
+    m_applied_first_layer_order = {};
     std::vector<unsigned int> tool_order;
     int initial_extruder_id = -1;
     std::map<int, double> min_areas_per_extruder;
@@ -586,13 +681,14 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
         tool_order.insert(iter, ape.first);
     }
 
-    apply_first_layer_order(m_print_full_config, tool_order);
+    m_applied_first_layer_order = apply_first_layer_order(m_print_full_config, tool_order);
 
     return tool_order;
 }
 
 std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const PrintObject& object)
 {
+    m_applied_first_layer_order = {};
     std::vector<unsigned int> tool_order;
     int initial_extruder_id = -1;
     std::map<int, double> min_areas_per_extruder;
@@ -648,13 +744,14 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
         tool_order.insert(iter, ape.first);
     }
 
-    apply_first_layer_order(m_print_full_config, tool_order);
+    m_applied_first_layer_order = apply_first_layer_order(m_print_full_config, tool_order);
 
     return tool_order;
 }
 
 void ToolOrdering::initialize_layers(std::vector<coordf_t> &zs)
 {
+    m_applied_first_layer_order = {};
     sort_remove_duplicates(zs);
     // Merge numerically very close Z values.
     for (size_t i = 0; i < zs.size();) {
@@ -722,25 +819,22 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             bool has_internal_solid     = false;
             bool has_top_solid_surface  = false;
             bool has_bottom_surface     = false;
-            bool has_fiber_contour      = false;
-            bool has_fiber_infill       = false;
+            std::set<unsigned> fiber_materials;
             bool something_nonoverriddable = false;
             for (const ExtrusionEntity *ee : layerm->fills.entities) {
                 // fill represents infill extrusions of a single island.
                 const auto *fill = dynamic_cast<const ExtrusionEntityCollection*>(ee);
-                ExtrusionRole role = fill->entities.empty() ? erNone : fill->entities.front()->role();
-                if (role == erContinuousFiberContour)
-                    has_fiber_contour = true;
-                else if (role == erContinuousFiberInfill)
-                    has_fiber_infill = true;
-                else if (role == erTopSolidInfill || role == erIroning)
-                    has_top_solid_surface = true;
-                else if (role == erBottomSurface)
-                    has_bottom_surface = true;
-                else if (is_solid_infill(role))
-                    has_internal_solid = true;
-                else if (role != erNone)
-                    has_infill = true;
+                visit_fiber_leaves(*fill, [&](const ExtrusionEntity& leaf) {
+                    if (const auto* fiber = dynamic_cast<const ExtrusionFiberPath*>(&leaf)) {
+                        fiber_materials.insert(fiber->prepared_path()->logical_filament_id + 1);
+                        return;
+                    }
+                    const auto role = leaf.role();
+                    if (role == erTopSolidInfill || role == erIroning) has_top_solid_surface = true;
+                    else if (role == erBottomSurface) has_bottom_surface = true;
+                    else if (is_solid_infill(role)) has_internal_solid = true;
+                    else if (role != erNone) has_infill = true;
+                });
 
                 if (m_print_config_ptr) {
                     if (! layer_tools.wiping_extrusions().is_overriddable_and_mark(*fill, *m_print_config_ptr, object, region))
@@ -758,14 +852,12 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                         layer_tools.extruders.emplace_back(region.config().bottom_surface_filament_id);
 	                if (has_infill)
 	                    layer_tools.extruders.emplace_back(region.config().sparse_infill_filament_id);
-                    if (has_fiber_contour)
-                        layer_tools.extruders.emplace_back(region.config().reinforced_perimeters_filament);
-                    if (has_fiber_infill)
-                        layer_tools.extruders.emplace_back(region.config().reinforced_infill_filament);
-                } else if (has_internal_solid || has_top_solid_surface || has_bottom_surface || has_infill || has_fiber_contour || has_fiber_infill)
+
+                } else if (has_internal_solid || has_top_solid_surface || has_bottom_surface || has_infill)
             		layer_tools.extruders.emplace_back(extruder_override);
             }
-            if (has_internal_solid || has_top_solid_surface || has_bottom_surface || has_infill || has_fiber_contour || has_fiber_infill)
+            layer_tools.extruders.insert(layer_tools.extruders.end(), fiber_materials.begin(), fiber_materials.end());
+            if (has_internal_solid || has_top_solid_surface || has_bottom_surface || has_infill || !fiber_materials.empty())
                 layer_tools.has_object = true;
         }
         layerCount++;
@@ -1265,8 +1357,12 @@ FilamentChangeStats ToolOrdering::get_filament_change_stats(FilamentChangeMode m
     return m_stats_by_single_extruder;
 }
 
-void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first_layer)
+void ToolOrdering::reorder_extruders_for_minimum_flush_volume(
+    bool reorder_first_layer, const std::set<coordf_t>& resin_first_layers)
 {
+    m_stats_by_single_extruder.clear();
+    m_stats_by_multi_extruder_curr.clear();
+    m_stats_by_multi_extruder_best.clear();
     const PrintConfig* print_config = m_print_config_ptr;
     if (!print_config && m_print_object_ptr) {
         print_config = &(m_print_object_ptr->print()->config());
@@ -1274,6 +1370,59 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first
 
     if (!print_config || m_layer_tools.empty())
         return;
+
+    std::vector<std::vector<unsigned int>> layer_filaments;
+    for (auto& lt : m_layer_tools) {
+        layer_filaments.emplace_back(lt.extruders);
+    }
+
+    std::vector<bool> affected_layers;
+    affected_layers.reserve(m_layer_tools.size());
+    for (const auto& layer : m_layer_tools) {
+        const auto near = resin_first_layers.lower_bound(layer.print_z - EPSILON);
+        affected_layers.push_back(near != resin_first_layers.end() &&
+            std::abs(*near - layer.print_z) <= EPSILON);
+    }
+
+    std::vector<LayerPrintSequence> other_layers_seqs;
+    const ConfigOptionInts* other_layers_print_sequence_op = print_config->option<ConfigOptionInts>("other_layers_print_sequence");
+    const ConfigOptionInt* other_layers_print_sequence_nums_op = print_config->option<ConfigOptionInt>("other_layers_print_sequence_nums");
+    if (other_layers_print_sequence_op && other_layers_print_sequence_nums_op) {
+        const std::vector<int>& print_sequence = other_layers_print_sequence_op->values;
+        int                     sequence_nums = other_layers_print_sequence_nums_op->value;
+        other_layers_seqs = get_other_layers_print_sequence(sequence_nums, print_sequence);
+    }
+
+    std::vector<unsigned int>first_layer_filaments;
+    if (!m_layer_tools.empty())
+        first_layer_filaments = m_layer_tools[0].extruders;
+
+    // other_layers_seq: the layer_idx and extruder_idx are base on 1
+    auto get_custom_seq = [&other_layers_seqs, &reorder_first_layer, &first_layer_filaments](int layer_idx, std::vector<int>& out_seq) -> bool {
+        if (!reorder_first_layer && layer_idx == 0) {
+            out_seq.resize(first_layer_filaments.size());
+            std::transform(first_layer_filaments.begin(), first_layer_filaments.end(), out_seq.begin(), [](auto item) {return item + 1; });
+            return true;
+        }
+        for (size_t idx = other_layers_seqs.size() - 1; idx != size_t(-1); --idx) {
+            const auto& other_layers_seq = other_layers_seqs[idx];
+            if (layer_idx + 1 >= other_layers_seq.first.first && layer_idx + 1 <= other_layers_seq.first.second) {
+                out_seq = other_layers_seq.second;
+                return true;
+            }
+        }
+        return false;
+        };
+
+    const auto constrain = [&](std::vector<std::vector<unsigned int>>& sequences) {
+        enforce_fiber_suffix(sequences, affected_layers, *print_config,
+            m_applied_first_layer_order, reorder_first_layer, get_custom_seq);
+    };
+    const auto preserve_constrained_layers = [&] {
+        constrain(layer_filaments);
+        for (size_t i = 0; i < layer_filaments.size(); ++i)
+            m_layer_tools[i].extruders = std::move(layer_filaments[i]);
+    };
 
     const unsigned int number_of_extruders = (unsigned int)(print_config->filament_colour.values.size() + EPSILON);
 
@@ -1308,11 +1457,6 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first
     std::vector<int>filament_maps(number_of_extruders, 0);
     FilamentMapMode map_mode = FilamentMapMode::fmmAutoForFlush;
 
-    std::vector<std::vector<unsigned int>> layer_filaments;
-    for (auto& lt : m_layer_tools) {
-        layer_filaments.emplace_back(lt.extruders);
-    }
-
     std::vector<unsigned int> used_filaments = collect_sorted_used_filaments(layer_filaments);
 
     std::vector<std::set<int>>geometric_unprintables = m_print->get_geometric_unprintable_filaments();
@@ -1320,6 +1464,10 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first
 
     filament_maps = m_print->get_filament_maps();
     map_mode = m_print->get_filament_map_mode();
+    if (filament_maps.empty() && map_mode >= FilamentMapMode::fmmManual) {
+        preserve_constrained_layers();
+        return;
+    }
     // only check and map in sequence mode, in by object mode, we check the map in print.cpp
     if (print_config->print_sequence != PrintSequence::ByObject || m_print->objects().size() == 1) {
         if (map_mode < FilamentMapMode::fmmManual) {
@@ -1330,8 +1478,10 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first
 
             filament_maps = ToolOrdering::get_recommended_filament_maps(layer_filaments, m_print, map_mode, physical_unprintables, geometric_unprintables);
 
-            if (filament_maps.empty())
+            if (filament_maps.empty()) {
+                preserve_constrained_layers();
                 return;
+            }
             std::transform(filament_maps.begin(), filament_maps.end(), filament_maps.begin(), [](int value) { return value + 1; });
             m_print->update_filament_maps_to_config(filament_maps);
         }
@@ -1345,39 +1495,14 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first
         std::transform(filament_maps.begin(), filament_maps.end(), filament_maps.begin(), [](int value) {return value - 1; });
     }
 
+    if (filament_maps.empty() || nozzle_flush_mtx.empty()) {
+        preserve_constrained_layers();
+        return;
+    }
+
     std::vector<std::vector<unsigned int>>filament_sequences;
     std::vector<unsigned int>filament_lists(number_of_extruders);
     std::iota(filament_lists.begin(), filament_lists.end(), 0);
-
-    std::vector<LayerPrintSequence> other_layers_seqs;
-    const ConfigOptionInts* other_layers_print_sequence_op = print_config->option<ConfigOptionInts>("other_layers_print_sequence");
-    const ConfigOptionInt* other_layers_print_sequence_nums_op = print_config->option<ConfigOptionInt>("other_layers_print_sequence_nums");
-    if (other_layers_print_sequence_op && other_layers_print_sequence_nums_op) {
-        const std::vector<int>& print_sequence = other_layers_print_sequence_op->values;
-        int                     sequence_nums = other_layers_print_sequence_nums_op->value;
-        other_layers_seqs = get_other_layers_print_sequence(sequence_nums, print_sequence);
-    }
-
-    std::vector<unsigned int>first_layer_filaments;
-    if (!m_layer_tools.empty())
-        first_layer_filaments = m_layer_tools[0].extruders;
-
-    // other_layers_seq: the layer_idx and extruder_idx are base on 1
-    auto get_custom_seq = [&other_layers_seqs, &reorder_first_layer, &first_layer_filaments](int layer_idx, std::vector<int>& out_seq) -> bool {
-        if (!reorder_first_layer && layer_idx == 0) {
-            out_seq.resize(first_layer_filaments.size());
-            std::transform(first_layer_filaments.begin(), first_layer_filaments.end(), out_seq.begin(), [](auto item) {return item + 1; });
-            return true;
-        }
-        for (size_t idx = other_layers_seqs.size() - 1; idx != size_t(-1); --idx) {
-            const auto& other_layers_seq = other_layers_seqs[idx];
-            if (layer_idx + 1 >= other_layers_seq.first.first && layer_idx + 1 <= other_layers_seq.first.second) {
-                out_seq = other_layers_seq.second;
-                return true;
-            }
-        }
-        return false;
-        };
 
     auto maps_without_group = filament_maps;
     for (auto& item : maps_without_group)
@@ -1392,6 +1517,7 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first
         &filament_sequences
     );
 
+    constrain(filament_sequences);
     auto curr_flush_info = calc_filament_change_info_by_toolorder(print_config, filament_maps, nozzle_flush_mtx, filament_sequences);
     if (nozzle_nums <= 1)
         m_stats_by_single_extruder = curr_flush_info;
@@ -1414,6 +1540,7 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first
                 get_custom_seq,
                 &filament_sequences_one_extruder
             );
+            constrain(filament_sequences_one_extruder);
             m_stats_by_single_extruder = calc_filament_change_info_by_toolorder(print_config, maps_without_group, nozzle_flush_mtx, filament_sequences_one_extruder);
         }
         // if not in best for flush mode,also calculate the info by best for flush mode
@@ -1421,15 +1548,18 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(bool reorder_first
         {
             std::vector<std::vector<unsigned int>>filament_sequences_one_extruder;
             std::vector<int>filament_maps_auto = get_recommended_filament_maps(layer_filaments, m_print, fmmAutoForFlush, physical_unprintables, geometric_unprintables);
-            reorder_filaments_for_minimum_flush_volume(
-                filament_lists,
-                filament_maps_auto,
-                layer_filaments,
-                nozzle_flush_mtx,
-                get_custom_seq,
-                &filament_sequences_one_extruder
-            );
-            m_stats_by_multi_extruder_best = calc_filament_change_info_by_toolorder(print_config, filament_maps_auto, nozzle_flush_mtx, filament_sequences_one_extruder);
+            if (!filament_maps_auto.empty()) {
+                reorder_filaments_for_minimum_flush_volume(
+                    filament_lists,
+                    filament_maps_auto,
+                    layer_filaments,
+                    nozzle_flush_mtx,
+                    get_custom_seq,
+                    &filament_sequences_one_extruder
+                );
+                constrain(filament_sequences_one_extruder);
+                m_stats_by_multi_extruder_best = calc_filament_change_info_by_toolorder(print_config, filament_maps_auto, nozzle_flush_mtx, filament_sequences_one_extruder);
+            }
         }
     }
 

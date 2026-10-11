@@ -6,6 +6,10 @@
 #include "libslic3r/AABBTreeLines.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/GCodeWriter.hpp"
+#include "libslic3r/Print.hpp"
+#include "libslic3r/Layer.hpp"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/ContinuousFiber/FiberPathValidator.hpp"
 #include "libslic3r/ContinuousFiber/ContinuousFiberFillStrategy.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -21,6 +25,8 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <tbb/global_control.h>
+#include <tbb/task_arena.h>
 #include <stdexcept>
 
 namespace {
@@ -972,18 +978,619 @@ int resin_model(const fs::path& fixture, const fs::path& output, const fs::path&
 
 } // namespace
 
-int main(int argc,char** argv)
+namespace fixture_fs = std::filesystem;
+
+// Exercise the production Fill -> PreparedFiberPath -> GCode pipeline. The
+// output oracle compares finalized paths with emitted G-code. Concentric
+// fill reuses the unchanged contour planner and process.
+struct RingCaseOptions {
+    double density=100;
+    std::optional<double> radius;
+    double translation=0;
+    bool rectilinear=false;
+    bool debug=true;
+    bool capture_geometry=false;
+    bool use_default_stability=false;
+    bool split_regions=false;
+    bool different_process=false;
+    bool hole=false;
+    std::optional<int> second_display_count;
+};
+struct RingReplayDomain {
+    Slic3r::ExPolygons area;
+    Slic3r::ContinuousFiberConfig config;
+    Slic3r::FiberDomainId id;
+};
+struct RingSlice {
+    Json report;
+    std::vector<std::string> commands;
+    std::vector<RingReplayDomain> domains;
+    std::set<const Slic3r::PreparedFiberPath*> displayed_outer_paths;
+    std::set<std::tuple<size_t,size_t,size_t,size_t>> exterior_ids;
+    std::vector<std::shared_ptr<const Slic3r::PreparedFiberPath>> paths;
+};
+void collect_ring_paths(const Slic3r::ExtrusionEntityCollection& collection,
+    std::vector<std::shared_ptr<const Slic3r::PreparedFiberPath>>& paths,bool allow_rectilinear=false,
+    std::set<const Slic3r::PreparedFiberPath*>* displayed_outer=nullptr)
 {
-    const fs::path assets=fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao";
+    for (const auto* entity:collection.entities) {
+        if (const auto* nested=dynamic_cast<const Slic3r::ExtrusionEntityCollection*>(entity))
+            collect_ring_paths(*nested,paths,allow_rectilinear,displayed_outer);
+        else if (const auto* fiber=dynamic_cast<const Slic3r::ExtrusionFiberPath*>(entity)) {
+            require(allow_rectilinear || fiber->fiber_purpose()==Slic3r::FiberPathPurpose::Contour,
+                "Concentric ring used independent infill process");
+            require(allow_rectilinear || fiber->role()==Slic3r::erContinuousFiberContour,"Ring role changed");
+            paths.push_back(fiber->prepared_path());
+            if(displayed_outer && fiber->display_purpose()==Slic3r::FiberPathPurpose::Contour)
+                displayed_outer->insert(fiber->prepared_path().get());
+        }
+    }
+}
+void write_ring_svg(const fixture_fs::path& file,size_t layer,const Json& diagnostics,const Json& emitted)
+{
+    double minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9;
+    const auto extend=[&](const Json& points) {
+        for(const auto& p:points) {const double x=p[0],y=p[1];minx=std::min(minx,x);miny=std::min(miny,y);maxx=std::max(maxx,x);maxy=std::max(maxy,y);}
+    };
+    for(const auto& d:diagnostics)if(d["layer"]==layer) {extend(d["points"]);for(const auto& ring:d["rings"])extend(ring);}
+    for(const auto& p:emitted)if(p["layer"]==layer)extend(p["local_points"]);
+    if(minx>maxx)return;
+    std::ofstream svg(file);require(bool(svg),"Cannot write SVG");
+    const double width=std::max(1.,maxx-minx),height=std::max(1.,maxy-miny),margin=width*.04;
+    svg<<std::setprecision(9)<<"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\""<<minx-margin<<' '<<-maxy-margin<<' '<<width+2*margin<<' '<<height+2*margin<<"\">\n";
+    svg<<"<rect x=\""<<minx-margin<<"\" y=\""<<-maxy-margin<<"\" width=\""<<width+2*margin<<"\" height=\""<<height+2*margin<<"\" fill=\"white\"/>\n";
+    const auto draw=[&](const Json& points,const char* color,double stroke) {
+        if(points.size()<2)return;
+        svg<<"<path fill=\"none\" stroke=\""<<color<<"\" stroke-width=\""<<stroke<<"\" stroke-linecap=\"round\" d=\"";
+        for(size_t i=0;i<points.size();++i)svg<<(i?'L':'M')<<points[i][0].get<double>()<<' '<<-points[i][1].get<double>()<<' ';
+        svg<<"\"/>\n";
+    };
+    for(const auto& d:diagnostics)if(d["layer"]==layer)for(const auto& ring:d["rings"]) {
+        auto closed=ring;if(!closed.empty())closed.push_back(closed.front());draw(closed,"#a5adb6",.16);
+    }
+    for(const auto& p:emitted)if(p["layer"]==layer)draw(p["local_points"],"#258759",.35);
+    svg<<"</svg>\n";
+}
+
+// read_blocks restores the configured tool offset, so its points are nozzle-tip
+// world coordinates. The origin comes from the model instance, never the output.
+bool ring_output_matches(const Path& local,const Block& block,Point origin,double* maximum_error=nullptr)
+{
+    if(local.size()<2 || local.size()!=block.points.size())return false;
+    const double tolerance=std::sqrt(2.)*.5*
+        Slic3r::GCodeFormatter::pow_10_inv[Slic3r::GCodeFormatter::XYZF_EXPORT_DIGITS]+2e-6;
+    double maximum=0;
+    for(size_t j=0;j<local.size();++j) {
+        const double error=distance({local[j].x+origin.x,local[j].y+origin.y},block.points[j]);
+        if(!std::isfinite(error) || error>tolerance)return false;
+        maximum=std::max(maximum,error);
+    }
+    if(maximum_error)*maximum_error=maximum;
+    return true;
+}
+
+void ring_coordinate_checker_self_test()
+{
+    const Point origin{100.0004,80.0005};
+    const Path local{{1.2,3.4},{5.6,3.4},{5.6,7.8}};
+    const std::vector<Point> offsets{{-19,0},{-7.25,2.5}};
+    std::ostringstream text;text<<std::fixed<<std::setprecision(Slic3r::GCodeFormatter::XYZF_EXPORT_DIGITS);
+    text<<"G90\n;FIBER_BEGIN layer=0 extruder=1 purpose=infill component=0\n";
+    for(size_t i=0;i<local.size();++i) {
+        text<<"G1 X"<<local[i].x+origin.x-offsets[1].x<<" Y"<<local[i].y+origin.y-offsets[1].y<<'\n';
+        if(i==0)text<<";FIBER_START\n";
+    }
+    text<<";FIBER_END\n";
+    std::istringstream input(text.str());const auto blocks=read_blocks(input,offsets,true);
+    require(blocks.size()==1 && ring_output_matches(local,blocks[0],origin),"Coordinate checker rejected correct quantized tool output");
+    auto shifted=blocks[0];for(auto& point:shifted.points){point.x+=1;point.y+=2;}
+    require(!ring_output_matches(local,shifted,origin),"Coordinate checker accepted a rigidly misplaced path");
+    auto bad_start=blocks[0];bad_start.points[0].x+=1;
+    require(!ring_output_matches(local,bad_start,origin),"Coordinate checker ignored the depositing start point");
+    require(!ring_output_matches(local,blocks[0],{origin.x+1,origin.y}),"Coordinate checker accepted an incorrect instance origin");
+    auto wrong_offsets=offsets;wrong_offsets[1].y+=1;
+    std::istringstream wrong_input(text.str());const auto wrong_blocks=read_blocks(wrong_input,wrong_offsets,true);
+    require(!ring_output_matches(local,wrong_blocks[0],origin),"Coordinate checker accepted an incorrect tool offset");
+}
+
+RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
+    size_t expected_layers,double preset_radius,int display_count,double stability,bool concentric,const fixture_fs::path& output,const RingCaseOptions& test_options={})
+{
+    fixture_fs::create_directories(output);
+    std::vector<std::pair<std::string,std::string>> patch{
+        {"generate_reinforced_perimeters",display_count==0?"0":"1"},
+        {"outer_reinforced_perimeters_counts",std::to_string(display_count)},
+        {"generate_reinforced_infills",concentric || test_options.rectilinear?"1":"0"},
+        {"reinforced_infill_pattern",concentric?"concentric":"rectilinear"},
+        {"reinforced_infill_density",std::to_string(test_options.density)+"%"},
+        {"fiber_fill_debug",test_options.debug?"1":"0"}};
+    const char* stability_key=concentric?"fiber_concentric_corner_stabilization_length":"fiber_corner_stabilization_length";
+    if (!test_options.use_default_stability) patch.emplace_back(stability_key,std::to_string(stability));
+    patch.emplace_back("fiber_contour_bend_radius",std::to_string(test_options.radius.value_or(preset_radius)));
+    patch.emplace_back("fiber_contour_include_holes",test_options.hole?"1":"0");
+    require(library.apply_active_config_patch(patch).success,"Ring fixture config rejected");
+    const auto snapshot=*library.active_config_snapshot();
+    Slic3r::DynamicPrintConfig config;config.apply(Slic3r::FullPrintConfig::defaults());
+    Json effective=Json::object();
+    for(const auto& [key,value]:snapshot.values()) {
+        effective[key]=value;
+        if(Slic3r::print_config_def.get(key))config.set_deserialize_strict(key,value);
+    }
+    write_json(output/"effective_config.json",effective);
+    stability=std::stod(effective.at(stability_key).get<std::string>());
+    auto input=read_model(model);input.transform[3]+=test_options.translation;input.transform[7]+=test_options.translation;
+    Slic3r::Model plate;
+    auto* object=plate.add_object();
+    if(test_options.split_regions) {
+        object->add_volume(Slic3r::make_cube(20,40,4.18),Slic3r::ModelVolumeType::MODEL_PART,false)->config.set("extruder",1);
+        auto second=Slic3r::make_cube(20,40,4.18);second.translate(20,0,0);
+        auto* right=object->add_volume(std::move(second),Slic3r::ModelVolumeType::MODEL_PART,false);
+        right->config.set("extruder",1);
+        right->config.set("outer_reinforced_perimeters_counts",test_options.second_display_count.value_or(concentric?4:100));
+        right->config.set("reinforced_infill_filament",3);
+        right->config.set("fiber_infill_bend_radius",.9);
+        right->config.set("fiber_infill_feed_ratio",1.2);
+        if(test_options.different_process)right->config.set("fiber_contour_feed_ratio",1.1);
+    } else if(test_options.hole) {
+        for(const auto& wall:std::vector<std::array<double,4>>{{0,0,10,40},{30,0,10,40},{10,0,20,10},{10,30,20,10}}) {
+            auto mesh=Slic3r::make_cube(wall[2],wall[3],4.18);mesh.translate(wall[0],wall[1],0);
+            object->add_volume(std::move(mesh),Slic3r::ModelVolumeType::MODEL_PART,false)->config.set("extruder",1);
+        }
+    } else for(const auto& volume:input.volumes) {
+        std::vector<Slic3r::Vec3f> vertices;std::vector<Slic3r::Vec3i32> faces;
+        for(const auto& point:volume.vertices)vertices.emplace_back(point.x,point.y,point.z);
+        for(const auto& face:volume.triangles)faces.emplace_back(face.vertex_a,face.vertex_b,face.vertex_c);
+        object->add_volume(Slic3r::TriangleMesh(std::move(vertices),std::move(faces)),Slic3r::ModelVolumeType::MODEL_PART,false)->config.set("extruder",1);
+    }
+    Slic3r::Transform3d transform=Slic3r::Transform3d::Identity();
+    for(int row=0;row<4;++row)for(int col=0;col<4;++col)transform(row,col)=input.transform[size_t(row*4+col)];
+    object->add_instance()->set_transformation(Slic3r::Geometry::Transformation(transform));
+    Slic3r::Print print;
+    // Mirror Library::slice: Print's machine-family flag is not initialized by apply().
+    const auto* printer_model=config.option<Slic3r::ConfigOptionString>("printer_model");
+    print.is_BBL_printer()=printer_model && printer_model->value.rfind("Bambu Lab",0)==0;
+    print.apply(plate,config);
+    Slic3r::StringObjectException warning;const auto error=print.validate(&warning);
+    require(error.string.empty(),error.string);
+    const auto started=std::chrono::steady_clock::now();print.process();
+    const double process_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+    RingSlice result;result.report={{"passed",false},{"contours",display_count},{"concentric",concentric},{"stability_mm",stability},
+        {"process_seconds",process_seconds},{"density",test_options.density},{"debug",test_options.debug},
+        {"translation",test_options.translation},{"radius_mm",std::stod(effective.at("fiber_contour_bend_radius").get<std::string>())},
+        {"layers",Json::array()},{"failures",Json::array()}};
+    Json diagnostics=Json::array();std::set<size_t> policy_groups;
+    std::map<std::tuple<size_t,size_t,size_t,size_t>,double> stable_entries;
+    std::map<size_t,Point> instance_origins;
+    for(const auto* printed:print.objects()) {
+        require(printed->instances().size()==1,"Ring coordinate fixture requires one instance per PrintObject");
+        const auto& shift=printed->instances().front().shift;
+        instance_origins.emplace(printed->id().id,Point{Slic3r::unscale<double>(shift.x()),Slic3r::unscale<double>(shift.y())});
+    }
+    size_t layers=0,candidates=0;
+    for(const auto* printed:print.objects())for(const auto* layer:printed->layers()) {
+        ++layers;const size_t before=result.paths.size();
+        for(const auto* region:layer->regions())collect_ring_paths(region->fills,result.paths,test_options.rectilinear,&result.displayed_outer_paths);
+        Json rejected=Json::object();
+        std::map<std::pair<size_t,size_t>,Slic3r::ExPolygons> replay_areas;
+        for(const auto& diagnostic:layer->fiber_fill_diagnostics) {
+            policy_groups.insert(diagnostic.policy_group_id);
+            if(test_options.capture_geometry && diagnostic.kind==Slic3r::Layer::FiberDiagnosticKind::OriginalContourRegion)
+                replay_areas[{diagnostic.policy_group_id,diagnostic.component_id}].push_back(diagnostic.region);
+            Json points=Json::array();for(const auto& point:diagnostic.geometry.points)
+                points.push_back({Slic3r::unscale<double>(point.x()),Slic3r::unscale<double>(point.y())});
+            Json rings=Json::array();
+            if(!diagnostic.region.empty()) {
+                Json outer=Json::array();for(const auto& p:diagnostic.region.contour.points)
+                    outer.push_back({Slic3r::unscale<double>(p.x()),Slic3r::unscale<double>(p.y())});
+                rings.push_back(outer);
+                for(const auto& hole:diagnostic.region.holes) {
+                    Json ring=Json::array();for(const auto& p:hole.points)ring.push_back({Slic3r::unscale<double>(p.x()),Slic3r::unscale<double>(p.y())});
+                    rings.push_back(ring);
+                }
+            }
+            diagnostics.push_back({{"layer",layer->id()+1},{"kind",int(diagnostic.kind)},{"reason",diagnostic.reason},
+                {"component",diagnostic.component_id},{"policy_group",diagnostic.policy_group_id},{"contour",diagnostic.contour},{"points",points},{"rings",rings}});
+            if(diagnostic.reason.rfind("concentric_stability_pass;",0)==0) {
+                const auto value=[&](const char* key) {const auto at=diagnostic.reason.find(key);require(at!=std::string::npos,"Missing stability diagnostic");return std::stod(diagnostic.reason.substr(at+std::string(key).size()));};
+                const double minimum=value("minimum_stable_path_mm="),required=value("required_mm=");
+                require(std::abs(required-stability)<1e-6 && minimum+1e-5>=required,"Accepted ring violates marked-bend stability");
+                stable_entries[{layer->id()+1,diagnostic.policy_group_id,diagnostic.component_id,size_t(value("candidate="))}]=minimum;
+            }
+            if(diagnostic.kind==Slic3r::Layer::FiberDiagnosticKind::RejectedPath) {
+                const std::string reason=diagnostic.reason.substr(0,diagnostic.reason.find(';'));
+                // A region summary and a supporting issue are diagnostics,
+                // not another rejected candidate. Count whole assignments.
+                if(!diagnostic.geometry.points.empty() && diagnostic.reason.find("Entire outer loop rejected")!=std::string::npos)
+                    rejected[reason]=rejected.value(reason,0)+1;
+                if(diagnostic.reason.find("interval_mapping_failure")!=std::string::npos ||
+                   diagnostic.reason.find("invalid_parameter")!=std::string::npos ||
+                   diagnostic.reason.find("finalized_path_outside_domain")!=std::string::npos)
+                    result.report["failures"].push_back(diagnostic.reason);
+            } else if(diagnostic.kind==Slic3r::Layer::FiberDiagnosticKind::ContourCandidate) {
+                ++candidates;
+                if(diagnostic.reason.rfind("outer;",0)==0) {
+                    const auto at=diagnostic.reason.find("candidate=");require(at!=std::string::npos,"Missing contour candidate ID");
+                    result.exterior_ids.emplace(layer->id()+1,diagnostic.policy_group_id,diagnostic.component_id,
+                        std::stoul(diagnostic.reason.substr(at+10)));
+                }
+            }
+        }
+        if(test_options.capture_geometry)for(auto& [group,area]:replay_areas) {
+            require(layer->regions().size()==1,"Geometry replay fixture requires one real owner region");
+            result.domains.push_back({std::move(area),Slic3r::resolve_continuous_fiber_config(*layer,*layer->regions()[0]),
+                {printed->id().id,layer->id(),group.first,group.second}});
+        }
+        result.report["layers"].push_back({{"layer",layer->id()+1},{"accepted",result.paths.size()-before},{"rejected",rejected}});
+    }
+    require(layers==expected_layers,"Ring slice layer count differs");
+    const fixture_fs::path gcode=output/"model.gcode";print.export_gcode(gcode.string(),nullptr);
+    result.report["full_slice_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+    std::ifstream commands(gcode);
+    for(std::string line;std::getline(commands,line);) {
+        line=line.substr(0,line.find(';'));
+        const auto last=line.find_last_not_of(" \t\r");if(last==std::string::npos)continue;
+        line.resize(last+1);result.commands.push_back(std::move(line));
+    }
+    std::vector<Point> offsets;
+    std::istringstream offset_stream(effective.at("extruder_offset").get<std::string>());
+    for(std::string item;std::getline(offset_stream,item,',');) {
+        const auto separator=item.find('x');offsets.push_back({std::stod(item.substr(0,separator)),std::stod(item.substr(separator+1))});
+    }
+    std::ifstream input_gcode(gcode);const auto blocks=read_blocks(input_gcode,offsets,true);
+    require(blocks.size()==result.paths.size(),"Prepared paths and output blocks differ");
+    std::vector<bool> used(result.paths.size());Json emitted=Json::array();double maximum_absolute_xy_error=0;
+    for(const auto& block:blocks) {
+        // Tool ordering may reorder paths, but cannot change their placement.
+        // Match every vertex, including the start, at its known instance origin.
+        size_t match=result.paths.size();
+        for(size_t i=0;i<result.paths.size();++i)if(!used[i] && result.paths[i]->id.parent.domain.layer_id+1==size_t(block.layer) &&
+            result.paths[i]->id.parent.domain.component_id==block.component &&
+            (result.displayed_outer_paths.count(result.paths[i].get())>0)==block.contour) {
+            Path candidate;
+            for(const auto& span:result.paths[i]->spans)if(span.deposits_fiber())
+                for(size_t j=candidate.empty()?0:1;j<span.geometry.points.size();++j)
+                    candidate.push_back({Slic3r::unscale<double>(span.geometry.points[j].x()),Slic3r::unscale<double>(span.geometry.points[j].y())});
+            const auto tool=Slic3r::resolve_fiber_tool(print.config(),result.paths[i]->logical_filament_id);
+            if(tool.logical_extruder_id!=unsigned(block.extruder))continue;
+            double error=0;
+            if(ring_output_matches(candidate,block,instance_origins.at(result.paths[i]->id.parent.domain.object_id),&error)) {
+                maximum_absolute_xy_error=std::max(maximum_absolute_xy_error,error);
+                match=i;break;
+            }
+        }
+        require(match<result.paths.size(),"Cannot map output block to finalized fiber geometry at its absolute instance/tool position");used[match]=true;
+        const auto& prepared=*result.paths[match];
+
+        Json local_points=Json::array(),world_points=Json::array();
+        const Point origin=instance_origins.at(prepared.id.parent.domain.object_id);
+        for(const auto& p:block.points) {world_points.push_back({p.x,p.y});local_points.push_back({p.x-origin.x,p.y-origin.y});}
+        emitted.push_back({{"layer",block.layer},{"component",block.component},{"display_contour",block.contour},
+            {"candidate",prepared.id.parent.job_ordinal},{"policy_group",prepared.id.parent.domain.policy_group_id},
+            {"instance_origin",{origin.x,origin.y}},{"extruder",block.extruder},
+            {"local_points",local_points},{"world_points",world_points}});
+        const auto stable=stable_entries.find({size_t(block.layer),prepared.id.parent.domain.policy_group_id,block.component,prepared.id.parent.job_ordinal});
+        if(stable!=stable_entries.end()) {
+            require(!block.contour,"Concentric stability changed a displayed outer contour");
+            emitted.back()["minimum_stable_path_mm"]=stable->second;
+        }
+    }
+    result.report["layers_count"]=layers;result.report["candidates"]=candidates;result.report["accepted"]=blocks.size();
+    result.report["policy_group_count"]=policy_groups.size();result.report["command_count"]=result.commands.size();
+    result.report["maximum_absolute_xy_error_mm"]=maximum_absolute_xy_error;
+    result.report["stability_checked_paths"]=stable_entries.size();
+    result.report["displayed_contours"]=std::count_if(emitted.begin(),emitted.end(),[](const auto& p){return p["display_contour"].template get<bool>();});
+    result.report["displayed_infills"]=blocks.size()-result.report["displayed_contours"].get<size_t>();
+    result.report["passed"]=result.report["failures"].empty();write_json(output/"diagnostics.json",diagnostics);write_json(output/"emitted-paths.json",emitted);
+    for(size_t layer:std::set<size_t>{4,24,179})write_ring_svg(output/("layer"+std::to_string(layer)+".svg"),layer,diagnostics,emitted);
+    write_json(output/"report.json",result.report);require(result.report["passed"].get<bool>(),"Ring slice contract failed");
+    std::cout<<"PASS ring model="<<model.filename()<<" S="<<stability<<" N="<<display_count<<" concentric="<<concentric<<" paths="<<blocks.size()<<" seconds="<<result.report["full_slice_seconds"]<<std::endl;
+    return result;
+}
+// Concentric stability is restricted to fill depths. Compare the immutable
+// outer process with a standalone N-contour slice, using actual depositing spans.
+void check_ring_outer_unchanged(const RingSlice& ordinary,const RingSlice& concentric)
+{
+    using Key=std::pair<size_t,size_t>;
+    std::map<Key,std::vector<Slic3r::Points3>> expected,actual;
+    const auto collect=[](const RingSlice& slice,auto& into,bool outer_only) {
+        for(const auto& prepared:slice.paths) {
+            if(!slice.exterior_ids.count({prepared->id.parent.domain.layer_id+1,
+                prepared->id.parent.domain.policy_group_id,prepared->id.parent.domain.component_id,
+                prepared->id.parent.job_ordinal}))continue;
+            bool displayed_outer=!outer_only;
+            if(outer_only) {
+                displayed_outer=slice.displayed_outer_paths.count(prepared.get())>0;
+            }
+            if(!displayed_outer)continue;
+            Slic3r::Points3 points;
+            for(const auto& span:prepared->spans)if(span.deposits_fiber())
+                points.insert(points.end(),span.geometry.points.begin()+(points.empty()?0:1),span.geometry.points.end());
+            into[{prepared->id.parent.domain.layer_id,prepared->id.parent.domain.component_id}].push_back(std::move(points));
+        }
+        for(auto& [key,paths]:into)std::sort(paths.begin(),paths.end(),[](const auto& a,const auto& b) {
+            return std::lexicographical_compare(a.begin(),a.end(),b.begin(),b.end(),[](const auto& p,const auto& q) {
+                return std::make_tuple(p.x(),p.y(),p.z())<std::make_tuple(q.x(),q.y(),q.z());
+            });
+        });
+    };
+    collect(ordinary,expected,false);collect(concentric,actual,true);
+    require(expected==actual,"Concentric stability changed original outer paths");
+}
+
+Json benchmark_ring_geometry(const std::vector<RingReplayDomain>& domains)
+{
+    Json report={{"passed",false},{"samples",Json::array()},{"scope","shared contour planning only; same complete model domains; debug=false"}};
+    std::vector<double> timings[2];
+    const auto measure=[&](bool concentric) {
+        const auto started=std::chrono::steady_clock::now();size_t candidates=0,accepted=0;
+        std::uint64_t hash=UINT64_C(14695981039346656037);
+        const auto mix=[&](std::uint64_t value) {hash=(hash^value)*UINT64_C(1099511628211);};
+        for(const auto& domain:domains) {
+            auto config=domain.config;
+            if(concentric) {config.infill_enabled=true;config.infill_pattern=Slic3r::ipConcentric;config.infill_density=100;config.contour_count=1;}
+            config=Slic3r::fiber_ring_reference_config(config);
+            const auto plan=Slic3r::FiberPathValidator::plan_contours(domain.area,config,domain.id,false);
+            require(plan.audit_lineage(),"Geometry benchmark broke branch lineage");
+            candidates+=plan.nodes.size();accepted+=plan.validation.accepted_count();
+            for(const auto& a:plan.validation.assignments) {
+                mix(size_t(a.kind));mix(size_t(a.reason));
+                if(a.prepared)for(const auto& span:a.prepared->spans) {
+                    mix(size_t(span.kind));for(const auto& point:span.geometry.points) {mix(point.x());mix(point.y());}
+                }
+            }
+        }
+        return Json{{"seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()},
+            {"candidates",candidates},{"accepted",accepted},{"path_digest",hash}};
+    };
+    for(int repeat=0;repeat<3;++repeat) {
+        Json samples[2];
+        for(int order=0;order<2;++order) {
+            const int which=(order+repeat)%2;samples[which]=measure(which==1);
+            timings[which].push_back(samples[which]["seconds"]);
+        }
+        for(const auto* field:{"candidates","accepted","path_digest"})
+            require(samples[0][field]==samples[1][field],std::string("Shared planning workload differs: ")+field);
+        report["samples"].push_back({{"contour100",samples[0]},{"concentric100",samples[1]}});
+    }
+    for(auto& values:timings)std::sort(values.begin(),values.end());
+    report["contour_median_seconds"]=timings[0][1];report["concentric_median_seconds"]=timings[1][1];
+    report["median_ratio"]=timings[1][1]/timings[0][1];report["passed"]=true;return report;
+}
+
+Json benchmark_ring_slice(libslicer::Library& library,const fixture_fs::path& model,
+    size_t layers,double preset_radius,double stability,const fixture_fs::path& output)
+{
+    Json report={{"passed",false},{"threads",8},{"debug",false},{"samples",Json::array()}};
+    std::vector<double> timings[2];
+    RingCaseOptions options;options.debug=false;
+    for(int repeat=0;repeat<3;++repeat) {
+        RingSlice samples[2];
+        for(int order=0;order<2;++order) {
+            const int which=(order+repeat)%2;
+            samples[which]=ring_slice(library,model,layers,preset_radius,which?1:100,stability,which==1,
+                output/("repeat"+std::to_string(repeat)+(which?"-concentric":"-contour")),options);
+            timings[which].push_back(samples[which].report["full_slice_seconds"]);
+        }
+        if(stability==0)require(samples[0].commands==samples[1].commands,"Repeated debug=false commands differ");
+        report["samples"].push_back({{"contour100",samples[0].report["full_slice_seconds"]},
+            {"concentric100",samples[1].report["full_slice_seconds"]}});
+    }
+    for(auto& values:timings)std::sort(values.begin(),values.end());
+    report["contour_median_seconds"]=timings[0][1];report["concentric_median_seconds"]=timings[1][1];
+    report["median_ratio"]=timings[1][1]/timings[0][1];report["passed"]=true;return report;
+}
+
+int ring_model_acceptance(const fixture_fs::path& model,size_t layers,const fixture_fs::path& output)
+{
+    fixture_fs::create_directories(output);
+    const auto pinned=read_json(fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao/config.json");const auto& selection=pinned.at("selection");
+    libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);libslicer::ConfigSelection selected;
+    selected.machine_model_id=selection.at("machine_model_id");selected.machine_variant_id=selection.at("machine_variant_id");selected.process_preset_id=selection.at("process_preset_id");
+    selected.filament_preset_ids=selection.at("filament_preset_ids").get<std::vector<std::string>>();selected.filament_physical_tools=selection.at("filament_physical_tools").get<std::vector<unsigned>>();
+    require(library->activate_config(selected).success,"Cannot activate ring presets");
+    const double preset_radius=std::stod(*library->active_config_snapshot()->value("fiber_contour_bend_radius"));
+    Json report={{"passed",false},{"model",model.string()},{"fingerprint",fingerprint(model)},{"cases",Json::array()}};
+    for(double stability:{0.,5.}) {
+        const auto base=output/("S"+std::to_string(int(stability)));
+        RingCaseOptions capture;capture.capture_geometry=true;
+        auto reference=ring_slice(*library,model,layers,preset_radius,100,stability,false,base/"contour100",capture);report["cases"].push_back(reference.report);
+        for(int count=0;count<=4;++count) {
+            auto concentric=ring_slice(*library,model,layers,preset_radius,count,stability,true,base/("concentric"+std::to_string(count)));
+            if(stability==0) {
+                require(concentric.commands==reference.commands,"Concentric commands differ from 100 contour reference at N="+std::to_string(count));
+                require(concentric.report["candidates"]==reference.report["candidates"],"Candidate count differs");
+                concentric.report["equivalent_to_contour100"]=true;
+            } else if(count>0) {
+                const auto ordinary=ring_slice(*library,model,layers,preset_radius,count,stability,false,base/("outer-reference"+std::to_string(count)));
+                check_ring_outer_unchanged(ordinary,concentric);
+                concentric.report["original_outer_unchanged"]=true;
+            }
+            report["cases"].push_back(concentric.report);
+        }
+        for(int count=1;count<=4;++count) {
+            report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,count,stability,false,base/("contour"+std::to_string(count))).report);
+            RingCaseOptions options;options.rectilinear=true;
+            report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,count,stability,false,base/("rectilinear"+std::to_string(count)),options).report);
+        }
+        for(double density:{0.,50.,75.})for(int count:{1,4}) {
+            RingCaseOptions options;options.density=density;
+            report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,count,stability,true,
+                base/("density"+std::to_string(int(density))+"-N"+std::to_string(count)),options).report);
+        }
+        for(double radius:{.3,.6}) {
+            RingCaseOptions options;options.radius=radius;
+            report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,1,stability,false,
+                base/("radius"+std::to_string(radius)),options).report);
+        }
+        if(stability==0) {
+            const auto geometry_timing=benchmark_ring_geometry(reference.domains);
+            write_json(base/"geometry-benchmark.json",geometry_timing);
+            report["geometry_benchmark"+std::to_string(int(stability))]=geometry_timing;
+            const auto full_timing=benchmark_ring_slice(*library,model,layers,preset_radius,stability,base/"timing");
+            write_json(base/"full-benchmark.json",full_timing);
+            report["full_benchmark"+std::to_string(int(stability))]=full_timing;
+        }
+        write_json(output/"report.json",report);
+    }
+    report["passed"]=true;write_json(output/"report.json",report);return 0;
+}
+
+int ring_positive_acceptance(const fixture_fs::path& output)
+{
+    ring_coordinate_checker_self_test();
+    fixture_fs::create_directories(output);const auto model=output/"cube.stl";
+    require(Slic3r::make_cube(40,40,4.18).write_binary(model.string().c_str()),"Cannot generate positive model");
+    const auto pinned=read_json(fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao/config.json");const auto& selection=pinned.at("selection");
+    libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);libslicer::ConfigSelection selected;
+    selected.machine_model_id=selection.at("machine_model_id");selected.machine_variant_id=selection.at("machine_variant_id");selected.process_preset_id=selection.at("process_preset_id");
+    selected.filament_preset_ids=selection.at("filament_preset_ids").get<std::vector<std::string>>();selected.filament_physical_tools=selection.at("filament_physical_tools").get<std::vector<unsigned>>();
+    require(library->activate_config(selected).success,"Cannot activate positive fixture");
+    const double preset_radius=std::stod(*library->active_config_snapshot()->value("fiber_contour_bend_radius"));
+    Json report={{"passed",false},{"coordinate_checker_self_test_passed",true},{"cases",Json::array()}};
+    for(double shift:{0.,.0004,.0005,.0009}) {
+        RingCaseOptions options;options.translation=shift;
+        const auto result=ring_slice(*library,model,32,preset_radius,1,5,true,output/("shift"+std::to_string(shift)),options);
+        require(result.report["accepted"].get<size_t>()>0,
+            "Positive fixture must emit actual fiber paths");
+        if(shift==0) {
+            libslicer::GCodePreviewRequest request;
+            request.gcode_path=(output/"shift0.000000/model.gcode").string();
+            const auto imported=library->load_gcode_preview(request);
+            require(imported.success && bool(imported.preview),"Cannot import shared-ring G-code preview");
+            size_t contours=0,infills=0;
+            for(const auto& segment:imported.preview->segments) {
+                if(segment.extrusion_role==libslicer::ToolpathExtrusionRole::ContinuousFiberContour)++contours;
+                if(segment.extrusion_role==libslicer::ToolpathExtrusionRole::ContinuousFiberInfill)++infills;
+            }
+            require(contours>0 && infills>0,"Shared contour process lost its independent preview labels");
+            report["preview_contour_segments"]=contours;report["preview_infill_segments"]=infills;
+        }
+        report["cases"].push_back(result.report);
+    }
+    // Exercise nonzero XY placement and asymmetric tool offsets in real export.
+    auto offset_library=libslicer::Library::open(options);
+    require(offset_library->activate_config(selected).success,"Cannot activate tool-offset fixture");
+    std::istringstream offset_input(*offset_library->active_config_snapshot()->value("extruder_offset"));
+    std::ostringstream changed_offsets;size_t offset_index=0;
+    for(std::string item;std::getline(offset_input,item,',');++offset_index) {
+        const auto separator=item.find('x');
+        if(offset_index)changed_offsets<<',';
+        changed_offsets<<std::stod(item.substr(0,separator))+3.125*(offset_index+1)<<'x'
+            <<std::stod(item.substr(separator+1))+2.75*(offset_index+1);
+    }
+    require(offset_library->apply_active_config_patch({{"extruder_offset",changed_offsets.str()}}).success,"Tool-offset fixture config rejected");
+    RingCaseOptions translated;translated.translation=7.125;
+    auto offset_result=ring_slice(*offset_library,model,32,preset_radius,1,5,true,output/"shift-and-tool-offset",translated);
+    require(!offset_result.paths.empty(),"Tool-offset fixture emitted no fiber");
+    report["cases"].push_back(offset_result.report);
+    // Adjacent regions must retain their own displayed contour counts when
+    // concentric stability uses its unpatched default of zero. Equal counts
+    // must still share a policy despite inactive infill process differences.
+    for(const auto counts: {std::pair<int,int>{1,4},{4,1},{1,1}}) {
+        RingCaseOptions region_options;
+        region_options.split_regions=true;
+        region_options.second_display_count=counts.second;
+        region_options.use_default_stability=true;
+        auto region_library=libslicer::Library::open(options);
+        require(region_library->activate_config(selected).success,"Cannot activate region display fixture");
+        auto result=ring_slice(*region_library,model,32,preset_radius,counts.first,0,true,
+            output/("split-default-N"+std::to_string(counts.first)+"-N"+std::to_string(counts.second)),region_options);
+        require(result.report["stability_mm"]==0,"Region fixture must use default concentric stability");
+        const bool different=counts.first!=counts.second;
+        require(result.report["policy_group_count"]==(different?2:1),"Region display policies were grouped incorrectly");
+        struct RegionDisplayCounts {
+            size_t contours=0;
+            coord_t min_x=std::numeric_limits<coord_t>::max();
+        };
+        std::map<size_t,std::map<std::pair<size_t,size_t>,RegionDisplayCounts>> contours_by_layer_domain;
+        for(const auto& path:result.paths) {
+            const auto& domain=path->id.parent.domain;
+            auto& region=contours_by_layer_domain[domain.layer_id][{domain.policy_group_id,domain.component_id}];
+            if(result.displayed_outer_paths.count(path.get()))++region.contours;
+            for(const auto& span:path->spans)if(span.deposits_fiber())
+                for(const auto& point:span.geometry.points)region.min_x=std::min(region.min_x,point.x());
+        }
+        require(!contours_by_layer_domain.empty(),"Region display fixture emitted no fiber");
+        for(const auto& [layer,domains]:contours_by_layer_domain) {
+            std::vector<std::pair<coord_t,size_t>> ordered;
+            for(const auto& [domain,region]:domains)ordered.emplace_back(region.min_x,region.contours);
+            std::sort(ordered.begin(),ordered.end());
+            std::vector<size_t> actual;
+            for(const auto& [x,count]:ordered)actual.push_back(count);
+            const std::vector<size_t> expected{size_t(counts.first),size_t(counts.second)};
+            require(actual==expected,"Region-specific displayed contour counts were lost");
+        }
+        result.report["region_display_counts"]={counts.first,counts.second};
+        result.report["checked_region_display_layers"]=contours_by_layer_domain.size();
+        report["cases"].push_back(result.report);
+    }
+    for(double density:{0.,50.,75.,100.})for(int count:{0,1,4}) {
+        RingCaseOptions options;options.density=density;
+        const auto result=ring_slice(*library,model,32,preset_radius,count,5,true,
+            output/("density"+std::to_string(int(density))+"-N"+std::to_string(count)),options);
+        if(density==0 && count==0)require(result.paths.empty(),"Disabled fiber unexpectedly deposited");
+        else require(result.report["accepted"].get<size_t>()>0,"Positive sparse fixture is empty");
+        report["cases"].push_back(result.report);
+    }
+    for(bool hole:{false,true}) {
+        RingCaseOptions options;options.hole=hole;options.split_regions=!hole;
+        const auto reference=ring_slice(*library,model,32,preset_radius,100,5,false,output/(hole?"hole-contour100":"split-contour100"),options);
+        const auto concentric=ring_slice(*library,model,32,preset_radius,1,5,true,output/(hole?"hole-concentric":"split-concentric"),options);
+        options.second_display_count=4;
+        const auto ordinary=ring_slice(*library,model,32,preset_radius,1,5,false,output/(hole?"hole-outer-reference":"split-outer-reference"),options);
+        check_ring_outer_unchanged(ordinary,concentric);
+        if(hole) {
+            // Hole allocation follows all outer depths. A standalone N=1 hole
+            // has a different available region; compare identical full traversal.
+            libslicer::LibraryOptions isolated_options;
+            isolated_options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;isolated_options.vendors={"CFSYS"};
+            auto original_library=libslicer::Library::open(isolated_options);
+            auto shared_library=libslicer::Library::open(isolated_options);
+            require(original_library->activate_config(selected).success && shared_library->activate_config(selected).success,
+                "Cannot activate independent hole comparison presets");
+            const auto original=ring_slice(*original_library,model,32,preset_radius,100,0,false,output/"hole-original-S0",options);
+            const auto shared=ring_slice(*shared_library,model,32,preset_radius,1,0,true,output/"hole-concentric-S0",options);
+            require(original.commands==shared.commands,"Shared traversal changed original hole output");
+        }
+        require(concentric.report["accepted"].get<size_t>()>0,"Cross-region/hole fixture is empty");
+        report["cases"].push_back(reference.report);report["cases"].push_back(concentric.report);
+        if(!hole) {
+            options.different_process=true;options.second_display_count=1;
+            const auto separated=ring_slice(*library,model,32,preset_radius,1,5,true,output/"split-process",options);
+            require(separated.report["policy_group_count"].get<size_t>()>=2,"Real process difference was merged away");
+            report["cases"].push_back(separated.report);
+        }
+    }
+    report["passed"]=true;write_json(output/"report.json",report);return 0;
+}
+
+int run_acceptance(int argc,char** argv)
+{
+    const fixture_fs::path assets=fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao";
     const bool gap_current=argc==2 && std::string(argv[1])=="--infill-gap-current";
     const bool gap_checking=argc==2 && std::string(argv[1])=="--infill-gap-self-test";
     const bool gap=gap_current || (argc==2 && std::string(argv[1])=="--infill-gap");
     const bool closed_outer_regression=argc==2 && std::string(argv[1])=="--closed-outer-regression";
-    const fs::path output=argc==6 && std::string(argv[1])=="--rounded-model" ? fs::path(argv[5]) : gap ? fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR)/(gap_current?"infill-gap-current":"infill-gap") : closed_outer_regression ? fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR)/"closed-outer-regression" :
-        fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR);
+    const fixture_fs::path output=argc==6 && std::string(argv[1])=="--rounded-model" ? fixture_fs::path(argv[5]) : gap ? fixture_fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR)/(gap_current?"infill-gap-current":"infill-gap") : closed_outer_regression ? fixture_fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR)/"closed-outer-regression" :
+        fixture_fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR);
     const bool checking=argc==2 && std::string(argv[1])=="--self-test";
     try {
-        if((argc==4 || argc==5) && std::string(argv[1])=="--resin-model")return resin_model(argv[2],argv[3],argc==5?fs::path(argv[4]):fs::path{});
+        if(argc==3 && std::string(argv[1])=="--ring-positive")return ring_positive_acceptance(argv[2]);
+        if(argc==8 && std::string(argv[1])=="--ring-case") {
+            const auto pinned=read_json(fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao/config.json");const auto& selected=pinned.at("selection");
+            libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};auto library=libslicer::Library::open(options);
+            libslicer::ConfigSelection selection;selection.machine_model_id=selected.at("machine_model_id");selection.machine_variant_id=selected.at("machine_variant_id");selection.process_preset_id=selected.at("process_preset_id");
+            selection.filament_preset_ids=selected.at("filament_preset_ids").get<std::vector<std::string>>();selection.filament_physical_tools=selected.at("filament_physical_tools").get<std::vector<unsigned>>();
+            require(library->activate_config(selection).success,"Cannot activate ring case");
+            const double preset_radius=std::stod(*library->active_config_snapshot()->value("fiber_contour_bend_radius"));
+            RingCaseOptions test_options;test_options.use_default_stability=std::string(argv[5])=="default";
+            ring_slice(*library,argv[2],std::stoul(argv[3]),preset_radius,std::stoi(argv[4]),
+                test_options.use_default_stability?0:std::stod(argv[5]),std::stoi(argv[6])!=0,argv[7],test_options);return 0;
+        }
+        if(argc==5 && std::string(argv[1])=="--ring-model")return ring_model_acceptance(argv[2],std::stoul(argv[3]),argv[4]);
+        if((argc==4 || argc==5) && std::string(argv[1])=="--resin-model")return resin_model(argv[2],argv[3],argc==5?fixture_fs::path(argv[4]):fixture_fs::path{});
         if(argc==2 && std::string(argv[1])=="--rounded-self-test") {rounded_checker_self_test();return 0;}
         if(argc==6 && std::string(argv[1])=="--rounded-model")
             return rounded_model_acceptance(argv[2],std::stoul(argv[3]),std::stoi(argv[4]),argv[5]);
@@ -1000,11 +1607,11 @@ int main(int argc,char** argv)
             rule["last_required_layer"]=17;
             rule["notes"]=Json::array({"Closed-outer regression: 0.05 mm clearance, hole loops disabled; display layers 14..17 must retain one complete main outer around both left bores."});
         }
-        fs::create_directories(output);
+        fixture_fs::create_directories(output);
         write_json(output/"report.json",{{"passed",false},{"status","running"}});
-        const fs::path model=assets/rule.at("model").get<std::string>();
+        const fixture_fs::path model=assets/rule.at("model").get<std::string>();
         require(fingerprint(model)==rule.at("model_fnv1a64").get<std::string>(),"Model fingerprint does not match the fixed fixture");
-        const fs::path config_file=assets/rule.at("config").get<std::string>();
+        const fixture_fs::path config_file=assets/rule.at("config").get<std::string>();
         Json config=read_json(config_file);
         if (closed_outer_regression) {
             config["settings"]["fiber_contour_boundary_clearance"]="0.05";
@@ -1081,7 +1688,7 @@ int main(int argc,char** argv)
         report["case"]="closed_outer_regression";
         report["config_overrides"]=closed_outer_regression ? Json{{"fiber_contour_boundary_clearance","0.05"},{"fiber_contour_include_holes","0"}} : Json::object();
         report["contract"]=rule;report["config_fingerprint"]=fingerprint(config_file);report["gcode_fingerprint"]=fingerprint(result.output.path);
-        report["binary_fingerprint"]=fingerprint(fs::absolute(argv[0]));report["slice_seconds"]=seconds;report["gcode"]=result.output.path;
+        report["binary_fingerprint"]=fingerprint(fixture_fs::absolute(argv[0]));report["slice_seconds"]=seconds;report["gcode"]=result.output.path;
         report["status"]=report.at("passed").get<bool>()?"passed":"failed";
         write_json(output/"report.json",report);
         for(const auto& row:report.at("layers")) if(row.at("required").get<bool>())
@@ -1090,7 +1697,16 @@ int main(int argc,char** argv)
         return report.at("passed").get<bool>()?0:1;
     } catch(const std::exception& error) {
         std::cerr<<"FAIL: "<<error.what()<<'\n';
-        if(!checking) {fs::create_directories(output);write_json(output/"report.json",{{"passed",false},{"status","error"},{"error",error.what()}});}
+        if(!checking) {fixture_fs::create_directories(output);write_json(output/"report.json",{{"passed",false},{"status","error"},{"error",error.what()}});}
         return 2;
     }
+}
+
+int main(int argc,char** argv)
+{
+    // The locale initialization barrier uses the arena concurrency. Keep it
+    // equal to the worker limit used for the alternating timing measurements.
+    tbb::global_control threads(tbb::global_control::max_allowed_parallelism,8);
+    tbb::task_arena arena(8);
+    return arena.execute([&] { return run_acceptance(argc,argv); });
 }
