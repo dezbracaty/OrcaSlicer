@@ -1379,9 +1379,9 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume(
     std::vector<bool> affected_layers;
     affected_layers.reserve(m_layer_tools.size());
     for (const auto& layer : m_layer_tools) {
-        const auto near = resin_first_layers.lower_bound(layer.print_z - EPSILON);
-        affected_layers.push_back(near != resin_first_layers.end() &&
-            std::abs(*near - layer.print_z) <= EPSILON);
+        const auto resin_layer_it = resin_first_layers.lower_bound(layer.print_z - EPSILON);
+        affected_layers.push_back(resin_layer_it != resin_first_layers.end() &&
+            std::abs(*resin_layer_it - layer.print_z) <= EPSILON);
     }
 
     std::vector<LayerPrintSequence> other_layers_seqs;
