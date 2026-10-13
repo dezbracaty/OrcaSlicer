@@ -11,6 +11,7 @@
 #include <map>
 #include <iterator>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 
@@ -706,10 +707,37 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 assignment.detail += contour_rounding_failure_name(issue.reason);
             }
 
+            // A valid infill interval below extraction resolution is too short
+            // to deposit, not invalid geometry. Retain its full assignment so
+            // coverage and interval accounting use the existing short-path rules.
+            const double interval_length = interval.end_scaled - interval.begin_scaled;
+            if (purpose == FiberPathPurpose::Infill &&
+                whole_path_reason == FiberRejectionReason::None &&
+                assignment.kind == FiberAssignmentKind::AcceptedFiber &&
+                !allowed_domain.empty() &&
+                std::isfinite(interval.begin_scaled) && std::isfinite(interval.end_scaled) &&
+                interval_length > 0.0 && interval_length <= SCALED_EPSILON &&
+                std::all_of(path.polyline.points.begin(), path.polyline.points.end(),
+                            [](const Point3& point) { return point.z() == 0; })) {
+                assignment.kind = FiberAssignmentKind::Rejected;
+                try {
+                    validate_fiber_process_config(config, purpose, path.is_closed());
+                    assignment.reason = FiberRejectionReason::TooShort;
+                    assignment.detail = "Infill interval is below path extraction resolution";
+                } catch (const std::invalid_argument& error) {
+                    assignment.reason = FiberRejectionReason::InvalidParameter;
+                    assignment.detail = error.what();
+                }
+                assignment.centerline.emplace(path);
+                result.assignments.emplace_back(std::move(assignment));
+                continue;
+            }
+
             Polyline3 fragment_geometry;
             if (!extract_subpath(path.polyline, interval.begin_scaled, interval.end_scaled, fragment_geometry)) {
                 assignment.kind = FiberAssignmentKind::Rejected;
                 assignment.reason = FiberRejectionReason::InvalidGeometry;
+                assignment.detail = "Could not extract the assigned fiber path interval";
                 assignment.centerline.emplace(path);
                 result.assignments.emplace_back(std::move(assignment));
                 continue;
@@ -855,9 +883,16 @@ FiberValidationResult FiberPathValidator::validate_infill(
             if (assignment.kind == FiberAssignmentKind::Rejected &&
                 assignment.reason != FiberRejectionReason::TooShort &&
                 assignment.reason != FiberRejectionReason::ProcessBudgetTooShort &&
-                std::find(policy_rejected.begin(), policy_rejected.end(), assignment.id) == policy_rejected.end())
-                throw std::runtime_error(std::string("Generated fiber infill failed preparation: ") +
-                    fiber_rejection_reason_name(assignment.reason) + "; " + assignment.detail);
+                std::find(policy_rejected.begin(), policy_rejected.end(), assignment.id) == policy_rejected.end()) {
+                std::ostringstream message;
+                message.precision(12);
+                message << "Generated fiber infill failed preparation: "
+                        << fiber_rejection_reason_name(assignment.reason) << "; " << assignment.detail
+                        << "; layer=" << domain_id.layer_id << "; component=" << domain_id.component_id
+                        << "; candidate=" << i << "; interval_mm=[" << assignment.source_begin_mm
+                        << ',' << assignment.source_end_mm << "]; extraction_epsilon_mm=" << EPSILON;
+                throw std::runtime_error(message.str());
+            }
         merge_validation(result, std::move(validated));
     }
     result.physical_footprint = union_ex(result.physical_footprint);
