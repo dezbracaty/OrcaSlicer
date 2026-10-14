@@ -721,7 +721,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
                             [](const Point3& point) { return point.z() == 0; })) {
                 assignment.kind = FiberAssignmentKind::Rejected;
                 try {
-                    validate_fiber_process_config(config, purpose, path.is_closed());
+                    validate_fiber_process_config(config, purpose, FiberFinishStrategy::TangentExtension);
                     assignment.reason = FiberRejectionReason::TooShort;
                     assignment.detail = "Infill interval is below path extraction resolution";
                 } catch (const std::invalid_argument& error) {
@@ -755,8 +755,15 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 // Rounded geometry is immutable here. Preserve its arc stations;
                 // command preparation handles process splits within its own budget.
                 const auto arcs=trim_arcs(reference_arcs,assignment.source_begin_mm,assignment.source_end_mm);
-                const auto finalized=FiberPathFinalizer::finalize(
-                    *assignment.centerline,allowed_domain,config,assignment.id,arcs,final_domain);
+                FiberFinalizationResult finalized;
+                try {
+                    const auto finish=make_independent_fiber_finish_route(*assignment.centerline,config,assignment.id);
+                    finalized=FiberPathFinalizer::finalize(
+                        *assignment.centerline,allowed_domain,config,assignment.id,finish,arcs,final_domain);
+                } catch (const std::invalid_argument& error) {
+                    finalized.failure=FiberFinalizationFailure::InvalidParameter;
+                    finalized.detail=error.what();
+                }
                 if (!finalized.prepared) {
                     assignment.kind=FiberAssignmentKind::Rejected;
                     assignment.reason=finalization_reason(finalized.failure);
@@ -1100,7 +1107,7 @@ FiberContourPlanResult FiberPathValidator::plan_contours(
         plan.validation.output_role = erContinuousFiberContour;
         return plan;
     }
-    validate_fiber_process_config(config, FiberPathPurpose::Contour);
+    validate_fiber_process_config(config, FiberPathPurpose::Contour, FiberFinishStrategy::LoopOverlap);
     const RingStageOptions stage{config.contour_flow, config.contour_boundary_clearance_mm,
         config.contour_bend_radius_mm, size_t(config.contour_count), config.contour_include_holes,
         FiberPathPurpose::Contour, erContinuousFiberContour,fill_start_depth,extra_spacing_mm};

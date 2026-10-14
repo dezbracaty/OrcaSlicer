@@ -121,7 +121,8 @@ void require_fiber_safe_script(const std::string& script, const char* name,
 void validate_fiber_cut_event(const std::string& script,
     FiberMachineProtocol protocol = FiberMachineProtocol::LinearE);
 // Validates common process values and only the requested path family.
-void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose, bool closed_path = true);
+enum class FiberFinishStrategy : uint8_t;
+void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose, FiberFinishStrategy finish);
 void validate_continuous_fiber_region_config(const PrintConfig& print_config,
     const PrintRegionConfig& region_config, double layer_height);
 ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region);
