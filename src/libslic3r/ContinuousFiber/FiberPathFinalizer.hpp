@@ -33,6 +33,22 @@ struct FiberFinalizationResult {
     std::string detail;
 };
 
+// Source geometry for non-depositing motion. The caller selects the strategy;
+// command preparation happens once in the Finalizer, together with other spans.
+// A zero request still carries LoopOverlap or TangentExtension explicitly.
+struct FiberFinishRoute {
+    Polyline3 geometry;
+    FiberFinishStrategy strategy {FiberFinishStrategy::None};
+    FiberFragmentId source;
+    double requested_length_mm {0.0};
+};
+
+// Preserve the existing policy for independent sources. An unavailable loop
+// leaves geometry empty so Finalizer retains its parameter/length error order.
+FiberFinishRoute make_independent_fiber_finish_route(
+    const ExtrusionPath& source, const ContinuousFiberConfig& config,
+    const FiberFragmentId& id);
+
 class FiberPathFinalizer {
 public:
     // Candidate geometry must be normalized before validation and source mapping.
@@ -41,6 +57,7 @@ public:
         const ExPolygons& allowed_domain,
         const ContinuousFiberConfig& config,
         const FiberFragmentId& id,
+        const FiberFinishRoute& finish,
         const std::vector<ContourArc>& arcs = {},
         const ExPolygons* planned_centerline_domain = nullptr);
 };

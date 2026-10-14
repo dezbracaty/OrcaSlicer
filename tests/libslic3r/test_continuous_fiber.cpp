@@ -71,7 +71,114 @@ FiberFragmentId test_id()
     return {{{7, 62, 4, 1}, FiberPathPurpose::Infill, 0, 9}, 0};
 }
 
+// Existing independent-source tests keep their original setup. The production
+// executor itself accepts only explicit routes and has no policy-inference overload.
+FiberFinalizationResult finalize_independent(
+    const ExtrusionPath& candidate, const ExPolygons& domain,
+    const ContinuousFiberConfig& config, const FiberFragmentId& id,
+    const std::vector<ContourArc>& arcs = {}, const ExPolygons* centerline_domain = nullptr)
+{
+    FiberFinishRoute finish;
+    finish.source = id;
+    finish.strategy = FiberFinishStrategy::TangentExtension;
+    if (candidate.polyline.points.size() < 2 || domain.empty() ||
+        std::any_of(candidate.polyline.points.begin(), candidate.polyline.points.end(),
+            [](const Point3& p) { return p.z() != 0; }))
+        return FiberPathFinalizer::finalize(candidate, domain, config, id, finish, arcs, centerline_domain);
+    try {
+        finish = make_independent_fiber_finish_route(candidate, config, id);
+        return FiberPathFinalizer::finalize(candidate, domain, config, id, finish, arcs, centerline_domain);
+    } catch (const std::invalid_argument& error) {
+        FiberFinalizationResult result;
+        result.failure = FiberFinalizationFailure::InvalidParameter;
+        result.length_mm = unscale<double>(candidate.length());
+        result.detail = error.what();
+        return result;
+    }
+}
+
 } // namespace
+
+TEST_CASE("explicit fiber finish follows its supplied route on open depositing geometry",
+    "[ContinuousFiber][FinishInterface]")
+{
+    auto candidate=straight_path(5,5,45,5);
+    auto id=test_id();id.parent.purpose=FiberPathPurpose::Contour;
+    const ExPolygons domain{rectangle(0,0,50,15)};
+    ContinuousFiberConfig config;config.cut_to_contact_length_mm=23;
+    config.finish_overlap_length_mm=10;
+    config.finish_extension_length_mm=std::numeric_limits<double>::quiet_NaN();
+    FiberFinishRoute finish;
+    finish.strategy=FiberFinishStrategy::LoopOverlap;
+    finish.source=id;finish.source.parent.job_ordinal+=1;
+    finish.requested_length_mm=10;
+    // An open prefix of a source loop: no straight or closure requirement.
+    finish.geometry.points={Point3::new_scale(45,5,0),Point3::new_scale(45,10,0),Point3::new_scale(40,10,0)};
+    const auto result=FiberPathFinalizer::finalize(candidate,domain,config,id,finish);
+    REQUIRE(result.prepared);
+    CHECK(result.prepared->finish_strategy==FiberFinishStrategy::LoopOverlap);
+    CHECK(result.prepared->passive_tail_length_mm()==Catch::Approx(23).margin(.002));
+    const auto& span=result.prepared->spans.back();
+    CHECK(span.kind==FiberMotionKind::NonDepositingFinish);
+    CHECK(span.geometry.points==finish.geometry.points);
+    for(const auto& edge:span.edges)CHECK(edge.feed_mm_per_xy_mm==0);
+    CHECK(result.prepared->outside_domain.empty());
+    const auto original=finalize_independent(candidate,domain,ContinuousFiberConfig{},id);
+    REQUIRE(original.prepared);
+    CHECK(diff_ex(result.prepared->physical_coverage,original.prepared->physical_coverage).empty());
+    CHECK(diff_ex(original.prepared->physical_coverage,result.prepared->physical_coverage).empty());
+}
+
+TEST_CASE("explicit fiber finish rejects incorrect route metadata and geometry",
+    "[ContinuousFiber][FinishInterface]")
+{
+    const auto candidate=straight_path(5,5,45,5);
+    const auto id=test_id();const ExPolygons domain{rectangle(0,0,50,15)};
+    ContinuousFiberConfig config;config.finish_extension_length_mm=5;
+    const auto valid=make_independent_fiber_finish_route(candidate,config,id);
+    REQUIRE(FiberPathFinalizer::finalize(candidate,domain,config,id,valid).prepared);
+    SECTION("wrong start") {auto route=valid;route.geometry.points.front().x()+=scale_(1);CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
+    SECTION("nonzero layer Z") {auto route=valid;route.geometry.points.back().z()=scale_(1);CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
+    SECTION("wrong actual length") {auto route=valid;route.geometry.points.back().x()+=scale_(1);CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
+    SECTION("wrong request") {auto route=valid;route.requested_length_mm=4;CHECK(FiberPathFinalizer::finalize(candidate,domain,config,id,route).failure==FiberFinalizationFailure::InvalidParameter);}
+    SECTION("nonfinite request") {auto route=valid;route.requested_length_mm=std::numeric_limits<double>::quiet_NaN();CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
+    SECTION("different source domain") {auto route=valid;route.source.parent.domain.component_id+=1;CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
+    SECTION("different source purpose") {auto route=valid;route.source.parent.purpose=FiberPathPurpose::Contour;CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
+    SECTION("invalid strategy") {auto route=valid;route.strategy=static_cast<FiberFinishStrategy>(255);CHECK(FiberPathFinalizer::finalize(candidate,domain,config,id,route).failure==FiberFinalizationFailure::InvalidParameter);}
+    SECTION("None cannot bypass configured finish") {auto route=valid;route.strategy=FiberFinishStrategy::None;route.requested_length_mm=0;route.geometry.points.clear();CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
+    SECTION("missing nonzero finish") {auto route=valid;route.geometry.points.clear();CHECK(FiberPathFinalizer::finalize(candidate,domain,config,id,route).failure==FiberFinalizationFailure::FinishUnavailable);}
+    SECTION("zero edge") {auto route=valid;route.geometry.points={route.geometry.points.front(),route.geometry.points.front()};CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
+}
+
+TEST_CASE("independent finish policy keeps zero requests and original failure ordering",
+    "[ContinuousFiber][FinishInterface]")
+{
+    const auto candidate=straight_path(5,5,45,5);const auto id=test_id();
+    const ExPolygons domain{rectangle(0,0,50,15)};
+    ContinuousFiberConfig config;config.finish_overlap_length_mm=std::numeric_limits<double>::quiet_NaN();
+    const auto zero=make_independent_fiber_finish_route(candidate,config,id);
+    CHECK(zero.strategy==FiberFinishStrategy::TangentExtension);CHECK(zero.geometry.empty());
+    const auto result=FiberPathFinalizer::finalize(candidate,domain,config,id,zero);
+    REQUIRE(result.prepared);CHECK(result.prepared->finish_strategy==FiberFinishStrategy::None);
+    config.finish_extension_length_mm=-1;
+    CHECK(finalize_independent(candidate,domain,config,id).failure==FiberFinalizationFailure::InvalidParameter);
+    config.finish_extension_length_mm=std::numeric_limits<double>::infinity();
+    CHECK(finalize_independent(candidate,domain,config,id).failure==FiberFinalizationFailure::InvalidParameter);
+    config.finish_extension_length_mm=1e100;
+    CHECK(finalize_independent(candidate,domain,config,id).failure==FiberFinalizationFailure::InvalidParameter);
+    auto loop=path_from_points({{5,5},{10,5},{10,10},{5,10},{5,5}});
+    auto contour=id;contour.parent.purpose=FiberPathPurpose::Contour;
+    config=ContinuousFiberConfig{};config.finish_overlap_length_mm=23;
+    CHECK(finalize_independent(loop,domain,config,contour).failure==FiberFinalizationFailure::FinishUnavailable);
+    config.cut_to_contact_length_mm=23;
+    CHECK(finalize_independent(loop,domain,config,contour).failure==FiberFinalizationFailure::TooShort);
+    config=ContinuousFiberConfig{};config.finish_extension_length_mm=5;
+    const auto degenerate=path_from_points({{5,5},{5,5}});
+    const auto unavailable=make_independent_fiber_finish_route(degenerate,config,id);
+    CHECK(unavailable.geometry.empty());
+    config.cut_to_contact_length_mm=23;
+    CHECK(finalize_independent(degenerate,domain,config,id).failure==FiberFinalizationFailure::TooShort);
+}
 
 TEST_CASE("continuous fiber grouping merges only identical policies", "[ContinuousFiber]")
 {
@@ -170,7 +277,7 @@ TEST_CASE("continuous fiber cut tail is finalized before coverage", "[Continuous
     config.resin_overlap_mm = 0.05;
     config.outside_tolerance_mm2 = 0.01;
 
-    const FiberFinalizationResult result = FiberPathFinalizer::finalize(candidate, domain, config, test_id());
+    const FiberFinalizationResult result = finalize_independent(candidate, domain, config, test_id());
     REQUIRE(result.prepared != nullptr);
     REQUIRE(result.prepared->spans.size() == 2);
     CHECK(result.prepared->spans[0].kind == FiberMotionKind::PoweredDepositing);
@@ -217,7 +324,7 @@ TEST_CASE("continuous fiber start procedure separates landing from powered depos
     config.resin_overlap_mm = 0.05;
     config.outside_tolerance_mm2 = 0.01;
 
-    const FiberFinalizationResult result = FiberPathFinalizer::finalize(candidate, domain, config, test_id());
+    const FiberFinalizationResult result = finalize_independent(candidate, domain, config, test_id());
     REQUIRE(result.prepared != nullptr);
     const PreparedFiberPath& prepared = *result.prepared;
     REQUIRE(prepared.spans.size() == 4);
@@ -251,8 +358,8 @@ TEST_CASE("non depositing finish does not change fiber coverage", "[ContinuousFi
     ContinuousFiberConfig with_finish = without_finish;
     with_finish.finish_extension_length_mm = 5.0;
 
-    const auto a = FiberPathFinalizer::finalize(candidate, domain, without_finish, test_id());
-    const auto b = FiberPathFinalizer::finalize(candidate, domain, with_finish, test_id());
+    const auto a = finalize_independent(candidate, domain, without_finish, test_id());
+    const auto b = finalize_independent(candidate, domain, with_finish, test_id());
     REQUIRE(a.prepared != nullptr);
     REQUIRE(b.prepared != nullptr);
     REQUIRE(b.prepared->spans.size() == 3);
@@ -275,7 +382,7 @@ TEST_CASE("contour coverage policies retain their widths and domain clipping", "
     // The physical strand fits exactly at the lower boundary; a wider
     // infill keepout must be clipped at both sides of this narrow domain.
     const ExPolygons domain{rectangle(0, 9.5, 70, 10.7)};
-    const auto result = FiberPathFinalizer::finalize(candidate, domain, config, id);
+    const auto result = finalize_independent(candidate, domain, config, id);
     REQUIRE(result.prepared);
     const auto area_mm2 = [](const ExPolygons& polygons) {
         return unscaled<double>(unscaled<double>(area(polygons)));
@@ -295,7 +402,7 @@ TEST_CASE("fiber path shorter than cut process budget is rejected", "[Continuous
     ContinuousFiberConfig config;
     config.cut_to_contact_length_mm = 23.0;
 
-    const FiberFinalizationResult result = FiberPathFinalizer::finalize(candidate, domain, config, test_id());
+    const FiberFinalizationResult result = finalize_independent(candidate, domain, config, test_id());
     CHECK(result.prepared == nullptr);
     CHECK(result.failure == FiberFinalizationFailure::TooShort);
 }
@@ -307,12 +414,12 @@ TEST_CASE("fiber path requires a real powered deposition span beyond its passive
     config.cut_to_contact_length_mm = 23.0;
     config.minimum_effective_length_mm = 25.0;
 
-    const FiberFinalizationResult rejected = FiberPathFinalizer::finalize(
+    const FiberFinalizationResult rejected = finalize_independent(
         straight_path(10, 10, 57, 10), domain, config, test_id());
     CHECK(rejected.prepared == nullptr);
     CHECK(rejected.failure == FiberFinalizationFailure::TooShort);
 
-    const FiberFinalizationResult accepted = FiberPathFinalizer::finalize(
+    const FiberFinalizationResult accepted = finalize_independent(
         straight_path(10, 10, 58, 10), domain, config, test_id());
     REQUIRE(accepted.prepared != nullptr);
     CHECK(accepted.prepared->passive_tail_length_mm() == Catch::Approx(23.0).margin(0.001));
@@ -328,7 +435,7 @@ TEST_CASE("fiber physical footprint outside its island is rejected", "[Continuou
     config.cut_to_contact_length_mm = 10.0;
     config.outside_tolerance_mm2 = 0.0;
 
-    const FiberFinalizationResult result = FiberPathFinalizer::finalize(candidate, domain, config, test_id());
+    const FiberFinalizationResult result = finalize_independent(candidate, domain, config, test_id());
     CHECK(result.prepared == nullptr);
     CHECK(result.failure == FiberFinalizationFailure::OutsideDomain);
 }
@@ -343,7 +450,7 @@ TEST_CASE("fiber infill cannot cross a contour keepout removed from its allowed 
     config.cut_to_contact_length_mm = 5.0;
     config.outside_tolerance_mm2 = 0.0;
 
-    const FiberFinalizationResult result = FiberPathFinalizer::finalize(
+    const FiberFinalizationResult result = finalize_independent(
         candidate, infill_allowed_domain, config, test_id());
     CHECK(result.prepared == nullptr);
     CHECK(result.failure == FiberFinalizationFailure::OutsideDomain);
@@ -559,7 +666,7 @@ TEST_CASE("fiber finalizer rejects non-finite process parameters", "[ContinuousF
 {
     ContinuousFiberConfig config;
     config.cut_to_contact_length_mm = std::numeric_limits<double>::infinity();
-    const FiberFinalizationResult result = FiberPathFinalizer::finalize(
+    const FiberFinalizationResult result = finalize_independent(
         straight_path(1, 1, 11, 1), ExPolygons {rectangle(0, 0, 12, 12)}, config, test_id());
     CHECK(result.prepared == nullptr);
     CHECK(result.failure == FiberFinalizationFailure::InvalidParameter);
@@ -573,12 +680,12 @@ TEST_CASE("fiber feed is independent of plastic flow geometry and binds hardware
     ContinuousFiberConfig config;
     config.infill_feed_ratio = 1.02;
     config.infill_feed_correction = 1.05;
-    const auto a = FiberPathFinalizer::finalize(candidate, domain, config, test_id());
+    const auto a = finalize_independent(candidate, domain, config, test_id());
     REQUIRE(a.prepared);
     candidate.mm3_per_mm *= 3;
     candidate.height *= 2;
     candidate.width *= 2;
-    const auto b = FiberPathFinalizer::finalize(candidate, domain, config, test_id());
+    const auto b = finalize_independent(candidate, domain, config, test_id());
     REQUIRE(b.prepared);
     const auto bound_a = bind_fiber_execution(a.prepared, 0, 1, 3, 2.0, ";cut");
     const auto bound_b = bind_fiber_execution(b.prepared, 0, 1, 3, 2.0, ";cut");
@@ -599,9 +706,9 @@ TEST_CASE("fiber normal speed is invariant under collinear tessellation", "[Cont
     for (int i = 5; i <= 25; ++i) b.polyline.points.push_back(Point3::new_scale(i, 5, 0));
     ContinuousFiberConfig config;
     const ExPolygons domain{rectangle(0, 0, 40, 20)};
-    const auto pa = FiberPathFinalizer::finalize(a, domain, config, test_id());
+    const auto pa = finalize_independent(a, domain, config, test_id());
     b.polyline = normalize_fiber_geometry(b.polyline);
-    const auto pb = FiberPathFinalizer::finalize(b, domain, config, test_id());
+    const auto pb = finalize_independent(b, domain, config, test_id());
     REQUIRE(pa.prepared); REQUIRE(pb.prepared);
     const auto& sa = pa.prepared->spans.front();
     const auto& sb = pb.prepared->spans.front();
@@ -615,7 +722,7 @@ TEST_CASE("fiber closed seam uses cyclic corner adjacency", "[ContinuousFiber][s
 {
     const auto candidate = path_from_points({{5,5},{25,5},{25,25},{5,25},{5,5}});
     ContinuousFiberConfig config;
-    const auto result = FiberPathFinalizer::finalize(candidate, {rectangle(0,0,30,30)}, config, test_id());
+    const auto result = finalize_independent(candidate, {rectangle(0,0,30,30)}, config, test_id());
     REQUIRE(result.prepared);
     const auto& edges = result.prepared->spans.front().edges;
     CHECK(edges.front().speed_mm_s == Catch::Approx(6.5));
@@ -629,7 +736,7 @@ TEST_CASE("fiber tail is forcibly sampled by arc length with exact endpoint spee
     config.tail_speed_step_length_mm = 2;
     config.tail_min_speed_mm_s = 3;
     config.tail_max_speed_mm_s = 10;
-    const auto result = FiberPathFinalizer::finalize(straight_path(5,5,55,5),
+    const auto result = finalize_independent(straight_path(5,5,55,5),
         {rectangle(0,0,60,10)}, config, test_id());
     REQUIRE(result.prepared);
     const auto& tail = result.prepared->spans.back();
@@ -649,17 +756,17 @@ TEST_CASE("fiber finish preserves infill policy and supports open contours", "[C
     config.finish_extension_length_mm = 2;
     config.finish_overlap_length_mm = 3;
     const ExPolygons domain{rectangle(0,0,30,30)};
-    const auto infill = FiberPathFinalizer::finalize(candidate, domain, config, test_id());
+    const auto infill = finalize_independent(candidate, domain, config, test_id());
     REQUIRE(infill.prepared);
     CHECK(infill.prepared->finish_strategy == FiberFinishStrategy::TangentExtension);
     CHECK(infill.prepared->spans.back().geometry.points.back() == Point3::new_scale(5,3,0));
     auto contour_id = test_id();
     contour_id.parent.purpose = FiberPathPurpose::Contour;
-    const auto contour = FiberPathFinalizer::finalize(candidate, domain, config, contour_id);
+    const auto contour = finalize_independent(candidate, domain, config, contour_id);
     REQUIRE(contour.prepared);
     CHECK(contour.prepared->finish_strategy == FiberFinishStrategy::LoopOverlap);
     CHECK(contour.prepared->spans.back().geometry.points.back() == Point3::new_scale(8,5,0));
-    const auto open = FiberPathFinalizer::finalize(straight_path(5,5,25,5), domain, config, contour_id);
+    const auto open = finalize_independent(straight_path(5,5,25,5), domain, config, contour_id);
     REQUIRE(open.prepared);
     CHECK(open.prepared->finish_strategy == FiberFinishStrategy::TangentExtension);
     CHECK(open.prepared->spans.back().geometry.points.back() == Point3::new_scale(27,5,0));
@@ -669,7 +776,7 @@ TEST_CASE("fiber finish is continuous motion not material clipped by a model hol
 {
     ContinuousFiberConfig config;
     config.finish_extension_length_mm = 15;
-    const auto result = FiberPathFinalizer::finalize(straight_path(2,5,10,5),
+    const auto result = finalize_independent(straight_path(2,5,10,5),
         {rectangle_with_hole(0,0,30,10,15,2,20,8)}, config, test_id());
     REQUIRE(result.prepared);
     const auto& finish = result.prepared->spans.back();
@@ -688,10 +795,10 @@ TEST_CASE("fiber finish leaves the deposition domain without changing feed tail 
     config.cut_to_contact_length_mm = 23;
     const ExPolygons domain {rectangle(0,0,60,10)};
     const auto source = straight_path(5,5,55,5);
-    const auto baseline = FiberPathFinalizer::finalize(source, domain, config, test_id());
+    const auto baseline = finalize_independent(source, domain, config, test_id());
     REQUIRE(baseline.prepared);
     config.finish_extension_length_mm = 23;
-    const auto result = FiberPathFinalizer::finalize(source, domain, config, test_id());
+    const auto result = finalize_independent(source, domain, config, test_id());
     REQUIRE(result.prepared);
     CHECK(result.prepared->passive_tail_length_mm() == Catch::Approx(23));
     CHECK(result.prepared->total_depositing_length_mm() == Catch::Approx(50));
@@ -710,10 +817,10 @@ TEST_CASE("fiber finish leaves the deposition domain without changing feed tail 
     auto sampled = source;
     sampled.polyline.points.insert(sampled.polyline.points.end()-1, Point3::new_scale(54,5,0));
     sampled.polyline = normalize_fiber_geometry(sampled.polyline);
-    const auto same = FiberPathFinalizer::finalize(sampled, domain, config, test_id());
+    const auto same = finalize_independent(sampled, domain, config, test_id());
     REQUIRE(same.prepared);
     CHECK(same.prepared->spans.back().geometry.points == finish.geometry.points);
-    CHECK_FALSE(FiberPathFinalizer::finalize(straight_path(5,5,65,5), domain, config, test_id()).prepared);
+    CHECK_FALSE(finalize_independent(straight_path(5,5,65,5), domain, config, test_id()).prepared);
 }
 
 TEST_CASE("fiber motion checks real tool coordinates exclusions and height", "[ContinuousFiber][machine-motion]")
@@ -747,7 +854,7 @@ TEST_CASE("fiber numerical knots and speed sampling do not discard a closed cont
     config.finish_overlap_length_mm = 23;
     config.tail_min_speed_mm_s = config.tail_max_speed_mm_s = 10;
     auto id = test_id(); id.parent.purpose = FiberPathPurpose::Contour;
-    const auto result = FiberPathFinalizer::finalize(candidate, {rectangle(0,0,20,20)}, config, id);
+    const auto result = finalize_independent(candidate, {rectangle(0,0,20,20)}, config, id);
     REQUIRE(result.prepared);
     CHECK(result.prepared->total_depositing_length_mm() == Catch::Approx(40.0002).margin(0.003));
     CHECK(result.prepared->spans.front().geometry.points.front() == candidate.polyline.points.front());
@@ -765,12 +872,12 @@ TEST_CASE("fiber loop overlap does not weaken depositing boundary validation", "
     config.outside_tolerance_mm2 = 0.01;
     auto id = test_id(); id.parent.purpose = FiberPathPurpose::Contour;
     const ExPolygons domain {rectangle(0,0,30,20)};
-    const auto result = FiberPathFinalizer::finalize(candidate, domain, config, id);
+    const auto result = finalize_independent(candidate, domain, config, id);
     REQUIRE(result.prepared);
     CHECK(result.prepared->finish_strategy == FiberFinishStrategy::LoopOverlap);
     auto unsafe = candidate;
     for (auto& p : unsafe.polyline.points) if (p.x() < scale_(1)) p.x() = scale_(0.3);
-    CHECK_FALSE(FiberPathFinalizer::finalize(unsafe, domain, config, id).prepared);
+    CHECK_FALSE(finalize_independent(unsafe, domain, config, id).prepared);
 }
 
 TEST_CASE("fiber LayerXY and immutable entity contracts reject mutation", "[ContinuousFiber]")
@@ -779,9 +886,9 @@ TEST_CASE("fiber LayerXY and immutable entity contracts reject mutation", "[Cont
     ContinuousFiberConfig config;
     const ExPolygons domain{rectangle(0,0,30,10)};
     candidate.polyline.points.back().z() = scale_(0.2);
-    CHECK_FALSE(FiberPathFinalizer::finalize(candidate, domain, config, test_id()).prepared);
+    CHECK_FALSE(finalize_independent(candidate, domain, config, test_id()).prepared);
     candidate.polyline.points.back().z() = 0;
-    const auto result = FiberPathFinalizer::finalize(candidate, domain, config, test_id());
+    const auto result = finalize_independent(candidate, domain, config, test_id());
     REQUIRE(result.prepared);
     ExtrusionFiberPath fiber(candidate, erContinuousFiberInfill, result.prepared);
     ExtrusionPath& base = fiber;
@@ -1272,7 +1379,7 @@ TEST_CASE("fiber tail obeys corner limits without rejecting a closed contour", "
     config.tail_min_speed_mm_s = 3;
     config.tail_max_speed_mm_s = 10;
     auto id = test_id(); id.parent.purpose = FiberPathPurpose::Contour;
-    const auto result = FiberPathFinalizer::finalize(candidate, {rectangle(0,0,30,30)}, config, id);
+    const auto result = finalize_independent(candidate, {rectangle(0,0,30,30)}, config, id);
     REQUIRE(result.prepared);
     CHECK(result.prepared->passive_tail_length_mm() == Catch::Approx(23));
     CHECK(result.prepared->total_depositing_length_mm() == Catch::Approx(80));
@@ -1294,7 +1401,7 @@ TEST_CASE("contour finish is independent of enabled concentric infill", "[Contin
     config.infill_enabled = true;
     config.infill_pattern = ipConcentric;
     auto id = test_id(); id.parent.purpose = FiberPathPurpose::Contour;
-    const auto result = FiberPathFinalizer::finalize(candidate, {rectangle(0,0,30,30)}, config, id);
+    const auto result = finalize_independent(candidate, {rectangle(0,0,30,30)}, config, id);
     REQUIRE(result.prepared);
     CHECK(result.prepared->finish_strategy == FiberFinishStrategy::LoopOverlap);
     CHECK(result.prepared->spans.back().geometry.points.back() == Point3::new_scale(8,5,0));
@@ -1309,8 +1416,8 @@ TEST_CASE("fiber finalization validates only the requested path family", "[Conti
     auto id = test_id(); id.parent.purpose = FiberPathPurpose::Contour;
     const auto path = path_from_points({{5,5},{25,5},{25,25},{5,25},{5,5}});
     const ExPolygons domain {rectangle(0,0,30,30)};
-    REQUIRE(FiberPathFinalizer::finalize(path, domain, config, id).prepared);
-    const auto invalid = FiberPathFinalizer::finalize(path, domain, config, test_id());
+    REQUIRE(finalize_independent(path, domain, config, id).prepared);
+    const auto invalid = finalize_independent(path, domain, config, test_id());
     CHECK(invalid.failure == FiberFinalizationFailure::InvalidParameter);
     CHECK_FALSE(invalid.detail.empty());
 }
@@ -1716,7 +1823,7 @@ TEST_CASE("rounded bend speed is independent of arc tessellation", "[ContinuousF
         ExtrusionPath candidate(*result.path,source);
         ContinuousFiberConfig config;config.cut_to_contact_length_mm=23;
         auto id=test_id();id.parent.purpose=FiberPathPurpose::Contour;
-        const auto prepared=FiberPathFinalizer::finalize(candidate,domain,config,id,result.arcs);
+        const auto prepared=finalize_independent(candidate,domain,config,id,result.arcs);
         REQUIRE(prepared.prepared);
         double slow=100,fast=0;
         for (const auto& span:prepared.prepared->spans) if (span.actively_feeds_fiber())
@@ -2531,7 +2638,7 @@ TEST_CASE("process splits preserve a bend beside the landing boundary", "[Contin
     config.landing_length_mm=2; config.cut_to_contact_length_mm=23;
     config.minimum_effective_length_mm=.5; config.finish_extension_length_mm=23;
     auto id=test_id(); id.parent.purpose=FiberPathPurpose::Contour;
-    const auto result=FiberPathFinalizer::finalize(candidate,offset_ex(planned,float(scale_(1))),config,id,{},&planned);
+    const auto result=finalize_independent(candidate,offset_ex(planned,float(scale_(1))),config,id,{},&planned);
     REQUIRE(result.prepared);
     CHECK_NOTHROW(result.prepared->validate());
     CHECK(result.prepared->spans.front().geometry.points.back()==candidate.polyline.points[1]);
@@ -3548,13 +3655,13 @@ TEST_CASE("fiber infill at a wall uses a circular footprint through process spli
     const double half=unscale<double>(candidate.length())*.5;
     for(double tail:{half-1,half,half+1}) {
         config.cut_to_contact_length_mm=tail;
-        const auto result=FiberPathFinalizer::finalize(candidate,material,config,test_id(),{},&centerlines);
+        const auto result=finalize_independent(candidate,material,config,test_id(),{},&centerlines);
         REQUIRE(result.prepared);
         CHECK(result.prepared->outside_domain.empty());
         CHECK(unscale<double>(get_extents(result.prepared->physical_coverage).min.x())>=-.0001);
         // Moving the same bend genuinely outside must still fail validation.
         auto outside=candidate;outside.polyline.points[1].x()=scale_(.3);
-        const auto invalid=FiberPathFinalizer::finalize(outside,material,config,test_id(),{},&centerlines);
+        const auto invalid=finalize_independent(outside,material,config,test_id(),{},&centerlines);
         CHECK(invalid.failure==FiberFinalizationFailure::OutsideDomain);
     }
 }
@@ -3815,15 +3922,15 @@ TEST_CASE("strict policy boundary rejects physical protrusion without changing b
     config.cut_to_contact_length_mm = 2;
     config.outside_tolerance_mm2 = 1.0;
     const auto candidate = straight_path(5, 0.399, 45, 0.399);
-    REQUIRE(FiberPathFinalizer::finalize(candidate, domain, config, test_id()).prepared);
+    REQUIRE(finalize_independent(candidate, domain, config, test_id()).prepared);
     config.enforce_policy_boundary = true;
     auto context = std::make_shared<FiberPolicyBoundary>();
     context->forbidden_core = {rectangle(0, -10, 50, 0)};
     config.policy_boundary = context;
-    const auto rejected = FiberPathFinalizer::finalize(candidate, domain, config, test_id());
+    const auto rejected = finalize_independent(candidate, domain, config, test_id());
     CHECK_FALSE(rejected.prepared);
     CHECK(rejected.failure == FiberFinalizationFailure::PolicyBoundaryRejected);
-    const auto accepted = FiberPathFinalizer::finalize(straight_path(5, 0.41, 45, 0.41), domain, config, test_id());
+    const auto accepted = finalize_independent(straight_path(5, 0.41, 45, 0.41), domain, config, test_id());
     REQUIRE(accepted.prepared);
     CHECK(accepted.prepared->policy_boundary == context);
     // With identical policy and planning domains, the accepted footprint is inside both.
@@ -3842,7 +3949,7 @@ TEST_CASE("strict policy boundary distinguishes planning reserve from the effect
     context->forbidden_core = {rectangle(0, -10, 50, 0)};
     config.policy_boundary = context;
     const auto candidate = straight_path(5, 0.4095, 45, 0.4095);
-    const auto accepted = FiberPathFinalizer::finalize(candidate, planning, config, test_id(), {}, &planning);
+    const auto accepted = finalize_independent(candidate, planning, config, test_id(), {}, &planning);
     REQUIRE(accepted.prepared);
     CHECK(accepted.prepared->policy_boundary == context);
     CHECK_FALSE(diff_ex(accepted.prepared->physical_coverage, offset_ex(planning, 4.f),
@@ -3851,19 +3958,19 @@ TEST_CASE("strict policy boundary distinguishes planning reserve from the effect
                   ApplySafetyOffset::No).empty());
 
     SECTION("true policy protrusion remains rejected") {
-        const auto result = FiberPathFinalizer::finalize(straight_path(5, 0.399, 45, 0.399),
+        const auto result = finalize_independent(straight_path(5, 0.399, 45, 0.399),
                                                        planning, config, test_id(), {}, &planning);
         CHECK_FALSE(result.prepared);
         CHECK(result.failure == FiberFinalizationFailure::PolicyBoundaryRejected);
     }
     SECTION("missing context preserves the original model-edge tolerance") {
         config.policy_boundary.reset();
-        const auto result = FiberPathFinalizer::finalize(candidate, planning, config, test_id());
+        const auto result = finalize_independent(candidate, planning, config, test_id());
         CHECK(result.prepared);
     }
     SECTION("empty foreign domain preserves the original model-edge tolerance") {
         context->forbidden_core.clear();
-        const auto result = FiberPathFinalizer::finalize(candidate, planning, config, test_id());
+        const auto result = finalize_independent(candidate, planning, config, test_id());
         CHECK(result.prepared);
     }
 }
@@ -3878,9 +3985,9 @@ TEST_CASE("strict policy boundary preserves real holes even with a permissive pl
     auto context = std::make_shared<FiberPolicyBoundary>();
     context->forbidden_core = {rectangle(20, 5, 30, 15)};
     config.policy_boundary = context;
-    REQUIRE(FiberPathFinalizer::finalize(straight_path(5, 4.59, 45, 4.59),
+    REQUIRE(finalize_independent(straight_path(5, 4.59, 45, 4.59),
                                         planning, config, test_id()).prepared);
-    const auto rejected = FiberPathFinalizer::finalize(straight_path(5, 4.601, 45, 4.601),
+    const auto rejected = finalize_independent(straight_path(5, 4.601, 45, 4.601),
                                                      planning, config, test_id());
     CHECK_FALSE(rejected.prepared);
     CHECK(rejected.failure == FiberFinalizationFailure::PolicyBoundaryRejected);

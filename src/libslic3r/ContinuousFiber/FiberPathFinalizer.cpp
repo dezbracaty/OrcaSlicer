@@ -270,35 +270,51 @@ bool split_process_span(const Polyline3& source, double distance, Polyline3& bef
 // Finish is a tool motion after the depositing tail, not another material path.
 // Its machine-space limits are checked at execution binding, never against the
 // deposition domain (or its contour keepouts) and never using fiber line width.
-bool plan_finish(PreparedFiberPath& prepared, const ExtrusionPath& candidate,
-                 const ContinuousFiberConfig& config)
+void append_finish(PreparedFiberPath& prepared, const FiberFinishRoute& finish)
 {
-    const bool tangent = !candidate.is_closed() || prepared.id.parent.purpose == FiberPathPurpose::Infill;
-    const double length = tangent ? config.finish_extension_length_mm : config.finish_overlap_length_mm;
-    if (length <= 0) return true;
-    Polyline3 finish;
-    if (tangent) {
-        const auto& points = candidate.polyline.points;
-        const Vec3d direction = (points.back()-points[points.size()-2]).cast<double>().normalized();
-        const Vec3d endpoint = points.back().cast<double>() + scale_(length)*direction;
-        finish.points = {points.back(), Point3(endpoint.x(), endpoint.y(), 0.0)};
-        prepared.finish_strategy = FiberFinishStrategy::TangentExtension;
-    } else {
-        if (!candidate.is_closed() || length > unscale<double>(candidate.length())) {
-            BOOST_LOG_TRIVIAL(debug) << "[FiberFinishRejected] layer=" << prepared.id.parent.domain.layer_id
-                << " closed=" << candidate.is_closed() << " requested=" << length
-                << " path=" << unscale<double>(candidate.length());
-            return false;
-        }
-        finish = candidate.polyline;
-        finish.clip_end(candidate.length()-scale_(length));
-        prepared.finish_strategy = FiberFinishStrategy::LoopOverlap;
-    }
-    prepared.spans.push_back({std::move(finish), FiberMotionKind::NonDepositingFinish});
-    return true;
+    if (finish.geometry.empty()) return;
+    prepared.finish_strategy = finish.strategy;
+    prepared.spans.push_back({finish.geometry, FiberMotionKind::NonDepositingFinish});
 }
 
 } // namespace
+
+FiberFinishRoute make_independent_fiber_finish_route(
+    const ExtrusionPath& source, const ContinuousFiberConfig& config,
+    const FiberFragmentId& id)
+{
+    FiberFinishRoute finish;
+    finish.source = id;
+    const bool tangent = source.polyline.points.size() < 2 || !source.is_closed() ||
+        id.parent.purpose == FiberPathPurpose::Infill;
+    finish.strategy = tangent ? FiberFinishStrategy::TangentExtension : FiberFinishStrategy::LoopOverlap;
+    // Validate before coordinate conversion. Zero requests retain their selected
+    // policy and do not start validating the other family's configuration.
+    validate_fiber_process_config(config, id.parent.purpose, finish.strategy);
+    finish.requested_length_mm = tangent ? config.finish_extension_length_mm : config.finish_overlap_length_mm;
+    if (finish.requested_length_mm == 0 || source.polyline.points.size() < 2) return finish;
+    if (tangent) {
+        const auto& points = source.polyline.points;
+        const Vec3d terminal = (points.back()-points[points.size()-2]).cast<double>();
+        if (terminal.squaredNorm() == 0) return finish;
+        const Vec3d direction = terminal.normalized();
+        const long double scaled_length = static_cast<long double>(finish.requested_length_mm) / SCALING_FACTOR;
+        if (scaled_length > std::numeric_limits<coord_t>::max())
+            throw std::invalid_argument("Fiber finish length cannot be represented in source coordinates");
+        const Vec3d endpoint = points.back().cast<double>() + scale_(finish.requested_length_mm)*direction;
+        for (int axis = 0; axis < 2; ++axis)
+            if (!std::isfinite(endpoint[axis]) ||
+                static_cast<long double>(endpoint[axis]) < std::numeric_limits<coord_t>::min() ||
+                static_cast<long double>(endpoint[axis]) > std::numeric_limits<coord_t>::max())
+                throw std::invalid_argument("Fiber finish endpoint cannot be represented in source coordinates");
+        finish.geometry.points = {points.back(), Point3(endpoint.x(), endpoint.y(), 0.0)};
+    } else {
+        if (finish.requested_length_mm > unscale<double>(source.length())) return finish;
+        finish.geometry = source.polyline;
+        finish.geometry.clip_end(source.length()-scale_(finish.requested_length_mm));
+    }
+    return finish;
+}
 
 Polyline3 normalize_fiber_geometry(const Polyline3& input, const ExPolygons* centerline_domain)
 {
@@ -309,7 +325,7 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     const ExtrusionPath& input,
     const ExPolygons& allowed_domain,
     const ContinuousFiberConfig& config,
-    const FiberFragmentId& id,
+    const FiberFragmentId& id, const FiberFinishRoute& finish,
     const std::vector<ContourArc>& arcs, const ExPolygons* planned_centerline_domain)
 {
     FiberFinalizationResult result;
@@ -330,7 +346,14 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         result.detail = "Non-finite fiber path length";
         return result;
     }
-    try { validate_fiber_process_config(config, id.parent.purpose, candidate.is_closed()); }
+    try {
+        validate_fiber_process_config(config, id.parent.purpose, finish.strategy);
+        const double requested = finish.strategy == FiberFinishStrategy::LoopOverlap ?
+            config.finish_overlap_length_mm : config.finish_extension_length_mm;
+        if (!std::isfinite(finish.requested_length_mm) || finish.requested_length_mm < 0 ||
+            finish.requested_length_mm != requested)
+            throw std::invalid_argument("Fiber finish request differs from its selected configuration");
+    }
     catch (const std::invalid_argument& error) {
         result.failure = FiberFinalizationFailure::InvalidParameter;
         result.detail = error.what();
@@ -412,11 +435,20 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     if (!passive.empty())
         prepared->spans.push_back({std::move(passive), FiberMotionKind::PassiveDepositingAfterCut});
 
-    if (!plan_finish(*prepared, candidate, config)) {
+    const bool finish_valid = finish.source.parent.purpose == id.parent.purpose &&
+        finish.source.parent.domain == id.parent.domain &&
+        (finish.requested_length_mm == 0 ? finish.geometry.empty() :
+            finish.geometry.points.size() >= 2 &&
+            finish.geometry.points.front() == candidate.polyline.points.back() &&
+            std::none_of(finish.geometry.points.begin(), finish.geometry.points.end(),
+                [](const Point3& point) { return point.z() != 0; }) &&
+            std::abs(unscale<double>(finish.geometry.length())-finish.requested_length_mm) <= command_resolution_mm);
+    if (!finish_valid) {
         result.failure = FiberFinalizationFailure::FinishUnavailable;
-        result.detail = "Loop overlap requires a closed path at least as long as its configured finish";
+        result.detail = "Fiber finish route has invalid source, endpoint, length or LayerXY geometry";
         return result;
     }
+    append_finish(*prepared, finish);
     const bool check_centerline = planned_centerline_domain || !arcs.empty();
     const ExPolygons centerline_domain = planned_centerline_domain ?
         offset_ex(*planned_centerline_domain, float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm))) :

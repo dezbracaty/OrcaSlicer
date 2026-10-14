@@ -1,4 +1,5 @@
 #include "ContinuousFiberConfig.hpp"
+#include "PreparedFiberPath.hpp"
 
 #include "../Layer.hpp"
 #include "../Print.hpp"
@@ -375,7 +376,7 @@ PrintRegionConfig resolve_resin_fill_config(const PrintRegionConfig& config)
     return result;
 }
 
-void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose, bool closed_path)
+void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPathPurpose purpose, FiberFinishStrategy finish_strategy)
 {
     const auto check = [](double value, const char* name, bool positive = false) {
         if (!std::isfinite(value) || (positive ? value <= 0 : value < 0))
@@ -422,7 +423,9 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
     check(contour ? config.contour_feed_ratio : config.infill_feed_ratio, "fiber feed ratio", true);
     check(contour ? config.contour_feed_correction : config.infill_feed_correction, "fiber feed correction", true);
     check(contour ? config.contour_acceleration_mm_s2 : config.infill_acceleration_mm_s2, "fiber acceleration", true);
-    const bool loop_finish = contour && closed_path;
+    if (finish_strategy != FiberFinishStrategy::LoopOverlap && finish_strategy != FiberFinishStrategy::TangentExtension)
+        throw std::invalid_argument("Fiber finish requires an explicit loop or tangent strategy");
+    const bool loop_finish = finish_strategy == FiberFinishStrategy::LoopOverlap;
     const double finish = loop_finish ? config.finish_overlap_length_mm : config.finish_extension_length_mm;
     check(finish, loop_finish ? "fiber_finish_overlap_length" : "fiber_finish_extension_length");
     if (finish > 0) check(config.finish_motion_speed_mm_s, "fiber_finish_motion_speed", true);
@@ -535,8 +538,8 @@ static ContinuousFiberConfig resolve_region_fiber_config(
         result.contour_feed_ratio = source.fiber_contour_feed_ratio.value;
         result.contour_feed_correction = correction_for(result.contour_material);
         result.finish_overlap_length_mm = source.fiber_finish_overlap_length.value;
-        validate_fiber_process_config(result, FiberPathPurpose::Contour);
-        validate_fiber_process_config(result, FiberPathPurpose::Contour, false);
+        validate_fiber_process_config(result, FiberPathPurpose::Contour, FiberFinishStrategy::LoopOverlap);
+        validate_fiber_process_config(result, FiberPathPurpose::Contour, FiberFinishStrategy::TangentExtension);
         result.contour_flow = flow_for(result.contour_material);
     }
     if (result.infill_enabled) {
@@ -555,7 +558,7 @@ static ContinuousFiberConfig resolve_region_fiber_config(
         if (!std::isfinite(source.reinforced_infill_density.value))
             throw std::runtime_error("reinforced_infill_density must be finite");
         result.infill_density = std::clamp(source.reinforced_infill_density.value, 0.0, 100.0);
-        if (concentric) validate_fiber_process_config(result, FiberPathPurpose::Contour);
+        if (concentric) validate_fiber_process_config(result, FiberPathPurpose::Contour, FiberFinishStrategy::LoopOverlap);
         if (!concentric) {
             result.infill_material = unsigned(std::max(1, source.reinforced_infill_filament.value));
             result.infill_min_speed_mm_s = source.fiber_infill_min_speed.value;
@@ -563,7 +566,7 @@ static ContinuousFiberConfig resolve_region_fiber_config(
             result.infill_acceleration_mm_s2 = source.fiber_infill_acceleration.value;
             result.infill_feed_ratio = source.fiber_infill_feed_ratio.value;
             result.infill_feed_correction = correction_for(result.infill_material);
-            validate_fiber_process_config(result, FiberPathPurpose::Infill);
+            validate_fiber_process_config(result, FiberPathPurpose::Infill, FiberFinishStrategy::TangentExtension);
             result.infill_flow = flow_for(result.infill_material);
         }
     }
