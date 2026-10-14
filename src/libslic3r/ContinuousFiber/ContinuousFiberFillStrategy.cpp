@@ -232,7 +232,10 @@ Polyline sample_connection(const TangentSolution& value, double tolerance)
     for (const auto& piece:connection_primitives(value)) {
         if (const auto* segment=std::get_if<Linef>(&piece)) {
             append(scaled_point(segment->a));append(scaled_point(segment->b));
-        } else for (const auto& p:discretize(std::get<ContourArc>(piece),tolerance).points) append(p);
+        } else {
+            const Polyline sampled_arc=discretize(std::get<ContourArc>(piece),tolerance);
+            for (const auto& p:sampled_arc.points) append(p);
+        }
     }
     return line;
 }
