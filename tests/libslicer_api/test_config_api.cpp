@@ -3382,7 +3382,7 @@ TEST_CASE("fiber mask scope is atomic and independent of inactive fiber presenta
 {
     auto config = libslicer::Config::defaults();
     const auto items = config.settings(libslicer::ConfigScope::FiberMask);
-    REQUIRE(items.size() == 39);
+    REQUIRE(items.size() == 42);
     std::set<std::string> keys;
     for (const auto& item : items) keys.insert(item.key);
     CHECK_FALSE(keys.count("fiber_mask_process"));
@@ -3997,4 +3997,21 @@ TEST_CASE("resin-only mask supplies zero-density wall-free core above a native b
     }
     CHECK(resin > 0);
     remove_slice(result);
+}
+
+TEST_CASE("open ring connection settings persist their explicit software trim multipliers", "[libslicer_api][config][fiber][OpenRingConnection]")
+{
+    auto config=libslicer::Config::defaults();
+    CHECK(config.snapshot().value("fiber_connect_adjacent_rings")=="0");
+    CHECK(config.snapshot().value("fiber_connection_tail_trim_widths")=="1.5");
+    CHECK(config.snapshot().value("fiber_connection_head_trim_widths")=="1");
+    REQUIRE(config.apply_patch(libslicer::ConfigScope::FiberMask,{{"fiber_connect_adjacent_rings","1"},
+        {"fiber_connection_tail_trim_widths","2.25"},{"fiber_connection_head_trim_widths","0"}}).success);
+    const auto snapshot=config.snapshot();
+    CHECK(snapshot.value("fiber_connect_adjacent_rings")=="1");
+    CHECK(snapshot.value("fiber_connection_tail_trim_widths")=="2.25");
+    CHECK(snapshot.value("fiber_connection_head_trim_widths")=="0");
+    const auto before=config.snapshot().values();
+    CHECK_FALSE(config.apply_patch(libslicer::ConfigScope::FiberMask,{{"fiber_connection_head_trim_widths","-1"}}).success);
+    CHECK(config.snapshot().values()==before);
 }

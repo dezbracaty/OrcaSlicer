@@ -1352,6 +1352,9 @@ bool PrintObject::invalidate_state_by_config_options(
         } else if (
                opt_key.rfind("fiber_resin_fill_", 0) == 0
             || opt_key == "fiber_contour_include_holes"
+            || opt_key == "fiber_connect_adjacent_rings"
+            || opt_key == "fiber_connection_tail_trim_widths"
+            || opt_key == "fiber_connection_head_trim_widths"
             || opt_key == "top_surface_pattern"
             || opt_key == "bottom_surface_pattern"
             || opt_key == "internal_solid_infill_pattern"

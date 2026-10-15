@@ -4845,3 +4845,399 @@ TEST_CASE("masked flush statistics describe the published constrained sequences"
     REQUIRE_THROWS_WITH(order.sort_and_build_data(print,unsigned(-1)),
         "Explicit material order conflicts with masked resin-before-fiber execution");
 }
+
+namespace {
+ContinuousFiberConfig open_ring_config()
+{
+    ContinuousFiberConfig config;
+    config.contour_enabled=true;config.contour_count=3;config.contour_include_holes=false;
+    config.contour_flow=Flow(1.f,.2f,.4f);config.infill_flow=config.contour_flow;
+    config.connect_adjacent_rings=true;
+    config.connection_tail_trim_widths=1.5;config.connection_head_trim_widths=1;
+    return config;
+}
+FiberContourPlanResult open_ring_plan(const ContinuousFiberConfig& config,
+    const ExPolygons& domain={rectangle(0,0,50,40)})
+{
+    return FiberPathValidator::plan_contours(domain,config,{7,11,2,0},true);
+}
+size_t open_ring_bridges(const FiberChainExecution& execution)
+{
+    return std::count_if(execution.pieces.begin(),execution.pieces.end(),[](const auto& piece){
+        return piece.kind==FiberExecutionPieceKind::Transition;
+    });
+}
+void check_open_ring_sources(const FiberContourPlanResult& plan)
+{
+    REQUIRE(plan.validation.audit_open_chains());
+    std::set<FiberFragmentId> seen;
+    size_t expected=0;for(const auto& source:plan.validation.assignments)
+        if(source.kind==FiberAssignmentKind::AcceptedFiber)++expected;
+    for(const auto& chain:plan.validation.chain_executions) {
+        REQUIRE_FALSE(chain.sources.empty());REQUIRE(chain.prepared);
+        CHECK(open_ring_bridges(chain)+1==chain.sources.size());
+        if(chain.sources.size()>1)CHECK(chain.centerline.polyline.points.front()!=chain.centerline.polyline.points.back());
+        for(size_t index=0;index<chain.sources.size();++index) {
+            const auto& source=chain.sources[index];
+            CHECK(seen.insert(source.source).second);
+            CHECK(source.head_mm==Catch::Approx(index?1.:0.));
+            CHECK(source.tail_mm==Catch::Approx(index+1<chain.sources.size()?1.5:0.));
+            CHECK(source.retained_mm+source.head_mm+source.tail_mm==Catch::Approx(source.original_mm).margin(1e-5));
+            REQUIRE(source.retained_intervals.size()<=2);
+            double retained=0;
+            const auto frozen=std::find_if(plan.validation.assignments.begin(),plan.validation.assignments.end(),[&](const auto& a){return a.id==source.source;});
+            REQUIRE(frozen!=plan.validation.assignments.end());
+            for(const auto& interval:source.retained_intervals) {
+                CHECK(std::isfinite(interval.first));CHECK(std::isfinite(interval.second));
+                CHECK(interval.first>=frozen->source_begin_mm);CHECK(interval.second<=frozen->source_end_mm);
+                CHECK(interval.second>interval.first);retained+=interval.second-interval.first;
+            }
+            CHECK(retained==Catch::Approx(source.retained_mm).margin(1e-5));
+        }
+        // Every command edge has one provenance owner, including the explicit finish.
+        std::vector<std::vector<int>> owners;
+        for(const auto& span:chain.prepared->spans)owners.emplace_back(span.edges.size(),0);
+        if(chain.sources.size()>1) {
+            REQUIRE_FALSE(chain.prepared->command_pieces.empty());
+            for(const auto& piece:chain.prepared->command_pieces) {
+                REQUIRE(piece.span_index<owners.size());
+                REQUIRE(piece.end_edge<=owners[piece.span_index].size());
+                CHECK(piece.begin_edge<piece.end_edge);
+                CHECK(piece.origin.source_end_mm>=piece.origin.source_begin_mm);
+                for(size_t edge=piece.begin_edge;edge<piece.end_edge;++edge)++owners[piece.span_index][edge];
+            }
+            for(const auto& span:owners)for(int count:span)CHECK(count==1);
+        }
+    }
+    CHECK(seen.size()==expected);
+}
+}
+
+TEST_CASE("open ring chain retains one forward arc and one local seam per source", "[ContinuousFiber][OpenRingConnection]")
+{
+    const auto config=open_ring_config();const ExPolygons domain{rectangle(0,0,50,40)};
+    auto plan=open_ring_plan(config,domain);REQUIRE(plan.validation.accepted_count()==3);
+    const auto frozen=plan.validation.assignments;
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    REQUIRE(plan.validation.chain_executions.size()==1);
+    const auto& chain=plan.validation.chain_executions.front();
+    REQUIRE(chain.sources.size()==3);CHECK(open_ring_bridges(chain)==2);
+    check_open_ring_sources(plan);
+    for(size_t i=0;i<frozen.size();++i) {
+        CHECK(plan.validation.assignments[i].centerline->polyline.points==frozen[i].centerline->polyline.points);
+        CHECK(plan.validation.assignments[i].prepared==frozen[i].prepared);
+    }
+    // Release the chain once; immutable three-source generation records are not three emitters.
+    ExtrusionEntitiesPtr output;plan.validation.release_to(output);REQUIRE(output.size()==1);
+    const auto* emitted=dynamic_cast<const ExtrusionEntityCollection*>(output.front());
+    REQUIRE(emitted);CHECK(emitted->entities.size()==1);
+    for(auto* entity:output)delete entity;
+}
+
+TEST_CASE("open ring connection off and no candidates preserve original prepared paths", "[ContinuousFiber][OpenRingConnection]")
+{
+    auto config=open_ring_config();
+    SECTION("disabled") {config.connect_adjacent_rings=false;}
+    SECTION("one source") {config.contour_count=1;}
+    const ExPolygons domain{rectangle(0,0,50,40)};auto plan=open_ring_plan(config,domain);
+    const auto original=plan.validation.assignments;
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    CHECK(plan.validation.chain_executions.empty());
+    REQUIRE(plan.validation.assignments.size()==original.size());
+    for(size_t i=0;i<original.size();++i)CHECK(plan.validation.assignments[i].prepared==original[i].prepared);
+    ExtrusionEntitiesPtr output;plan.validation.release_to(output);REQUIRE(output.size()==1);
+    const auto* emitted=dynamic_cast<const ExtrusionEntityCollection*>(output.front());
+    REQUIRE(emitted);CHECK(emitted->entities.size()==original.size());for(auto* entity:output)delete entity;
+}
+
+TEST_CASE("open ring rejected extension restores the terminal role and untouched child", "[ContinuousFiber][OpenRingConnection]")
+{
+    auto config=open_ring_config();const ExPolygons domain{rectangle(0,0,50,40)};
+    auto plan=open_ring_plan(config,domain);REQUIRE(plan.validation.assignments.size()==3);
+    // A child with a different material must not borrow the inherited seam or receive a bridge.
+    auto& foreign=plan.validation.assignments.back();
+    auto foreign_prepared=std::make_shared<PreparedFiberPath>(*foreign.prepared);
+    foreign_prepared->logical_filament_id+=1;foreign.prepared=foreign_prepared;
+    REQUIRE(plan.audit_lineage());
+    const auto frozen=foreign.prepared;
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    REQUIRE_FALSE(plan.validation.chain_executions.empty());
+    size_t bridges=0;for(const auto& chain:plan.validation.chain_executions) {
+        bridges+=open_ring_bridges(chain);
+        if(chain.sources.size()>1) {CHECK(chain.sources.size()==2);CHECK(chain.sources.back().tail_mm==0);}
+        for(const auto& piece:chain.pieces)if(piece.kind==FiberExecutionPieceKind::Transition)
+            CHECK(piece.other_source.parent.domain.policy_group_id==piece.source.parent.domain.policy_group_id);
+    }
+    CHECK(bridges==1);
+    CHECK(plan.validation.assignments.back().prepared==frozen);
+}
+
+TEST_CASE("open ring excessive clipping never leaves ghost cut windows", "[ContinuousFiber][OpenRingConnection]")
+{
+    auto config=open_ring_config();const ExPolygons domain{rectangle(0,0,50,40)};
+    auto plan=open_ring_plan(config,domain);const auto original=plan.validation.assignments;
+    config.connection_tail_trim_widths=1000;
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    CHECK(plan.validation.chain_executions.empty());
+    for(const auto& decision:plan.chain_decisions)CHECK_FALSE(decision.published);
+    for(size_t i=0;i<original.size();++i)CHECK(plan.validation.assignments[i].prepared==original[i].prepared);
+}
+
+TEST_CASE("open ring planning tail crosses bridge once and finish uses terminal forward source", "[ContinuousFiber][OpenRingConnection]")
+{
+    auto config=open_ring_config();config.finish_overlap_length_mm=3;
+    config.contour_count=2;
+    // Terminal perimeter 20mm <23mm: the passive tail must extend back across its incoming bridge.
+    const ExPolygons domain{rectangle(0,0,8,8)};auto plan=open_ring_plan(config,domain);
+    REQUIRE(plan.validation.accepted_count()==2);
+    // Synthetic already accepted sources isolate whole-execution budget splitting.
+    config.cut_to_contact_length_mm=23;
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    REQUIRE(plan.validation.chain_executions.size()==1);const auto& chain=plan.validation.chain_executions.front();
+    REQUIRE(chain.sources.size()==2);REQUIRE(chain.prepared);
+    const auto& prepared=*chain.prepared;
+    CHECK(prepared.passive_tail_length_mm()==Catch::Approx(23).margin(.002));
+    CHECK(std::count_if(prepared.actions.begin(),prepared.actions.end(),[](const auto& a){return a.type==FiberActionType::Cut;})==1);
+    bool tail_bridge=false;std::set<FiberFragmentId> tail_sources;
+    double finish_length=0;
+    for(const auto& piece:prepared.command_pieces) {
+        const auto& span=prepared.spans.at(piece.span_index);
+        if(span.kind==FiberMotionKind::PassiveDepositingAfterCut) {
+            tail_bridge|=piece.origin.kind==FiberExecutionPieceKind::Transition;
+            if(piece.origin.kind==FiberExecutionPieceKind::RetainedSource)tail_sources.insert(piece.origin.source);
+        }
+        if(span.kind==FiberMotionKind::NonDepositingFinish) {
+            CHECK(piece.origin.source==chain.sources.back().source);
+            CHECK(piece.origin.kind==FiberExecutionPieceKind::RetainedSource);
+            finish_length+=piece.command_end_mm-piece.command_begin_mm;
+        }
+    }
+    CHECK(tail_bridge);CHECK(tail_sources.size()==2);CHECK(finish_length==Catch::Approx(3).margin(.002));
+    CHECK(prepared.finish_strategy==FiberFinishStrategy::LoopOverlap);
+    REQUIRE(prepared.spans.back().kind==FiberMotionKind::NonDepositingFinish);
+    CHECK(prepared.spans.back().geometry.points.front()==chain.centerline.polyline.points.back());
+    for(const auto& span:prepared.spans)if(span.kind==FiberMotionKind::PassiveDepositingAfterCut || span.kind==FiberMotionKind::NonDepositingFinish)
+        for(const auto& edge:span.edges)CHECK(edge.feed_mm_per_xy_mm==0);
+    check_open_ring_sources(plan);
+}
+
+TEST_CASE("open ring software trim policy is inactive while connections are disabled", "[ContinuousFiber][OpenRingConnection]")
+{
+    auto a=open_ring_config(),b=a;a.connect_adjacent_rings=false;b.connect_adjacent_rings=false;
+    b.connection_tail_trim_widths=4;b.connection_head_trim_widths=0;
+    CHECK(fiber_policy_key(a,0,true)==fiber_policy_key(b,0,true));
+    b.connect_adjacent_rings=true;CHECK_FALSE(fiber_policy_key(a,0,true)==fiber_policy_key(b,0,true));
+    a=b;a.connection_head_trim_widths=1;
+    CHECK_FALSE(fiber_policy_key(a,0,true)==fiber_policy_key(b,0,true));
+}
+
+TEST_CASE("open ring branch forms separate chains without reopening an occupied parent", "[ContinuousFiber][OpenRingConnection]")
+{
+    const auto config=open_ring_config();const ExPolygons domain{rectangle(0,0,50,40)};
+    auto plan=open_ring_plan(config,domain);REQUIRE(plan.nodes.size()==3);
+    // Both are direct children, but the open path has capacity for one successor only.
+    plan.nodes[2].parent=plan.nodes[0].id;plan.nodes[2].depth=1;
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    REQUIRE(plan.validation.chain_executions.size()==2);
+    size_t bridges=0;std::set<FiberFragmentId> seen;
+    for(const auto& chain:plan.validation.chain_executions) {
+        bridges+=open_ring_bridges(chain);
+        for(const auto& source:chain.sources)CHECK(seen.insert(source.source).second);
+    }
+    CHECK(bridges==1);CHECK(seen.size()==3);CHECK(plan.validation.audit_open_chains());
+}
+
+TEST_CASE("open ring source station bounds remain strict on noninteger geometry", "[ContinuousFiber][OpenRingConnection]")
+{
+    auto config=open_ring_config();config.contour_bend_radius_mm=.37;
+    auto shape=rectangle(0,0,50.123,40.317);
+    const ExPolygons domain{shape};auto plan=open_ring_plan(config,domain);
+    REQUIRE(plan.validation.accepted_count()==3);
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    REQUIRE_FALSE(plan.validation.chain_executions.empty());check_open_ring_sources(plan);
+    CHECK(std::count_if(plan.chain_decisions.begin(),plan.chain_decisions.end(),[](const auto& d){return d.published;})==2);
+}
+
+TEST_CASE("open ring invalid terminal finish restores the entire domain", "[ContinuousFiber][OpenRingConnection]")
+{
+    auto config=open_ring_config();const ExPolygons domain{rectangle(0,0,50,40)};
+    auto plan=open_ring_plan(config,domain);const auto original=plan.validation.assignments;
+    config.finish_overlap_length_mm=1000;
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    CHECK(plan.validation.chain_executions.empty());
+    for(const auto& decision:plan.chain_decisions)CHECK_FALSE(decision.published);
+    for(size_t i=0;i<original.size();++i)CHECK(plan.validation.assignments[i].prepared==original[i].prepared);
+}
+
+TEST_CASE("open ring zero finish retains explicit terminal LoopOverlap strategy", "[ContinuousFiber][OpenRingConnection]")
+{
+    const auto config=open_ring_config();const ExPolygons domain{rectangle(0,0,50,40)};
+    auto plan=open_ring_plan(config,domain);
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    REQUIRE(plan.validation.chain_executions.size()==1);
+    const auto& prepared=*plan.validation.chain_executions.front().prepared;
+    CHECK(prepared.finish_strategy==FiberFinishStrategy::LoopOverlap);
+    for(const auto& span:prepared.spans)CHECK(span.kind!=FiberMotionKind::NonDepositingFinish);
+}
+
+TEST_CASE("open chain bridge corners do not invent radius-treated stability events", "[ContinuousFiber][OpenRingConnection][OpenChainStability]")
+{
+    auto config=open_ring_config();config.contour_count=2;
+    const ExPolygons domain{rectangle(0,0,50,40)};auto plan=open_ring_plan(config,domain);
+    plan.set_display_cutoff(0);
+    for(const auto& source:plan.validation.assignments)REQUIRE(source.source_bends.empty());
+    config.concentric_corner_stabilization_length_mm=10000;
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    REQUIRE(plan.validation.chain_executions.size()==1);
+    CHECK(plan.validation.chain_executions.front().sources.size()==2);
+    CHECK(open_ring_bridges(plan.validation.chain_executions.front())==1);
+}
+
+TEST_CASE("open chain stability clips the original marked region at its true retained start", "[ContinuousFiber][OpenRingConnection][OpenChainStability]")
+{
+    auto config=open_ring_config();config.contour_count=2;
+    const ExPolygons domain{rectangle(0,0,50,40)};
+    auto frozen=open_ring_plan(config,domain);frozen.set_display_cutoff(0);
+    auto reference=frozen;FiberPathValidator::plan_open_ring_chains(reference,domain,config,true);
+    REQUIRE(reference.validation.chain_executions.size()==1);
+    const auto& head=reference.validation.chain_executions.front().sources.front();
+    REQUIRE(head.seam_mm>.5);REQUIRE(head.seam_mm+.5<head.original_mm);
+    auto& source=*std::find_if(frozen.validation.assignments.begin(),frozen.validation.assignments.end(),[&](const auto& source){return source.id==head.source;});
+    // Controlled metadata-interface fixture: these intervals deliberately mark a
+    // region around the chosen seam. They do not claim the square was radius-treated.
+    ContourBend bend;bend.begin_mm=head.seam_mm-.5;bend.end_mm=head.seam_mm+.5;
+    source.source_bends={bend};config.concentric_corner_stabilization_length_mm=.1;
+    SECTION("Infill first retained fragment starts inside bend and has zero prefix") {
+        FiberPathValidator::plan_open_ring_chains(frozen,domain,config,true);
+        CHECK(frozen.validation.chain_executions.empty());
+        REQUIRE_FALSE(frozen.chain_decisions.empty());
+        CHECK(std::any_of(frozen.chain_decisions.begin(),frozen.chain_decisions.end(),[](const auto& decision){
+            return !decision.published && decision.reason.find("bend_stabilization_too_short")!=std::string::npos;
+        }));
+    }
+    SECTION("the identical Contour mark does not acquire an Infill threshold") {
+        source.display_purpose=FiberPathPurpose::Contour;
+        FiberPathValidator::plan_open_ring_chains(frozen,domain,config,true);
+        REQUIRE(frozen.validation.chain_executions.size()==1);
+        CHECK(frozen.validation.chain_executions.front().sources.size()==2);
+    }
+    SECTION("a completely trimmed marked region is not a predecessor event") {
+        source.source_bends.front().begin_mm=head.seam_mm-1;
+        source.source_bends.front().end_mm=head.seam_mm-.5;
+        config.concentric_corner_stabilization_length_mm=10000;
+        FiberPathValidator::plan_open_ring_chains(frozen,domain,config,true);
+        REQUIRE(frozen.validation.chain_executions.size()==1);
+        CHECK(frozen.validation.chain_executions.front().sources.size()==2);
+    }
+}
+
+TEST_CASE("open chain first-edge rejection leaves no inherited seam on the next root", "[ContinuousFiber][OpenRingConnection]")
+{
+    const auto config=open_ring_config();const ExPolygons domain{rectangle(0,0,50,40)};
+    auto plan=open_ring_plan(config,domain);
+    REQUIRE(plan.validation.assignments.size()==3);
+    // Keep the second edge eligible while blocking the first through its real
+    // source identity. No failed parent contact may initialize source1's seam.
+    auto& first=plan.validation.assignments.front();
+    auto prepared=std::make_shared<PreparedFiberPath>(*first.prepared);
+    prepared->logical_filament_id+=1;first.prepared=prepared;
+    REQUIRE(plan.audit_lineage());
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    REQUIRE_FALSE(plan.validation.chain_executions.empty());
+    size_t bridges=0;
+    for(const auto& execution:plan.validation.chain_executions)if(execution.sources.size()>1) {
+        bridges+=open_ring_bridges(execution);CHECK(execution.sources.size()==2);
+        CHECK(execution.sources.front().head_mm==0);
+        CHECK(execution.sources.back().tail_mm==0);
+    }
+    CHECK(bridges==1);
+    for(const auto& decision:plan.chain_decisions)if(decision.published)CHECK_FALSE(decision.inherited_seam);
+}
+
+TEST_CASE("open chain subpicometer positive retained arc safely preserves independent sources", "[ContinuousFiber][OpenRingConnection][TinyRetainedArc]")
+{
+    auto config=open_ring_config();config.contour_count=2;
+    const ExPolygons domain{rectangle(0,0,50,40)};
+    auto plan=open_ring_plan(config,domain);REQUIRE(plan.validation.accepted_count()==2);
+    // Establish that this same pair is connectable with ordinary parameters.
+    auto ordinary=plan;FiberPathValidator::plan_open_ring_chains(ordinary,domain,config,true);
+    REQUIRE(ordinary.validation.chain_executions.size()==1);
+    REQUIRE(ordinary.validation.chain_executions.front().sources.size()==2);
+    const auto head_id=ordinary.validation.chain_executions.front().sources.front().source;
+    const auto head=std::find_if(plan.validation.assignments.begin(),plan.validation.assignments.end(),
+        [&](const auto& source){return source.id==head_id;});
+    REQUIRE(head!=plan.validation.assignments.end());REQUIRE(head->centerline);
+    REQUIRE(head->centerline->width==1.f);
+    const double original=head->source_end_mm-head->source_begin_mm;
+    config.connection_tail_trim_widths=std::nextafter(original,0.0);
+    const double tiny_retained=original-config.connection_tail_trim_widths*head->centerline->width;
+    REQUIRE(std::isfinite(config.connection_tail_trim_widths));
+    REQUIRE(config.connection_tail_trim_widths>=0);
+    REQUIRE(std::isfinite(config.connection_head_trim_widths));
+    REQUIRE(config.connection_head_trim_widths>=0);
+    REQUIRE(tiny_retained>0);REQUIRE(tiny_retained<1e-12);
+    const auto frozen=plan.validation.assignments;
+    REQUIRE_NOTHROW(FiberPathValidator::plan_open_ring_chains(plan,domain,config,true));
+    CHECK(plan.validation.chain_executions.empty());
+    REQUIRE_FALSE(plan.chain_decisions.empty());
+    for(const auto& decision:plan.chain_decisions)CHECK_FALSE(decision.published);
+    REQUIRE(plan.validation.assignments.size()==frozen.size());
+    for(size_t i=0;i<frozen.size();++i) {
+        CHECK(plan.validation.assignments[i].prepared==frozen[i].prepared);
+        CHECK(plan.validation.assignments[i].centerline->polyline.points==frozen[i].centerline->polyline.points);
+        CHECK(plan.validation.assignments[i].source_begin_mm==frozen[i].source_begin_mm);
+        CHECK(plan.validation.assignments[i].source_end_mm==frozen[i].source_end_mm);
+    }
+    ExtrusionEntitiesPtr output;plan.validation.release_to(output);
+    REQUIRE(output.size()==1);
+    const auto* emitted=dynamic_cast<const ExtrusionEntityCollection*>(output.front());
+    REQUIRE(emitted);CHECK(emitted->entities.size()==frozen.size());for(auto* entity:output)delete entity;
+}
+
+TEST_CASE("open ring rotated corner gate rejects a bridge crossing the retained child", "[ContinuousFiber][OpenRingConnection]")
+{
+    auto config=open_ring_config();config.contour_bend_radius_mm=.37;
+    auto shape=rectangle(0,0,50.123,40.317);shape.rotate(.217);
+    const ExPolygons domain{shape};auto plan=open_ring_plan(config,domain);
+    REQUIRE(plan.validation.accepted_count()==3);
+    const auto original=plan.validation.assignments;
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    CHECK(plan.validation.chain_executions.empty());
+    REQUIRE(plan.chain_decisions.size()==2);
+    for(const auto& decision:plan.chain_decisions) {
+        CHECK_FALSE(decision.published);
+        CHECK(decision.reason=="open_chain_self_intersection");
+    }
+    for(size_t i=0;i<original.size();++i)
+        CHECK(plan.validation.assignments[i].prepared==original[i].prepared);
+}
+
+TEST_CASE("connected coordinate precision restores after exceptions without losing emitted Z", "[ContinuousFiber][OpenRingConnection][writer]")
+{
+    PrintConfig config;GCodeWriter writer,other;
+    writer.apply_print_config(config);writer.set_extruders({0});writer.toolchange(0);
+    writer.set_position(Vec3d(0,0,.2));
+    std::string precise,feed;
+    REQUIRE_THROWS_AS(([&] {
+        GCodeWriter::ScopedXYZPrecision scope(writer,6);
+        CHECK(other.xyz_export_digits()==3);
+        precise=writer.extrude_to_xyz(Vec3d(1.123456,2.765432,.200499),1.2345678);
+        feed=writer.set_speed(1234.56789);
+        throw std::runtime_error("abort connected export");
+    })(),std::runtime_error);
+    CHECK(precise.find("X1.123456")!=std::string::npos);
+    CHECK(precise.find("Y2.765432")!=std::string::npos);
+    CHECK(precise.find(" Z.200499")!=std::string::npos);
+    CHECK(precise.find("E1.23457")!=std::string::npos);
+    CHECK(feed.find("F1234.568")!=std::string::npos);
+    CHECK(writer.xyz_export_digits()==3);
+    CHECK(writer.get_emitted_position().z()==Catch::Approx(.200499));
+    // A format restore sends no move. The next ordinary command must really
+    // lower from the last six-place Z, rather than suppressing that correction.
+    const auto ordinary=writer.extrude_to_xyz(Vec3d(1.123456,2.765432,.2),0,"",true);
+    CHECK(ordinary.find("X1.123 ")!=std::string::npos);
+    CHECK(ordinary.find("Y2.765 ")!=std::string::npos);
+    CHECK(ordinary.find(" Z.2")!=std::string::npos);
+    CHECK(ordinary.find(" E")==std::string::npos);
+    CHECK(writer.get_emitted_position().z()==Catch::Approx(.2));
+}

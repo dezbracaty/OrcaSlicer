@@ -9,6 +9,7 @@
 #include <cmath>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <boost/log/trivial.hpp>
 
@@ -30,7 +31,8 @@ double area_mm2(const ExPolygons& polygons)
 // The optional map relates retained points to their original arc length, so
 // command cleanup cannot shift a bend's speed interval or a process boundary.
 Polyline3 normalized_xy(const Polyline3& input, std::vector<double>* source_positions = nullptr,
-                        double error_mm = normalization_error_mm, const ExPolygons* centerline_domain = nullptr)
+                        double error_mm = normalization_error_mm, const ExPolygons* centerline_domain = nullptr,
+                        const std::vector<bool>* protected_knots = nullptr)
 {
     Polyline3 result;
     // Collapse exact straight runs first. Their endpoints bound the distance of
@@ -46,6 +48,7 @@ Polyline3 normalized_xy(const Polyline3& input, std::vector<double>* source_posi
             unscale<double>((point-input.points[i-1]).cast<double>().norm());
         if (!knots.empty() && point==input.points[knots.back()]) continue;
         while (knots.size()>=2) {
+            if (protected_knots && (*protected_knots)[knots.back()]) break;
             const Vec2d a=(input.points[knots.back()]-input.points[knots[knots.size()-2]]).head<2>().cast<double>();
             const Vec2d b=(point-input.points[knots.back()]).head<2>().cast<double>();
             if (a.dot(b)<=0 || a.x()*b.y()!=a.y()*b.x()) break;
@@ -75,6 +78,7 @@ Polyline3 normalized_xy(const Polyline3& input, std::vector<double>* source_posi
     for (size_t index=0;index<knots.size();++index) {
         const auto& point=input.points[knots[index]];
         while (result.points.size()>=2) {
+            if (protected_knots && (*protected_knots)[knots[retained.back()]]) break;
             const Vec2d a=(result.points.back()-result.points[result.points.size()-2]).head<2>().cast<double>();
             const Vec2d b=(point-result.points.back()).head<2>().cast<double>();
             if (std::min(a.norm(),b.norm())>scale_(command_resolution_mm)) break;
@@ -123,6 +127,133 @@ struct ArcGeometry {
     }
 };
 
+// Piece boundaries are geometry knots, not approximate cumulative command lengths.
+// The tiny station allowance below only reconciles sum(unscale(edge)) with
+// unscale(sum(edge)); it never accepts a negative source range.
+constexpr double station_roundoff_mm = 1e-8;
+
+double source_station_at(const FiberExecutionPiece& piece,double station)
+{
+    if (station<=piece.execution_begin_mm) return piece.source_begin_mm;
+    if (station>=piece.execution_end_mm) return piece.source_end_mm;
+    if (piece.source_station_knots && !piece.source_station_knots->empty()) {
+        const auto& chart=*piece.source_station_knots;
+        const auto next=std::upper_bound(chart.begin(),chart.end(),station,
+            [](double s,const auto& knot){return s<knot.first;});
+        if (next==chart.begin() || next==chart.end())
+            throw std::invalid_argument("Fiber source chart does not cover its planning range");
+        const auto& before=*(next-1);
+        const double t=(station-before.first)/(next->first-before.first);
+        return std::clamp(before.second+t*(next->second-before.second),piece.source_begin_mm,piece.source_end_mm);
+    }
+    const double ratio=std::clamp((station-piece.execution_begin_mm)/
+        (piece.execution_end_mm-piece.execution_begin_mm),0.0,1.0);
+    return std::clamp(piece.source_begin_mm+ratio*(piece.source_end_mm-piece.source_begin_mm),
+                      piece.source_begin_mm,piece.source_end_mm);
+}
+
+std::vector<bool> piece_knots(const Polyline3& geometry,
+                              const std::vector<FiberExecutionPiece>& pieces)
+{
+    const ArcGeometry arc(geometry);
+    std::vector<bool> keep(geometry.points.size(), false);
+    double previous = 0.0;
+    for (const auto& piece : pieces) {
+        if (!std::isfinite(piece.execution_begin_mm) || !std::isfinite(piece.execution_end_mm) ||
+            piece.execution_begin_mm != previous || piece.execution_end_mm <= piece.execution_begin_mm ||
+            (piece.kind == FiberExecutionPieceKind::RetainedSource &&
+             (!std::isfinite(piece.source_begin_mm) || !std::isfinite(piece.source_end_mm) ||
+              piece.source_begin_mm < 0 || piece.source_end_mm <= piece.source_begin_mm)))
+            throw std::invalid_argument("Invalid ordered fiber planning piece");
+        if (piece.source_station_knots) {
+            const auto& chart=*piece.source_station_knots;
+            if (piece.kind!=FiberExecutionPieceKind::RetainedSource || chart.size()<2 ||
+                chart.front().first>piece.execution_begin_mm || chart.back().first<piece.execution_end_mm ||
+                chart.front().second>piece.source_begin_mm || chart.back().second<piece.source_end_mm)
+                throw std::invalid_argument("Fiber source chart has invalid bounds");
+            for (size_t i=0;i<chart.size();++i)
+                if (!std::isfinite(chart[i].first) || !std::isfinite(chart[i].second) ||
+                    chart[i].first<0 || chart[i].second<0 ||
+                    (i && (chart[i].first<=chart[i-1].first || chart[i].second<=chart[i-1].second)))
+                    throw std::invalid_argument("Fiber source chart is not strictly positive and ordered");
+        }
+        for (double boundary : {piece.execution_begin_mm, piece.execution_end_mm}) {
+            auto next = std::lower_bound(arc.positions.begin(), arc.positions.end(), boundary);
+            size_t index = next == arc.positions.end() ? arc.positions.size()-1 : size_t(next-arc.positions.begin());
+            if (index && std::abs(arc.positions[index-1]-boundary) < std::abs(arc.positions[index]-boundary)) --index;
+            if (std::abs(arc.positions[index]-boundary) > station_roundoff_mm)
+                throw std::invalid_argument("Fiber piece boundary is not an exact geometry knot");
+            keep[index] = true;
+        }
+        previous = piece.execution_end_mm;
+    }
+    if (!pieces.empty() && std::abs(previous-arc.positions.back()) > station_roundoff_mm)
+        throw std::invalid_argument("Fiber planning pieces do not cover their geometry");
+    return keep;
+}
+
+// Locate exact original knots first. Only inserted process split points need a
+// finite-segment projection. Advancing monotonically avoids confusing a cyclic
+// source seam or a close neighboring ring with the next point on this chain.
+struct PlanningStationMap {
+    const Polyline3& geometry;
+    ArcGeometry arc;
+    std::map<std::pair<coord_t,coord_t>,std::vector<size_t>> vertices;
+    double previous = 0.0;
+    size_t segment = 0;
+    explicit PlanningStationMap(const Polyline3& line) : geometry(line), arc(line)
+    {
+        for (size_t i=0;i<line.points.size();++i)
+            vertices[{line.points[i].x(),line.points[i].y()}].push_back(i);
+    }
+    double at(const Point3& point)
+    {
+        const auto found = vertices.find({point.x(),point.y()});
+        if (found != vertices.end()) {
+            const auto next = std::lower_bound(found->second.begin(),found->second.end(),previous,
+                [&](size_t index,double station){return arc.positions[index] < station;});
+            if (next != found->second.end()) {
+                segment = std::min(*next,geometry.points.size()-2);
+                return previous = arc.positions[*next];
+            }
+        }
+        const double tolerance = ContourRoundingOptions{}.geometry_tolerance_mm;
+        for (size_t i=segment;i+1<geometry.points.size();++i) {
+            const Vec2d a=geometry.points[i].head<2>().cast<double>();
+            const Vec2d delta=(geometry.points[i+1]-geometry.points[i]).head<2>().cast<double>();
+            if (delta.squaredNorm()==0) continue;
+            const Vec2d from=point.head<2>().cast<double>()-a;
+            const double t=std::clamp(from.dot(delta)/delta.squaredNorm(),0.0,1.0);
+            const double station=arc.positions[i]+t*(arc.positions[i+1]-arc.positions[i]);
+            if (station < previous || unscale<double>((from-t*delta).norm()) > tolerance) continue;
+            segment=i;
+            return previous=station;
+        }
+        throw std::invalid_argument("Fiber command point has no ordered planning station");
+    }
+};
+
+double interpolate_stations(const std::vector<double>& from, const std::vector<double>& to, double station)
+{
+    if (station<=from.front()) return to.front();
+    if (station>=from.back()) return to.back();
+    const size_t i=size_t(std::upper_bound(from.begin(),from.end(),station)-from.begin());
+    const double t=(station-from[i-1])/(from[i]-from[i-1]);
+    return to[i-1]+t*(to[i]-to[i-1]);
+}
+
+FiberExecutionPiece clipped_piece(const FiberExecutionPiece& piece,double begin,double end)
+{
+    FiberExecutionPiece clipped=piece;
+    clipped.execution_begin_mm=begin;
+    clipped.execution_end_mm=end;
+    if (piece.kind==FiberExecutionPieceKind::RetainedSource) {
+        clipped.source_begin_mm=source_station_at(piece,begin);
+        clipped.source_end_mm=source_station_at(piece,end);
+    }
+    return clipped;
+}
+
 // A speed field on the complete normalized path, including the cyclic seam.
 // No source vertex number or input edge length enters the speed formula.
 struct FiberSpeedPlanner {
@@ -131,19 +262,23 @@ struct FiberSpeedPlanner {
     double length, minimum, maximum, transition;
     bool closed;
     FiberSpeedPlanner(const Polyline3& path, double vmin, double vmax, double distance,
-                      const std::vector<ContourArc>& arcs)
+                      const std::vector<ContourArc>& arcs, bool include_nonarc_turns = false)
         : length(unscale<double>(path.length())), minimum(vmin), maximum(vmax), transition(distance),
           closed(path.points.front() == path.points.back())
     {
         if (!arcs.empty()) {
             for (const auto& arc:arcs)
                 bends.push_back({arc.begin_mm,arc.end_distance_mm,std::abs(arc.source_sweep_radians != 0 ? arc.source_sweep_radians : arc.sweep_radians)});
-            return;
+            if (!include_nonarc_turns) return;
         }
         const ArcGeometry arc(path);
         const size_t n = path.points.size();
         for (size_t i = 0; i + 1 < n; ++i) {
             if (i == 0 && !closed) continue;
+            if (include_nonarc_turns && std::any_of(arcs.begin(),arcs.end(),[&](const ContourArc& bend) {
+                    return arc.positions[i]>bend.begin_mm+station_roundoff_mm &&
+                           arc.positions[i]<bend.end_distance_mm-station_roundoff_mm;
+                })) continue;
             const auto& prev = path.points[i == 0 ? n-2 : i-1];
             const Vec2d incoming = (path.points[i]-prev).head<2>().cast<double>().normalized();
             const Vec2d outgoing = (path.points[i+1]-path.points[i]).head<2>().cast<double>().normalized();
@@ -168,7 +303,9 @@ struct FiberSpeedPlanner {
 };
 
 void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const ContinuousFiberConfig& config,
-                const std::vector<ContourArc>& arcs, const ExPolygons* centerline_domain)
+                const std::vector<ContourArc>& arcs, const ExPolygons* centerline_domain,
+                const std::vector<FiberExecutionPiece>& pieces,
+                const Polyline3& finish, const std::vector<FiberExecutionPiece>& finish_pieces)
 {
     const bool contour = prepared.id.parent.purpose == FiberPathPurpose::Contour;
     const double ratio = contour ? config.contour_feed_ratio*config.contour_feed_correction :
@@ -176,16 +313,44 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
     FiberSpeedPlanner speeds(depositing,
         contour ? config.contour_min_speed_mm_s : config.infill_min_speed_mm_s,
         contour ? config.contour_max_speed_mm_s : config.infill_max_speed_mm_s,
-        config.corner_transition_length_mm, arcs);
+        config.corner_transition_length_mm, arcs, !pieces.empty());
     const FiberSpeedPlanner tail_limits(depositing, config.tail_min_speed_mm_s,
-                                       config.tail_max_speed_mm_s, config.corner_transition_length_mm, arcs);
+                                       config.tail_max_speed_mm_s, config.corner_transition_length_mm, arcs, !pieces.empty());
+    std::optional<PlanningStationMap> deposition_map, finish_map;
+    if (!pieces.empty()) {
+        piece_knots(depositing,pieces);
+        deposition_map.emplace(depositing);
+        if (!finish.empty()) {
+            if (finish_pieces.empty()) throw std::invalid_argument("Connected fiber finish has no source pieces");
+            piece_knots(finish,finish_pieces);
+            finish_map.emplace(finish);
+        } else if (!finish_pieces.empty()) throw std::invalid_argument("Empty fiber finish has source pieces");
+    } else if (!finish_pieces.empty()) throw std::invalid_argument("Fiber finish pieces require a connected plan");
     double offset = 0.0;
-    for (FiberMotionSpan& span : prepared.spans) {
+    double command_offset = 0.0;
+    for (size_t span_index=0;span_index<prepared.spans.size();++span_index) {
+        FiberMotionSpan& span=prepared.spans[span_index];
+        const auto& origins=span.deposits_fiber()?pieces:finish_pieces;
+        std::vector<double> planning_stations;
+        std::vector<bool> protected_knots(span.geometry.points.size(),false);
+        const ArcGeometry input_arc(span.geometry);
+        if (!origins.empty()) {
+            auto& map=span.deposits_fiber()?*deposition_map:*finish_map;
+            for (size_t i=0;i<span.geometry.points.size();++i) {
+                const double station=map.at(span.geometry.points[i]);
+                planning_stations.push_back(station);
+                protected_knots[i]=std::any_of(origins.begin(),origins.end(),[&](const auto& piece) {
+                    return std::abs(station-piece.execution_begin_mm)<=station_roundoff_mm ||
+                           std::abs(station-piece.execution_end_mm)<=station_roundoff_mm;
+                });
+            }
+        }
         const double source_length=unscale<double>(span.geometry.length());
         std::vector<double> source_positions;
         span.geometry = normalized_xy(span.geometry,&source_positions,
-            arcs.empty() ? normalization_error_mm : ContourRoundingOptions{}.chord_tolerance_mm,
-            span.deposits_fiber() ? centerline_domain : nullptr);
+            !origins.empty() || !arcs.empty() ? ContourRoundingOptions{}.chord_tolerance_mm : normalization_error_mm,
+            span.deposits_fiber() ? centerline_domain : nullptr,
+            origins.empty()?nullptr:&protected_knots);
         const ArcGeometry arc(span.geometry);
         const double length = arc.positions.back();
         const auto source_at = [&](double s) {
@@ -194,6 +359,11 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
             const size_t i=size_t(std::upper_bound(arc.positions.begin(),arc.positions.end(),s)-arc.positions.begin());
             const double t=(s-arc.positions[i-1])/(arc.positions[i]-arc.positions[i-1]);
             return source_positions[i-1]+t*(source_positions[i]-source_positions[i-1]);
+        };
+        const auto planning_at = [&](double s) {
+            if (s<=0) return planning_stations.front();
+            if (s>=length) return planning_stations.back();
+            return interpolate_stations(input_arc.positions,planning_stations,source_at(s));
         };
         std::vector<double> cuts = arc.positions;
         const bool tail = span.kind == FiberMotionKind::PassiveDepositingAfterCut;
@@ -222,11 +392,14 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
         cuts.erase(std::unique(cuts.begin(), cuts.end(), [](double a, double b){return std::abs(a-b)<1e-7;}), cuts.end());
         Polyline3 sampled;
         std::vector<FiberEdgeProcess> edges;
+        size_t previous_owner=origins.size();
         for (double s : cuts) sampled.points.push_back(arc.at(s));
         for (size_t i = 1; i < cuts.size(); ++i) {
             double speed = config.finish_motion_speed_mm_s;
+            const double speed_begin=origins.empty()?offset+source_at(cuts[i-1]):planning_at(cuts[i-1]);
+            const double speed_end=origins.empty()?offset+source_at(cuts[i]):planning_at(cuts[i]);
             if (span.actively_feeds_fiber()) {
-                speed = speeds.limit(offset+source_at(cuts[i-1]), offset+source_at(cuts[i]));
+                speed = speeds.limit(speed_begin,speed_end);
                 if (span.kind == FiberMotionKind::PoweredStart) speed = std::min(speed, config.start_speed_mm_s);
             } else if (span.kind == FiberMotionKind::PrefedLanding) {
                 speed = config.landing_speed_mm_s;
@@ -235,9 +408,45 @@ void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const 
                 speed = config.tail_min_speed_mm_s + (config.tail_max_speed_mm_s-config.tail_min_speed_mm_s)*double(cell)/double(cells-1);
                 // The requested ramp is capped by the path's corner limits.
                 // A speed conflict does not invalidate an otherwise printable path.
-                speed = std::min(speed, tail_limits.limit(offset+source_at(cuts[i-1]), offset+source_at(cuts[i])));
+                speed = std::min(speed, tail_limits.limit(speed_begin,speed_end));
             }
             edges.push_back({speed, span.actively_feeds_fiber() ? ratio : 0.0});
+            if (!origins.empty()) {
+                const double begin=planning_at(cuts[i-1]);
+                const double end=planning_at(cuts[i]);
+                const double middle=(begin+end)*0.5;
+                const auto owner=std::find_if(origins.begin(),origins.end(),[&](const auto& piece) {
+                    return middle>=piece.execution_begin_mm && middle<piece.execution_end_mm;
+                });
+                if (owner==origins.end() || begin<owner->execution_begin_mm-station_roundoff_mm ||
+                    end>owner->execution_end_mm+station_roundoff_mm || end<=begin)
+                    throw std::invalid_argument("Fiber command edge crosses a source-piece boundary");
+                const auto clipped=clipped_piece(*owner,std::max(begin,owner->execution_begin_mm),
+                                                        std::min(end,owner->execution_end_mm));
+                const size_t owner_index=size_t(owner-origins.begin());
+                const double edge_length=unscale<double>((sampled.points[i]-sampled.points[i-1]).cast<double>().norm());
+                if (!prepared.command_pieces.empty()) {
+                    auto& previous=prepared.command_pieces.back();
+                    if (previous_owner==owner_index && previous.span_index==span_index && previous.end_edge==i-1 &&
+                        previous.origin.kind==clipped.kind && previous.origin.source==clipped.source &&
+                        previous.origin.other_source==clipped.other_source &&
+                        previous.origin.transition_id==clipped.transition_id &&
+                        previous.origin.display_purpose==clipped.display_purpose &&
+                        previous.origin.source_station_knots==clipped.source_station_knots &&
+                        previous.origin.execution_end_mm==clipped.execution_begin_mm &&
+                        (clipped.kind!=FiberExecutionPieceKind::RetainedSource || previous.origin.source_end_mm==clipped.source_begin_mm)) {
+                        previous.end_edge=i;
+                        previous.origin.execution_end_mm=clipped.execution_end_mm;
+                        previous.origin.source_end_mm=clipped.source_end_mm;
+                        previous.command_end_mm=command_offset+edge_length;
+                        command_offset+=edge_length;
+                        continue;
+                    }
+                }
+                prepared.command_pieces.push_back({clipped,span_index,i-1,i,command_offset,command_offset+edge_length});
+                previous_owner=owner_index;
+                command_offset+=edge_length;
+            }
         }
         span.geometry = std::move(sampled);
         span.edges = std::move(edges);
@@ -321,12 +530,51 @@ Polyline3 normalize_fiber_geometry(const Polyline3& input, const ExPolygons* cen
     return normalized_xy(input, nullptr, normalization_error_mm, centerline_domain);
 }
 
+Polyline3 normalize_fiber_chain_geometry(const Polyline3& input,
+    std::vector<FiberExecutionPiece>& pieces, const ExPolygons* centerline_domain,
+    std::vector<double>* original_stations_mm)
+{
+    if (input.points.size()<2 || pieces.empty())
+        throw std::invalid_argument("Fiber chain normalization requires geometry and source pieces");
+    const auto keep=piece_knots(input,pieces);
+    std::vector<double> old_stations;
+    Polyline3 normalized=normalized_xy(input,&old_stations,ContourRoundingOptions{}.chord_tolerance_mm,centerline_domain,&keep);
+    const ArcGeometry output(normalized);
+    const auto boundary_station=[&](double station) {
+        auto next=std::lower_bound(old_stations.begin(),old_stations.end(),station);
+        size_t index=next==old_stations.end()?old_stations.size()-1:size_t(next-old_stations.begin());
+        if (index && std::abs(old_stations[index-1]-station)<std::abs(old_stations[index]-station)) --index;
+        if (std::abs(old_stations[index]-station)>station_roundoff_mm)
+            throw std::invalid_argument("Normalized fiber chain lost a protected piece boundary");
+        return output.positions[index];
+    };
+    for (auto& piece:pieces) {
+        const FiberExecutionPiece original=piece;
+        piece.execution_begin_mm=boundary_station(piece.execution_begin_mm);
+        piece.execution_end_mm=boundary_station(piece.execution_end_mm);
+        if (piece.kind==FiberExecutionPieceKind::RetainedSource) {
+            std::vector<std::pair<double,double>> chart;
+            chart.emplace_back(piece.execution_begin_mm,piece.source_begin_mm);
+            for (size_t i=0;i<old_stations.size();++i)
+                if (output.positions[i]>piece.execution_begin_mm && output.positions[i]<piece.execution_end_mm)
+                    chart.emplace_back(output.positions[i],source_station_at(original,old_stations[i]));
+            chart.emplace_back(piece.execution_end_mm,piece.source_end_mm);
+            piece.source_station_knots=std::make_shared<const std::vector<std::pair<double,double>>>(std::move(chart));
+        }
+    }
+    if (original_stations_mm) *original_stations_mm=std::move(old_stations);
+    piece_knots(normalized,pieces);
+    return normalized;
+}
+
 FiberFinalizationResult FiberPathFinalizer::finalize(
     const ExtrusionPath& input,
     const ExPolygons& allowed_domain,
     const ContinuousFiberConfig& config,
     const FiberFragmentId& id, const FiberFinishRoute& finish,
-    const std::vector<ContourArc>& arcs, const ExPolygons* planned_centerline_domain)
+    const std::vector<ContourArc>& arcs, const ExPolygons* planned_centerline_domain,
+    const std::vector<FiberExecutionPiece>& pieces,
+    const std::vector<FiberExecutionPiece>& finish_pieces)
 {
     FiberFinalizationResult result;
     // The validator owns source normalization, before geometry checks and
@@ -449,15 +697,21 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         return result;
     }
     append_finish(*prepared, finish);
+    if (!pieces.empty()) prepared->finish_strategy=finish.strategy;
     const bool check_centerline = planned_centerline_domain || !arcs.empty();
     const ExPolygons centerline_domain = planned_centerline_domain ?
         offset_ex(*planned_centerline_domain, float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm))) :
         check_centerline ? offset_ex(allowed_domain, -float(scale_(0.5*candidate.width +
             (contour ? config.contour_boundary_clearance_mm : 0.0) - ContourRoundingOptions{}.geometry_tolerance_mm))) : ExPolygons{};
     try {
-        plan_edges(*prepared, candidate.polyline, config, arcs, check_centerline ? &centerline_domain : nullptr);
+        plan_edges(*prepared, candidate.polyline, config, arcs, check_centerline ? &centerline_domain : nullptr,
+                   pieces,finish.geometry,finish_pieces);
     } catch (const std::length_error& error) {
         result.failure = FiberFinalizationFailure::SamplingLimit;
+        result.detail = error.what();
+        return result;
+    } catch (const std::invalid_argument& error) {
+        result.failure = FiberFinalizationFailure::InvalidGeometry;
         result.detail = error.what();
         return result;
     }

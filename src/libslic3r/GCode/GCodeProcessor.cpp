@@ -3132,6 +3132,9 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
     // extrusion role tag
     if (const std::string_view tag = matching_tag(ETags::Role); !tag.empty()) {
         set_extrusion_role(ExtrusionEntity::string_to_role(comment.substr(tag.length())));
+        if (m_fiber_process.inside() &&
+            (m_extrusion_role==erContinuousFiberContour || m_extrusion_role==erContinuousFiberInfill))
+            m_fiber_process.contour=m_extrusion_role==erContinuousFiberContour;
         if (m_extrusion_role == erExternalPerimeter)
             m_seams_detector.activate(true);
         m_processing_start_custom_gcode = (m_extrusion_role == erCustom && m_g1_line_id == 0);

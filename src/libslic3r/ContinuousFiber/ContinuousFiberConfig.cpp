@@ -14,11 +14,14 @@
 
 namespace Slic3r {
 
-const std::array<std::string_view, 39>& fiber_mask_parameter_keys()
+const std::array<std::string_view, 42>& fiber_mask_parameter_keys()
 {
-    static constexpr std::array<std::string_view, 39> keys{{
+    static constexpr std::array<std::string_view, 42> keys{{
         "generate_reinforced_perimeters",
         "fiber_contour_include_holes",
+        "fiber_connect_adjacent_rings",
+        "fiber_connection_tail_trim_widths",
+        "fiber_connection_head_trim_widths",
         "outer_reinforced_perimeters_counts",
         "reinforced_perimeters_filament",
         "fiber_contour_boundary_clearance",
@@ -429,6 +432,10 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
     const double finish = loop_finish ? config.finish_overlap_length_mm : config.finish_extension_length_mm;
     check(finish, loop_finish ? "fiber_finish_overlap_length" : "fiber_finish_extension_length");
     if (finish > 0) check(config.finish_motion_speed_mm_s, "fiber_finish_motion_speed", true);
+    if (config.connect_adjacent_rings) {
+        check(config.connection_tail_trim_widths, "fiber_connection_tail_trim_widths");
+        check(config.connection_head_trim_widths, "fiber_connection_head_trim_widths");
+    }
     if (contour) {
         check(config.contour_boundary_clearance_mm, "fiber_contour_boundary_clearance");
         check(config.contour_bend_radius_mm, "fiber_contour_bend_radius");
@@ -527,6 +534,9 @@ static ContinuousFiberConfig resolve_region_fiber_config(
         return Flow(float(width), float(layer_height), nozzle);
     };
     if (result.contour_enabled || concentric) {
+        result.connect_adjacent_rings = source.fiber_connect_adjacent_rings.value;
+        result.connection_tail_trim_widths = source.fiber_connection_tail_trim_widths.value;
+        result.connection_head_trim_widths = source.fiber_connection_head_trim_widths.value;
         result.contour_include_holes = source.fiber_contour_include_holes.value;
         result.contour_count = std::max(0, source.outer_reinforced_perimeters_counts.value);
         result.contour_material = unsigned(std::max(1, source.reinforced_perimeters_filament.value));

@@ -1929,6 +1929,10 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         auto plan = FiberPathValidator::plan_contours(planning_area,ring_config,domain_id,collect_debug,
             display_depths,extra_spacing,concentric?config.concentric_corner_stabilization_length_mm:0.0);
         if (concentric) plan.set_display_cutoff(display_depths);
+        if (config.connect_adjacent_rings)
+            FiberPathValidator::plan_open_ring_chains(plan, planning_area, ring_config, collect_debug);
+        if (collect_debug) context.layer.fiber_connection_plans.push_back(
+            std::make_shared<const FiberContourPlanResult>(plan));
         if (std::none_of(plan.nodes.begin(), plan.nodes.end(),
                 [](const auto& node) { return node.side == FiberContourSide::Outer; }))
             ++context.layer.fiber_outer_contour_failures["no_outer_contour_candidate"];
@@ -2009,10 +2013,55 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     coverage.accepted_infill_exclusion = infill_result.resin_exclusion;
     if (concentric) {
         coverage.accepted_contour_exclusion.clear();
-        for (const auto& assignment:contour_result.assignments) if (assignment.prepared) {
-            auto& bucket=assignment.display_purpose==FiberPathPurpose::Infill?
-                coverage.accepted_infill_exclusion:coverage.accepted_contour_exclusion;
-            append_expolygons(bucket,assignment.prepared->resin_exclusion);
+        if (contour_result.chain_executions.empty()) {
+            for (const auto& assignment:contour_result.assignments) if (assignment.prepared) {
+                auto& bucket=assignment.display_purpose==FiberPathPurpose::Infill?
+                    coverage.accepted_infill_exclusion:coverage.accepted_contour_exclusion;
+                append_expolygons(bucket,assignment.prepared->resin_exclusion);
+            }
+        } else {
+            // The finalizer's continuous sweep is the physical truth. Sweeping
+            // every provenance piece independently uses butt caps and loses
+            // the round join at a source/bridge corner. Classify that existing
+            // footprint; never reconstruct a smaller material exclusion here.
+            for (const auto& execution:contour_result.chain_executions) {
+                const auto& prepared=*execution.prepared;
+                if (prepared.command_pieces.empty()) {
+                    const auto source=std::find_if(contour_result.assignments.begin(),contour_result.assignments.end(),
+                        [&](const auto& item){return !execution.sources.empty() && item.id==execution.sources.front().source;});
+                    if (source==contour_result.assignments.end())
+                        throw std::runtime_error("Independent fiber chain source is absent");
+                    if (source->display_purpose==FiberPathPurpose::Contour)
+                        append_expolygons(coverage.accepted_contour_exclusion,prepared.resin_exclusion);
+                    continue;
+                }
+                bool has_contour=false,has_infill=false;
+                Polyline contour_run;ExPolygons contour_mask;
+                const auto flush=[&] {
+                    if (contour_run.points.size()>1)
+                        append_expolygons(contour_mask,fiber_contour_coverage(contour_run,0.5*prepared.width_mm));
+                    contour_run.points.clear();
+                };
+                for (const auto& piece:prepared.command_pieces) {
+                    const auto& span=prepared.spans[piece.span_index];
+                    if (!span.deposits_fiber()) continue;
+                    if (piece.origin.display_purpose!=FiberPathPurpose::Contour) {
+                        has_infill=true;flush();continue;
+                    }
+                    has_contour=true;
+                    const auto points=span.geometry.to_polyline().points;
+                    if (!contour_run.points.empty() && contour_run.points.back()!=points[piece.begin_edge]) flush();
+                    contour_run.points.insert(contour_run.points.end(),
+                        points.begin()+piece.begin_edge+(contour_run.points.empty()?0:1),points.begin()+piece.end_edge+1);
+                }
+                flush();
+                if (has_contour)
+                    append_expolygons(coverage.accepted_contour_exclusion,has_infill?
+                        intersection_ex(union_ex(contour_mask),prepared.resin_exclusion):prepared.resin_exclusion);
+            }
+            coverage.accepted_contour_exclusion=intersection_ex(union_ex(coverage.accepted_contour_exclusion),
+                contour_result.resin_exclusion);
+            coverage.accepted_infill_exclusion=diff_ex(contour_result.resin_exclusion,coverage.accepted_contour_exclusion);
         }
         coverage.accepted_contour_exclusion=union_ex(coverage.accepted_contour_exclusion);
         coverage.accepted_infill_exclusion=union_ex(coverage.accepted_infill_exclusion);
@@ -2154,6 +2203,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 {
     fiber_infill_statistics = {};
     fiber_fill_diagnostics.clear();
+    fiber_connection_plans.clear();
     fiber_outer_contour_failures.clear();
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
@@ -2269,7 +2319,9 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         // comparing its sum with one path's tolerance would report false errors
         // when several individually valid paths have small numerical residuals.
         if (audit.unassigned_area_mm2 > 0.01 || audit.unexpected_overlap_area_mm2 > 0.01)
-            throw Slic3r::RuntimeError("Continuous fiber coverage audit failed");
+            throw Slic3r::RuntimeError("Continuous fiber coverage audit failed: unassigned=" +
+                std::to_string(audit.unassigned_area_mm2) + " mm2, overlap=" +
+                std::to_string(audit.unexpected_overlap_area_mm2) + " mm2");
     }
     transaction.commit(*this);
 

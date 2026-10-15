@@ -8,12 +8,36 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Slic3r {
 
 // LayerXY: every stored Z is a placeholder zero, never a machine coordinate.
 enum class FiberFinishStrategy : uint8_t { None, TangentExtension, LoopOverlap };
+
+enum class FiberExecutionPieceKind : uint8_t { RetainedSource, Transition };
+
+// Ordered positive source ranges. A cyclic seam is represented by two ranges,
+// never by reversing a source or by joining separated retained arcs.
+struct FiberExecutionPiece {
+    FiberExecutionPieceKind kind {FiberExecutionPieceKind::RetainedSource};
+    FiberFragmentId source, other_source;
+    double source_begin_mm {0.0}, source_end_mm {0.0};
+    double execution_begin_mm {0.0}, execution_end_mm {0.0};
+    FiberPathPurpose display_purpose {FiberPathPurpose::Contour};
+    size_t transition_id {0};
+    // Execution station -> frozen source station. Shared by clipped command
+    // pieces so normalization does not force an affine source approximation or
+    // copy an entire source chart for every sampled edge. Empty means affine.
+    std::shared_ptr<const std::vector<std::pair<double,double>>> source_station_knots;
+};
+
+struct FiberCommandPiece {
+    FiberExecutionPiece origin;
+    size_t span_index {0}, begin_edge {0}, end_edge {0};
+    double command_begin_mm {0.0}, command_end_mm {0.0};
+};
 
 struct FiberEdgeProcess {
     double speed_mm_s { 0.0 };
@@ -92,6 +116,9 @@ struct PreparedFiberPath {
     float height_mm { 0.0f };
     std::vector<FiberMotionSpan> spans;
     std::vector<FiberProcessAction> actions;
+    // Empty for unchanged independent paths; otherwise partitions actual edges,
+    // including the explicitly supplied non-depositing terminal source route.
+    std::vector<FiberCommandPiece> command_pieces;
     FiberStartProcedure start_procedure;
     ExPolygons physical_coverage;
     ExPolygons resin_exclusion;
