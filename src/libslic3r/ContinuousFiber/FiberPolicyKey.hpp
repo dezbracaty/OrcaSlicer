@@ -13,6 +13,8 @@ namespace Slic3r {
 // domain only when every value affecting candidate geometry, validation, or
 // process output is identical.
 struct FiberPolicyKey {
+    bool connect_adjacent_rings {false};
+    double connection_tail_trim_widths {0.0}, connection_head_trim_widths {0.0};
     bool contour_enabled { false };
     bool contour_include_holes { true };
     bool infill_enabled { false };
@@ -76,6 +78,7 @@ struct FiberPolicyKey {
     auto values() const
     {
         return std::tie(
+            connect_adjacent_rings, connection_tail_trim_widths, connection_head_trim_widths,
             contour_enabled, contour_include_holes, infill_enabled, layer_interval, contour_count,
             infill_pattern, infill_density, infill_direction, fixed_direction,
             contour_width, contour_spacing, contour_height, contour_nozzle,
@@ -124,6 +127,9 @@ inline FiberPolicyKey fiber_policy_key(
     if (!std::isfinite(infill_direction))
         throw std::runtime_error("Continuous fiber infill direction must be finite");
     return {
+        config.connect_adjacent_rings,
+        config.connect_adjacent_rings ? config.connection_tail_trim_widths : 0.0,
+        config.connect_adjacent_rings ? config.connection_head_trim_widths : 0.0,
         config.contour_enabled,
         config.contour_include_holes,
         config.infill_enabled,

@@ -1,3 +1,7 @@
+#include <iomanip>
+#include <locale>
+#include <sstream>
+
 #include "BoundingBox.hpp"
 #include "Config.hpp"
 #include "GCodeWriter.hpp"
@@ -6378,6 +6382,11 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     const auto bound = bind_fiber_execution(path.prepared_path(), tool.logical_filament_id,
         tool.logical_extruder_id, tool.physical_tool_id, tool.e_units_per_mm, m_config.fiber_cut_gcode.value);
     const PreparedFiberPath& prepared = *bound.prepared;
+    const bool connected_execution = !prepared.command_pieces.empty();
+    // Preserve the accepted source/transition coordinate grid throughout
+    // approach, landing, tail and finish as well as powered deposition.
+    const GCodeWriter::ScopedXYZPrecision xyz_precision(m_writer,
+        connected_execution ? 6 : m_writer.xyz_export_digits());
     if (m_writer.filament()->effective_retracted() != 0.0 || m_writer.filament()->restart_extra() != 0.0)
         throw Slic3r::RuntimeError("Fiber execution found nonzero generic retraction state");
     // Printable/tool areas are the conservative limits available in the machine
@@ -6412,14 +6421,15 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
                 std::to_string(to.x()) + "," + std::to_string(to.y()) + "," + std::to_string(to.z()));
         }
     };
-    const Vec3d approach_from = m_writer.get_position();
+    const Vec3d approach_from = connected_execution ?
+        m_writer.get_emitted_position() : m_writer.get_position();
     // Quantization must not erase a motion or a process boundary.
     for (const auto& span : prepared.spans)
         for (size_t i = 1; i < span.geometry.points.size(); ++i) {
             const Vec2d a = point_to_gcode(span.geometry.points[i-1].to_point());
             const Vec2d b = point_to_gcode(span.geometry.points[i].to_point());
-            if (GCodeFormatter::quantize_xyzf(a.x()) == GCodeFormatter::quantize_xyzf(b.x()) &&
-                GCodeFormatter::quantize_xyzf(a.y()) == GCodeFormatter::quantize_xyzf(b.y()))
+            if (m_writer.quantize_xyz(a.x()) == m_writer.quantize_xyz(b.x()) &&
+                m_writer.quantize_xyz(a.y()) == m_writer.quantize_xyz(b.y()))
                 throw Slic3r::RuntimeError("Fiber edge disappears after G-code coordinate quantization");
             validate_motion(Vec3d(a.x(), a.y(), m_nominal_z), Vec3d(b.x(), b.y(), m_nominal_z));
         }
@@ -6439,7 +6449,7 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             Vec3d machine(command.x() - plate.x(), command.y() - plate.y(), z);
             if (belt) machine = belt->oriented_to_machine(machine);
             for (int axis = 0; axis < 3; ++axis)
-                machine[axis] = GCodeFormatter::quantize_xyzf(machine[axis]);
+                machine[axis] = m_writer.quantize_xyz(machine[axis]);
             Vec3d oriented = belt ? belt->world_to_oriented(belt->machine_to_world(machine)) : machine;
             const Vec2d local = oriented.head<2>() + plate.head<2>() + nozzle - m_origin;
             return Point::new_scale(local.x(), local.y());
@@ -6488,6 +6498,36 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     // BEGIN metadata is authoritative even before the first powered move.
     gcode += ";TYPE:" + std::string(path.display_purpose() == FiberPathPurpose::Contour ?
         "Continuous fiber contour" : "Continuous fiber infill") + "\n";
+    size_t piece_cursor=0;
+    FiberPathPurpose current_display=path.display_purpose();
+    const auto emit_piece=[&](size_t span_index,size_t edge) {
+        if (piece_cursor==prepared.command_pieces.size()) return;
+        const auto& command=prepared.command_pieces[piece_cursor];
+        if (command.span_index!=span_index || command.begin_edge!=edge) return;
+        const auto& origin=command.origin;
+        if (current_display!=origin.display_purpose) {
+            current_display=origin.display_purpose;
+            gcode+=";TYPE:"+std::string(current_display==FiberPathPurpose::Contour?
+                "Continuous fiber contour":"Continuous fiber infill")+"\n";
+        }
+        const auto identity=[](const FiberFragmentId& id) {
+            const auto& p=id.parent; const auto& d=p.domain;
+            return std::to_string(d.object_id)+"/"+std::to_string(d.layer_id)+"/"+
+                std::to_string(d.policy_group_id)+"/"+std::to_string(d.component_id)+"/"+
+                std::to_string(unsigned(p.purpose))+"/"+std::to_string(p.job_ordinal)+"/"+
+                std::to_string(p.path_ordinal)+"/"+std::to_string(id.fragment_ordinal);
+        };
+        std::ostringstream row;row.imbue(std::locale::classic());row<<std::setprecision(17);
+        row<<";CF_PIECE occurrence="<<m_fiber_path_occurrence<<" span="<<span_index
+           <<" edge_begin="<<command.begin_edge<<" edge_end="<<command.end_edge
+           <<" kind="<<(origin.kind==FiberExecutionPieceKind::RetainedSource?"source":"transition")
+           <<" source="<<identity(origin.source)<<" other_source="<<identity(origin.other_source)
+           <<" source_begin="<<origin.source_begin_mm<<" source_end="<<origin.source_end_mm
+           <<" direction=1 transition="<<origin.transition_id
+           <<" planning_begin="<<origin.execution_begin_mm<<" planning_end="<<origin.execution_end_mm
+           <<" command_begin="<<command.command_begin_mm<<" command_end="<<command.command_end_mm<<"\n";
+        gcode+=row.str();++piece_cursor;
+    };
     const FiberStartProcedure& start = prepared.start_procedure;
     // Also covers an initial fiber tool already selected before set_extruder().
     gcode += ensure_fiber_pressure_advance_zero();
@@ -6506,10 +6546,12 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             m_fiber_first_approach_pending = false;
             gcode += m_writer.unlift();
             const Point first = prepared.spans.front().geometry.points.front().to_point();
-            if (!m_last_pos_defined || m_last_pos.to_point() != first || m_need_change_layer_lift_z)
+            if (connected_execution || !m_last_pos_defined || m_last_pos.to_point() != first || m_need_change_layer_lift_z)
                 gcode += travel_to(first, path.role(), "move to first continuous fiber point", DBL_MAX, speed_limit);
             gcode += m_writer.unlift();
-            if (GCodeFormatter::quantize_xyzf(m_writer.get_position().z()) != GCodeFormatter::quantize_xyzf(m_nominal_z))
+            const double current_z = connected_execution ?
+                m_writer.get_emitted_position().z() : m_writer.get_position().z();
+            if (m_writer.quantize_xyz(current_z) != m_writer.quantize_xyz(m_nominal_z))
                 gcode += m_writer.travel_to_z(m_nominal_z, "continuous fiber layer Z", true);
             m_need_change_layer_lift_z = false;
             m_writer.add_object_change_labels(gcode);
@@ -6540,6 +6582,7 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             const double total = landing.geometry.length();
             const double z = m_writer.get_position().z();
             for (size_t i = 0; i < landing.edges.size(); ++i) {
+                emit_piece(action.span_index,i);
                 distance += (landing.geometry.points[i+1]-landing.geometry.points[i]).cast<double>().norm();
                 const Vec2d xy = point_to_gcode(landing.geometry.points[i+1].to_point());
                 gcode += m_writer.set_speed(landing.edges[i].speed_mm_s*60.0);
@@ -6566,6 +6609,7 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
         case FiberActionType::MotionSpan: {
             const auto& span = prepared.spans[action.span_index];
             for (size_t edge = 0; edge < span.edges.size(); ++edge) {
+                emit_piece(action.span_index,edge);
                 gcode += m_writer.set_speed(span.edges[edge].speed_mm_s*60.0);
                 gcode += m_writer.extrude_to_xy(point_to_gcode(span.geometry.points[edge+1].to_point()),
                     bound.edge_dE[action.span_index][edge], description, !span.actively_feeds_fiber());
@@ -6589,6 +6633,8 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             break;
         }
     }
+    if (piece_cursor!=prepared.command_pieces.size())
+        throw Slic3r::RuntimeError("Fiber source command provenance was not fully emitted");
     // Also check the actual absolute-XYZ commands, including approach routing,
     // Z-hop, and quantization. A failed export is discarded atomically; no
     // partial fiber file is delivered. No firmware/custom motion is invented here.

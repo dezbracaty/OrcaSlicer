@@ -1,6 +1,9 @@
 #include "PreparedFiberPath.hpp"
 #include "../ClipperUtils.hpp"
+#include "../GCodeWriter.hpp"
+#include <algorithm>
 #include <cmath>
+#include <map>
 #include <stdexcept>
 
 namespace Slic3r {
@@ -118,6 +121,102 @@ void PreparedFiberPath::validate() const
                     "Fiber command edge is below coordinate resolution");
         }
     }
+    if (!command_pieces.empty()) {
+        // Display cutoff can label a Contour process source as Infill. The
+        // validator checks the frozen source labels; here only their internal
+        // consistency is available, never derive them from process identity.
+        std::map<FiberFragmentId,FiberPathPurpose> source_labels;
+        for (const auto& command:command_pieces)
+            if (command.origin.kind==FiberExecutionPieceKind::RetainedSource) {
+                const auto inserted=source_labels.emplace(command.origin.source,command.origin.display_purpose);
+                require(inserted.second || inserted.first->second==command.origin.display_purpose,
+                        "Fiber source has inconsistent display labels");
+            }
+        size_t cursor=0;
+        double command_station=0.0, planning_station=0.0;
+        bool finishing=false;
+        const FiberExecutionPiece* previous=nullptr;
+        for (size_t span_index=0;span_index<spans.size();++span_index) {
+            const auto& span=spans[span_index];
+            if (!span.deposits_fiber() && !finishing) {
+                finishing=true;
+                planning_station=0.0;
+                previous=nullptr;
+            }
+            size_t edge=0;
+            while (edge<span.edges.size()) {
+                require(cursor<command_pieces.size(),"Fiber command provenance is incomplete");
+                const auto& piece=command_pieces[cursor++];
+                const auto& origin=piece.origin;
+                require(piece.span_index==span_index && piece.begin_edge==edge &&
+                        piece.end_edge>edge && piece.end_edge<=span.edges.size(),
+                        "Fiber command provenance does not partition actual edges");
+                require(std::isfinite(origin.execution_begin_mm) && std::isfinite(origin.execution_end_mm) &&
+                        origin.execution_begin_mm==planning_station &&
+                        origin.execution_end_mm>origin.execution_begin_mm,
+                        "Fiber command provenance has a discontinuous planning range");
+                require(origin.source.parent.domain==id.parent.domain,
+                        "Fiber command source belongs to another domain");
+                require(origin.display_purpose==FiberPathPurpose::Contour || origin.display_purpose==FiberPathPurpose::Infill,
+                        "Fiber command provenance has an invalid display purpose");
+                if (origin.kind==FiberExecutionPieceKind::RetainedSource) {
+                    require(std::isfinite(origin.source_begin_mm) && std::isfinite(origin.source_end_mm) &&
+                            origin.source_begin_mm>=0 && origin.source_end_mm>origin.source_begin_mm,
+                            "Fiber command provenance has an invalid positive source range");
+                    if (origin.source_station_knots) {
+                        const auto& chart=*origin.source_station_knots;
+                        require(chart.size()>=2 && chart.front().first<=origin.execution_begin_mm &&
+                                chart.back().first>=origin.execution_end_mm &&
+                                chart.front().second<=origin.source_begin_mm && chart.back().second>=origin.source_end_mm,
+                                "Fiber command source range exceeds its frozen chart");
+                        for (size_t i=0;i<chart.size();++i)
+                            require(std::isfinite(chart[i].first) && std::isfinite(chart[i].second) &&
+                                    chart[i].first>=0 && chart[i].second>=0 &&
+                                    (!i || (chart[i].first>chart[i-1].first && chart[i].second>chart[i-1].second)),
+                                    "Fiber command source chart is not strictly ordered");
+                        const auto canonical_at=[&](double station) {
+                            if (station==chart.front().first) return chart.front().second;
+                            if (station==chart.back().first) return chart.back().second;
+                            const auto next=std::upper_bound(chart.begin(),chart.end(),station,
+                                [](double s,const auto& knot){return s<knot.first;});
+                            const auto& before=*(next-1);
+                            return std::clamp(before.second+(station-before.first)/(next->first-before.first)*
+                                (next->second-before.second),chart.front().second,chart.back().second);
+                        };
+                        require(canonical_at(origin.execution_begin_mm)==origin.source_begin_mm &&
+                                canonical_at(origin.execution_end_mm)==origin.source_end_mm,
+                                "Fiber command source endpoints differ from the frozen chart");
+                    }
+                    if (previous && previous->kind==FiberExecutionPieceKind::RetainedSource &&
+                        previous->source==origin.source)
+                        require(previous->source_end_mm==origin.source_begin_mm || origin.source_begin_mm==0.0,
+                                "Fiber consecutive source ranges are discontinuous");
+                } else {
+                    require(!origin.source_station_knots,"Fiber transition cannot carry a source chart");
+                    require(origin.kind==FiberExecutionPieceKind::Transition && !finishing &&
+                            origin.other_source.parent.domain==id.parent.domain &&
+                            !(origin.other_source==origin.source),"Invalid fiber transition provenance");
+                    const auto from=source_labels.find(origin.source), to=source_labels.find(origin.other_source);
+                    require(from!=source_labels.end() && to!=source_labels.end(),
+                            "Fiber transition has no retained source display labels");
+                    const auto display=from->second==FiberPathPurpose::Contour || to->second==FiberPathPurpose::Contour ?
+                        FiberPathPurpose::Contour: FiberPathPurpose::Infill;
+                    require(origin.display_purpose==display,"Fiber transition has a misleading display purpose");
+                }
+                require(std::isfinite(piece.command_begin_mm) && std::isfinite(piece.command_end_mm) &&
+                        std::abs(piece.command_begin_mm-command_station)<=1e-8 &&
+                        piece.command_end_mm>piece.command_begin_mm,
+                        "Fiber command provenance has an invalid command range");
+                for (;edge<piece.end_edge;++edge)
+                    command_station+=unscale<double>((span.geometry.points[edge+1]-span.geometry.points[edge]).cast<double>().norm());
+                require(std::abs(piece.command_end_mm-command_station)<=1e-8,
+                        "Fiber command provenance length differs from actual edges");
+                planning_station=origin.execution_end_mm;
+                previous=&origin;
+            }
+        }
+        require(cursor==command_pieces.size(),"Fiber command provenance has unused pieces");
+    }
     const double values[] = {start_procedure.prefeed_length_mm, start_procedure.prefeed_speed_mm_s,
         start_procedure.z_hop_height_mm, start_procedure.landing_speed_mm_s, start_procedure.start_speed_mm_s};
     for (double v : values) require(std::isfinite(v) && v >= 0, "Invalid fiber start procedure");
@@ -146,6 +245,16 @@ BoundFiberExecutionPlan bind_fiber_execution(
     bound.physical_tool_id = physical_tool_id;
     bound.e_units_per_mm = e_units_per_mm;
     bound.cut_gcode = std::move(cut_gcode);
+    double ideal_e = bound.prepared->start_procedure.prefeed_length_mm * e_units_per_mm;
+    bound.prefeed_F = bound.prepared->start_procedure.prefeed_speed_mm_s * e_units_per_mm * 60.0;
+    if (!std::isfinite(ideal_e) || !std::isfinite(bound.prefeed_F) || bound.prefeed_F >= 100000.0 ||
+        (ideal_e > 0 && ideal_e < 0.00001))
+        throw std::invalid_argument("Fiber prefeed conversion overflow");
+    bound.prefeed_dE = GCodeFormatter::quantize_e(ideal_e);
+    double emitted_e = bound.prefeed_dE;
+    // Quantize the cumulative owned feed, rather than independently rounding
+    // every relative-E command. Residuals stay before CUT; passive spans never
+    // receive an E command, including any remaining fraction of one E grid.
     for (const auto& span : bound.prepared->spans) {
         std::vector<double> deltas;
         for (size_t i = 0; i < span.edges.size(); ++i) {
@@ -153,15 +262,19 @@ BoundFiberExecutionPlan bind_fiber_execution(
             const double delta = length * span.edges[i].feed_mm_per_xy_mm * e_units_per_mm;
             if (!std::isfinite(delta) || (span.actively_feeds_fiber() && delta < 0.00001))
                 throw std::invalid_argument("Fiber E command is not representable");
-            deltas.push_back(delta);
+            double command_delta = 0.0;
+            if (span.actively_feeds_fiber()) {
+                ideal_e += delta;
+                const double next_e = GCodeFormatter::quantize_e(ideal_e);
+                command_delta = next_e-emitted_e;
+                if (!std::isfinite(next_e) || !std::isfinite(command_delta) || command_delta <= 0)
+                    throw std::invalid_argument("Quantized fiber E command is not representable");
+                emitted_e = next_e;
+            }
+            deltas.push_back(command_delta);
         }
         bound.edge_dE.push_back(std::move(deltas));
     }
-    bound.prefeed_dE = bound.prepared->start_procedure.prefeed_length_mm * e_units_per_mm;
-    bound.prefeed_F = bound.prepared->start_procedure.prefeed_speed_mm_s * e_units_per_mm * 60.0;
-    if (!std::isfinite(bound.prefeed_dE) || !std::isfinite(bound.prefeed_F) || bound.prefeed_F >= 100000.0 ||
-        (bound.prefeed_dE > 0 && bound.prefeed_dE < 0.00001))
-        throw std::invalid_argument("Fiber prefeed conversion overflow");
     return bound;
 }
 

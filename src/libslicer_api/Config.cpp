@@ -208,6 +208,10 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
         item.enabled = infill_enabled && !(concentric && item.key=="reinforced_infill_filament");
     } else if (key_is(item.key, {"fiber_contour_boundary_clearance", "fiber_contour_bend_radius"})) {
         item.enabled = contour_enabled || concentric;
+    } else if (item.key == "fiber_connect_adjacent_rings") {
+        item.enabled = contour_enabled || concentric;
+    } else if (key_is(item.key, {"fiber_connection_tail_trim_widths", "fiber_connection_head_trim_widths"})) {
+        item.enabled = (contour_enabled || concentric) && boolean_value(config, "fiber_connect_adjacent_rings");
     } else if (item.key == "fiber_infill_angle_sequence") {
         item.visible = item.enabled = infill_enabled &&
             config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;

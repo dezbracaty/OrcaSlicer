@@ -957,6 +957,28 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("Generate fiber contour loops around closed holes in the fiber region. Disabling this option keeps holes excluded from all material paths and does not change fiber infill patterns.");
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("fiber_connect_adjacent_rings", coBool);
+    def->label = L("Connect adjacent fiber rings");
+    def->category = L("Continuous fiber");
+    def->tooltip = L("Connect accepted neighboring rings with one forward bridge and one local seam per ring. Branches remain separate paths.");
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("fiber_connection_tail_trim_widths", coFloat);
+    def->label = L("Fiber connection tail trim");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("line widths");
+    def->tooltip = L("Trim this multiple of the fiber width before the local seam. This is a connection setting, not a device limit.");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(1.5));
+
+    def = this->add("fiber_connection_head_trim_widths", coFloat);
+    def->label = L("Fiber connection head trim");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("line widths");
+    def->tooltip = L("Trim this multiple of the fiber width after the local seam. The first source of a chain has no head trim.");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
     def = this->add("outer_reinforced_perimeters_counts", coInt);
     def->label = L("Continuous fiber contour count");
     def->category = L("Continuous fiber");

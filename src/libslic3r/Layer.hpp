@@ -7,6 +7,7 @@
 #include "SurfaceCollection.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include <map>
+#include <memory>
 #include "BoundingBox.hpp"
 namespace Slic3r {
 
@@ -18,6 +19,7 @@ class LayerRegion;
 using LayerRegionPtrs = std::vector<LayerRegion*>;
 class PrintRegion;
 class PrintObject;
+struct FiberContourPlanResult;
 
 namespace FillAdaptive {
     struct Octree;
@@ -144,6 +146,7 @@ public:
         size_t component_id {0};
     };
     std::vector<FiberFillDiagnostic> fiber_fill_diagnostics;
+    std::vector<std::shared_ptr<const FiberContourPlanResult>> fiber_connection_plans;
     // Sequential index of this layer in PrintObject::m_layers, offsetted by the number of raft layers.
     size_t              id() const          { return m_id; }
     void                set_id(size_t id)   { m_id = id; }

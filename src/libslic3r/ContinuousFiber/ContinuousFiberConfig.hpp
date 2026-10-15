@@ -18,10 +18,13 @@ class Layer;
 class LayerRegion;
 struct FiberPolicyBoundary;
 
-const std::array<std::string_view, 39>& fiber_mask_parameter_keys();
+const std::array<std::string_view, 42>& fiber_mask_parameter_keys();
 bool is_fiber_mask_parameter(std::string_view key);
 
 struct ContinuousFiberConfig {
+    bool connect_adjacent_rings { false };
+    double connection_tail_trim_widths {1.5};
+    double connection_head_trim_widths {1.0};
     bool contour_enabled { false };
     bool contour_include_holes { true };
     bool infill_enabled { false };

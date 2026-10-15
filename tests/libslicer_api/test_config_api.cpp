@@ -64,6 +64,69 @@ libslicer::SliceObjectInput binary_stl_on_bed(const std::string& path)
     return result;
 }
 
+// Independently integrate owned feed from exported decimal E commands.
+struct ActualFiberFeed {
+    double total_mm {0.0};
+    std::size_t command_count {0};
+    std::size_t path_count {0};
+};
+ActualFiberFeed actual_fiber_feed(const std::string& gcode)
+{
+    ActualFiberFeed result;
+    long double e_position=0, total=0, units=1;
+    bool relative_e=false, relative_xyz=false, inside=false, owned_feed=false;
+    std::istringstream input(gcode);
+    for(std::string line;std::getline(input,line);) {
+        if(line.rfind(";FIBER_BEGIN ",0)==0) {
+            REQUIRE_FALSE(inside);
+            inside=true;owned_feed=false;++result.path_count;
+            const auto start=line.find(" e_units_per_mm=");
+            REQUIRE(start!=std::string::npos);
+            units=std::stold(line.substr(start+16));
+            REQUIRE(std::isfinite(units));REQUIRE(units>0);
+        } else if(line==";FIBER_PREFEED_BEGIN" || line==";FIBER_START") {
+            REQUIRE(inside);owned_feed=true;
+        } else if(line==";FIBER_PREFEED_END" || line==";FIBER_CUT") {
+            REQUIRE(inside);owned_feed=false;
+        } else if(line==";FIBER_END") {
+            REQUIRE(inside);inside=false;owned_feed=false;
+        }
+        std::istringstream command(line.substr(0,line.find(';')));
+        std::string opcode;command>>opcode;
+        if(opcode=="M82")relative_e=false;
+        if(opcode=="M83")relative_e=true;
+        if(opcode=="G90")relative_xyz=false;
+        if(opcode=="G91")relative_xyz=true;
+        const bool move=opcode=="G0" || opcode=="G1" || opcode=="G2" || opcode=="G3";
+        if(!move && opcode!="G92")continue;
+        std::optional<long double> e_word;
+        bool axis_found=false;
+        for(std::string word;command>>word;) {
+            if(word.size()<2)continue;
+            if(std::string("XYZE").find(word[0])!=std::string::npos)axis_found=true;
+            if(word[0]=='E')e_word=std::stold(word.substr(1));
+        }
+        if(opcode=="G92") {
+            if(e_word)e_position=*e_word;
+            else if(!axis_found)e_position=0;
+            continue;
+        }
+        if(!e_word)continue;
+        const long double target=relative_e || relative_xyz ? e_position+*e_word : *e_word;
+        const long double delta=target-e_position;
+        if(inside) {
+            REQUIRE(owned_feed);
+            REQUIRE(delta>0);
+            total+=delta/units;
+            ++result.command_count;
+        }
+        e_position=target;
+    }
+    REQUIRE_FALSE(inside);
+    result.total_mm=static_cast<double>(total);
+    return result;
+}
+
 const libslicer::SettingItem* find_item(const std::vector<libslicer::SettingItem>& items, std::string_view key)
 {
     for (const auto& item : items) {
@@ -532,6 +595,7 @@ TEST_CASE("CFSYS original machine scripts produce real fiber G-code and reimport
     INFO(activation_diagnostics);
     REQUIRE(activated.success);
     std::optional<double> reference_feed;
+    std::optional<ActualFiberFeed> reference_actual_feed;
     for (bool relative_e : {false, true}) {
         INFO("relative_e=" << relative_e);
         REQUIRE(library->apply_active_config_patch({{"use_relative_e_distances", relative_e ? "1" : "0"}}).success);
@@ -590,6 +654,17 @@ TEST_CASE("CFSYS original machine scripts produce real fiber G-code and reimport
             cursor += 11;
         }
         REQUIRE(cuts > 0);
+        const auto actual_feed=actual_fiber_feed(gcode);
+        CHECK(actual_feed.path_count==cuts);
+        CHECK(actual_feed.total_mm==Catch::Approx(result.preview->statistics.total_fiber_feed_mm).margin(.02));
+        if(reference_actual_feed) {
+            CHECK(actual_feed.path_count==reference_actual_feed->path_count);
+            CHECK(actual_feed.command_count==reference_actual_feed->command_count);
+            CHECK(actual_feed.total_mm==Catch::Approx(reference_actual_feed->total_mm).margin(.05));
+            std::cout<<"[FiberFeedQuantization] slot="<<fiber_slot<<" absolute="<<std::setprecision(12)
+                <<reference_actual_feed->total_mm<<" relative="<<actual_feed.total_mm
+                <<" difference="<<actual_feed.total_mm-reference_actual_feed->total_mm<<'\n';
+        } else reference_actual_feed=actual_feed;
         std::istringstream commands(gcode);
         std::string line;
         double acceleration = 0;
@@ -3445,7 +3520,7 @@ TEST_CASE("fiber mask scope is atomic and independent of inactive fiber presenta
 {
     auto config = libslicer::Config::defaults();
     const auto items = config.settings(libslicer::ConfigScope::FiberMask);
-    REQUIRE(items.size() == 39);
+    REQUIRE(items.size() == 42);
     std::set<std::string> keys;
     for (const auto& item : items) keys.insert(item.key);
     CHECK_FALSE(keys.count("fiber_mask_process"));
@@ -4060,4 +4135,21 @@ TEST_CASE("resin-only mask supplies zero-density wall-free core above a native b
     }
     CHECK(resin > 0);
     remove_slice(result);
+}
+
+TEST_CASE("open ring connection settings persist their explicit software trim multipliers", "[libslicer_api][config][fiber][OpenRingConnection]")
+{
+    auto config=libslicer::Config::defaults();
+    CHECK(config.snapshot().value("fiber_connect_adjacent_rings")=="0");
+    CHECK(config.snapshot().value("fiber_connection_tail_trim_widths")=="1.5");
+    CHECK(config.snapshot().value("fiber_connection_head_trim_widths")=="1");
+    REQUIRE(config.apply_patch(libslicer::ConfigScope::FiberMask,{{"fiber_connect_adjacent_rings","1"},
+        {"fiber_connection_tail_trim_widths","2.25"},{"fiber_connection_head_trim_widths","0"}}).success);
+    const auto snapshot=config.snapshot();
+    CHECK(snapshot.value("fiber_connect_adjacent_rings")=="1");
+    CHECK(snapshot.value("fiber_connection_tail_trim_widths")=="2.25");
+    CHECK(snapshot.value("fiber_connection_head_trim_widths")=="0");
+    const auto before=config.snapshot().values();
+    CHECK_FALSE(config.apply_patch(libslicer::ConfigScope::FiberMask,{{"fiber_connection_head_trim_widths","-1"}}).success);
+    CHECK(config.snapshot().values()==before);
 }
