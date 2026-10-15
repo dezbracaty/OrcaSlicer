@@ -224,9 +224,9 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
         item.enabled = infill_enabled && config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
     } else if (item.key == "fiber_contour_infill_clearance") {
         item.enabled = contour_enabled && infill_enabled && !concentric;
-    } else if (item.key == "fiber_finish_extension_length") {
-        item.visible = item.enabled = contour_enabled || concentric;
-    } else if (key_is(item.key, {"fiber_finish_overlap_length", "fiber_finish_motion_speed"})) {
+    } else if (key_is(item.key, {"fiber_finish_extension_length", "fiber_finish_motion_speed"})) {
+        item.visible = item.enabled = contour_enabled || infill_enabled;
+    } else if (item.key == "fiber_finish_overlap_length") {
         item.visible = item.enabled = contour_enabled || concentric;
     } else if (key_is(item.key, {"fiber_width", "fiber_layer_height_ratio",
                                  "fiber_toolchange_approach_speed",

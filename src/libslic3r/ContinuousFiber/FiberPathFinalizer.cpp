@@ -494,12 +494,8 @@ FiberFinishRoute make_independent_fiber_finish_route(
 {
     FiberFinishRoute finish;
     finish.source = id;
-    if (is_rectilinear_fiber_infill(config, id.parent.purpose)) {
-        finish.strategy = FiberFinishStrategy::None;
-        validate_fiber_process_config(config, id.parent.purpose, finish.strategy);
-        return finish;
-    }
-    const bool tangent = source.polyline.points.size() < 2 || !source.is_closed();
+    const bool tangent = is_rectilinear_fiber_infill(config, id.parent.purpose) ||
+        source.polyline.points.size() < 2 || !source.is_closed();
     finish.strategy = tangent ? FiberFinishStrategy::TangentExtension : FiberFinishStrategy::LoopOverlap;
     // Validate before coordinate conversion. Zero requests retain their selected
     // policy and do not start validating the other family's configuration.
@@ -600,8 +596,6 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     }
     try {
         validate_fiber_process_config(config, id.parent.purpose, finish.strategy);
-        if (is_rectilinear_fiber_infill(config, id.parent.purpose) && !finish.geometry.empty())
-            throw std::invalid_argument("Rectilinear fiber infill cannot append a finish route");
         const double requested = finish.strategy == FiberFinishStrategy::None ? 0.0 :
             finish.strategy == FiberFinishStrategy::LoopOverlap ?
                 config.finish_overlap_length_mm : config.finish_extension_length_mm;
@@ -703,6 +697,20 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         result.detail = "Fiber finish route has invalid source, endpoint, length or LayerXY geometry";
         return result;
     }
+    if (is_rectilinear_fiber_infill(config, id.parent.purpose)) {
+        // Independent infill must use its own final tangent, even when a caller
+        // supplies an explicit route. Finish never extends the depositing path
+        // used above to locate CUT at candidate.length() - cutter-to-contact.
+        const auto expected = make_independent_fiber_finish_route(candidate, config, id);
+        if (!(finish.source == id) || finish.strategy != expected.strategy ||
+            finish.geometry.points != expected.geometry.points) {
+            result.failure = FiberFinalizationFailure::FinishUnavailable;
+            result.detail = "Rectilinear fiber finish differs from its source tangent";
+            return result;
+        }
+        // append_finish() does not append a span for a zero-length request.
+        prepared->finish_strategy = finish.strategy;
+    }
     append_finish(*prepared, finish);
     if (!pieces.empty()) prepared->finish_strategy=finish.strategy;
     const bool check_centerline = planned_centerline_domain || !arcs.empty();
@@ -723,10 +731,13 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         return result;
     }
     try {
-        if (is_rectilinear_fiber_infill(config, id.parent.purpose) &&
-            (prepared->spans.back().kind == FiberMotionKind::NonDepositingFinish ||
-             prepared->spans.back().geometry.points.back() != candidate.polyline.points.back()))
-            throw std::invalid_argument("Rectilinear fiber infill must end at its source endpoint");
+        if (is_rectilinear_fiber_infill(config, id.parent.purpose)) {
+            const auto last_depositing = std::find_if(prepared->spans.rbegin(), prepared->spans.rend(),
+                [](const auto& span) { return span.deposits_fiber(); });
+            if (last_depositing == prepared->spans.rend() ||
+                last_depositing->geometry.points.back() != candidate.polyline.points.back())
+                throw std::invalid_argument("Rectilinear fiber deposition must end at its source endpoint");
+        }
         prepared->finalize_actions();
         prepared->validate();
     }

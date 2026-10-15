@@ -426,19 +426,14 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
     check(contour ? config.contour_feed_ratio : config.infill_feed_ratio, "fiber feed ratio", true);
     check(contour ? config.contour_feed_correction : config.infill_feed_correction, "fiber feed correction", true);
     check(contour ? config.contour_acceleration_mm_s2 : config.infill_acceleration_mm_s2, "fiber acceleration", true);
-    if (is_rectilinear_fiber_infill(config, purpose)) {
-        if (finish_strategy != FiberFinishStrategy::None)
-            throw std::invalid_argument("Rectilinear fiber infill cannot append finishing motion");
-        // The final cutter-to-contact tail already belongs to the source path.
-        // Legacy finish settings have no effect on rectilinear deposition.
-    } else {
-        if (finish_strategy != FiberFinishStrategy::LoopOverlap && finish_strategy != FiberFinishStrategy::TangentExtension)
-            throw std::invalid_argument("Fiber finish requires an explicit loop or tangent strategy");
-        const bool loop_finish = finish_strategy == FiberFinishStrategy::LoopOverlap;
-        const double finish = loop_finish ? config.finish_overlap_length_mm : config.finish_extension_length_mm;
-        check(finish, loop_finish ? "fiber_finish_overlap_length" : "fiber_finish_extension_length");
-        if (finish > 0) check(config.finish_motion_speed_mm_s, "fiber_finish_motion_speed", true);
-    }
+    if (is_rectilinear_fiber_infill(config, purpose) && finish_strategy != FiberFinishStrategy::TangentExtension)
+        throw std::invalid_argument("Rectilinear fiber infill requires a tangent finish strategy");
+    if (finish_strategy != FiberFinishStrategy::LoopOverlap && finish_strategy != FiberFinishStrategy::TangentExtension)
+        throw std::invalid_argument("Fiber finish requires an explicit loop or tangent strategy");
+    const bool loop_finish = finish_strategy == FiberFinishStrategy::LoopOverlap;
+    const double finish = loop_finish ? config.finish_overlap_length_mm : config.finish_extension_length_mm;
+    check(finish, loop_finish ? "fiber_finish_overlap_length" : "fiber_finish_extension_length");
+    if (finish > 0) check(config.finish_motion_speed_mm_s, "fiber_finish_motion_speed", true);
     if (config.connect_adjacent_rings) {
         check(config.connection_tail_trim_widths, "fiber_connection_tail_trim_widths");
         check(config.connection_head_trim_widths, "fiber_connection_head_trim_widths");
@@ -583,7 +578,7 @@ static ContinuousFiberConfig resolve_region_fiber_config(
             result.infill_acceleration_mm_s2 = source.fiber_infill_acceleration.value;
             result.infill_feed_ratio = source.fiber_infill_feed_ratio.value;
             result.infill_feed_correction = correction_for(result.infill_material);
-            validate_fiber_process_config(result, FiberPathPurpose::Infill, FiberFinishStrategy::None);
+            validate_fiber_process_config(result, FiberPathPurpose::Infill, FiberFinishStrategy::TangentExtension);
             result.infill_flow = flow_for(result.infill_material);
         }
     }

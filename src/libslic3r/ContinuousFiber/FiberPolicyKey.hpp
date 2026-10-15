@@ -119,10 +119,9 @@ inline FiberPolicyKey fiber_policy_key(
         config.infill_enabled=true;config.infill_pattern=ipConcentric;config.infill_density=source.infill_density;
     }
     if (config.infill_enabled && !config.contour_enabled && config.infill_pattern == ipRectilinear) {
-        // Inactive finish settings must not split adjoining rectilinear domains.
-        config.finish_extension_length_mm = 0.0;
+        // Only closed-loop overlap is inactive for pure rectilinear infill.
+        // Tangent extension and its speed must distinguish execution policies.
         config.finish_overlap_length_mm = 0.0;
-        config.finish_motion_speed_mm_s = 0.0;
     }
     if (!std::isfinite(infill_direction))
         throw std::runtime_error("Continuous fiber infill direction must be finite");
