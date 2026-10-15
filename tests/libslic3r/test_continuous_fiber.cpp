@@ -14,6 +14,7 @@
 #include "libslic3r/GCode/FanMover.hpp"
 
 #include <set>
+#include <map>
 #include <limits>
 #include <random>
 #include <nlopt.hpp>
@@ -133,7 +134,8 @@ TEST_CASE("explicit fiber finish rejects incorrect route metadata and geometry",
     "[ContinuousFiber][FinishInterface]")
 {
     const auto candidate=straight_path(5,5,45,5);
-    const auto id=test_id();const ExPolygons domain{rectangle(0,0,50,15)};
+    auto id=test_id();id.parent.purpose=FiberPathPurpose::Contour;
+    const ExPolygons domain{rectangle(0,0,50,15)};
     ContinuousFiberConfig config;config.finish_extension_length_mm=5;
     const auto valid=make_independent_fiber_finish_route(candidate,config,id);
     REQUIRE(FiberPathFinalizer::finalize(candidate,domain,config,id,valid).prepared);
@@ -143,7 +145,7 @@ TEST_CASE("explicit fiber finish rejects incorrect route metadata and geometry",
     SECTION("wrong request") {auto route=valid;route.requested_length_mm=4;CHECK(FiberPathFinalizer::finalize(candidate,domain,config,id,route).failure==FiberFinalizationFailure::InvalidParameter);}
     SECTION("nonfinite request") {auto route=valid;route.requested_length_mm=std::numeric_limits<double>::quiet_NaN();CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
     SECTION("different source domain") {auto route=valid;route.source.parent.domain.component_id+=1;CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
-    SECTION("different source purpose") {auto route=valid;route.source.parent.purpose=FiberPathPurpose::Contour;CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
+    SECTION("different source purpose") {auto route=valid;route.source.parent.purpose=FiberPathPurpose::Infill;CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
     SECTION("invalid strategy") {auto route=valid;route.strategy=static_cast<FiberFinishStrategy>(255);CHECK(FiberPathFinalizer::finalize(candidate,domain,config,id,route).failure==FiberFinalizationFailure::InvalidParameter);}
     SECTION("None cannot bypass configured finish") {auto route=valid;route.strategy=FiberFinishStrategy::None;route.requested_length_mm=0;route.geometry.points.clear();CHECK_FALSE(FiberPathFinalizer::finalize(candidate,domain,config,id,route).prepared);}
     SECTION("missing nonzero finish") {auto route=valid;route.geometry.points.clear();CHECK(FiberPathFinalizer::finalize(candidate,domain,config,id,route).failure==FiberFinalizationFailure::FinishUnavailable);}
@@ -153,7 +155,8 @@ TEST_CASE("explicit fiber finish rejects incorrect route metadata and geometry",
 TEST_CASE("independent finish policy keeps zero requests and original failure ordering",
     "[ContinuousFiber][FinishInterface]")
 {
-    const auto candidate=straight_path(5,5,45,5);const auto id=test_id();
+    const auto candidate=straight_path(5,5,45,5);
+    auto id=test_id();id.parent.purpose=FiberPathPurpose::Contour;
     const ExPolygons domain{rectangle(0,0,50,15)};
     ContinuousFiberConfig config;config.finish_overlap_length_mm=std::numeric_limits<double>::quiet_NaN();
     const auto zero=make_independent_fiber_finish_route(candidate,config,id);
@@ -178,6 +181,132 @@ TEST_CASE("independent finish policy keeps zero requests and original failure or
     CHECK(unavailable.geometry.empty());
     config.cut_to_contact_length_mm=23;
     CHECK(finalize_independent(degenerate,domain,config,id).failure==FiberFinalizationFailure::TooShort);
+}
+
+TEST_CASE("rectilinear finish extends motion without moving the cut or depositing endpoint", "[ContinuousFiber][finish]")
+{
+    ContinuousFiberConfig config;config.cut_to_contact_length_mm=23;config.landing_length_mm=2;
+    const auto source=straight_path(0,5,100,5);
+    const ExPolygons domain{rectangle(-5,0,110,25)};
+    const auto baseline=finalize_independent(source,domain,config,test_id());
+    REQUIRE(baseline.prepared);
+    CHECK(baseline.prepared->finish_strategy==FiberFinishStrategy::TangentExtension);
+    for (double extension : {0.,12.,23.,500.}) {
+        config.finish_extension_length_mm=extension;
+        // Closed-loop overlap is irrelevant to this open infill path.
+        config.finish_overlap_length_mm=std::numeric_limits<double>::quiet_NaN();
+        const auto result=finalize_independent(source,domain,config,test_id());
+        REQUIRE(result.prepared);
+        const auto& prepared=*result.prepared;
+        CHECK(prepared.finish_strategy==FiberFinishStrategy::TangentExtension);
+        REQUIRE(prepared.spans.size()==baseline.prepared->spans.size()+(extension>0?1:0));
+        CHECK(prepared.passive_tail_length_mm()==Catch::Approx(23).margin(.002));
+        const auto& tail=prepared.spans[baseline.prepared->spans.size()-1];
+        CHECK(tail.kind==FiberMotionKind::PassiveDepositingAfterCut);
+        CHECK(tail.geometry.points.front()==Point3::new_scale(77,5,0));
+        CHECK(tail.geometry.points.back()==source.polyline.points.back());
+        CHECK(prepared.spans.back().geometry.points.back()==Point3::new_scale(100+extension,5,0));
+        CHECK(std::count_if(prepared.actions.begin(),prepared.actions.end(),[](const auto& a) {
+            return a.type==FiberActionType::Cut;
+        })==1);
+        bool cut=false;
+        for(const auto& action:prepared.actions) {
+            if(action.type==FiberActionType::Cut)cut=true;
+            if(cut) {
+                CHECK(action.type!=FiberActionType::Prefeed);
+                CHECK(action.type!=FiberActionType::Start);
+            }
+        }
+        for(size_t i=0;i<baseline.prepared->spans.size();++i) {
+            CHECK(prepared.spans[i].geometry.points==baseline.prepared->spans[i].geometry.points);
+            REQUIRE(prepared.spans[i].edges.size()==baseline.prepared->spans[i].edges.size());
+            for(size_t e=0;e<prepared.spans[i].edges.size();++e) {
+                CHECK(prepared.spans[i].edges[e].feed_mm_per_xy_mm==baseline.prepared->spans[i].edges[e].feed_mm_per_xy_mm);
+                CHECK(prepared.spans[i].edges[e].speed_mm_s==baseline.prepared->spans[i].edges[e].speed_mm_s);
+            }
+        }
+        CHECK(prepared.total_depositing_length_mm()==Catch::Approx(100));
+        CHECK(diff_ex(prepared.physical_coverage,baseline.prepared->physical_coverage).empty());
+        CHECK(diff_ex(baseline.prepared->physical_coverage,prepared.physical_coverage).empty());
+        CHECK(diff_ex(prepared.resin_exclusion,baseline.prepared->resin_exclusion).empty());
+        CHECK(diff_ex(baseline.prepared->resin_exclusion,prepared.resin_exclusion).empty());
+        const auto bound=bind_fiber_execution(result.prepared,0,0,0,1.,";cut");
+        for(size_t i=0;i<prepared.spans.size();++i)
+            if(!prepared.spans[i].actively_feeds_fiber())
+                for(double e:bound.edge_dE[i])CHECK(e==0);
+    }
+    config.finish_extension_length_mm=23;
+    const auto bent=path_from_points({{0,5},{80,5},{80,15}});
+    const auto result=finalize_independent(bent,domain,config,test_id());
+    REQUIRE(result.prepared);
+    const auto& tail=result.prepared->spans[result.prepared->spans.size()-2];
+    CHECK(tail.geometry.points.front()==Point3::new_scale(67,5,0));
+    CHECK(tail.geometry.points.back()==Point3::new_scale(80,15,0));
+    CHECK(result.prepared->spans.back().geometry.points.back()==Point3::new_scale(80,38,0));
+    CHECK(result.prepared->passive_tail_length_mm()==Catch::Approx(23).margin(.002));
+    CHECK(finalize_independent(straight_path(0,5,23,5),domain,config,test_id()).failure==FiberFinalizationFailure::TooShort);
+    const auto reversed=finalize_independent(straight_path(100,5,0,5),domain,config,test_id());
+    REQUIRE(reversed.prepared);
+    CHECK(reversed.prepared->spans.back().geometry.points.back()==Point3::new_scale(-23,5,0));
+    for(double invalid:{-1.,std::numeric_limits<double>::infinity(),std::numeric_limits<double>::quiet_NaN()}) {
+        config.finish_extension_length_mm=invalid;
+        CHECK(finalize_independent(source,domain,config,test_id()).failure==FiberFinalizationFailure::InvalidParameter);
+    }
+}
+
+TEST_CASE("rectilinear finalization accepts only its own forward tangent finish", "[ContinuousFiber][FinishInterface]")
+{
+    const auto source=straight_path(5,5,105,5);const auto id=test_id();
+    const ExPolygons domain{rectangle(0,0,120,15)};
+    ContinuousFiberConfig config;config.cut_to_contact_length_mm=23;config.finish_extension_length_mm=23;
+    auto route=make_independent_fiber_finish_route(source,config,id);
+    REQUIRE(FiberPathFinalizer::finalize(source,domain,config,id,route).prepared);
+    SECTION("None") {route.strategy=FiberFinishStrategy::None;}
+    SECTION("loop strategy") {route.strategy=FiberFinishStrategy::LoopOverlap;}
+    SECTION("wrong request") {route.requested_length_mm=12;}
+    SECTION("wrong start") {route.geometry.points.front().x()+=scale_(1);}
+    SECTION("wrong length") {route.geometry.points.back().x()+=scale_(1);}
+    SECTION("backward") {route.geometry.points.back()=Point3::new_scale(82,5,0);}
+    SECTION("sideways") {route.geometry.points.back()=Point3::new_scale(105,28,0);}
+    SECTION("wrong fragment") {route.source.fragment_ordinal+=1;}
+    SECTION("wrong source") {route.source.parent.job_ordinal+=1;}
+    SECTION("missing geometry") {route.geometry.points.clear();}
+    CHECK_FALSE(FiberPathFinalizer::finalize(source,domain,config,id,route).prepared);
+}
+
+TEST_CASE("rectilinear grouping distinguishes active finishing settings only", "[ContinuousFiber][finish][grouping]")
+{
+    ContinuousFiberConfig first;
+    first.infill_enabled=true;first.infill_pattern=ipRectilinear;first.infill_density=100;
+    first.infill_flow=Flow(1.f,.2f,.4f);first.cut_to_contact_length_mm=23;
+    auto second=first;second.finish_overlap_length_mm=12;
+    std::map<FiberPolicyKey,std::vector<FiberContributorDomainSource>> groups;
+    groups[fiber_policy_key(first,0,false)].push_back({0,{rectangle(0,0,20,40)}});
+    groups[fiber_policy_key(second,0,false)].push_back({1,{rectangle(20,0,40,40)}});
+    REQUIRE(groups.size()==1);
+    const auto merged=merge_connected_fiber_domains(groups.begin()->second);
+    REQUIRE(merged.size()==1);CHECK(merged.front().contributor_indices==std::vector<size_t>{0,1});
+    second.finish_extension_length_mm=23;
+    CHECK_FALSE(fiber_policy_key(first,0,false)==fiber_policy_key(second,0,false));
+    first.finish_extension_length_mm=23;
+    CHECK(fiber_policy_key(first,0,false)==fiber_policy_key(second,0,false));
+    second.finish_motion_speed_mm_s=7;
+    CHECK_FALSE(fiber_policy_key(first,0,false)==fiber_policy_key(second,0,false));
+    second=first;second.finish_overlap_length_mm=12;
+    first.contour_enabled=second.contour_enabled=true;
+    CHECK_FALSE(fiber_policy_key(first,0,false)==fiber_policy_key(second,0,false));
+}
+
+TEST_CASE("rectilinear tangent validation retains enabled ring connection checks", "[ContinuousFiber][OpenRingConnection][FinishInterface]")
+{
+    ContinuousFiberConfig config;
+    config.connect_adjacent_rings=true;
+    CHECK_NOTHROW(validate_fiber_process_config(config,FiberPathPurpose::Infill,FiberFinishStrategy::TangentExtension));
+    SECTION("negative tail trim") {config.connection_tail_trim_widths=-1;}
+    SECTION("nonfinite head trim") {config.connection_head_trim_widths=std::numeric_limits<double>::quiet_NaN();}
+    CHECK_THROWS_AS(validate_fiber_process_config(config,FiberPathPurpose::Infill,FiberFinishStrategy::TangentExtension),std::invalid_argument);
+    config.connect_adjacent_rings=false;
+    CHECK_NOTHROW(validate_fiber_process_config(config,FiberPathPurpose::Infill,FiberFinishStrategy::TangentExtension));
 }
 
 TEST_CASE("continuous fiber grouping merges only identical policies", "[ContinuousFiber]")
@@ -358,8 +487,9 @@ TEST_CASE("non depositing finish does not change fiber coverage", "[ContinuousFi
     ContinuousFiberConfig with_finish = without_finish;
     with_finish.finish_extension_length_mm = 5.0;
 
-    const auto a = finalize_independent(candidate, domain, without_finish, test_id());
-    const auto b = finalize_independent(candidate, domain, with_finish, test_id());
+    auto id = test_id();id.parent.purpose = FiberPathPurpose::Contour;
+    const auto a = finalize_independent(candidate, domain, without_finish, id);
+    const auto b = finalize_independent(candidate, domain, with_finish, id);
     REQUIRE(a.prepared != nullptr);
     REQUIRE(b.prepared != nullptr);
     REQUIRE(b.prepared->spans.size() == 3);
@@ -698,6 +828,36 @@ TEST_CASE("fiber feed is independent of plastic flow geometry and binds hardware
     CHECK_THROWS(bind_fiber_execution(a.prepared, 0, 1, 3, 0.0, ";cut"));
 }
 
+TEST_CASE("fiber E quantization carries residuals before cut only", "[ContinuousFiber][feed]")
+{
+    ContinuousFiberConfig config;config.cut_to_contact_length_mm=23;config.landing_length_mm=2;
+    config.finish_extension_length_mm=23;
+    config.infill_feed_ratio=config.contour_feed_ratio=1.000014;config.speed_sampling_length_mm=.01;
+    auto id=test_id();id.parent.purpose=GENERATE(FiberPathPurpose::Infill,FiberPathPurpose::Contour);
+    const auto result=finalize_independent(straight_path(0,5,100,5),{rectangle(-5,0,110,15)},config,id);
+    REQUIRE(result.prepared);
+    const double units=GENERATE(.5,1.,2.);
+    const auto bound=bind_fiber_execution(result.prepared,0,0,0,units,";cut");
+    double ideal=result.prepared->start_procedure.prefeed_length_mm*units;
+    double emitted=bound.prefeed_dE,naive=bound.prefeed_dE;
+    size_t fed_edges=0;
+    for(size_t s=0;s<result.prepared->spans.size();++s){
+        const auto& span=result.prepared->spans[s];
+        for(size_t e=0;e<span.edges.size();++e){
+            const double length=unscale<double>((span.geometry.points[e+1]-span.geometry.points[e]).cast<double>().norm());
+            const double delta=length*span.edges[e].feed_mm_per_xy_mm*units;
+            ideal+=delta;naive+=GCodeFormatter::quantize_e(delta);emitted+=bound.edge_dE[s][e];
+            if(span.actively_feeds_fiber()){
+                CHECK(bound.edge_dE[s][e]>0);++fed_edges;
+                CHECK(emitted==Catch::Approx(ideal).margin(.0000051));
+            }else CHECK(bound.edge_dE[s][e]==0);
+        }
+    }
+    CHECK(fed_edges>7000);
+    CHECK(std::abs(naive-ideal)>.0005);
+    CHECK(emitted==Catch::Approx(ideal).margin(.0000051));
+}
+
 TEST_CASE("fiber normal speed is invariant under collinear tessellation", "[ContinuousFiber][speed]")
 {
     auto a = straight_path(5, 5, 25, 5);
@@ -749,7 +909,7 @@ TEST_CASE("fiber tail is forcibly sampled by arc length with exact endpoint spee
     }
 }
 
-TEST_CASE("fiber finish preserves infill policy and supports open contours", "[ContinuousFiber][finish]")
+TEST_CASE("rectilinear infill uses its tangent while contours retain their policies", "[ContinuousFiber][finish]")
 {
     const auto candidate = path_from_points({{5,5},{25,5},{25,25},{5,25},{5,5}});
     ContinuousFiberConfig config;
@@ -772,22 +932,20 @@ TEST_CASE("fiber finish preserves infill policy and supports open contours", "[C
     CHECK(open.prepared->spans.back().geometry.points.back() == Point3::new_scale(27,5,0));
 }
 
-TEST_CASE("fiber finish is continuous motion not material clipped by a model hole", "[ContinuousFiber][finish]")
+TEST_CASE("rectilinear non-depositing finish may cross a model hole", "[ContinuousFiber][finish]")
 {
     ContinuousFiberConfig config;
     config.finish_extension_length_mm = 15;
     const auto result = finalize_independent(straight_path(2,5,10,5),
         {rectangle_with_hole(0,0,30,10,15,2,20,8)}, config, test_id());
     REQUIRE(result.prepared);
-    const auto& finish = result.prepared->spans.back();
-    CHECK(finish.kind == FiberMotionKind::NonDepositingFinish);
-    CHECK(finish.geometry.points.front() == Point3::new_scale(10,5,0));
-    CHECK(finish.geometry.points.back() == Point3::new_scale(25,5,0));
-    CHECK(finish.edges.front().feed_mm_per_xy_mm == 0);
+    CHECK(result.prepared->finish_strategy == FiberFinishStrategy::TangentExtension);
+    CHECK(result.prepared->spans.back().kind == FiberMotionKind::NonDepositingFinish);
+    CHECK(result.prepared->spans.back().geometry.points.back() == Point3::new_scale(25,5,0));
     CHECK(result.prepared->total_depositing_length_mm() == Catch::Approx(8));
 }
 
-TEST_CASE("fiber finish leaves the deposition domain without changing feed tail or coverage", "[ContinuousFiber][finish]")
+TEST_CASE("rectilinear infill separates the source endpoint from its finish endpoint", "[ContinuousFiber][finish]")
 {
     ContinuousFiberConfig config;
     config.landing_length_mm = 2;
@@ -804,10 +962,13 @@ TEST_CASE("fiber finish leaves the deposition domain without changing feed tail 
     CHECK(result.prepared->total_depositing_length_mm() == Catch::Approx(50));
     CHECK(area(result.prepared->physical_coverage) == Catch::Approx(area(baseline.prepared->physical_coverage)));
     CHECK(area(result.prepared->resin_exclusion) == Catch::Approx(area(baseline.prepared->resin_exclusion)));
-    const auto& finish = result.prepared->spans.back();
-    CHECK(finish.geometry.points.back() == Point3::new_scale(78,5,0));
-    CHECK(unscale<double>(finish.geometry.length()) == Catch::Approx(23));
-    CHECK(finish.edges.front().feed_mm_per_xy_mm == 0);
+    const auto& tail = result.prepared->spans[result.prepared->spans.size()-2];
+    CHECK(result.prepared->finish_strategy == FiberFinishStrategy::TangentExtension);
+    CHECK(tail.kind == FiberMotionKind::PassiveDepositingAfterCut);
+    CHECK(tail.geometry.points.back() == source.polyline.points.back());
+    CHECK(unscale<double>(tail.geometry.length()) == Catch::Approx(23));
+    CHECK(tail.edges.front().feed_mm_per_xy_mm == 0);
+    CHECK(result.prepared->spans.size() == baseline.prepared->spans.size()+1);
     for (size_t i = 0; i < baseline.prepared->spans.size(); ++i) {
         CHECK(result.prepared->spans[i].geometry.points == baseline.prepared->spans[i].geometry.points);
         for (size_t e = 0; e < baseline.prepared->spans[i].edges.size(); ++e)
@@ -819,7 +980,7 @@ TEST_CASE("fiber finish leaves the deposition domain without changing feed tail 
     sampled.polyline = normalize_fiber_geometry(sampled.polyline);
     const auto same = finalize_independent(sampled, domain, config, test_id());
     REQUIRE(same.prepared);
-    CHECK(same.prepared->spans.back().geometry.points == finish.geometry.points);
+    CHECK(same.prepared->spans[same.prepared->spans.size()-2].geometry.points == tail.geometry.points);
     CHECK_FALSE(finalize_independent(straight_path(5,5,65,5), domain, config, test_id()).prepared);
 }
 

@@ -1,5 +1,6 @@
 #include "PreparedFiberPath.hpp"
 #include "../ClipperUtils.hpp"
+#include "../GCodeWriter.hpp"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -90,6 +91,10 @@ void PreparedFiberPath::validate() const
         if (!condition) throw std::invalid_argument(message);
     };
     require(!spans.empty(), "Fiber plan has no spans");
+    if (finish_strategy == FiberFinishStrategy::None)
+        require(std::none_of(spans.begin(), spans.end(), [](const auto& span) {
+            return span.kind == FiberMotionKind::NonDepositingFinish;
+        }), "Fiber path without a finish strategy contains finishing motion");
     require(std::isfinite(acceleration_mm_s2) && acceleration_mm_s2 > 0, "Invalid fiber acceleration");
     const auto expected = planned_actions(*this);
     require(actions.size() == expected.size(), "Invalid fiber action count");
@@ -240,6 +245,16 @@ BoundFiberExecutionPlan bind_fiber_execution(
     bound.physical_tool_id = physical_tool_id;
     bound.e_units_per_mm = e_units_per_mm;
     bound.cut_gcode = std::move(cut_gcode);
+    double ideal_e = bound.prepared->start_procedure.prefeed_length_mm * e_units_per_mm;
+    bound.prefeed_F = bound.prepared->start_procedure.prefeed_speed_mm_s * e_units_per_mm * 60.0;
+    if (!std::isfinite(ideal_e) || !std::isfinite(bound.prefeed_F) || bound.prefeed_F >= 100000.0 ||
+        (ideal_e > 0 && ideal_e < 0.00001))
+        throw std::invalid_argument("Fiber prefeed conversion overflow");
+    bound.prefeed_dE = GCodeFormatter::quantize_e(ideal_e);
+    double emitted_e = bound.prefeed_dE;
+    // Quantize the cumulative owned feed, rather than independently rounding
+    // every relative-E command. Residuals stay before CUT; passive spans never
+    // receive an E command, including any remaining fraction of one E grid.
     for (const auto& span : bound.prepared->spans) {
         std::vector<double> deltas;
         for (size_t i = 0; i < span.edges.size(); ++i) {
@@ -247,15 +262,19 @@ BoundFiberExecutionPlan bind_fiber_execution(
             const double delta = length * span.edges[i].feed_mm_per_xy_mm * e_units_per_mm;
             if (!std::isfinite(delta) || (span.actively_feeds_fiber() && delta < 0.00001))
                 throw std::invalid_argument("Fiber E command is not representable");
-            deltas.push_back(delta);
+            double command_delta = 0.0;
+            if (span.actively_feeds_fiber()) {
+                ideal_e += delta;
+                const double next_e = GCodeFormatter::quantize_e(ideal_e);
+                command_delta = next_e-emitted_e;
+                if (!std::isfinite(next_e) || !std::isfinite(command_delta) || command_delta <= 0)
+                    throw std::invalid_argument("Quantized fiber E command is not representable");
+                emitted_e = next_e;
+            }
+            deltas.push_back(command_delta);
         }
         bound.edge_dE.push_back(std::move(deltas));
     }
-    bound.prefeed_dE = bound.prepared->start_procedure.prefeed_length_mm * e_units_per_mm;
-    bound.prefeed_F = bound.prepared->start_procedure.prefeed_speed_mm_s * e_units_per_mm * 60.0;
-    if (!std::isfinite(bound.prefeed_dE) || !std::isfinite(bound.prefeed_F) || bound.prefeed_F >= 100000.0 ||
-        (bound.prefeed_dE > 0 && bound.prefeed_dE < 0.00001))
-        throw std::invalid_argument("Fiber prefeed conversion overflow");
     return bound;
 }
 

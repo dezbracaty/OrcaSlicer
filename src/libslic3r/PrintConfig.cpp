@@ -1274,6 +1274,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("fiber_finish_extension_length", coFloat);
     def->label = L("Fiber finish extension length");
+    def->tooltip = L("Non-depositing travel along the final tangent after rectilinear fiber infill or an open fiber contour reaches its planned endpoint. Does not change the cutter-to-contact tail or cut position.");
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;
