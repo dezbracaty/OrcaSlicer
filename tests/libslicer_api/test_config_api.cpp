@@ -131,7 +131,9 @@ TEST_CASE("configuration exposes one grouped settings snapshot", "[libslicer_api
     for (const auto& item : items) {
         INFO(item.key);
         const bool conditionally_hidden = item.key == "fiber_concentric_corner_stabilization_length" ||
-            item.key == "fiber_corner_stabilization_length" || item.key == "fiber_infill_angle_sequence";
+            item.key == "fiber_corner_stabilization_length" || item.key == "fiber_infill_angle_sequence" ||
+            item.key == "fiber_finish_extension_length" || item.key == "fiber_finish_overlap_length" ||
+            item.key == "fiber_finish_motion_speed";
         CHECK(item.visible == !conditionally_hidden);
         CHECK(unique_keys.insert(item.key).second);
     }
@@ -1204,7 +1206,7 @@ TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libsl
     std::filesystem::remove(debug.output.path);
 }
 
-TEST_CASE("CFSYS default finish permits internal fiber output on T1", "[libslicer_api][fiber][fiber-infill-output]")
+TEST_CASE("CFSYS rectilinear fiber ends at tail depletion on T1", "[libslicer_api][fiber][fiber-infill-output]")
 {
     const unsigned fiber_slot = GENERATE(1u, 4u);
     const bool relative_e = GENERATE(false, true);
@@ -1266,7 +1268,7 @@ TEST_CASE("CFSYS default finish permits internal fiber output on T1", "[libslice
             if (infill) {
                 CHECK(powered > 0);
                 CHECK(tail == Catch::Approx(23).margin(0.03));
-                CHECK(finish == Catch::Approx(23).margin(0.003));
+                CHECK(finish == 0.0);
             }
             infill = false; phase.clear();
         }
@@ -1333,7 +1335,7 @@ TEST_CASE("CFSYS default finish permits internal fiber output on T1", "[libslice
     if (request.output_gcode_path.empty()) { std::error_code ec; std::filesystem::remove(result.output.path,ec); }
 }
 
-TEST_CASE("CFSYS rejects a finish outside machine limits instead of dropping fiber", "[libslicer_api][fiber][fiber-motion-limit]")
+TEST_CASE("CFSYS rectilinear infill ignores legacy finish lengths in final G-code", "[libslicer_api][fiber][fiber-rectilinear-finish]")
 {
     libslicer::LibraryOptions options;
     options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
@@ -1345,17 +1347,78 @@ TEST_CASE("CFSYS rejects a finish outside machine limits instead of dropping fib
     selection.process_preset_id = "CCF&CIRON @CFSYS";
     selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
     selection.filament_physical_tools = {0,1};
-    REQUIRE(library->activate_config(selection, {{"generate_reinforced_infills","1"},
-        {"fiber_finish_extension_length","500"}}).success);
-    libslicer::SliceRequest request;
-    request.objects.push_back(fiber_infill_block());
-    request.config = *library->active_config_snapshot();
-    const auto result = library->slice(request);
-    CHECK_FALSE(result.success);
-    CHECK(result.output.path.empty());
-    CHECK(std::any_of(result.diagnostics.begin(), result.diagnostics.end(), [](const auto& d) {
-        return !d.warning && d.message.find("Fiber motion exceeds") != std::string::npos;
+    std::vector<std::string> reference;
+    for (const std::string legacy : {"0","23","500"}) {
+        CAPTURE(legacy);
+        REQUIRE(library->activate_config(selection, {{"generate_reinforced_infills","1"},
+            {"generate_reinforced_perimeters","0"},{"reinforced_infill_pattern","rectilinear"},
+            {"fiber_finish_extension_length",legacy}}).success);
+        libslicer::SliceRequest request;request.objects.push_back(fiber_infill_block());
+        request.config=*library->active_config_snapshot();
+        const auto result=library->slice(request);
+        for(const auto& d:result.diagnostics)UNSCOPED_INFO(d.message);
+        REQUIRE(result.success);
+        std::ifstream input(result.output.path);REQUIRE(input.good());
+        std::vector<std::string> commands;
+        bool active=false,cut=false,finish=false;
+        size_t paths=0,cuts=0;std::string line;
+        while(std::getline(input,line)) {
+            if(line.rfind(";FIBER_BEGIN ",0)==0) {
+                CHECK(line.find("purpose=infill ")!=std::string::npos);
+                active=true;cut=false;finish=false;++paths;
+            } else if(line==";FIBER_CUT") {cut=true;++cuts;}
+            else if(line==";FIBER_FINISH_BEGIN")finish=true;
+            else if(line==";FIBER_END")active=false;
+            if(!active || line.empty() || line.front()==';')continue;
+            commands.push_back(line);
+            if(line.rfind("G1 ",0)==0 || line.rfind("G0 ",0)==0) {
+                if(cut)CHECK_FALSE(std::regex_search(line,std::regex(R"(\bE[-+0-9.])")));
+                if(finish)CHECK_FALSE(std::regex_search(line,std::regex(R"(\b[XYZ][-+0-9.])")));
+            }
+        }
+        REQUIRE(paths>0);CHECK(cuts==paths);
+        if(reference.empty())reference=commands;else CHECK(commands==reference);
+        std::filesystem::remove(result.output.path);
+    }
+}
+
+TEST_CASE("CFSYS rejects fiber motion outside machine height limits", "[libslicer_api][fiber][fiber-motion-limit]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id="CFSYS Alpha500 Printer";selection.machine_variant_id="0.4";
+    selection.process_preset_id="CCF&CIRON @CFSYS";
+    selection.filament_preset_ids={"CFSYS CIRON","CFSYS CCF"};selection.filament_physical_tools={0,1};
+    REQUIRE(library->activate_config(selection,{{"generate_reinforced_infills","1"},
+        {"fiber_z_hop_height","600"}}).success);
+    libslicer::SliceRequest request;request.objects.push_back(fiber_infill_block());
+    request.config=*library->active_config_snapshot();
+    const auto result=library->slice(request);
+    CHECK_FALSE(result.success);CHECK(result.output.path.empty());
+    CHECK(std::any_of(result.diagnostics.begin(),result.diagnostics.end(),[](const auto& d) {
+        return !d.warning && d.message.find("Fiber motion exceeds")!=std::string::npos;
     }));
+}
+
+TEST_CASE("finishing controls are hidden for pure rectilinear fiber infill", "[libslicer_api][fiber-rectilinear-finish]")
+{
+    auto config=libslicer::Config::defaults();
+    REQUIRE(config.apply_patch({{"generate_reinforced_perimeters","0"},{"generate_reinforced_infills","1"},
+        {"reinforced_infill_pattern","rectilinear"},{"fiber_finish_extension_length","23"}}).success);
+    auto items=config.settings();
+    for(const auto* key:{"fiber_finish_extension_length","fiber_finish_overlap_length","fiber_finish_motion_speed"}) {
+        const auto* item=find_item(items,key);REQUIRE(item);CHECK_FALSE(item->visible);CHECK_FALSE(item->enabled);
+    }
+    CHECK(config.snapshot().value("fiber_finish_extension_length")=="23");
+    REQUIRE(config.set("generate_reinforced_perimeters","1").success);
+    items=config.settings();CHECK(find_item(items,"fiber_finish_extension_length")->visible);
+    REQUIRE(config.apply_patch({{"generate_reinforced_perimeters","0"},{"reinforced_infill_pattern","concentric"}}).success);
+    items=config.settings();
+    CHECK(find_item(items,"fiber_finish_extension_length")->visible);
+    CHECK(find_item(items,"fiber_finish_overlap_length")->visible);
+    CHECK(find_item(items,"fiber_finish_motion_speed")->enabled);
 }
 
 TEST_CASE("continuous fiber rejects a machine without a cut command", "[libslicer_api][fiber-missing-cut][slice]")

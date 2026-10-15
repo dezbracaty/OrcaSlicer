@@ -285,8 +285,12 @@ FiberFinishRoute make_independent_fiber_finish_route(
 {
     FiberFinishRoute finish;
     finish.source = id;
-    const bool tangent = source.polyline.points.size() < 2 || !source.is_closed() ||
-        id.parent.purpose == FiberPathPurpose::Infill;
+    if (is_rectilinear_fiber_infill(config, id.parent.purpose)) {
+        finish.strategy = FiberFinishStrategy::None;
+        validate_fiber_process_config(config, id.parent.purpose, finish.strategy);
+        return finish;
+    }
+    const bool tangent = source.polyline.points.size() < 2 || !source.is_closed();
     finish.strategy = tangent ? FiberFinishStrategy::TangentExtension : FiberFinishStrategy::LoopOverlap;
     // Validate before coordinate conversion. Zero requests retain their selected
     // policy and do not start validating the other family's configuration.
@@ -348,8 +352,11 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     }
     try {
         validate_fiber_process_config(config, id.parent.purpose, finish.strategy);
-        const double requested = finish.strategy == FiberFinishStrategy::LoopOverlap ?
-            config.finish_overlap_length_mm : config.finish_extension_length_mm;
+        if (is_rectilinear_fiber_infill(config, id.parent.purpose) && !finish.geometry.empty())
+            throw std::invalid_argument("Rectilinear fiber infill cannot append a finish route");
+        const double requested = finish.strategy == FiberFinishStrategy::None ? 0.0 :
+            finish.strategy == FiberFinishStrategy::LoopOverlap ?
+                config.finish_overlap_length_mm : config.finish_extension_length_mm;
         if (!std::isfinite(finish.requested_length_mm) || finish.requested_length_mm < 0 ||
             finish.requested_length_mm != requested)
             throw std::invalid_argument("Fiber finish request differs from its selected configuration");
@@ -461,7 +468,14 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         result.detail = error.what();
         return result;
     }
-    try { prepared->finalize_actions(); prepared->validate(); }
+    try {
+        if (is_rectilinear_fiber_infill(config, id.parent.purpose) &&
+            (prepared->spans.back().kind == FiberMotionKind::NonDepositingFinish ||
+             prepared->spans.back().geometry.points.back() != candidate.polyline.points.back()))
+            throw std::invalid_argument("Rectilinear fiber infill must end at its source endpoint");
+        prepared->finalize_actions();
+        prepared->validate();
+    }
     catch (const std::invalid_argument& error) {
         result.detail = error.what();
         result.failure = FiberFinalizationFailure::InvalidGeometry;

@@ -88,6 +88,10 @@ void PreparedFiberPath::validate() const
         if (!condition) throw std::invalid_argument(message);
     };
     require(!spans.empty(), "Fiber plan has no spans");
+    if (finish_strategy == FiberFinishStrategy::None)
+        require(std::none_of(spans.begin(), spans.end(), [](const auto& span) {
+            return span.kind == FiberMotionKind::NonDepositingFinish;
+        }), "Fiber path without a finish strategy contains finishing motion");
     require(std::isfinite(acceleration_mm_s2) && acceleration_mm_s2 > 0, "Invalid fiber acceleration");
     const auto expected = planned_actions(*this);
     require(actions.size() == expected.size(), "Invalid fiber action count");

@@ -85,6 +85,11 @@ struct ContinuousFiberConfig {
     }
 };
 
+inline bool is_rectilinear_fiber_infill(const ContinuousFiberConfig& config, FiberPathPurpose purpose)
+{
+    return purpose == FiberPathPurpose::Infill && config.infill_pattern == ipRectilinear;
+}
+
 bool fiber_concentric_uses_contour_process(const PrintRegionConfig& config);
 // The returned configuration owns geometry/process only. Display cutoff N is
 // retained by the caller. Concentric stability is applied only beyond that cutoff.

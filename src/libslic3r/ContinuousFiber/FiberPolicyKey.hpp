@@ -115,6 +115,12 @@ inline FiberPolicyKey fiber_policy_key(
         config.contour_count=source.contour_enabled?source.contour_count:0;
         config.infill_enabled=true;config.infill_pattern=ipConcentric;config.infill_density=source.infill_density;
     }
+    if (config.infill_enabled && !config.contour_enabled && config.infill_pattern == ipRectilinear) {
+        // Inactive finish settings must not split adjoining rectilinear domains.
+        config.finish_extension_length_mm = 0.0;
+        config.finish_overlap_length_mm = 0.0;
+        config.finish_motion_speed_mm_s = 0.0;
+    }
     if (!std::isfinite(infill_direction))
         throw std::runtime_error("Continuous fiber infill direction must be finite");
     return {

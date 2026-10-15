@@ -35,7 +35,8 @@ struct FiberFinalizationResult {
 
 // Source geometry for non-depositing motion. The caller selects the strategy;
 // command preparation happens once in the Finalizer, together with other spans.
-// A zero request still carries LoopOverlap or TangentExtension explicitly.
+// Rectilinear infill carries None and no route. Other zero requests retain
+// their selected LoopOverlap or TangentExtension policy.
 struct FiberFinishRoute {
     Polyline3 geometry;
     FiberFinishStrategy strategy {FiberFinishStrategy::None};
