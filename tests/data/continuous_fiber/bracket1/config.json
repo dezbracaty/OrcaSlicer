@@ -163,7 +163,7 @@
     "fiber_infill_feed_ratio": "1",
     "fiber_infill_max_speed": "10",
     "fiber_infill_min_speed": "10",
-    "fiber_landing_length": "2",
+    "fiber_start_length": "0",
     "fiber_landing_speed": "3",
     "fiber_layer_height_ratio": "1",
     "fiber_minimum_effective_length": "0.5",

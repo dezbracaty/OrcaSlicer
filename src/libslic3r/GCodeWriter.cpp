@@ -63,16 +63,38 @@ double GCodeWriter::quantize_xyz(double value) const
     return GCodeFormatter::quantize(value, m_xyz_export_digits);
 }
 
+Vec3d GCodeWriter::quantized_machine_position(const Vec3d& oriented) const
+{
+    Vec3d machine=machine_position(oriented);
+    for(int axis=0;axis<3;++axis) machine[axis]=quantize_xyz(machine[axis]);
+    return machine;
+}
+
+Vec3d GCodeWriter::oriented_position(const Vec3d& machine) const
+{
+    Vec3d oriented=m_belt_coordinates ?
+        m_belt_coordinates->world_to_oriented(m_belt_coordinates->machine_to_world(machine)) : machine;
+    oriented.x()+=m_x_offset;oriented.y()+=m_y_offset;
+    return oriented;
+}
+
 Vec3d GCodeWriter::get_emitted_position() const
 {
     Vec3d machine = machine_position(m_pos);
     for (size_t axis = 0; axis < 3; ++axis)
         machine[axis] = GCodeFormatter::quantize(machine[axis], m_position_export_digits[axis]);
-    Vec3d oriented = m_belt_coordinates ?
-        m_belt_coordinates->world_to_oriented(m_belt_coordinates->machine_to_world(machine)) : machine;
-    oriented.x() += m_x_offset;
-    oriented.y() += m_y_offset;
-    return oriented;
+    return oriented_position(machine);
+}
+
+std::string GCodeWriter::travel_to_bound_xyz(const Vec3d& oriented,const Vec3d& machine)
+{
+    if (!oriented.allFinite() || !machine.allFinite() || quantized_machine_position(oriented)!=machine)
+        throw std::invalid_argument("Bound XYZ differs from the writer machine transform");
+    m_pos=oriented;m_lifted=0;m_position_export_digits.fill(m_xyz_export_digits);
+    GCodeG1Formatter command(m_xyz_export_digits);
+    command.emit_xyz(machine);
+    command.emit_f(m_current_speed);
+    return command.string();
 }
 
 void GCodeWriter::apply_print_config(const PrintConfig &print_config)

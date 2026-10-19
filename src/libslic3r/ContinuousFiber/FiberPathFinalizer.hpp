@@ -6,6 +6,7 @@
 #include "ContinuousFiberFillStrategy.hpp"
 
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace Slic3r {
@@ -70,7 +71,8 @@ public:
         const std::vector<ContourArc>& arcs = {},
         const ExPolygons* planned_centerline_domain = nullptr,
         const std::vector<FiberExecutionPiece>& pieces = {},
-        const std::vector<FiberExecutionPiece>& finish_pieces = {});
+        const std::vector<FiberExecutionPiece>& finish_pieces = {},
+        const std::optional<FiberSourceEntry>& source_entry = std::nullopt);
 };
 
 } // namespace Slic3r

@@ -1116,7 +1116,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                fiber_prefeed_extra_length))
     ((ConfigOptionFloat,                fiber_prefeed_speed))
     ((ConfigOptionFloat,                fiber_z_hop_height))
-    ((ConfigOptionFloat,                fiber_landing_length))
+    ((ConfigOptionFloat,                fiber_start_length))
     ((ConfigOptionFloat,                fiber_landing_speed))
     ((ConfigOptionInt,                  fiber_adhesion_dwell_ms))
     ((ConfigOptionFloat,                fiber_start_speed))

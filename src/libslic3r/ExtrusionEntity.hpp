@@ -344,7 +344,7 @@ public:
     const std::shared_ptr<const PreparedFiberPath>& prepared_path() const { return m_prepared; }
     Point first_point() const override { return first_point3().to_point(); }
     Point last_point() const override { return last_point3().to_point(); }
-    const Point3& first_point3() const override { return m_prepared->spans.front().geometry.points.front(); }
+    const Point3& first_point3() const override { return m_prepared->entry.source.start; }
     const Point3& last_point3() const override { return m_prepared->spans.back().geometry.points.back(); }
     // Detect direct writes through legacy ExtrusionPath's public derived view.
     void validate_derived_view() const;

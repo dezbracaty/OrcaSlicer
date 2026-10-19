@@ -13,6 +13,8 @@
 
 namespace Slic3r {
 
+class GCodeWriter;
+
 // LayerXY: every stored Z is a placeholder zero, never a machine coordinate.
 enum class FiberFinishStrategy : uint8_t { None, TangentExtension, LoopOverlap };
 
@@ -44,9 +46,31 @@ struct FiberEdgeProcess {
     double feed_mm_per_xy_mm { 0.0 };
 };
 
+// Capture before numerical cleanup. A repeated first source vertex is an
+// intentional zero-length entry, not permission to use the next source edge.
+struct FiberSourceEntry {
+    Point3 start {Point3::Zero()}, end {Point3::Zero()};
+    static FiberSourceEntry from(const Polyline3& path) {
+        return {path.points.at(0), path.points.at(1)};
+    }
+};
+
+enum class FiberEntryMode : uint8_t { StraightLanding, VerticalLanding, PoweredFirstEdge };
+
+struct FiberEntryPlan {
+    FiberEntryMode mode {FiberEntryMode::PoweredFirstEdge};
+    FiberSourceEntry source;
+    Point3 contact {Point3::Zero()};
+    double end_station_mm {0.0};
+    // Landing owns [0,end_station]; spans start at contact. Source stations and
+    // machine-rounded XY lengths are different quantities, especially for Z-only entry.
+    std::vector<FiberExecutionPiece> pieces;
+    bool lowers() const { return mode != FiberEntryMode::PoweredFirstEdge; }
+};
+
 enum class FiberMotionKind : uint8_t {
-    PrefedLanding,
     PoweredStart,
+    PoweredEntry,
     PoweredDepositing,
     PassiveDepositingAfterCut,
     NonDepositingFinish
@@ -59,13 +83,13 @@ struct FiberMotionSpan {
 
     bool actively_feeds_fiber() const
     {
-        return kind == FiberMotionKind::PoweredStart || kind == FiberMotionKind::PoweredDepositing;
+        return kind == FiberMotionKind::PoweredStart || kind == FiberMotionKind::PoweredEntry || kind == FiberMotionKind::PoweredDepositing;
     }
 
     bool deposits_fiber() const
     {
-        return kind == FiberMotionKind::PrefedLanding ||
-               kind == FiberMotionKind::PoweredStart ||
+        return kind == FiberMotionKind::PoweredStart ||
+               kind == FiberMotionKind::PoweredEntry ||
                kind == FiberMotionKind::PoweredDepositing ||
                kind == FiberMotionKind::PassiveDepositingAfterCut;
     }
@@ -120,6 +144,7 @@ struct PreparedFiberPath {
     // including the explicitly supplied non-depositing terminal source route.
     std::vector<FiberCommandPiece> command_pieces;
     FiberStartProcedure start_procedure;
+    FiberEntryPlan entry;
     ExPolygons physical_coverage;
     ExPolygons resin_exclusion;
     ExPolygons outside_domain;
@@ -145,7 +170,19 @@ struct BoundFiberExecutionPlan {
     double prefeed_dE { 0.0 };
     double prefeed_F { 0.0 };
     std::string cut_gcode;
+    struct EntryMotion {
+        Vec3d from {Vec3d::Zero()}, to {Vec3d::Zero()};
+        Vec3d writer_target {Vec3d::Zero()};
+        double speed_mm_s {0.0};
+        bool bound {false};
+    } entry_motion;
 };
+
+// Bind once after the instance transform and writer quantization. Every machine
+// check and the emitter consume this exact motion, never reconstruct its Z.
+void bind_fiber_entry_motion(BoundFiberExecutionPlan& plan, const GCodeWriter& writer, const Vec2d& start_xy,
+    const Vec2d& contact_xy, double layer_z);
+std::string emit_fiber_landing(GCodeWriter& writer, const BoundFiberExecutionPlan& plan);
 
 // Available machine limits, not a model/deposition domain or a full collision
 // envelope. Positions are emitted G-code coordinates; XY limits describe the

@@ -450,7 +450,7 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     const auto cut_to_contact = config->value("fiber_cut_to_contact_length");
     const auto prefeed_extra = config->value("fiber_prefeed_extra_length");
     const auto z_hop_height = config->value("fiber_z_hop_height");
-    const auto landing_length = config->value("fiber_landing_length");
+    const auto source_split_length = config->value("fiber_start_length");
     const auto landing_speed = config->value("fiber_landing_speed");
     const auto start_speed = config->value("fiber_start_speed");
     const auto minimum_effective = config->value("fiber_minimum_effective_length");
@@ -462,7 +462,7 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     REQUIRE(cut_to_contact.has_value());
     REQUIRE(prefeed_extra.has_value());
     REQUIRE(z_hop_height.has_value());
-    REQUIRE(landing_length.has_value());
+    REQUIRE(source_split_length.has_value());
     REQUIRE(landing_speed.has_value());
     REQUIRE(start_speed.has_value());
     REQUIRE(minimum_effective.has_value());
@@ -476,7 +476,8 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     CHECK(*cut_to_contact == "23");
     CHECK(*prefeed_extra == "0.5");
     CHECK(*z_hop_height == "2");
-    CHECK(*landing_length == "2");
+    CHECK(*source_split_length == "0");
+    CHECK_FALSE(config->value("fiber_landing_length").has_value());
     CHECK(*landing_speed == "3");
     CHECK(*start_speed == "10");
     CHECK(*minimum_effective == "0.5");
@@ -1701,7 +1702,7 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
         {"fiber_prefeed_extra_length", "0.5"},
         {"fiber_prefeed_speed", "10"},
         {"fiber_z_hop_height", "2"},
-        {"fiber_landing_length", "2"},
+        {"fiber_start_length", "0"},
         {"fiber_landing_speed", "3"},
         {"fiber_adhesion_dwell_ms", "25"},
         {"fiber_start_stabilization_length", "2"},
@@ -3277,7 +3278,7 @@ std::unique_ptr<libslicer::Library> mask_library()
         {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"},
         {"infill_combination", "0"}, {"interface_shells", "0"},
         {"fiber_minimum_path_length", "1"}, {"fiber_minimum_effective_length", "0"},
-        {"fiber_cut_to_contact_length", "2"}, {"fiber_landing_length", "0"},
+        {"fiber_cut_to_contact_length", "2"}, {"fiber_start_length", "0"},
         {"fiber_width", "0.8"},
         {"outer_reinforced_perimeters_counts", "1"},
         {"fiber_contour_bend_radius", "0"}, {"fiber_infill_bend_radius", "0"},
@@ -3542,7 +3543,15 @@ bool same_resin_only_fiber_commands(const std::vector<MaskFiberCommands>& actual
     if (actual.size()!=expected.size()) return false;
     for (size_t i=0;i<actual.size();++i) {
         const auto& a=actual[i]; const auto& b=expected[i];
-        if (a.metadata!=b.metadata || a.phases!=b.phases || a.commands!=b.commands || a.feed.size()!=b.feed.size()) return false;
+        if (a.metadata!=b.metadata || a.phases!=b.phases || a.commands.size()!=b.commands.size() || a.feed.size()!=b.feed.size()) return false;
+        for(size_t command=0;command<a.commands.size();++command) {
+            const auto& x=a.commands[command];const auto& y=b.commands[command];
+            if(std::get<0>(x)!=std::get<0>(y) || std::get<2>(x)!=std::get<2>(y) || std::get<3>(x)!=std::get<3>(y))return false;
+            // Residual resin may introduce a tool activation before this same
+            // strand. Only the first approach then receives the configured cap;
+            // dedicated approach tests check that policy. Process speeds stay exact.
+            if((std::get<0>(x)!="approach" || std::get<3>(x)) && std::get<1>(x)!=std::get<1>(y))return false;
+        }
         const double units=std::stod(a.metadata.at("e_units_per_mm"));
         for (const auto& [phase,feed] : a.feed) {
             const auto found=b.feed.find(phase);
@@ -4196,7 +4205,18 @@ TEST_CASE("resin-only mask changes local residual use while preserving connected
     REQUIRE(same_resin_only_fiber_geometry(*actual.preview, *baseline.preview));
     const auto original = mask_fiber_commands(baseline.output.path);
     const auto changed = mask_fiber_commands(actual.output.path);
+    INFO("baseline="<<baseline.output.path<<" actual="<<actual.output.path);
     REQUIRE(same_resin_only_fiber_commands(changed, original));
+    auto wrong_speed=changed;
+    bool changed_speed=false;
+    for(auto& path:wrong_speed) {
+        for(auto& command:path.commands) if(std::get<0>(command)==";FIBER_START" && std::get<3>(command)) {
+            std::get<1>(command)+=1;changed_speed=true;break;
+        }
+        if(changed_speed)break;
+    }
+    REQUIRE(changed_speed);
+    CHECK_FALSE(same_resin_only_fiber_commands(wrong_speed,original));
     auto translated = *actual.preview;
     for (auto& segment : translated.segments) if (depositing_fiber(segment)) {
         segment.start_mm.x += .01; segment.end_mm.x += .01;

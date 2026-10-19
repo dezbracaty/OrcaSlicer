@@ -33,7 +33,7 @@ void FiberMachineMotionLimits::validate_move(const Vec3d& from, const Vec3d& to)
 
 double PreparedFiberPath::total_depositing_length_mm() const
 {
-    double result = 0.0;
+    double result = entry.lowers() ? entry.end_station_mm : 0.0;
     for (const FiberMotionSpan& span : spans)
         if (span.deposits_fiber())
             result += unscale<double>(span.geometry.length());
@@ -51,6 +51,45 @@ double PreparedFiberPath::passive_tail_length_mm() const
 
 
 namespace {
+void validate_origin(const FiberExecutionPiece& origin,const FiberFragmentId& id)
+{
+    const auto require=[](bool ok,const char* message){if(!ok)throw std::invalid_argument(message);};
+    require(origin.source.parent.domain==id.parent.domain,"Fiber source belongs to another domain");
+    require(origin.display_purpose==FiberPathPurpose::Contour || origin.display_purpose==FiberPathPurpose::Infill,
+            "Fiber source has an invalid display purpose");
+    require(std::isfinite(origin.execution_begin_mm) && std::isfinite(origin.execution_end_mm) &&
+            origin.execution_begin_mm>=0 && origin.execution_end_mm>origin.execution_begin_mm,
+            "Fiber source has an invalid execution range");
+    if(origin.kind==FiberExecutionPieceKind::RetainedSource) {
+        require(std::isfinite(origin.source_begin_mm) && std::isfinite(origin.source_end_mm) &&
+                origin.source_begin_mm>=0 && origin.source_end_mm>origin.source_begin_mm,
+                "Fiber source has an invalid positive source range");
+        if(origin.source_station_knots) {
+            const auto& chart=*origin.source_station_knots;
+            require(chart.size()>=2 && chart.front().first<=origin.execution_begin_mm &&
+                    chart.back().first>=origin.execution_end_mm && chart.front().second<=origin.source_begin_mm &&
+                    chart.back().second>=origin.source_end_mm,"Fiber source exceeds its frozen chart");
+            for(size_t i=0;i<chart.size();++i)
+                require(std::isfinite(chart[i].first) && std::isfinite(chart[i].second) && chart[i].first>=0 && chart[i].second>=0 &&
+                        (!i || (chart[i].first>chart[i-1].first && chart[i].second>chart[i-1].second)),
+                        "Fiber source chart is not strictly ordered");
+            const auto at=[&](double station) {
+                if(station==chart.front().first)return chart.front().second;
+                if(station==chart.back().first)return chart.back().second;
+                const auto next=std::upper_bound(chart.begin(),chart.end(),station,[](double value,const auto& knot){return value<knot.first;});
+                const auto& prev=*(next-1);
+                return std::clamp(prev.second+(station-prev.first)/(next->first-prev.first)*(next->second-prev.second),chart.front().second,chart.back().second);
+            };
+            require(at(origin.execution_begin_mm)==origin.source_begin_mm && at(origin.execution_end_mm)==origin.source_end_mm,
+                    "Fiber source endpoints differ from its frozen chart");
+        }
+    } else {
+        require(origin.kind==FiberExecutionPieceKind::Transition && !origin.source_station_knots &&
+                origin.other_source.parent.domain==id.parent.domain && !(origin.other_source==origin.source),
+                "Invalid fiber transition source");
+    }
+}
+
 std::vector<FiberProcessAction> planned_actions(const PreparedFiberPath& path)
 {
     std::vector<FiberProcessAction> result;
@@ -60,16 +99,22 @@ std::vector<FiberProcessAction> planned_actions(const PreparedFiberPath& path)
     if (path.start_procedure.z_hop_height_mm > 0) add(FiberActionType::ZHop);
     if (path.start_procedure.prefeed_length_mm > 0) add(FiberActionType::Prefeed);
     size_t i = 0;
-    if (i < path.spans.size() && path.spans[i].kind == FiberMotionKind::PrefedLanding)
-        add(FiberActionType::LandingSpan, i++);
-    else if (path.start_procedure.z_hop_height_mm > 0)
-        add(FiberActionType::LowerToLayer);
-    if (path.start_procedure.adhesion_dwell_ms > 0) add(FiberActionType::AdhesionDwell);
-    add(FiberActionType::Start, i);
+    if (path.entry.lowers()) {
+        add(path.entry.end_station_mm>0 ? FiberActionType::LandingSpan : FiberActionType::LowerToLayer);
+        add(FiberActionType::AdhesionDwell);
+        add(FiberActionType::Start, i);
+    } else {
+        add(FiberActionType::Start, i);
+        if (i<path.spans.size() && path.spans[i].kind==FiberMotionKind::PoweredEntry)
+            add(FiberActionType::MotionSpan,i++);
+        // Keep even a zero-length first source edge and G4 P0 in old order.
+        add(FiberActionType::AdhesionDwell);
+    }
     const size_t first_powered = i;
     while (i < path.spans.size() && path.spans[i].actively_feeds_fiber())
         add(FiberActionType::MotionSpan, i++);
-    if (i == first_powered) throw std::invalid_argument("Fiber plan needs active deposition before cut");
+    if (i == first_powered && (i==0 || path.spans[i-1].kind!=FiberMotionKind::PoweredEntry))
+        throw std::invalid_argument("Fiber plan needs active deposition before cut");
     add(FiberActionType::Cut, i);
     while (i < path.spans.size() && path.spans[i].kind == FiberMotionKind::PassiveDepositingAfterCut)
         add(FiberActionType::MotionSpan, i++);
@@ -91,6 +136,19 @@ void PreparedFiberPath::validate() const
         if (!condition) throw std::invalid_argument(message);
     };
     require(!spans.empty(), "Fiber plan has no spans");
+    require(std::isfinite(entry.end_station_mm) && entry.end_station_mm>=0, "Invalid entry station");
+    require(entry.source.start.z()==0 && entry.source.end.z()==0 && entry.contact.z()==0, "Invalid entry LayerXY");
+    require(entry.lowers()==(start_procedure.z_hop_height_mm>0), "Entry mode differs from Z-hop");
+    const Vec3d source_delta=(entry.source.end-entry.source.start).cast<double>();
+    const Vec3d contact_delta=(entry.contact-entry.source.start).cast<double>();
+    const double first_length=unscale<double>(source_delta.norm());
+    require(entry.end_station_mm<=first_length+0.000002, "Entry exceeds its first source edge");
+    if (entry.end_station_mm>0) {
+        const Vec3d expected=source_delta*(entry.end_station_mm/first_length);
+        require(unscale<double>((contact_delta-expected).norm())<=0.000002, "Entry is not on its first source edge");
+    } else require(entry.contact==entry.source.start,"Zero entry must retain its source start");
+    require(spans.front().geometry.points.front()==(entry.lowers()?entry.contact:entry.source.start),
+            "Entry does not join the motion spans");
     if (finish_strategy == FiberFinishStrategy::None)
         require(std::none_of(spans.begin(), spans.end(), [](const auto& span) {
             return span.kind == FiberMotionKind::NonDepositingFinish;
@@ -121,6 +179,15 @@ void PreparedFiberPath::validate() const
                     "Fiber command edge is below coordinate resolution");
         }
     }
+    double entry_station=0.0;
+    for (const auto& piece:entry.pieces) {
+        validate_origin(piece,id);
+        require(piece.execution_begin_mm==entry_station && piece.execution_end_mm>entry_station,
+            "Entry provenance has a discontinuous source range");
+        entry_station=piece.execution_end_mm;
+    }
+    require((entry.pieces.empty() && command_pieces.empty()) ||
+            entry_station==(entry.lowers()?entry.end_station_mm:0.0), "Entry provenance is incomplete");
     if (!command_pieces.empty()) {
         // Display cutoff can label a Contour process source as Infill. The
         // validator checks the frozen source labels; here only their internal
@@ -133,7 +200,7 @@ void PreparedFiberPath::validate() const
                         "Fiber source has inconsistent display labels");
             }
         size_t cursor=0;
-        double command_station=0.0, planning_station=0.0;
+        double command_station=0.0, planning_station=entry.lowers()?entry.end_station_mm:0.0;
         bool finishing=false;
         const FiberExecutionPiece* previous=nullptr;
         for (size_t span_index=0;span_index<spans.size();++span_index) {
@@ -155,38 +222,8 @@ void PreparedFiberPath::validate() const
                         origin.execution_begin_mm==planning_station &&
                         origin.execution_end_mm>origin.execution_begin_mm,
                         "Fiber command provenance has a discontinuous planning range");
-                require(origin.source.parent.domain==id.parent.domain,
-                        "Fiber command source belongs to another domain");
-                require(origin.display_purpose==FiberPathPurpose::Contour || origin.display_purpose==FiberPathPurpose::Infill,
-                        "Fiber command provenance has an invalid display purpose");
+                validate_origin(origin,id);
                 if (origin.kind==FiberExecutionPieceKind::RetainedSource) {
-                    require(std::isfinite(origin.source_begin_mm) && std::isfinite(origin.source_end_mm) &&
-                            origin.source_begin_mm>=0 && origin.source_end_mm>origin.source_begin_mm,
-                            "Fiber command provenance has an invalid positive source range");
-                    if (origin.source_station_knots) {
-                        const auto& chart=*origin.source_station_knots;
-                        require(chart.size()>=2 && chart.front().first<=origin.execution_begin_mm &&
-                                chart.back().first>=origin.execution_end_mm &&
-                                chart.front().second<=origin.source_begin_mm && chart.back().second>=origin.source_end_mm,
-                                "Fiber command source range exceeds its frozen chart");
-                        for (size_t i=0;i<chart.size();++i)
-                            require(std::isfinite(chart[i].first) && std::isfinite(chart[i].second) &&
-                                    chart[i].first>=0 && chart[i].second>=0 &&
-                                    (!i || (chart[i].first>chart[i-1].first && chart[i].second>chart[i-1].second)),
-                                    "Fiber command source chart is not strictly ordered");
-                        const auto canonical_at=[&](double station) {
-                            if (station==chart.front().first) return chart.front().second;
-                            if (station==chart.back().first) return chart.back().second;
-                            const auto next=std::upper_bound(chart.begin(),chart.end(),station,
-                                [](double s,const auto& knot){return s<knot.first;});
-                            const auto& before=*(next-1);
-                            return std::clamp(before.second+(station-before.first)/(next->first-before.first)*
-                                (next->second-before.second),chart.front().second,chart.back().second);
-                        };
-                        require(canonical_at(origin.execution_begin_mm)==origin.source_begin_mm &&
-                                canonical_at(origin.execution_end_mm)==origin.source_end_mm,
-                                "Fiber command source endpoints differ from the frozen chart");
-                    }
                     if (previous && previous->kind==FiberExecutionPieceKind::RetainedSource &&
                         previous->source==origin.source)
                         require(previous->source_end_mm==origin.source_begin_mm || origin.source_begin_mm==0.0,
@@ -276,6 +313,30 @@ BoundFiberExecutionPlan bind_fiber_execution(
         bound.edge_dE.push_back(std::move(deltas));
     }
     return bound;
+}
+
+void bind_fiber_entry_motion(BoundFiberExecutionPlan& plan, const GCodeWriter& writer, const Vec2d& start_xy,
+    const Vec2d& contact_xy, double layer_z)
+{
+    if (!plan.prepared || !start_xy.allFinite() || !contact_xy.allFinite() || !std::isfinite(layer_z))
+        throw std::invalid_argument("Invalid fiber entry placement");
+    const auto& start=plan.prepared->start_procedure;
+    plan.entry_motion.from=writer.quantized_machine_position(Vec3d(start_xy.x(),start_xy.y(),layer_z+start.z_hop_height_mm));
+    plan.entry_motion.writer_target=Vec3d(contact_xy.x(),contact_xy.y(),layer_z);
+    plan.entry_motion.to=writer.quantized_machine_position(plan.entry_motion.writer_target);
+    plan.entry_motion.speed_mm_s=start.landing_speed_mm_s;
+    plan.entry_motion.bound=true;
+}
+
+std::string emit_fiber_landing(GCodeWriter& writer, const BoundFiberExecutionPlan& plan)
+{
+    if (!plan.prepared || !plan.prepared->entry.lowers() || !plan.entry_motion.bound)
+        throw std::invalid_argument("Unbound fiber landing motion");
+    // Keep the legacy single G1 XYZ F command, rather than a separate G1 F.
+    writer.set_speed(plan.entry_motion.speed_mm_s*60.0);
+    return ";FIBER_LANDING_BEGIN\n" +
+        writer.travel_to_bound_xyz(plan.entry_motion.writer_target,plan.entry_motion.to) +
+        ";FIBER_LANDING_END\n";
 }
 
 } // namespace Slic3r

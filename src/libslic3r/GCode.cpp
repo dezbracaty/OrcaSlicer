@@ -2074,16 +2074,14 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
             check_limit(acceleration, limits.machine_max_acceleration_x, "X acceleration limit");
             check_limit(acceleration, limits.machine_max_acceleration_y, "Y acceleration limit");
             check_limit(bound.prefeed_F / 60.0, limits.machine_max_speed_e, "E feedrate limit");
+            // Instance/belt placement is unavailable here. Entry axis speeds
+            // are checked on the final machine-bound motion at export.
             for (const auto& span : bound.prepared->spans) {
-                const double landing_length = span.kind == FiberMotionKind::PrefedLanding ?
-                    unscale<double>(span.geometry.length()) : 0.0;
-                const double z_per_xy = landing_length > 0 ? bound.prepared->start_procedure.z_hop_height_mm / landing_length : 0.0;
                 for (size_t edge = 0; edge < span.edges.size(); ++edge) {
                     const Vec3d delta = (span.geometry.points[edge+1] - span.geometry.points[edge]).cast<double>();
-                    const double xy_speed = span.edges[edge].speed_mm_s / std::sqrt(1.0 + z_per_xy*z_per_xy);
+                    const double xy_speed = span.edges[edge].speed_mm_s;
                     check_limit(xy_speed * std::abs(delta.x()) / delta.norm(), limits.machine_max_speed_x, "X feedrate limit");
                     check_limit(xy_speed * std::abs(delta.y()) / delta.norm(), limits.machine_max_speed_y, "Y feedrate limit");
-                    check_limit(xy_speed * z_per_xy, limits.machine_max_speed_z, "Z feedrate limit");
                     check_limit(xy_speed * span.edges[edge].feed_mm_per_xy_mm * bound.e_units_per_mm,
                                 limits.machine_max_speed_e, "E feedrate limit");
                 }
@@ -6379,7 +6377,7 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     const auto tool = resolve_fiber_tool(m_config, m_writer.filament()->id());
     validate_fiber_cut_event(m_config.fiber_cut_gcode.value, fiber_machine_protocol(m_config));
     path.validate_derived_view();
-    const auto bound = bind_fiber_execution(path.prepared_path(), tool.logical_filament_id,
+    auto bound = bind_fiber_execution(path.prepared_path(), tool.logical_filament_id,
         tool.logical_extruder_id, tool.physical_tool_id, tool.e_units_per_mm, m_config.fiber_cut_gcode.value);
     const PreparedFiberPath& prepared = *bound.prepared;
     const bool connected_execution = !prepared.command_pieces.empty();
@@ -6387,6 +6385,9 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     // approach, landing, tail and finish as well as powered deposition.
     const GCodeWriter::ScopedXYZPrecision xyz_precision(m_writer,
         connected_execution ? 6 : m_writer.xyz_export_digits());
+    const Vec2d entry_start=point_to_gcode(prepared.entry.source.start.to_point());
+    const Vec2d entry_contact=point_to_gcode(prepared.entry.contact.to_point());
+    bind_fiber_entry_motion(bound,m_writer,entry_start,entry_contact,m_nominal_z);
     if (m_writer.filament()->effective_retracted() != 0.0 || m_writer.filament()->restart_extra() != 0.0)
         throw Slic3r::RuntimeError("Fiber execution found nonzero generic retraction state");
     // Printable/tool areas are the conservative limits available in the machine
@@ -6433,29 +6434,39 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
                 throw Slic3r::RuntimeError("Fiber edge disappears after G-code coordinate quantization");
             validate_motion(Vec3d(a.x(), a.y(), m_nominal_z), Vec3d(b.x(), b.y(), m_nominal_z));
         }
-    const Vec2d first_xy = point_to_gcode(prepared.spans.front().geometry.points.front().to_point());
+    const Vec2d first_xy = entry_start;
     validate_motion(Vec3d(first_xy.x(), first_xy.y(), m_nominal_z),
-                    Vec3d(first_xy.x(), first_xy.y(), m_nominal_z + prepared.start_procedure.z_hop_height_mm));
+                    m_writer.oriented_position(bound.entry_motion.from));
+    if (prepared.entry.lowers()) {
+        validate_motion(m_writer.oriented_position(bound.entry_motion.from),m_writer.oriented_position(bound.entry_motion.to));
+        const Vec3d delta=bound.entry_motion.to-bound.entry_motion.from;
+        const Vec3d velocity=delta.norm()>0 ? Vec3d(delta.normalized()*bound.entry_motion.speed_mm_s) : Vec3d::Zero();
+        const ConfigOptionFloats* axis_limits[]={&m_config.machine_max_speed_x,&m_config.machine_max_speed_y,&m_config.machine_max_speed_z};
+        for(int axis=0;axis<3;++axis)
+            if(!axis_limits[axis]->values.empty() && axis_limits[axis]->values.front()>0 &&
+               std::abs(velocity[axis])>axis_limits[axis]->values.front()+EPSILON)
+                throw Slic3r::RuntimeError("Bound fiber entry exceeds machine axis feedrate limit");
+    }
 
     if (prepared.policy_boundary && !prepared.policy_boundary->forbidden_core.empty()) {
         if (!m_print || !m_layer || prepared.id.parent.domain.object_id != m_layer->object()->id().id ||
             prepared.id.parent.domain.layer_id != m_layer->id())
             throw Slic3r::RuntimeError("Fiber policy boundary does not belong to the current export layer");
-        const Vec3d plate = m_print->get_plate_origin();
-        const auto* belt = m_print->belt_coordinate_system();
         const Vec2d nozzle = EXTRUDER_CONFIG(extruder_offset);
+        const auto machine_tip = [&](const Vec3d& machine) {
+            const Vec3d oriented=m_writer.oriented_position(machine);
+            const Vec2d local=oriented.head<2>()+nozzle-m_origin;
+            return Point::new_scale(local.x(),local.y());
+        };
         const auto emitted_tip = [&](const Point3& point, double z) {
-            const Vec2d command = point_to_gcode(point.to_point());
-            Vec3d machine(command.x() - plate.x(), command.y() - plate.y(), z);
-            if (belt) machine = belt->oriented_to_machine(machine);
-            for (int axis = 0; axis < 3; ++axis)
-                machine[axis] = m_writer.quantize_xyz(machine[axis]);
-            Vec3d oriented = belt ? belt->world_to_oriented(belt->machine_to_world(machine)) : machine;
-            const Vec2d local = oriented.head<2>() + plate.head<2>() + nozzle - m_origin;
-            return Point::new_scale(local.x(), local.y());
+            const Vec2d xy=point_to_gcode(point.to_point());
+            return machine_tip(m_writer.quantized_machine_position(Vec3d(xy.x(),xy.y(),z)));
         };
         Polygons physical;
         Polyline depositing;
+        if (prepared.entry.lowers()) {
+            depositing.points={machine_tip(bound.entry_motion.from),machine_tip(bound.entry_motion.to)};
+        }
         const auto flush = [&] {
             if (depositing.points.size() >= 2)
                 append(physical, to_polygons(fiber_contour_coverage(depositing, 0.5 * prepared.width_mm)));
@@ -6468,8 +6479,7 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             const double total = span.geometry.length();
             for (std::size_t i = 0; i < span.geometry.points.size(); ++i) {
                 if (i) distance += (span.geometry.points[i] - span.geometry.points[i-1]).cast<double>().norm();
-                const double z = m_nominal_z + (span.kind == FiberMotionKind::PrefedLanding ?
-                    prepared.start_procedure.z_hop_height_mm * (1.0 - distance / total) : 0.0);
+                const double z = m_nominal_z;
                 actual.push_back(emitted_tip(span.geometry.points[i], z));
             }
             if (!depositing.points.empty() && depositing.points.back() != actual.front()) flush();
@@ -6498,6 +6508,15 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     // BEGIN metadata is authoritative even before the first powered move.
     gcode += ";TYPE:" + std::string(path.display_purpose() == FiberPathPurpose::Contour ?
         "Continuous fiber contour" : "Continuous fiber infill") + "\n";
+    {
+        const Vec2d first_end=point_to_gcode(prepared.entry.source.end.to_point());
+        std::ostringstream row;row.imbue(std::locale::classic());row<<std::setprecision(17);
+        row<<";CF_ENTRY mode="<<unsigned(prepared.entry.mode)
+           <<" start_x="<<entry_start.x()<<" start_y="<<entry_start.y()
+           <<" first_x="<<first_end.x()<<" first_y="<<first_end.y()
+           <<" source_station="<<prepared.entry.end_station_mm<<"\n";
+        gcode+=row.str();
+    }
     size_t piece_cursor=0;
     FiberPathPurpose current_display=path.display_purpose();
     const auto emit_piece=[&](size_t span_index,size_t edge) {
@@ -6545,7 +6564,7 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             // the first process segment of this tool activation.
             m_fiber_first_approach_pending = false;
             gcode += m_writer.unlift();
-            const Point first = prepared.spans.front().geometry.points.front().to_point();
+            const Point first = prepared.entry.source.start.to_point();
             if (connected_execution || !m_last_pos_defined || m_last_pos.to_point() != first || m_need_change_layer_lift_z)
                 gcode += travel_to(first, path.role(), "move to first continuous fiber point", DBL_MAX, speed_limit);
             gcode += m_writer.unlift();
@@ -6575,29 +6594,10 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             gcode += ";FIBER_PREFEED_END\n";
             break;
         }
-        case FiberActionType::LandingSpan: {
-            const auto& landing = prepared.spans[action.span_index];
-            gcode += ";FIBER_LANDING_BEGIN\n";
-            double distance = 0.0;
-            const double total = landing.geometry.length();
-            const double z = m_writer.get_position().z();
-            for (size_t i = 0; i < landing.edges.size(); ++i) {
-                emit_piece(action.span_index,i);
-                distance += (landing.geometry.points[i+1]-landing.geometry.points[i]).cast<double>().norm();
-                const Vec2d xy = point_to_gcode(landing.geometry.points[i+1].to_point());
-                gcode += m_writer.set_speed(landing.edges[i].speed_mm_s*60.0);
-                gcode += m_writer.extrude_to_xyz(Vec3d(xy.x(), xy.y(), lerp(z, m_nominal_z, distance/total)),
-                                               0.0, "continuous fiber landing", true);
-            }
-            set_last_pos(landing.geometry.points.back());
-            gcode += ";FIBER_LANDING_END\n";
-            break;
-        }
+        case FiberActionType::LandingSpan:
         case FiberActionType::LowerToLayer: {
-            const Vec3d current = m_writer.get_position();
-            gcode += m_writer.set_speed(start.landing_speed_mm_s * 60.0);
-            gcode += m_writer.extrude_to_xyz(Vec3d(current.x(), current.y(), m_nominal_z),
-                                           0.0, "fiber lowering without deposition", true);
+            gcode += emit_fiber_landing(m_writer,bound);
+            set_last_pos(prepared.entry.contact);
             break;
         }
         case FiberActionType::AdhesionDwell:

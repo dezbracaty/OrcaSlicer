@@ -41,7 +41,7 @@ struct FiberPolicyKey {
     double prefeed_extra_length_mm { 0.0 };
     double prefeed_speed_mm_s { 0.0 };
     double z_hop_height_mm { 0.0 };
-    double landing_length_mm { 0.0 };
+    double source_start_split_length_mm { 0.0 };
     double landing_speed_mm_s { 0.0 };
     int adhesion_dwell_ms { 0 };
     double start_speed_mm_s { 0.0 };
@@ -85,7 +85,7 @@ struct FiberPolicyKey {
             infill_width, infill_spacing, infill_height, infill_nozzle,
             contour_material, infill_material, minimum_path_length_mm,
             cut_to_contact_length_mm, prefeed_extra_length_mm, prefeed_speed_mm_s,
-            z_hop_height_mm, landing_length_mm, landing_speed_mm_s, adhesion_dwell_ms,
+            z_hop_height_mm, source_start_split_length_mm, landing_speed_mm_s, adhesion_dwell_ms,
             start_speed_mm_s, start_stabilization_length_mm,
             minimum_effective_length_mm, finish_extension_length_mm,
             outside_tolerance_mm2, contour_max_speed_mm_s, infill_max_speed_mm_s,
@@ -153,7 +153,7 @@ inline FiberPolicyKey fiber_policy_key(
         config.prefeed_extra_length_mm,
         config.prefeed_speed_mm_s,
         config.z_hop_height_mm,
-        config.landing_length_mm,
+        config.source_start_split_length_mm,
         config.landing_speed_mm_s,
         config.adhesion_dwell_ms,
         config.start_speed_mm_s,

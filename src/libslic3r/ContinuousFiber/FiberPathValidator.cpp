@@ -36,6 +36,19 @@ SegmentKey undirected_segment_key(const Point& a, const Point& b)
     return {b.x(), b.y(), a.x(), a.y()};
 }
 
+// Keep semantic source vertices through seam selection and clipping. Command
+// normalization belongs after Finalizer has frozen the source entry. Exact
+// duplicate entry intent is retained separately in FiberSourceEntry.
+Polyline3 fiber_source_geometry(const Polyline3& input)
+{
+    Polyline3 result;
+    for(const auto& point:input.points) {
+        if(point.z()!=0)throw std::invalid_argument("Fiber LayerXY source has nonzero Z");
+        if(result.points.empty() || result.points.back()!=point)result.points.push_back(point);
+    }
+    return result;
+}
+
 FiberRejectionReason validate_path_geometry(
     const ExtrusionPath& path, bool check_intersections = true)
 {
@@ -455,7 +468,7 @@ FiberAssignmentAudit FiberValidationResult::audit_assignments() const
                     last = &span;
                 }
                 if (!first || first->geometry.points.empty() || last->geometry.points.empty() ||
-                    first->geometry.points.front() != last->geometry.points.back())
+                    fragment->prepared->entry.source.start != last->geometry.points.back())
                     ++audit.invalid_assignment_count;
             }
         }
@@ -567,14 +580,15 @@ FiberValidationResult FiberPathValidator::validate_impl(
 
     const auto process_path = [&](const ExtrusionPath& input) {
         ExtrusionPath path(input);
+        std::optional<FiberSourceEntry> entry_source;
+        if (input.polyline.points.size()>1) entry_source=FiberSourceEntry::from(input.polyline);
         bool planar = true;
         // Source shaping may ignore other boundaries, but simplification must
         // not create a shortcut outside the physical domain and then clip it
         // as an unavailable interval during allocation.
         // Empty arc metadata permits normalization, but its non-null pointer
         // still identifies a whole generated path for containment below.
-        try { if (!source_arcs || source_arcs->empty()) path.polyline = normalize_fiber_geometry(input.polyline,
-            requires_closed_loop && planned_centerline_domain ? planned_centerline_domain : physical_centerline_domain); }
+        try { if (!source_arcs || source_arcs->empty()) path.polyline = fiber_source_geometry(input.polyline); }
         catch (const std::invalid_argument&) { planar = false; }
         const FiberCandidateId candidate_id {domain_id, purpose, job_ordinal, path_ordinal++};
         FiberRejectionReason whole_path_reason = !planar ? FiberRejectionReason::InvalidGeometry :
@@ -603,6 +617,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 rounding_issues=std::move(rounded.issues);
             } else {
                 path.polyline=std::move(*rounded.path);
+                entry_source=FiberSourceEntry::from(path.polyline);
                 reference_arcs=std::move(rounded.arcs);
                 reference_bends=std::move(rounded.bends);
             }
@@ -626,6 +641,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
                     throw std::runtime_error("Marked contour bend endpoint is absent from its path");
                 std::rotate(path.polyline.points.begin(),at,path.polyline.points.end()-1);
                 path.polyline.points.back()=path.polyline.points.front();
+                entry_source=FiberSourceEntry::from(path.polyline);
                 // All marked arcs precede this seam, so their order is retained.
                 for (auto& arc:reference_arcs) {
                     arc.begin_mm+=total-seam;arc.end_distance_mm+=total-seam;
@@ -660,7 +676,11 @@ FiberValidationResult FiberPathValidator::validate_impl(
             } else {
                 intervals=partition_candidate(path,partition_domain_for_width(path.width),mapping_valid);
                 if (!mapping_valid) whole_path_reason=FiberRejectionReason::IntervalMappingFailure;
-                else if (allocates_contour) rotate_reference(path,reference_arcs,intervals);
+                else if (allocates_contour) {
+                    const auto old_first=path.polyline.points.front();
+                    rotate_reference(path,reference_arcs,intervals);
+                    if (path.polyline.points.front()!=old_first) entry_source=FiberSourceEntry::from(path.polyline);
+                }
             }
         }
         if (whole_path_reason!=FiberRejectionReason::None)
@@ -752,7 +772,8 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 try {
                     const auto finish=make_independent_fiber_finish_route(*assignment.centerline,config,assignment.id);
                     finalized=FiberPathFinalizer::finalize(
-                        *assignment.centerline,allowed_domain,config,assignment.id,finish,arcs,final_domain);
+                        *assignment.centerline,allowed_domain,config,assignment.id,finish,arcs,final_domain,{}, {},
+                        interval.begin_scaled==0 ? entry_source : std::nullopt);
                 } catch (const std::invalid_argument& error) {
                     finalized.failure=FiberFinalizationFailure::InvalidParameter;
                     finalized.detail=error.what();
@@ -834,6 +855,8 @@ std::optional<Polygon> accepted_cycle(const FiberValidationResult& result, const
     }
     if (!accepted) return std::nullopt;
     Points points;
+    if (accepted->prepared->entry.lowers() && accepted->prepared->entry.end_station_mm>0)
+        points={accepted->prepared->entry.source.start.to_point(),accepted->prepared->entry.contact.to_point()};
     for (const auto& span : accepted->prepared->spans) if (span.deposits_fiber()) {
         const auto part = span.geometry.to_polyline().points;
         if (part.empty()) continue;
@@ -1501,6 +1524,8 @@ void normalize_open_chain(OpenChainGeometry& geometry,const ExPolygons& domain)
 Polyline3 actual_chain_deposition(const PreparedFiberPath& prepared)
 {
     Polyline3 result;
+    if (prepared.entry.lowers() && prepared.entry.end_station_mm>0)
+        result.points={prepared.entry.source.start,prepared.entry.contact};
     for (const auto& span:prepared.spans) if (span.deposits_fiber()) append_chain_geometry(result,span.geometry);
     return result;
 }
@@ -1515,6 +1540,9 @@ ExPolygons chain_contour_keepout(const FiberChainExecution& chain,const Continuo
             0.5*chain.centerline.width+config.contour_infill_clearance_mm)));
         continuous.points.clear();
     };
+    if (chain.prepared->entry.lowers() && chain.prepared->entry.end_station_mm>0 &&
+        !chain.prepared->entry.pieces.empty() && chain.prepared->entry.pieces.front().display_purpose==FiberPathPurpose::Contour)
+        continuous.points={chain.prepared->entry.source.start.to_point(),chain.prepared->entry.contact.to_point()};
     for (const auto& piece:chain.prepared->command_pieces) {
         const auto& span=chain.prepared->spans.at(piece.span_index);
         if (!span.deposits_fiber() || piece.origin.display_purpose!=FiberPathPurpose::Contour) {flush();continue;}
@@ -1647,6 +1675,17 @@ bool FiberValidationResult::audit_open_chains() const
             if (bridge_count+1!=chain.sources.size() || source_index+1!=chain.sources.size() ||
                 std::abs(station-unscale<double>(chain.centerline.length()))>interval_epsilon_mm) return false;
             for (const auto& slice:chain.sources) if (!same_ranges(expected[slice.source],observed[slice.source])) return false;
+            for (const auto& entry_piece:chain.prepared->entry.pieces) {
+                const auto planned=std::find_if(chain.pieces.begin(),chain.pieces.end(),[&](const auto& piece) {
+                    return entry_piece.execution_begin_mm>=piece.execution_begin_mm &&
+                           entry_piece.execution_end_mm<=piece.execution_end_mm;
+                });
+                if (planned==chain.pieces.end() || !(planned->source==entry_piece.source) ||
+                    entry_piece.kind!=FiberExecutionPieceKind::RetainedSource ||
+                    std::abs(entry_piece.source_begin_mm-canonical_at(*planned,entry_piece.execution_begin_mm))>interval_epsilon_mm ||
+                    std::abs(entry_piece.source_end_mm-canonical_at(*planned,entry_piece.execution_end_mm))>interval_epsilon_mm) return false;
+                command_ranges[entry_piece.source].emplace_back(entry_piece.source_begin_mm,entry_piece.source_end_mm);
+            }
             for (const auto& command:chain.prepared->command_pieces) {
                 const bool depositing=chain.prepared->spans.at(command.span_index).deposits_fiber();
                 const auto& pieces=depositing?chain.pieces:chain.finish_pieces;
@@ -1812,6 +1851,7 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
             if (draft.sources.size()==1) {
                 chain.centerline=*root.centerline;chain.prepared=root.prepared;
             } else {
+                const auto chain_entry=FiberSourceEntry::from(geometry.path);
                 normalize_open_chain(geometry,safe_domain(root.centerline->width));
                 if (!open_chain_stability(geometry.bends,config.concentric_corner_stabilization_length_mm))
                     throw std::invalid_argument("normalized_open_chain_bend_stabilization_too_short");
@@ -1831,7 +1871,7 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
                     finish.geometry=std::move(route.path);chain.finish_pieces=std::move(route.pieces);
                 }
                 const auto prepared=FiberPathFinalizer::finalize(chain.centerline,allowed_domain,config,root.id,finish,
-                    geometry.arcs,&safe_domain(chain.centerline.width),geometry.pieces,chain.finish_pieces);
+                    geometry.arcs,&safe_domain(chain.centerline.width),geometry.pieces,chain.finish_pieces,chain_entry);
                 if (!prepared.prepared) throw std::invalid_argument(std::string("open_chain_finalization_")+
                     fiber_rejection_reason_name(finalization_reason(prepared.failure))+": "+prepared.detail);
                 chain.prepared=prepared.prepared;

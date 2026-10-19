@@ -26,6 +26,8 @@ ExtrusionFiberPath::ExtrusionFiberPath(
     m_display_purpose=display_purpose.value_or(fiber_purpose());
     m_prepared->validate();
     polyline.points.clear();
+    if (m_prepared->entry.lowers() && m_prepared->entry.end_station_mm>0)
+        polyline.points={m_prepared->entry.source.start,m_prepared->entry.contact};
     for (const auto& span : m_prepared->spans)
         polyline.points.insert(polyline.points.end(), span.geometry.points.begin() + (polyline.points.empty() ? 0 : 1), span.geometry.points.end());
     mm3_per_mm = m_prepared->geometric_mm3_per_mm;
@@ -43,6 +45,12 @@ void ExtrusionFiberPath::reverse()
 void ExtrusionFiberPath::validate_derived_view() const
 {
     size_t position = 0;
+    if (m_prepared->entry.lowers() && m_prepared->entry.end_station_mm>0) {
+        if (polyline.points.size()<2 || polyline.points[0]!=m_prepared->entry.source.start ||
+            polyline.points[1]!=m_prepared->entry.contact)
+            throw Slic3r::RuntimeError("Finalized fiber entry was mutated through a legacy path API");
+        position=2;
+    }
     for (const auto& span : m_prepared->spans)
         for (size_t i = position == 0 ? 0 : 1; i < span.geometry.points.size(); ++i, ++position)
             if (position >= polyline.points.size() || polyline.points[position] != span.geometry.points[i])

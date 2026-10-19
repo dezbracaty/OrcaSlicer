@@ -307,7 +307,7 @@
   "fiber_prefeed_extra_length": "0.5",
   "fiber_prefeed_speed": "6",
   "fiber_z_hop_height": "1",
-  "fiber_landing_length": "1",
+  "fiber_start_length": "0",
   "fiber_landing_speed": "3",
   "fiber_adhesion_dwell_ms": "0",
   "fiber_start_stabilization_length": "12",

@@ -18,7 +18,7 @@
       "fiber_width_mm": 1,
       "boundary_clearance_mm": 0.2,
       "cut_to_contact_length_mm": 23,
-      "landing_length_mm": 2,
+      "source_start_split_length_mm": 0,
       "minimum_effective_length_mm": 0.5,
       "start_stabilization_length_mm": 0,
       "original_region": [
@@ -7402,7 +7402,7 @@
       "fiber_width_mm": 1,
       "boundary_clearance_mm": 0.2,
       "cut_to_contact_length_mm": 23,
-      "landing_length_mm": 2,
+      "source_start_split_length_mm": 0,
       "minimum_effective_length_mm": 0.5,
       "start_stabilization_length_mm": 0,
       "original_region": [
@@ -7721,7 +7721,7 @@
       "fiber_width_mm": 1,
       "boundary_clearance_mm": 0.2,
       "cut_to_contact_length_mm": 23,
-      "landing_length_mm": 2,
+      "source_start_split_length_mm": 0,
       "minimum_effective_length_mm": 0.5,
       "start_stabilization_length_mm": 0,
       "original_region": [
@@ -7974,7 +7974,7 @@
       "fiber_width_mm": 1,
       "boundary_clearance_mm": 0.2,
       "cut_to_contact_length_mm": 23,
-      "landing_length_mm": 2,
+      "source_start_split_length_mm": 0,
       "minimum_effective_length_mm": 0.5,
       "start_stabilization_length_mm": 0,
       "original_region": [

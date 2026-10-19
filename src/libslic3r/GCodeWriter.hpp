@@ -123,6 +123,9 @@ public:
     size_t      xyz_export_digits() const { return m_xyz_export_digits; }
     double      quantize_xyz(double value) const;
     Vec3d       get_emitted_position() const;
+    Vec3d       quantized_machine_position(const Vec3d& oriented) const;
+    Vec3d       oriented_position(const Vec3d& machine) const;
+    std::string travel_to_bound_xyz(const Vec3d& oriented, const Vec3d& machine);
     double      get_zhop() const { return m_lifted; }
 
     //BBS: set offset for gcode writer

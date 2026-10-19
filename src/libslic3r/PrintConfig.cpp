@@ -1230,8 +1230,9 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(0.0));
 
-    def = this->add("fiber_landing_length", coFloat);
-    def->label = L("Fiber landing length");
+    def = this->add("fiber_start_length", coFloat);
+    def->label = L("Fiber source segment split length");
+    def->tooltip = L("Legacy source-edge split distance. Zero disables this split. Applied after the Z-hop entry split; independent of the powered start stabilization distance.");
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;

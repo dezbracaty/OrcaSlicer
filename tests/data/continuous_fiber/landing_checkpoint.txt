@@ -1,0 +1,94 @@
+Development checkpoint: legacy-style fiber entry, 2026-10-19
+
+This checkpoint saves the current implementation for a separately reviewed
+follow-up. It is not a completed fix for curved entry and is not evidence that
+current model slicing reproduces the supplied standard G-code.
+
+Implementation saved here
+
+- Explicit source-entry and placed machine-motion data, with preflight checks.
+- Prefeed, lowering, dwell, and powered-entry ordering for H>0 and H=0.
+- Legacy-style H/S source splits and protected entry/process knots.
+- Replacement of fiber_landing_length by fiber_start_length throughout the
+  configuration, presets, API, and tests. These settings have different meanings:
+  fiber_start_length=0 disables the additional source-segment split; it does not
+  by itself mean that the whole lowering procedure has zero XY travel.
+- Corresponding entry provenance and machine-quantization handling.
+- The legacy_landing_4xiao.json fixture is explicitly reconstructed compatible
+  input for command replay. Its 45 rows do not prove real-model equivalence.
+
+Confirmed limitations that remain open
+
+1. FiberPathValidator captures entry endpoints again after contour rounding and
+   seam changes. They may be the first two tessellated arc points. The finalizer
+   and PreparedFiberPath checks constrain entry to that first source edge.
+   The resulting curved-contour entry can be only about 0.007-0.011mm in XY.
+
+2. Lowering currently emits one G1 XYZ command. Merely increasing the chosen
+   entry distance would connect endpoints by a straight chord, not follow an
+   intervening circular arc. Distance selection and trajectory execution must
+   be redesigned together before claiming path-length-based curved entry.
+
+3. Native G2/G3 fiber output was already absent from the pre-checkpoint new
+   fiber execution chain. Analytic arcs are sampled for geometry/process work;
+   executable spans and the E binder use polyline edges, and the fiber exporter
+   calls the linear writer for each edge. The generic circular writer exists,
+   but a native arc primitive is not carried through this execution model.
+
+4. Current strict standard matching still fails. Stage-contract/unit-test
+   success is not a substitute for matching real path geometry and commands.
+
+Real-slice evidence frozen before this checkpoint
+
+Models: 80x60mm rectangle, radius-35mm regular hexagon, and radius-35mm regular
+128-gon, all 4.18mm high. Each control produced 32 layers and 21 fiber paths.
+New and legacy runs used the same STL, 1mm fiber width, 2mm Z-hop, zero additional
+start split, 23mm cut-to-contact distance, and 23mm contour finishing distance.
+The new fixed-radius geometry and old corner-trim geometry are different rules;
+these tests are output comparisons, not an identical-analytic-curve benchmark.
+
+Short G1 means 0.005 <= emitted planar XY length <= 0.015mm. Counts include
+powered motion and passive tail/finish. Lowering and native arcs are separate.
+
+Case                      New short G1    Legacy short G1
+Rectangle contour                 4599                  0
+Hexagon contour                   4242                  0
+128-gon contour                   6004                  0
+Rectangle rectilinear infill     207388                  0
+
+The legacy rectangle additionally emitted 32 native G2 commands. They were not
+converted into endpoint chords for these counts. The new rectangle emitted no
+G2/G3. Its 4599 short commands are (175 powered + 44 finishing) per path x 21.
+All 21 new rectangle entries lowered over 0.011mm XY. In a single-variable
+control, disabling contour rounding in the same new engine retained 21 paths,
+reduced short G1 to zero, and made all entry XY distances 2mm. That setting was
+used for diagnosis, not adopted as a production correction.
+Both new and old rectangle infill lowered over about 2mm XY despite the large
+difference in short return-arc commands.
+
+The investigation completed 11 full slices, including new/old real 4xiao runs.
+The new SDK 4xiao run had 76 paths, while the separately frozen Oct19 App output
+had 77. Their model channel/build/context was not fully normalized; no identity
+claim or exact cause for that one-path difference is made here.
+
+Evidence is stored outside versioned source in the parent GPlatform build tree:
+build-Release/test-results/fiber-entry-phase1-20261016/
+build-Release/test-results/fiber-entry-difference-investigation/
+build-Release/test-results/fiber-small-chords-20261019/
+These contain actual G-code, traces, manifests, effective settings, commands,
+fixture generation, segment CSVs, and independent cross-check results. Preserve
+or archive those directories when moving the investigation to another machine.
+Legacy source HEAD: cca1f9cd232103af7dbe242a844f9e30d1ed0d62.
+Pre-checkpoint new source HEAD: e309af9716d7792855b8dcfb11b6cff94ada8b4c,
+with the uncommitted implementation saved by this checkpoint.
+Standard SHA256: 3e41bd307fbd595467b1fc215c79edca903c4ff64c2e225908ef2912f060ff22.
+
+Checkpoint verification on macOS arm64 passed: 176 ContinuousFiber core test
+cases, 32 fiber API test cases, and FiberEntryComparisonChecker (19 Python
+regressions). The configured core/API test targets were up to date and staged
+diff whitespace checks passed. These results retain the limitations above.
+
+Next work must define independent line/arc execution geometry and process
+lengths, then verify both command output and complete real-model results.
+Do not describe this checkpoint as native-arc support or completed landing
+equivalence, and do not merge it as that completed fix.
