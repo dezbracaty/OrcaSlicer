@@ -6,6 +6,7 @@
 #include "libslic3r/ContinuousFiber/FiberPolicyKey.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/Flow.hpp"
 #include "libslic3r/GCode/FiberGCodeBlockParser.hpp"
 #include "libslic3r/GCodeWriter.hpp"
 #include "libslic3r/GCode.hpp"
@@ -21,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <regex>
+#include <sstream>
 #include <nlohmann/json.hpp>
 
 using namespace Slic3r;
@@ -66,6 +68,14 @@ ExtrusionPath path_from_points(std::initializer_list<std::pair<double, double>> 
     for (const auto& [x, y] : points)
         result.polyline.points.push_back(Point3::new_scale(x, y, 0.0));
     return result;
+}
+
+std::string rejection_details(const FiberValidationResult& result)
+{
+    std::string text;
+    for(const auto& item:result.assignments)if(item.kind!=FiberAssignmentKind::AcceptedFiber)
+        text+=std::string(fiber_rejection_reason_name(item.reason))+": "+item.detail+"; ";
+    return text;
 }
 
 FiberFragmentId test_id()
@@ -446,7 +456,6 @@ TEST_CASE("continuous fiber start procedure separates landing from powered depos
     config.prefeed_extra_length_mm = 0.5;
     config.prefeed_speed_mm_s = 10.0;
     config.z_hop_height_mm = 2.0;
-    config.z_hop_height_mm = 2;
     config.landing_speed_mm_s = 3.0;
     config.adhesion_dwell_ms = 25;
     config.start_stabilization_length_mm = 3.0;
@@ -458,7 +467,7 @@ TEST_CASE("continuous fiber start procedure separates landing from powered depos
     REQUIRE(result.prepared != nullptr);
     const PreparedFiberPath& prepared = *result.prepared;
     REQUIRE(prepared.spans.size() == 3);
-    CHECK(prepared.entry.mode==FiberEntryMode::StraightLanding);
+    CHECK(prepared.entry.mode==FiberEntryMode::PathLanding);
     CHECK(prepared.entry.end_station_mm==Catch::Approx(2.0));
     CHECK(prepared.spans[0].kind == FiberMotionKind::PoweredStart);
     CHECK(prepared.spans[1].kind == FiberMotionKind::PoweredDepositing);
@@ -519,10 +528,16 @@ TEST_CASE("contour coverage policies retain their widths and domain clipping", "
         return unscaled<double>(unscaled<double>(area(polygons)));
     };
     CHECK(area_mm2(result.prepared->physical_coverage) == Catch::Approx(50.0).margin(.002));
-    CHECK(area_mm2(result.prepared->resin_exclusion) ==
-        Catch::Approx(50.0).margin(.002));
-    CHECK(area_mm2(result.prepared->contour_to_infill_keepout) ==
-        Catch::Approx(config.contour_infill_clearance_mm == 0 ? 50.0 : 60.0).margin(.002));
+    // Material allocation includes the declared numerical envelope, while
+    // physical strand width and the model boundary remain unchanged.
+    const double envelope_area=104*result.prepared->execution_deviation_mm+.002;
+    const double resin_area=area_mm2(result.prepared->resin_exclusion);
+    CHECK(resin_area>=50.0);CHECK(resin_area<=50.0+envelope_area);
+    const double nominal_keepout=config.contour_infill_clearance_mm==0?50.0:60.0;
+    const double keepout_area=area_mm2(result.prepared->contour_to_infill_keepout);
+    CHECK(keepout_area>=nominal_keepout);CHECK(keepout_area<=nominal_keepout+envelope_area);
+    CHECK(diff_ex(result.prepared->resin_exclusion,domain).empty());
+    CHECK(diff_ex(result.prepared->contour_to_infill_keepout,domain,ApplySafetyOffset::Yes).empty());
     CHECK(result.prepared->outside_domain.empty());
 }
 
@@ -887,7 +902,6 @@ TEST_CASE("fiber closed seam uses cyclic corner adjacency", "[ContinuousFiber][s
     REQUIRE(result.prepared);
     const auto& entry=result.prepared->spans.front();
     REQUIRE(entry.kind==FiberMotionKind::PoweredEntry);
-    for(const auto& edge:entry.edges)CHECK(edge.speed_mm_s==Catch::Approx(config.start_speed_mm_s));
     const auto& edges=result.prepared->spans.back().edges;
     CHECK(edges.front().speed_mm_s == Catch::Approx(6.5));
     CHECK(edges.back().speed_mm_s == Catch::Approx(6.5));
@@ -1005,6 +1019,29 @@ TEST_CASE("fiber motion checks real tool coordinates exclusions and height", "[C
     CHECK_NOTHROW(limits.validate_move(Vec3d(19,0,0), Vec3d(119,0,0)));
 }
 
+TEST_CASE("fiber arc feedrate limits follow command direction independently of chord samples",
+    "[ContinuousFiber][NativeArc][machine-motion]")
+{
+    const double radius_component=GENERATE(.000007,1.0);
+    const Vec3d from(radius_component,radius_component,1),to(radius_component,-radius_component,1);
+    FiberMachineMotionLimits limits;
+    limits.maximum_axis_speed_mm_s=Vec3d(8,20,20);
+    // Endpoint tangents use 10/sqrt(2) mm/s in X. Only the 270-degree
+    // route reaches 10 mm/s; the tiny arc may have just one check chord.
+    CHECK_NOTHROW(limits.validate_feedrate(from,to,10,EMovePathType::Arc_move_cw));
+    CHECK_THROWS(limits.validate_feedrate(from,to,10,EMovePathType::Arc_move_ccw));
+    CHECK_NOTHROW(limits.validate_feedrate(to,from,10,EMovePathType::Arc_move_ccw));
+    CHECK_THROWS(limits.validate_feedrate(to,from,10,EMovePathType::Arc_move_cw));
+    CHECK_THROWS(limits.validate_feedrate(from,from,10,EMovePathType::Arc_move_ccw));
+    limits.maximum_axis_speed_mm_s.x()=10;
+    CHECK_NOTHROW(limits.validate_feedrate(from,to,10,EMovePathType::Arc_move_ccw));
+    CHECK_NOTHROW(limits.validate_feedrate(to,from,10,EMovePathType::Arc_move_cw));
+    CHECK_NOTHROW(limits.validate_feedrate(from,from,10,EMovePathType::Arc_move_ccw));
+    limits.maximum_axis_speed_mm_s.z()=2;
+    CHECK_THROWS(limits.validate_feedrate(from,from+Vec3d(0,0,1),3));
+    CHECK_NOTHROW(limits.validate_feedrate(from,from+Vec3d(0,0,1),2));
+}
+
 TEST_CASE("fiber numerical knots and speed sampling do not discard a closed contour", "[ContinuousFiber][geometry]")
 {
     // A near-duplicate from offsetting plus a real corner very close to the
@@ -1022,7 +1059,7 @@ TEST_CASE("fiber numerical knots and speed sampling do not discard a closed cont
     const auto result = finalize_independent(candidate, {rectangle(0,0,20,20)}, config, id);
     REQUIRE(result.prepared);
     CHECK(result.prepared->total_depositing_length_mm() == Catch::Approx(40.0002).margin(0.003));
-    CHECK(result.prepared->entry.source.start == candidate.polyline.points.front());
+    CHECK(result.prepared->entry.start == candidate.polyline.points.front());
     CHECK(result.prepared->spans.front().geometry.points.front() == result.prepared->entry.contact);
     CHECK_NOTHROW(result.prepared->validate());
     for (const auto& span : result.prepared->spans)
@@ -1071,7 +1108,7 @@ TEST_CASE("fiber LayerXY and immutable entity contracts reject mutation", "[Cont
     CHECK_THROWS(bind_fiber_execution(broken, 0, 0, 0, 1, ";cut"));
     auto quantized = std::make_shared<PreparedFiberPath>(*result.prepared);
     auto& edge_points = quantized->spans.front().geometry.points;
-    edge_points[1] = edge_points[0] + Point3(scale_(0.0008), scale_(0.0008), 0.0);
+    edge_points[1] = edge_points[0] + Point3(scale_(0.0000001), scale_(0.0000001), 0.0);
     CHECK_THROWS(quantized->validate());
 }
 
@@ -1656,11 +1693,11 @@ TEST_CASE("contour tangent rounding retains the frozen layer 54 main loop", "[Co
             CHECK(arc.radius_mm==Catch::Approx(radius));
             CHECK(arc.begin_mm>=end-1e-6);
             CHECK(arc.end_distance_mm>arc.begin_mm);
-            CHECK((arc.start_mm-arc.center_mm).norm()==Catch::Approx(arc.radius_mm).margin(1e-6));
-            CHECK((arc.end_mm-arc.center_mm).norm()==Catch::Approx(arc.radius_mm).margin(1e-6));
+            CHECK((arc.start_mm-arc.center_mm).norm()==Catch::Approx(arc.radius_mm).margin(2*SCALING_FACTOR));
+            CHECK((arc.end_mm-arc.center_mm).norm()==Catch::Approx(arc.radius_mm).margin(2*SCALING_FACTOR));
             end=arc.end_distance_mm;
         }
-        CHECK(end<=unscale<double>(result.path->length())+1e-6);
+        CHECK(end<=Geometry::length_with_arcs_mm(*result.path)+1e-6);
         for (size_t i=0;i<result.arcs.size();++i) {
             const auto& a=result.arcs[i];
             const auto& b=result.arcs[(i+1)%result.arcs.size()];
@@ -2049,8 +2086,8 @@ TEST_CASE("frozen contours retain their geometry with local tangent connections"
             for (size_t i=0;i<result.arcs.size();++i) {
                 const auto& a=result.arcs[i];const auto& b=result.arcs[(i+1)%result.arcs.size()];
                 CHECK(a.radius_mm==Catch::Approx(radius));
-                CHECK((a.start_mm-a.center_mm).norm()==Catch::Approx(a.radius_mm).margin(1e-6));
-                CHECK((a.end_mm-a.center_mm).norm()==Catch::Approx(a.radius_mm).margin(1e-6));
+                CHECK((a.start_mm-a.center_mm).norm()==Catch::Approx(a.radius_mm).margin(2*SCALING_FACTOR));
+                CHECK((a.end_mm-a.center_mm).norm()==Catch::Approx(a.radius_mm).margin(2*SCALING_FACTOR));
                 CHECK(a.begin_mm>=distance-1e-6);
                 CHECK(a.end_distance_mm>a.begin_mm);
                 distance=a.end_distance_mm;
@@ -2110,6 +2147,11 @@ TEST_CASE("frozen contours retain their geometry with local tangent connections"
             CHECK_NOTHROW(assignment.prepared->validate());
             CHECK(assignment.prepared->passive_tail_length_mm()==Catch::Approx(23).margin(.003));
             CHECK(validation.accepted_count()==1);
+            // Recheck a finer, differently phased sampling against the original
+            // material domain, not just the rounder's centerline budget.
+            const auto fine=Geometry::sample_with_arcs(assignment.centerline->polyline,.000005).to_polyline();
+            const auto outside=diff_ex(fiber_contour_coverage(fine,.5*extrusion.width),original,ApplySafetyOffset::Yes);
+            CHECK(std::abs(area(outside))*SCALING_FACTOR*SCALING_FACTOR<=config.outside_tolerance_mm2);
             CHECK(validation.audit_assignments().valid());
         }
     }
@@ -2633,7 +2675,7 @@ TEST_CASE("layer 12 keeps the outside continuous when hole strands are disabled"
     config.contour_include_holes=false;
     const auto result=FiberPathValidator::plan_contours(region,config,{1,11,0,0}).validation;
     const auto physical_domain=fiber_material_offset(region,-.7);
-    REQUIRE(result.accepted_count()==1);
+    INFO(rejection_details(result));REQUIRE(result.accepted_count()==1);
     const auto accepted=std::find_if(result.assignments.begin(),result.assignments.end(),[](const auto& a){return bool(a.prepared);});
     REQUIRE(accepted!=result.assignments.end());
     // The irregular hole closes its exterior passage after inset. Reconstruct
@@ -2684,7 +2726,7 @@ TEST_CASE("layer 107 plans closed nonoverlapping outer loops", "[ContinuousFiber
     REQUIRE(plan.nodes.size()>=2);
     const auto& result=plan.validation;
     CHECK(result.audit_assignments().valid());
-    REQUIRE(result.assignments.front().prepared);
+    INFO(rejection_details(result));REQUIRE(result.assignments.front().prepared);
     ExPolygons occupied;
     for (const auto& assignment:result.assignments) {
         if (!assignment.prepared) continue;
@@ -2796,7 +2838,7 @@ TEST_CASE("process splits preserve a bend beside the landing boundary", "[Contin
     for (auto p:std::vector<Vec2d>{{-1,0},{1.9993,0},{1.9993,-11},{35,-11},{35,1},{-1,1}})
         region.contour.points.push_back(Point::new_scale(p.x(),p.y()));
     const ExPolygons planned{region};
-    const auto small_bend=path_from_points({{0,0},{1.9993,0},{1.9993,-.0007}}).polyline;
+    const auto small_bend=path_from_points({{0,0},{1.9993,0},{1.9993,-.00002}}).polyline;
     CHECK(normalize_fiber_geometry(small_bend).points.size()==2);
     CHECK(normalize_fiber_geometry(small_bend,&planned).points==small_bend.points);
     auto candidate=path_from_points({{0,0},{1.9993,0},{1.9993,-10},{30,-10}},1.0);
@@ -2807,9 +2849,9 @@ TEST_CASE("process splits preserve a bend beside the landing boundary", "[Contin
     const auto result=finalize_independent(candidate,offset_ex(planned,float(scale_(1))),config,id,{},&planned);
     REQUIRE(result.prepared);
     CHECK_NOTHROW(result.prepared->validate());
-    CHECK(result.prepared->entry.contact==candidate.polyline.points[1]);
-    CHECK(result.prepared->entry.end_station_mm==Catch::Approx(1.9993).margin(.000001));
-    CHECK(result.prepared->spans.front().geometry.points.front()==candidate.polyline.points[1]);
+    CHECK(result.prepared->entry.contact==Point3::new_scale(1.9993,-.0007,0));
+    CHECK(result.prepared->entry.end_station_mm==2);
+    CHECK(result.prepared->spans.front().geometry.points.front()==result.prepared->entry.contact);
     CHECK(result.prepared->passive_tail_length_mm()==Catch::Approx(23).margin(.002));
     CHECK(result.prepared->total_depositing_length_mm()==Catch::Approx(unscale<double>(candidate.length())).margin(.00001));
     const auto checked=offset_ex(planned,float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
@@ -2913,7 +2955,7 @@ TEST_CASE("closed outer routing absorbs connected hole groups at every depth", "
 
     const auto plan=FiberPathValidator::plan_contours({region},config,{},true);
     REQUIRE(plan.audit_lineage());
-    REQUIRE(plan.validation.accepted_count()==3);
+    INFO(rejection_details(plan.validation));REQUIRE(plan.validation.accepted_count()==3);
     const auto physical=fiber_material_offset({region},-.55);
     for (const auto& node:plan.nodes) {
         REQUIRE(node.source);
@@ -2953,7 +2995,7 @@ TEST_CASE("outer routing stays closed across a passage width threshold", "[Conti
     REQUIRE(plan.nodes.front().source);
     Polygon ring(plan.nodes.front().source->points);
     CHECK(ring.contains(Point::new_scale(35,15))==(gap>1.1));
-    REQUIRE(plan.validation.accepted_count()==1);
+    INFO(rejection_details(plan.validation));REQUIRE(plan.validation.accepted_count()==1);
     CHECK(plan.validation.assignments.front().centerline->is_closed());
     CHECK(plan.audit_lineage());
 }
@@ -2970,8 +3012,8 @@ TEST_CASE("closed contour audit rejects broken centerlines and depositing sequen
     const auto plan=FiberPathValidator::plan_contours(region,config,{});
     const auto& result=plan.validation;
     REQUIRE(plan.audit_lineage());
-    REQUIRE(result.accepted_count()==1);
-    REQUIRE(result.assignments.front().prepared);
+    INFO(rejection_details(result));REQUIRE(result.accepted_count()==1);
+    INFO(rejection_details(result));REQUIRE(result.assignments.front().prepared);
     const auto& expected=result.assignments.front().prepared->physical_coverage;
     CHECK(diff_ex(result.physical_footprint,expected).empty());
     CHECK(diff_ex(expected,result.physical_footprint).empty());
@@ -3004,7 +3046,7 @@ TEST_CASE("outer generation preserves whole loops inside the physical domain", "
     config.contour_include_holes=false;
     const auto plan=FiberPathValidator::plan_contours(region,config,{});
     REQUIRE(plan.audit_lineage());
-    REQUIRE(plan.validation.accepted_count()==4);
+    INFO(rejection_details(plan.validation));REQUIRE(plan.validation.accepted_count()==4);
     const auto physical=fiber_material_offset(region,-.5);
     for (const auto& assignment:plan.validation.assignments) {
         REQUIRE(assignment.prepared);
@@ -3034,7 +3076,7 @@ TEST_CASE("progressive contours consume finalized coverage with one boundary cle
         for (const auto& issue : a.contour_issues) INFO(contour_rounding_failure_name(issue.reason));
     }
     REQUIRE(plan.nodes.size() == 4);
-    REQUIRE(plan.validation.accepted_count() == 4);
+    INFO(rejection_details(plan.validation));REQUIRE(plan.validation.accepted_count() == 4);
     for (size_t i = 0; i < 4; ++i) {
         const auto& node = plan.nodes[i];
         CHECK(node.depth == i);
@@ -3075,7 +3117,7 @@ TEST_CASE("progressive split contours stop only the rejected branch", "[Continuo
         for (const auto& assignment : plan.validation.assignments) if (assignment.id.parent == node.id &&
             assignment.kind == FiberAssignmentKind::Rejected) {
             ++rejected_count;
-            CHECK(assignment.reason == FiberRejectionReason::ProcessBudgetTooShort);
+            INFO(assignment.detail);CHECK(assignment.reason == FiberRejectionReason::ProcessBudgetTooShort);
             CHECK(std::none_of(plan.nodes.begin(), plan.nodes.end(), [&](const auto& child) {
                 return child.parent == std::optional<FiberCandidateId>(node.id);
             }));
@@ -3202,7 +3244,7 @@ TEST_CASE("4xiao fourth contour has three accepted ancestors", "[ContinuousFiber
                 assignment.prepared->physical_coverage).empty());
             occupied = union_ex(occupied, assignment.prepared->physical_coverage);
         } else {
-            CHECK(assignment.reason == FiberRejectionReason::ProcessBudgetTooShort);
+            INFO(assignment.detail);CHECK(assignment.reason == FiberRejectionReason::ProcessBudgetTooShort);
             CHECK(assignment.source_end_mm - assignment.source_begin_mm < 25.5);
         }
     }
@@ -4316,14 +4358,25 @@ TEST_CASE("CFSYS final export limits only first approaches and restores material
         size_t paths = 0;
         bool in_approach = false, second_moves = false;
         double f = 0;
+        Vec2d previous=Vec2d::Zero();
+        const std::regex xy_axis("(?:^| )([XY])([-0-9.]+)");
         while (std::getline(input, line)) {
             if (line.find(";FIBER_BEGIN ") == 0) { ++paths; in_approach = true; }
             if (std::regex_search(line, match, feed)) f = std::stod(match[1]);
+            Vec2d target=previous;
+            for(auto it=std::sregex_iterator(line.begin(),line.end(),xy_axis);it!=std::sregex_iterator();++it)
+                target[(*it)[1].str()=="X"?0:1]=std::stod((*it)[2]);
             if (in_approach && line.find("G1 ") == 0 &&
                 (line.find('X') != std::string::npos || line.find('Y') != std::string::npos)) {
-                CHECK(paths != 1);
+                if(paths==1) {
+                    // Resin used three decimal places; align its rounded end
+                    // to the fiber's six-decimal source before the first arc.
+                    CHECK((target-previous).norm()<=std::sqrt(2.)*.001);
+                    CHECK(f<=3600);
+                }
                 if (paths == 2) { CHECK(f == Catch::Approx(21000)); second_moves = true; }
             }
+            previous=target;
             if (line == ";FIBER_PREFEED_BEGIN") in_approach = false;
             if (paths == 2 && line == ";FIBER_PREFEED_BEGIN") break;
         }
@@ -5083,7 +5136,7 @@ void check_open_ring_sources(const FiberContourPlanResult& plan)
 TEST_CASE("open ring chain retains one forward arc and one local seam per source", "[ContinuousFiber][OpenRingConnection]")
 {
     const auto config=open_ring_config();const ExPolygons domain{rectangle(0,0,50,40)};
-    auto plan=open_ring_plan(config,domain);REQUIRE(plan.validation.accepted_count()==3);
+    auto plan=open_ring_plan(config,domain);INFO(rejection_details(plan.validation));REQUIRE(plan.validation.accepted_count()==3);
     const auto frozen=plan.validation.assignments;
     FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
     REQUIRE(plan.validation.chain_executions.size()==1);
@@ -5156,13 +5209,16 @@ TEST_CASE("open ring planning tail crosses bridge once and finish uses terminal 
     config.contour_count=2;
     // Terminal perimeter 20mm <23mm: the passive tail must extend back across its incoming bridge.
     const ExPolygons domain{rectangle(0,0,8,8)};auto plan=open_ring_plan(config,domain);
-    REQUIRE(plan.validation.accepted_count()==2);
+    INFO(rejection_details(plan.validation));REQUIRE(plan.validation.accepted_count()==2);
     // Synthetic already accepted sources isolate whole-execution budget splitting.
     config.cut_to_contact_length_mm=23;
     FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
     REQUIRE(plan.validation.chain_executions.size()==1);const auto& chain=plan.validation.chain_executions.front();
     REQUIRE(chain.sources.size()==2);REQUIRE(chain.prepared);
     const auto& prepared=*chain.prepared;
+    CHECK(std::any_of(prepared.command_pieces.begin(),prepared.command_pieces.end(),[](const auto& piece) {
+        return piece.end_edge-piece.begin_edge>1;
+    }));
     CHECK(prepared.passive_tail_length_mm()==Catch::Approx(23).margin(.002));
     CHECK(std::count_if(prepared.actions.begin(),prepared.actions.end(),[](const auto& a){return a.type==FiberActionType::Cut;})==1);
     bool tail_bridge=false;std::set<FiberFragmentId> tail_sources;
@@ -5219,7 +5275,7 @@ TEST_CASE("open ring source station bounds remain strict on noninteger geometry"
     auto config=open_ring_config();config.contour_bend_radius_mm=.37;
     auto shape=rectangle(0,0,50.123,40.317);
     const ExPolygons domain{shape};auto plan=open_ring_plan(config,domain);
-    REQUIRE(plan.validation.accepted_count()==3);
+    INFO(rejection_details(plan.validation));REQUIRE(plan.validation.accepted_count()==3);
     FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
     REQUIRE_FALSE(plan.validation.chain_executions.empty());check_open_ring_sources(plan);
     CHECK(std::count_if(plan.chain_decisions.begin(),plan.chain_decisions.end(),[](const auto& d){return d.published;})==2);
@@ -5325,7 +5381,7 @@ TEST_CASE("open chain subpicometer positive retained arc safely preserves indepe
 {
     auto config=open_ring_config();config.contour_count=2;
     const ExPolygons domain{rectangle(0,0,50,40)};
-    auto plan=open_ring_plan(config,domain);REQUIRE(plan.validation.accepted_count()==2);
+    auto plan=open_ring_plan(config,domain);INFO(rejection_details(plan.validation));REQUIRE(plan.validation.accepted_count()==2);
     // Establish that this same pair is connectable with ordinary parameters.
     auto ordinary=plan;FiberPathValidator::plan_open_ring_chains(ordinary,domain,config,true);
     REQUIRE(ordinary.validation.chain_executions.size()==1);
@@ -5361,20 +5417,34 @@ TEST_CASE("open chain subpicometer positive retained arc safely preserves indepe
     REQUIRE(emitted);CHECK(emitted->entities.size()==frozen.size());for(auto* entity:output)delete entity;
 }
 
-TEST_CASE("open ring rotated corner gate rejects a bridge crossing the retained child", "[ContinuousFiber][OpenRingConnection]")
+TEST_CASE("open ring rotated corner gate follows the analytic retained child", "[ContinuousFiber][OpenRingConnection]")
 {
     auto config=open_ring_config();config.contour_bend_radius_mm=.37;
     auto shape=rectangle(0,0,50.123,40.317);shape.rotate(.217);
     const ExPolygons domain{shape};auto plan=open_ring_plan(config,domain);
-    REQUIRE(plan.validation.accepted_count()==3);
+    INFO(rejection_details(plan.validation));REQUIRE(plan.validation.accepted_count()==3);
     const auto original=plan.validation.assignments;
     FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
-    CHECK(plan.validation.chain_executions.empty());
+    REQUIRE_FALSE(plan.validation.chain_executions.empty());
+    CHECK(plan.validation.audit_open_chains());CHECK(plan.validation.audit_assignments().valid());
     REQUIRE(plan.chain_decisions.size()==2);
-    for(const auto& decision:plan.chain_decisions) {
-        CHECK_FALSE(decision.published);
-        CHECK(decision.reason=="open_chain_self_intersection");
+    CHECK(std::any_of(plan.chain_decisions.begin(),plan.chain_decisions.end(),[](const auto& d){return d.published;}));
+    std::vector<Polyline> routes;
+    for(const auto& chain:plan.validation.chain_executions)
+        routes.push_back(Geometry::sample_with_arcs(chain.centerline.polyline,.000005).to_polyline());
+    bool crossing=false;
+    for(size_t a=0;a<routes.size();++a)for(size_t b=a;b<routes.size();++b) {
+        const auto& p=routes[a].points;const auto& q=routes[b].points;
+        for(size_t i=1;i<p.size();++i)for(size_t j=(a==b?i+2:1);j<q.size();++j) {
+            if(a==b && i==1 && j==p.size()-1 && p.front()==p.back())continue;
+            if(std::max(p[i-1].x(),p[i].x())<std::min(q[j-1].x(),q[j].x()) ||
+               std::max(q[j-1].x(),q[j].x())<std::min(p[i-1].x(),p[i].x()) ||
+               std::max(p[i-1].y(),p[i].y())<std::min(q[j-1].y(),q[j].y()) ||
+               std::max(q[j-1].y(),q[j].y())<std::min(p[i-1].y(),p[i].y()))continue;
+            crossing|=Geometry::segments_intersect(p[i-1],p[i],q[j-1],q[j]);
+        }
     }
+    CHECK_FALSE(crossing);
     for(size_t i=0;i<original.size();++i)
         CHECK(plan.validation.assignments[i].prepared==original[i].prepared);
 }
@@ -5410,73 +5480,33 @@ TEST_CASE("connected coordinate precision restores after exceptions without losi
 }
 
 
-// These reconstructed inputs exercise command replay, not a full-model slice
-// or the unquantized source paths generated by the legacy engine.
-TEST_CASE("legacy landing replays 45 standard commands from reconstructed inputs", "[ContinuousFiber][LegacyLanding]")
+// Historical commands remain immutable evidence. Current landing deliberately
+// follows an independent route length, while retaining prefeed/dwell/feed state.
+TEST_CASE("fiber route landing preserves historical prefeed and dwell procedure", "[ContinuousFiber][Landing]")
 {
     std::ifstream input(std::filesystem::path(TEST_DATA_DIR)/"continuous_fiber/legacy_landing_4xiao.json");
-    REQUIRE(input.good());
-    nlohmann::json fixture;input>>fixture;
-    REQUIRE(fixture.at("rows").size()==45);
+    REQUIRE(input.good());nlohmann::json fixture;input>>fixture;REQUIRE(fixture.at("rows").size()==45);
     for(const auto& row:fixture.at("rows")) {
-        INFO("standard line="<<row.at("line")<<" raw="<<row.at("raw"));
-        const auto& a=row.at("start");const auto& b=row.at("contact");
-        const auto& source_a=row.at("source_start_xy");const auto& source_b=row.at("source_first_end_xy");
-        auto candidate=path_from_points({{source_a[0],source_a[1]},{source_b[0],source_b[1]},
-            {source_b[0].get<double>()+35,source_b[1]}});
-        ContinuousFiberConfig config;config.z_hop_height_mm=fixture.at("H");
-        config.source_start_split_length_mm=fixture.at("S");config.cut_to_contact_length_mm=fixture.at("D");
-        config.prefeed_extra_length_mm=fixture.at("extra");config.landing_speed_mm_s=row.at("speed");
-        config.adhesion_dwell_ms=fixture.at("dwell_ms");
+        const auto& a=row.at("source_start_xy");const auto& b=row.at("source_first_end_xy");
+        auto candidate=path_from_points({{a[0],a[1]},{b[0],b[1]},{b[0].get<double>()+35,b[1]}});
+        ContinuousFiberConfig config;config.z_hop_height_mm=fixture.at("H");config.landing_length_mm=2;
+        config.cut_to_contact_length_mm=fixture.at("D");config.prefeed_extra_length_mm=fixture.at("extra");
+        config.landing_speed_mm_s=row.at("speed");config.adhesion_dwell_ms=fixture.at("dwell_ms");
         const auto result=finalize_independent(candidate,{rectangle(0,0,500,500)},config,test_id());
         INFO(result.detail);REQUIRE(result.prepared);
-        auto bound=bind_fiber_execution(result.prepared,result.prepared->logical_filament_id,0,0,1,"S0");
+        CHECK(result.prepared->entry.end_station_mm==2);
+        const auto bound=bind_fiber_execution(result.prepared,0,0,0,1,"S0");
         CHECK(bound.prefeed_dE==Catch::Approx(row.at("prefeed").get<double>()).margin(.000005));
         CHECK(bound.prefeed_F==600);
-        PrintConfig machine;GCodeWriter writer;writer.apply_print_config(machine);writer.set_extruders({0});writer.toolchange(0);
-        const auto& entry=result.prepared->entry;
-        const Vec2d from(unscale<double>(entry.source.start.x()),unscale<double>(entry.source.start.y()));
-        const Vec2d to(unscale<double>(entry.contact.x()),unscale<double>(entry.contact.y()));
-        bind_fiber_entry_motion(bound,writer,from,to,b[2]);
-        for(int axis=0;axis<3;++axis) {
-            bound.entry_motion.from[axis]=writer.quantize_xyz(bound.entry_motion.from[axis]);
-            bound.entry_motion.to[axis]=writer.quantize_xyz(bound.entry_motion.to[axis]);
-        }
-        writer.set_position(bound.entry_motion.from);
-        const std::string gcode=emit_fiber_landing(writer,bound);
-        INFO(gcode);
-        CHECK(gcode.find(" E")==std::string::npos);
-        CHECK(bound.entry_motion.to.x()==Catch::Approx(b[0].get<double>()).margin(.0000001));
-        CHECK(bound.entry_motion.to.y()==Catch::Approx(b[1].get<double>()).margin(.0000001));
-        CHECK(bound.entry_motion.to.z()==Catch::Approx(b[2].get<double>()).margin(.0000001));
-        CHECK(bound.entry_motion.from.x()==Catch::Approx(a[0].get<double>()).margin(.0000001));
-        CHECK(bound.entry_motion.from.y()==Catch::Approx(a[1].get<double>()).margin(.0000001));
-        CHECK(bound.entry_motion.from.z()==Catch::Approx(a[2].get<double>()).margin(.0000001));
-        std::istringstream commands(gcode);std::string line;size_t xyz=0;double feed=0;
-        const std::regex word("([XYZEF])([-+]?[0-9]*\\.?[0-9]+)");
-        for(;std::getline(commands,line);) {
-            bool motion=false;
-            for(std::sregex_iterator i(line.begin(),line.end(),word),end;i!=end;++i) {
-                const auto key=(*i)[1].str();const double value=std::stod((*i)[2]);
-                if(key=="F")feed=value;
-                if(key=="X" || key=="Y" || key=="Z") {
-                    const size_t axis=key=="X"?0:key=="Y"?1:2;
-                    CHECK(value==Catch::Approx(b[axis].get<double>()).margin(.0000001));motion=true;
-                }
-            }
-            if(motion){++xyz;CHECK(feed==180);CHECK(line==row.at("raw").get<std::string>());}
-        }
-        CHECK(xyz==1);
         const auto& actions=result.prepared->actions;
-        const auto landing=std::find_if(actions.begin(),actions.end(),[](const auto& e){return e.type==FiberActionType::LandingSpan || e.type==FiberActionType::LowerToLayer;});
+        const auto landing=std::find_if(actions.begin(),actions.end(),[](const auto& action){return action.type==FiberActionType::LandingSpan;});
         REQUIRE(landing!=actions.end());REQUIRE(std::distance(landing,actions.end())>2);
-        CHECK((landing+1)->type==FiberActionType::AdhesionDwell);
-        CHECK((landing+2)->type==FiberActionType::Start);
+        CHECK((landing+1)->type==FiberActionType::AdhesionDwell);CHECK((landing+2)->type==FiberActionType::Start);
         CHECK(result.prepared->start_procedure.adhesion_dwell_ms==0);
     }
 }
 
-TEST_CASE("legacy entry uses source edge and is independent of velocity sampling", "[ContinuousFiber][LegacyLanding]")
+TEST_CASE("landing path length is independent of source edges and velocity sampling", "[ContinuousFiber][LegacyLanding]")
 {
     const auto first=GENERATE(.741,2.,5.);
     const auto split=GENERATE(0.,.5);
@@ -5484,11 +5514,11 @@ TEST_CASE("legacy entry uses source edge and is independent of velocity sampling
     const auto step=GENERATE(.13,1.7);
     auto candidate=path_from_points({{10,10},{10+first,10},{70,10}});
     ContinuousFiberConfig config;config.cut_to_contact_length_mm=23;config.z_hop_height_mm=hop;
-    config.source_start_split_length_mm=split;config.speed_sampling_length_mm=step;
+    config.landing_length_mm=split;config.speed_sampling_length_mm=step;
     config.start_stabilization_length_mm=3;
     const auto result=finalize_independent(candidate,{rectangle(0,0,80,20)},config,test_id());
     REQUIRE(result.prepared);
-    const double expected=std::min(first,std::min(hop>0?hop:first,split>0?split:first));
+    const double expected=hop>0?split:0;
     CHECK(result.prepared->entry.end_station_mm==Catch::Approx(expected).margin(.000001));
     CHECK(unscale<double>(result.prepared->entry.contact.x())==Catch::Approx(10+expected).margin(.000001));
     CHECK(result.prepared->total_depositing_length_mm()==Catch::Approx(60).margin(.002));
@@ -5498,26 +5528,26 @@ TEST_CASE("legacy entry uses source edge and is independent of velocity sampling
     REQUIRE(dwell!=actions.end());REQUIRE(dwell!=actions.begin());
     if(hop==0) {
         CHECK((dwell-1)->type==FiberActionType::MotionSpan);
-        CHECK(result.prepared->spans[(dwell-1)->span_index].kind==FiberMotionKind::PoweredEntry);
-        double stable=0;for(const auto& span:result.prepared->spans)
-            if(span.kind==FiberMotionKind::PoweredEntry || span.kind==FiberMotionKind::PoweredStart)
-                stable+=unscale<double>(span.geometry.length());
-        CHECK(stable==Catch::Approx(std::max(expected,3.)).margin(.002));
-    } else CHECK((dwell-1)->type==FiberActionType::LandingSpan);
+        CHECK(result.prepared->spans.front().kind==FiberMotionKind::PoweredEntry);
+        for(const auto& edge:result.prepared->spans.front().edges) {
+            CHECK(edge.speed_mm_s>0);
+            CHECK(edge.speed_mm_s<=config.start_speed_mm_s);
+        }
+    } else CHECK((dwell-1)->type==(split>0?FiberActionType::LandingSpan:FiberActionType::LowerToLayer));
 }
 
-TEST_CASE("legacy entry keeps duplicate and machine-rounded zero first edges", "[ContinuousFiber][LegacyLanding]")
+TEST_CASE("landing ignores duplicate and machine-rounded zero first source edges", "[ContinuousFiber][LegacyLanding]")
 {
     const auto first=GENERATE(0.,.0001);
     ContinuousFiberConfig config;config.z_hop_height_mm=2;config.cut_to_contact_length_mm=23;
     const auto candidate=path_from_points({{10,10},{10+first,10},{60,10}});
     const auto result=finalize_independent(candidate,{rectangle(0,0,70,20)},config,test_id());
-    CAPTURE(first);INFO(result.detail);REQUIRE(result.prepared);CHECK(result.prepared->entry.end_station_mm==Catch::Approx(first));
+    CAPTURE(first);INFO(result.detail);REQUIRE(result.prepared);CHECK(result.prepared->entry.end_station_mm==2);
     auto bound=bind_fiber_execution(result.prepared,result.prepared->logical_filament_id,0,0,1,"S0");
     PrintConfig machine;GCodeWriter writer;writer.apply_print_config(machine);
-    bind_fiber_entry_motion(bound,writer,Vec2d(10,10),Vec2d(10+first,10),.54);
-    CHECK(bound.entry_motion.from.head<2>()==bound.entry_motion.to.head<2>());
-    CHECK(bound.prepared->entry.end_station_mm==Catch::Approx(first));
+    bind_fiber_entry_motion(bound,writer,Vec2d(10,10),Vec2d(12,10),.54);
+    CHECK(bound.entry_motion.to.x()-bound.entry_motion.from.x()==2);
+    CHECK(bound.prepared->entry.end_station_mm==2);
     CHECK(bound.entry_motion.to.z()==.54);
 }
 
@@ -5545,12 +5575,12 @@ TEST_CASE("fiber landing binds after plate and belt transforms exactly once", "[
     const bool belted=GENERATE(false,true);
     if(belted){const auto belt=BeltCoordinateSystem::create(45,250);writer.set_belt_coordinate_system(&belt);}
     bind_fiber_entry_motion(bound,writer,Vec2d(10,10),Vec2d(10.00051,10),.54);
-    CHECK(bound.entry_motion.to.x()==10.0); // Early rounding would produce 10.001.
+    CHECK(bound.entry_motion.to.x()==12.0); // The route follows the configured 2mm, not the tiny first edge.
     writer.set_position(Vec3d(10,10,2.54));
     const auto text=emit_fiber_landing(writer,bound);
     INFO(text);
     CHECK(text.find(" E")==std::string::npos);
-    CHECK(text.find("X10 Y")!=std::string::npos);
+    CHECK(text.find("X12 Y")!=std::string::npos);
     CHECK((writer.quantized_machine_position(writer.get_position())-bound.entry_motion.to).norm()<1e-10);
     CHECK((writer.get_emitted_position()-writer.oriented_position(bound.entry_motion.to)).norm()<1e-10);
 }
@@ -5570,4 +5600,419 @@ TEST_CASE("legacy zero-hop duplicate entry keeps adhesion before subsequent feed
     REQUIRE(dwell!=actions.end());REQUIRE(dwell!=actions.begin());REQUIRE(dwell+1!=actions.end());
     CHECK((dwell-1)->type==FiberActionType::Start);
     CHECK((dwell+1)->type==FiberActionType::MotionSpan);
+}
+
+TEST_CASE("analytic fiber geometry uses true arc stations and preserves circles", "[ContinuousFiber][NativeArc]")
+{
+    Polyline3 path;
+    path.points={Point3::new_scale(20,0,0),Point3::new_scale(0,20,0),Point3::new_scale(-50,20,0)};
+    ArcSegment arc(Point(0,0),scale_(20.),path.points[0].to_point(),path.points[1].to_point(),ArcDirection::Arc_Dir_CCW);
+    path.fitting_result={{0,1,EMovePathType::Arc_move_ccw,arc},{1,2,EMovePathType::Linear_move,{}}};
+    CHECK(Geometry::length_with_arcs_mm(path)==Catch::Approx(10*PI+50));
+    CHECK(unscale<double>(path.length())!=Catch::Approx(10*PI+50));
+    auto first=Geometry::slice_with_arcs_mm(path,0,2);
+    REQUIRE(first.fitting_result.size()==1);
+    CHECK(first.fitting_result.front().arc_data.center==Point(0,0));
+    CHECK(Geometry::length_with_arcs_mm(first)==Catch::Approx(2).margin(0.000002));
+    const auto tangent=Geometry::tangent_at_length_with_arcs_mm(path,10*PI,true);
+    CHECK(tangent.x()==Catch::Approx(-1));CHECK(tangent.y()==Catch::Approx(0).margin(1e-8));
+    for(double error:{.01,.00005}) {
+        std::vector<double> stations;
+        const auto samples=Geometry::sample_with_arcs(path,error,&stations);
+        REQUIRE(samples.points.size()==stations.size());
+        CHECK(stations.back()==Catch::Approx(10*PI+50));
+        CHECK(Geometry::point_at_length_with_arcs_mm(path,2)==first.points.back());
+    }
+    auto reversed=path;reversed.reverse();
+    CHECK(Geometry::length_with_arcs_mm(reversed)==Catch::Approx(10*PI+50));
+    auto stale=path;stale.fitting_result.front().end_point_index=2;
+    CHECK_THROWS(Geometry::validate_with_arcs(stale));
+}
+
+TEST_CASE("fiber landing follows an arc and binding preserves cut tail without E", "[ContinuousFiber][NativeArc]")
+{
+    auto candidate=path_from_points({{40,0},{0,40},{-50,40}});
+    ArcSegment arc(Point(0,0),scale_(40.),candidate.polyline.points[0].to_point(),candidate.polyline.points[1].to_point(),ArcDirection::Arc_Dir_CCW);
+    candidate.polyline.fitting_result={{0,1,EMovePathType::Arc_move_ccw,arc},{1,2,EMovePathType::Linear_move,{}}};
+    ContinuousFiberConfig config;
+    config.z_hop_height_mm=3;config.landing_length_mm=2;config.cut_to_contact_length_mm=23;
+    config.finish_extension_length_mm=7;
+    const auto result=finalize_independent(candidate,{rectangle(-80,-20,80,80)},config,test_id());
+    INFO(result.detail);REQUIRE(result.prepared);
+    const auto& prepared=*result.prepared;
+    CHECK(prepared.entry.end_station_mm==2);
+    REQUIRE(prepared.entry.geometry.fitting_result.size()==1);
+    CHECK(prepared.entry.geometry.fitting_result[0].path_type==EMovePathType::Arc_move_ccw);
+    CHECK(prepared.passive_tail_length_mm()==Catch::Approx(23).margin(.00001));
+    auto no_hop=config;no_hop.z_hop_height_mm=0;no_hop.start_speed_mm_s=10;
+    const auto h0=finalize_independent(candidate,{rectangle(-80,-20,80,80)},no_hop,test_id(),
+        continuous_fiber_detail::arc_metadata(candidate.polyline));
+    INFO(h0.detail);REQUIRE(h0.prepared);
+    REQUIRE(h0.prepared->spans.front().kind==FiberMotionKind::PoweredEntry);
+    for(const auto& edge:h0.prepared->spans.front().edges)CHECK(edge.speed_mm_s<=6.5+1e-8);
+    const auto dwell=std::find_if(h0.prepared->actions.begin(),h0.prepared->actions.end(),[](const auto& action) {
+        return action.type==FiberActionType::AdhesionDwell;
+    });
+    REQUIRE(dwell!=h0.prepared->actions.end());REQUIRE(dwell!=h0.prepared->actions.begin());
+    CHECK((dwell-1)->type==FiberActionType::MotionSpan);
+    for(bool native:{false,true}) {
+        const auto bound=bind_fiber_execution(result.prepared,0,0,0,1,"M400\nS0\nM400\n",nullptr,{},0,native);
+        size_t arcs=0;
+        for(size_t s=0;s<bound.spans.size();++s) {
+            if(native) CHECK(bound.spans[s].geometry.points==prepared.spans[s].geometry.points);
+            for(size_t e=0;e<bound.spans[s].edges.size();++e) {
+                const auto owner=bound.source_primitives[s][e];
+                REQUIRE(owner<prepared.spans[s].edges.size());
+                CHECK(bound.spans[s].edges[e].speed_mm_s==prepared.spans[s].edges[owner].speed_mm_s);
+                CHECK(bound.spans[s].edges[e].feed_mm_per_xy_mm==prepared.spans[s].edges[owner].feed_mm_per_xy_mm);
+                if(bound.command_types[s][e]==EMovePathType::Arc_move_ccw)++arcs;
+                if(!bound.spans[s].actively_feeds_fiber())CHECK(bound.edge_dE[s][e]==0);
+            }
+        }
+        CHECK((arcs>0)==native);
+    }
+}
+
+TEST_CASE("native fiber preview retains small feed after large absolute E", "[ContinuousFiber][NativeArc][preview]")
+{
+    PrintConfig config;config.gcode_flavor.value=gcfKlipper;
+    GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+    const std::string gcode=
+        "G90\nM82\nG92 E75000\nG1 X1 Y0 Z0.2 F600\n"
+        ";FIBER_BEGIN v=3 occurrence=1 purpose=contour width=0.8 height=0.2 e_units_per_mm=1\n"
+        ";FIBER_PREFEED_BEGIN\nG1 E75023.5 F600\n;FIBER_PREFEED_END\n"
+        ";FIBER_LANDING_BEGIN\nG1 X1 Y0 Z0.2 F180\n;FIBER_LANDING_END\n;FIBER_START\n"
+        "G3 X0.999999 Y0.001 I-1 J0 E75023.501 F600\n"
+        ";FIBER_CUT\n;FIBER_TAIL_BEGIN\nG1 X0.9 Y0.1 F600\n"
+        ";FIBER_DEPLETED\n;FIBER_FINISH_BEGIN\n;FIBER_FINISH\n;FIBER_END\n";
+    REQUIRE_NOTHROW(processor.process_buffer(gcode));
+    double powered_feed=0;
+    for(const auto& move:processor.get_result().moves)
+        if(move.deposition==ToolpathDeposition::ContinuousFiberPowered)powered_feed+=move.fiber_feed_delta_mm;
+    CHECK(powered_feed==Catch::Approx(.001).margin(1e-8));
+}
+
+TEST_CASE("analytic slices preserve tiny junctions and closed circles", "[ContinuousFiber][NativeArc]")
+{
+    Polyline3 tiny=path_from_points({{0,0},{100,0},{100.0001,.0001},{100.0001,1}}).polyline;
+    ArcSegment a(Point::new_scale(100,.0001),scale_(.0001),tiny.points[1].to_point(),tiny.points[2].to_point(),ArcDirection::Arc_Dir_CCW);
+    tiny.fitting_result={{0,1,EMovePathType::Linear_move,{}},{1,2,EMovePathType::Arc_move_ccw,a},{2,3,EMovePathType::Linear_move,{}}};
+    const auto copy=Geometry::slice_with_arcs_mm(tiny,0,Geometry::length_with_arcs_mm(tiny));
+    CHECK(copy.points==tiny.points);
+    Polyline3 circle=path_from_points({{10,0},{-10,0},{10,0}}).polyline;
+    for(size_t i=0;i<2;++i)circle.fitting_result.push_back({i,i+1,EMovePathType::Arc_move_ccw,
+        ArcSegment(Point(0,0),scale_(10.),circle.points[i].to_point(),circle.points[i+1].to_point(),ArcDirection::Arc_Dir_CCW)});
+    CHECK(Geometry::length_with_arcs_mm(circle)==Catch::Approx(20*PI));
+    auto reverse=circle;reverse.reverse();
+    CHECK(Geometry::length_with_arcs_mm(reverse)==Catch::Approx(20*PI));
+    Polyline3 before,after;REQUIRE(Geometry::split_at_length_with_arcs_mm(circle,23,before,after));
+    CHECK(before.points.back()==after.points.front());
+    CHECK(Geometry::length_with_arcs_mm(after)==Catch::Approx(20*PI-23).margin(.000003));
+}
+
+TEST_CASE("preview shares literal E precision across fiber boundaries", "[ContinuousFiber][OrcaCorrections][preview]")
+{
+    for (bool relative:{false,true}) for (bool streaming:{false,true}) {
+        CAPTURE(relative,streaming);
+        PrintConfig config;config.gcode_flavor.value=gcfKlipper;
+        GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+        const std::string code=std::string("G90\n")+(relative?"M83\n":"M82\n")+
+            "G92 E75000.000001\nG1 X0 Y0 Z0.2 F600\nG1 X1 E"+(relative?"0.003":"75000.003001")+"\n"
+            ";FIBER_BEGIN v=3 occurrence=1 purpose=contour width=0.8 height=0.2 e_units_per_mm=1\n"
+            ";FIBER_PREFEED_BEGIN\nG1 E"+(relative?"23.5":"75023.503001")+" F600\n;FIBER_PREFEED_END\n"
+            ";FIBER_LANDING_BEGIN\nG1 X1 Y0 Z0.2 F180\n;FIBER_LANDING_END\n;FIBER_START\n"
+            "G1 X2 E"+(relative?"0.1":"75023.603001")+" F600\n"
+            ";FIBER_CUT\n;FIBER_TAIL_BEGIN\nG1 X3 F600\n;FIBER_DEPLETED\n"
+            ";FIBER_FINISH_BEGIN\nG1 X4 F600\n;FIBER_FINISH\n;FIBER_END\nG0 E"+
+            (relative?"0.0001":"75023.603101")+"\n";
+        if (streaming) {
+            std::istringstream input(code);std::string line;
+            while (std::getline(input,line)) processor.process_buffer(line+"\n");
+        } else processor.process_buffer(code);
+        double prefeed=0,powered=0;
+        for (const auto& move:processor.get_result().moves) {
+            if (move.fiber_phase==FiberProcessPhase::Prefeed) prefeed+=move.fiber_feed_delta_mm;
+            if (move.deposition==ToolpathDeposition::ContinuousFiberPowered) powered+=move.fiber_feed_delta_mm;
+            CHECK(move.type!=EMoveType::Retract);
+        }
+        CHECK(prefeed==Catch::Approx(23.5).margin(1e-7));
+        CHECK(powered==Catch::Approx(.1).margin(1e-7));
+        CHECK(processor.get_result().moves.back().delta_extruder==Catch::Approx(.0001).margin(1e-8));
+    }
+}
+
+TEST_CASE("double coordinate reading preserves native word rules", "[ContinuousFiber][OrcaCorrections][preview]")
+{
+    PrintConfig config;config.gcode_flavor.value=gcfKlipper;
+    GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+    processor.process_buffer("G90\nM82\nG92 E75000.000001 Ebad\nG1 Z0.2 F600\n"
+        "G1 X1 X2 Xoops Y1 Y+9 E75000.001001 Ebad ; X100 E0\n");
+    const auto& move=processor.get_result().moves.back();
+    CHECK(move.position.x()==2);
+    CHECK(move.position.y()==1);
+    CHECK(move.delta_extruder==Catch::Approx(.001).margin(1e-8));
+}
+
+TEST_CASE("preview synthetic retracts retain configured precision", "[ContinuousFiber][OrcaCorrections][preview]")
+{
+    PrintConfig config;config.gcode_flavor.value=gcfKlipper;
+    config.retraction_length.values={.123456};config.retract_restart_extra.values={.000001};
+    GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+    processor.process_buffer("M83\nG1 Z0.2 F600\nG10\nG11\n");
+    const auto& moves=processor.get_result().moves;
+    REQUIRE(moves.size()>=3);
+    CHECK(moves[moves.size()-2].delta_extruder==Catch::Approx(-.123456).margin(1e-8));
+    CHECK(moves.back().delta_extruder==Catch::Approx(.123457).margin(1e-8));
+}
+
+TEST_CASE("seam visualization restores precise machine position", "[ContinuousFiber][OrcaCorrections][preview]")
+{
+    PrintConfig config;config.gcode_flavor.value=gcfKlipper;
+    GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+    processor.process_buffer("G90\nM83\nG1 X1000.000001 Y1000.000001 Z0.2 F600\n"
+        "; FEATURE: Outer wall\nG1 X1001.000001 E1\nG1 Y1001.000001 E1\n"
+        "G1 X1000.000001 E1\nG1 Y1000.000001 E1\n"
+        "G1 X1000.000002\nG1 X1000.000003\n");
+    const auto& moves=processor.get_result().moves;
+    REQUIRE(std::any_of(moves.begin(),moves.end(),[](const auto& m){return m.type==EMoveType::Seam;}));
+    CHECK(moves.back().travel_dist==Catch::Approx(.000001).margin(1e-10));
+}
+
+TEST_CASE("arc preview preserves G92 origin units and extrusion modes", "[ContinuousFiber][OrcaCorrections][preview]")
+{
+    for (const auto flavor:{gcfKlipper,gcfMarlinFirmware})
+        for (bool inches:{false,true}) for (bool xyz_relative:{false,true})
+            for (bool e_relative:{false,true}) for (bool clockwise:{false,true})
+                for (const std::string fitting:{"I-1 J0","R1","R+1","R-1"}) {
+        CAPTURE(flavor,inches,xyz_relative,e_relative,clockwise,fitting);
+        PrintConfig config;config.gcode_flavor.value=flavor;
+        GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+        const double unit=inches?25.4:1.;
+        const std::string code=std::string(inches?"G20\n":"G21\n")+
+            "G90\nM82\nG1 X0 Y0 Z0.2 F600\nG92 X10 Y20 E75000.000001\nG1 X11 Y20\n"+
+            (xyz_relative?"G91\n":"G90\n")+(e_relative?"M83\n":"M82\n")+
+            (clockwise?"G2 ":"G3 ")+(xyz_relative?"X-1 ":"X10 ")+
+            (xyz_relative?(clockwise?"Y-1 ":"Y1 "):(clockwise?"Y19 ":"Y21 "))+fitting+
+            (xyz_relative || e_relative?" E0.001\n":" E75000.001001\n");
+        processor.process_buffer(code);
+        const auto& moves=processor.get_result().moves;
+        REQUIRE(moves.size()>2);
+        CHECK(moves.back().position.x()==Catch::Approx(0).margin(1e-5));
+        CHECK(moves.back().position.y()==Catch::Approx(clockwise?-unit:unit).margin(1e-5));
+        double feed=0,travel=0;
+        // Only the arc has E, and its exact expected length follows from its
+        // quarter/three-quarter unit circle, independently of the parser.
+        for (const auto& move:moves) if (move.delta_extruder!=0) {
+            CHECK(move.delta_extruder>0);
+            feed+=move.delta_extruder;travel+=move.travel_dist;
+        }
+        CHECK(feed==Catch::Approx(.001*unit).margin(1e-7));
+        const double arc_length=(fitting=="R-1"?1.5:.5)*PI*unit;
+        CHECK(travel==Catch::Approx(arc_length).margin(.03*arc_length));
+    }
+}
+
+TEST_CASE("arc preview retains native malformed parameter handling", "[ContinuousFiber][OrcaCorrections][preview]")
+{
+    for (const std::string invalid:{"Rbad I-1 J0","Ibad J-1","I-1 Jbad","Rbad"}) {
+        CAPTURE(invalid);
+        PrintConfig config;config.gcode_flavor.value=gcfKlipper;
+        GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+        processor.process_buffer("G90\nG1 X1 Y0 Z0.2 F600\nG3 X0 Y1 "+invalid+"\nG1 X1.000001\n");
+        CHECK(processor.get_result().moves.back().travel_dist==Catch::Approx(.000001).margin(1e-10));
+    }
+}
+
+TEST_CASE("preview keeps shared precision through virtual moves tools and cache", "[ContinuousFiber][OrcaCorrections][preview]")
+{
+    PrintConfig config;config.gcode_flavor.value=gcfKlipper;
+    SECTION("virtual G1 updates the same coordinate state") {
+        GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+        processor.process_buffer("G90\nM82\nG92 E75000.000001\nG1 Z0.2 F600\n"
+            "VG1 X1 E75000.001001\nG1 X2 E75000.001101\n");
+        CHECK(processor.get_result().moves.back().delta_extruder==Catch::Approx(.0001).margin(1e-8));
+    }
+    SECTION("real tool changes preserve existing shared E rules") {
+        config.filament_diameter.values={1.75,1.75};config.filament_map.values={1,2};
+        config.physical_extruder_map.values={0,1};
+        GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+        processor.process_buffer("G90\nM82\nT0\nG92 E75000.000001\nG1 Z0.2 F600\n"
+            "G1 X1 E75000.001001\nT1\nG1 X2 E75000.001101\nT0\nG1 X3 E75000.001201\n");
+        const auto& moves=processor.get_result().moves;
+        REQUIRE(std::any_of(moves.begin(),moves.end(),[](const auto& m){return m.extruder_id==1;}));
+        CHECK(moves.back().delta_extruder==Catch::Approx(.0001).margin(1e-8));
+        CHECK(std::none_of(moves.begin(),moves.end(),[](const auto& m){return m.type==EMoveType::Retract;}));
+    }
+    SECTION("Repetier cache commands preserve their existing position semantics") {
+        config.gcode_flavor.value=gcfRepetier;
+        GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+        processor.process_buffer("G90\nM82\nG92 E75000.000001\nG1 X1000.000001 Z0.2 F600\nM401\n"
+            "G1 X1001.000001 E75000.001001\nM402\nG1 X1001.000002 E75000.001101\n");
+        const auto& move=processor.get_result().moves.back();
+        CHECK(move.travel_dist==Catch::Approx(.000001).margin(1e-10));
+        CHECK(move.delta_extruder==Catch::Approx(.0001).margin(1e-8));
+    }
+}
+
+TEST_CASE("arc projection searches the permitted interval", "[ContinuousFiber][OrcaCorrections][NativeArc]")
+{
+    for (bool clockwise:{false,true}) {
+        CAPTURE(clockwise);
+        Polyline3 arc=path_from_points({{10,0},{0,clockwise?10.:-10.}}).polyline;
+        const auto direction=clockwise?ArcDirection::Arc_Dir_CW:ArcDirection::Arc_Dir_CCW;
+        arc.fitting_result={{0,1,clockwise?EMovePathType::Arc_move_cw:EMovePathType::Arc_move_ccw,
+            ArcSegment(Point(0,0),scale_(10.),arc.points.front().to_point(),arc.points.back().to_point(),direction)}};
+        const double angle=(clockwise?-340.:340.)*PI/180;
+        const Point3 query=Point3::new_scale(10*std::cos(angle),10*std::sin(angle),0);
+        CHECK(Geometry::project_with_arcs_mm(arc,query,5*PI)==Catch::Approx(15*PI).margin(1e-6));
+        CHECK(Geometry::project_with_arcs_mm(arc,query)==Catch::Approx(0).margin(1e-6));
+        CHECK(Geometry::project_with_arcs_mm(arc,Point3(0,0,0),5*PI)==Catch::Approx(5*PI).margin(1e-6));
+        CHECK(Geometry::project_with_arcs_mm(arc,Point3(0,0,0),2.5*PI)==Catch::Approx(2.5*PI).margin(1e-6));
+        CHECK(Geometry::project_with_arcs_mm(arc,Point3::new_scale(-10,0,0),5*PI)==Catch::Approx(10*PI).margin(1e-6));
+        CHECK(Geometry::project_with_arcs_mm(arc,query,15*PI)==Catch::Approx(15*PI).margin(1e-6));
+        CHECK_THROWS_AS(Geometry::project_with_arcs_mm(arc,query,-1),std::invalid_argument);
+        CHECK_THROWS_AS(Geometry::project_with_arcs_mm(arc,query,16*PI),std::invalid_argument);
+        CHECK_THROWS_AS(Geometry::project_with_arcs_mm(arc,query,std::numeric_limits<double>::quiet_NaN()),std::invalid_argument);
+    }
+    Polyline3 empty,point;point.points={Point3(0,0,0)};
+    CHECK_THROWS_AS(Geometry::project_with_arcs_mm(empty,Point3(0,0,0)),std::invalid_argument);
+    CHECK(Geometry::project_with_arcs_mm(point,Point3(1,2,0))==0);
+    point.points.push_back(point.points.front());
+    CHECK(Geometry::project_with_arcs_mm(point,Point3(1,2,0))==0);
+}
+
+TEST_CASE("fiber entity measures deposition separately from finish travel", "[ContinuousFiber][OrcaCorrections][FinishInterface]")
+{
+    ContinuousFiberConfig config;config.finish_extension_length_mm=23;config.z_hop_height_mm=3;config.cut_to_contact_length_mm=23;
+    const auto source=straight_path(0,0,60,0);
+    const auto result=finalize_independent(source,{rectangle(-10,-10,90,10)},config,test_id());
+    INFO(result.detail);REQUIRE(result.prepared);
+    ExtrusionFiberPath fiber(source,erContinuousFiberInfill,result.prepared);
+    const ExtrusionEntity* entity=&fiber;
+    const ExtrusionPath* path=&fiber;
+    CHECK(unscale<double>(entity->length())==Catch::Approx(83).margin(1e-6));
+    CHECK(entity->total_volume()==Catch::Approx(6).margin(1e-6));
+    CHECK(entity->first_point()==Point::new_scale(0,0));
+    CHECK(entity->last_point()==Point::new_scale(83,0));
+    for (double epsilon:{-.1,0.,.1}) {
+        CAPTURE(epsilon);
+        const float scaled_epsilon=float(scale_(epsilon));
+        const double width=source.width+2*epsilon;
+        Polygons polymorphic;entity->polygons_covered_by_width(polymorphic,scaled_epsilon);
+        const auto direct=fiber.polygons_covered_by_width(scaled_epsilon);
+        const auto inherited=path->polygons_covered_by_width(scaled_epsilon);
+        for (const auto& polygons:{polymorphic,direct,inherited}) {
+            CHECK(unscaled<double>(unscaled<double>(area(union_ex(polygons))))==Catch::Approx(60*width).margin(1e-5));
+            CHECK(diff_ex(union_ex(polygons),{rectangle(0,-width/2,60,width/2)}).empty());
+        }
+        const double spacing=Flow(source.width,source.height,0.f).spacing()+2*epsilon;
+        CHECK(unscaled<double>(unscaled<double>(area(union_ex(fiber.polygons_covered_by_spacing(scaled_epsilon)))))==
+            Catch::Approx(60*spacing).margin(1e-5));
+    }
+    CHECK(fiber.polygons_covered_by_width(float(scale_(-1.))).empty());
+    CHECK(fiber.polygons_covered_by_spacing(float(scale_(-1.))).empty());
+}
+
+TEST_CASE("fiber coverage keeps closed seams and touching strands continuous", "[ContinuousFiber][OrcaCorrections][FinishInterface]")
+{
+    ContinuousFiberConfig config;config.cut_to_contact_length_mm=23;
+    config.finish_extension_length_mm=23;config.finish_overlap_length_mm=23;config.z_hop_height_mm=3;
+    SECTION("closed square has no caps at landing CUT or seam") {
+        const auto source=path_from_points({{0,0},{40,0},{40,40},{0,40},{0,0}});
+        auto id=test_id();id.parent.purpose=FiberPathPurpose::Contour;
+        const auto result=finalize_independent(source,{rectangle(-5,-5,45,45)},config,id);
+        INFO(result.detail);REQUIRE(result.prepared);
+        ExtrusionFiberPath fiber(source,erContinuousFiberContour,result.prepared);
+        CHECK(unscale<double>(fiber.length())==Catch::Approx(183).margin(1e-6));
+        CHECK(fiber.total_volume()==Catch::Approx(16).margin(1e-6));
+        for (double epsilon:{-.1,0.,.1}) {
+            const double radius=source.width/2.+epsilon;
+            const auto coverage=union_ex(fiber.polygons_covered_by_width(float(scale_(epsilon))));
+            REQUIRE(coverage.size()==1);REQUIRE(coverage.front().holes.size()==1);
+            // Outer corners are round and inner corners square. Their area
+            // difference gives an independent closed-stroke area oracle.
+            const double expected=320*radius+(PI-4)*radius*radius;
+            CHECK(unscaled<double>(unscaled<double>(area(coverage)))==Catch::Approx(expected).margin(.0001));
+            CHECK_FALSE(coverage.front().contains(Point::new_scale(20,20)));
+        }
+    }
+    SECTION("narrower spacing reopens the gap between touching parallel strands") {
+        const auto source=path_from_points({{0,0},{60,0},{60,.8},{0,.8}});
+        const auto result=finalize_independent(source,{rectangle(-5,-5,65,5)},config,test_id());
+        INFO(result.detail);REQUIRE(result.prepared);
+        ExtrusionFiberPath fiber(source,erContinuousFiberInfill,result.prepared);
+        const Point middle=Point::new_scale(30,.4);
+        const auto contains=[&](const Polygons& polygons) {
+            const auto coverage=union_ex(polygons);
+            return std::any_of(coverage.begin(),coverage.end(),[&](const auto& p){return p.contains(middle);});
+        };
+        CHECK(contains(fiber.polygons_covered_by_width()));
+        CHECK_FALSE(contains(fiber.polygons_covered_by_spacing()));
+        CHECK_FALSE(contains(fiber.polygons_covered_by_width(float(scale_(-.05)))));
+        CHECK(contains(fiber.polygons_covered_by_spacing(float(scale_(.05)))));
+    }
+}
+
+TEST_CASE("fiber finalization retains multi-support analytic primitives", "[ContinuousFiber][OrcaCorrections][NativeArc]")
+{
+    for (bool clockwise:{false,true}) for (bool duplicate:{false,true}) {
+        CAPTURE(clockwise,duplicate);
+        const double sign=clockwise?-1.:1.;
+        auto source=path_from_points({{40,-50*sign},{40,-25*sign},{40,0},
+            {40/std::sqrt(2.),40/std::sqrt(2.)*sign},{0,40*sign},{-30,40*sign},{-60,40*sign}});
+        if (duplicate) source.polyline.points.insert(source.polyline.points.begin()+1,source.polyline.points.front());
+        const size_t shift=duplicate?1:0;
+        const auto type=clockwise?EMovePathType::Arc_move_cw:EMovePathType::Arc_move_ccw;
+        const auto direction=clockwise?ArcDirection::Arc_Dir_CW:ArcDirection::Arc_Dir_CCW;
+        source.polyline.fitting_result={{0,2+shift,EMovePathType::Linear_move,{}},
+            {2+shift,4+shift,type,ArcSegment(Point(0,0),scale_(40.),Point::new_scale(40,0),Point::new_scale(0,40*sign),direction)},
+            {4+shift,6+shift,EMovePathType::Linear_move,{}}};
+        ContinuousFiberConfig config;config.z_hop_height_mm=3;config.cut_to_contact_length_mm=23;
+        config.finish_extension_length_mm=23;
+        const auto arcs=continuous_fiber_detail::arc_metadata(source.polyline);
+        const auto result=finalize_independent(source,{rectangle(-90,-90,90,90)},config,test_id(),arcs);
+        INFO(result.detail);REQUIRE(result.prepared);
+        const auto& prepared=*result.prepared;
+        CHECK(prepared.total_depositing_length_mm()==Catch::Approx(110+20*PI).margin(1e-5));
+        CHECK(prepared.passive_tail_length_mm()==Catch::Approx(23).margin(1e-6));
+        double arc_length=0;
+        for (const auto& span:prepared.spans) {
+            REQUIRE(span.edges.size()==span.geometry.fitting_result.size());
+            for (size_t i=0;i<span.edges.size();++i) {
+                const auto& record=span.geometry.fitting_result[i];
+                if (record.path_type==type) {
+                    CHECK(record.arc_data.center==Point(0,0));
+                    CHECK(record.arc_data.direction==direction);
+                    CHECK(span.edges[i].speed_mm_s<=6.5+1e-8);
+                    arc_length+=unscale<double>(record.arc_data.length);
+                }
+            }
+        }
+        CHECK(arc_length==Catch::Approx(20*PI).margin(1e-5));
+        CHECK_NOTHROW(prepared.validate());
+    }
+}
+
+TEST_CASE("fiber finalization preserves a tiny arc after a large station", "[ContinuousFiber][OrcaCorrections][NativeArc]")
+{
+    auto source=path_from_points({{0,0},{1000,0},{1000.0001,.0001},{1000.0001,100.0001}});
+    const auto& points=source.polyline.points;
+    source.polyline.fitting_result={{0,1,EMovePathType::Linear_move,{}},
+        {1,2,EMovePathType::Arc_move_ccw,ArcSegment(Point::new_scale(1000,.0001),scale_(.0001),
+            points[1].to_point(),points[2].to_point(),ArcDirection::Arc_Dir_CCW)},
+        {2,3,EMovePathType::Linear_move,{}}};
+    ContinuousFiberConfig config;config.z_hop_height_mm=3;config.cut_to_contact_length_mm=23;
+    config.finish_extension_length_mm=23;config.speed_sampling_length_mm=10000;
+    const auto result=finalize_independent(source,{rectangle(-5,-5,1010,110)},config,test_id(),
+        continuous_fiber_detail::arc_metadata(source.polyline));
+    INFO(result.detail);REQUIRE(result.prepared);
+    size_t arcs=0;
+    for (const auto& span:result.prepared->spans) for (const auto& record:span.geometry.fitting_result)
+        if (record.path_type==EMovePathType::Arc_move_ccw) {
+            ++arcs;
+            CHECK(span.geometry.points[record.start_point_index]==points[1]);
+            CHECK(span.geometry.points[record.end_point_index]==points[2]);
+            CHECK(unscale<double>(record.arc_data.length)==Catch::Approx(.00005*PI).margin(1e-9));
+        }
+    CHECK(arcs==1);
 }

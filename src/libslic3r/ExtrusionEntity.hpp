@@ -333,6 +333,16 @@ public:
     bool can_reverse() const override { return false; }
     void reverse() override;
 
+    double length() const override {
+        double result=Geometry::length_with_arcs_mm(m_prepared->entry.geometry);
+        for(const auto& span:m_prepared->spans) result+=Geometry::length_with_arcs_mm(span.geometry);
+        return scale_(result);
+    }
+    double total_volume() const override;
+    using ExtrusionPath::polygons_covered_by_width;
+    using ExtrusionPath::polygons_covered_by_spacing;
+    void polygons_covered_by_width(Polygons &out, float scaled_epsilon) const override;
+    void polygons_covered_by_spacing(Polygons &out, float scaled_epsilon) const override;
     const FiberFragmentId& fragment_id() const { return m_prepared->id; }
     void simplify(double) override { throw std::logic_error("Cannot simplify finalized fiber geometry"); }
     void simplify_by_fitting_arc(double) override { throw std::logic_error("Cannot arc-fit finalized fiber geometry"); }
@@ -344,7 +354,7 @@ public:
     const std::shared_ptr<const PreparedFiberPath>& prepared_path() const { return m_prepared; }
     Point first_point() const override { return first_point3().to_point(); }
     Point last_point() const override { return last_point3().to_point(); }
-    const Point3& first_point3() const override { return m_prepared->entry.source.start; }
+    const Point3& first_point3() const override { return m_prepared->entry.start; }
     const Point3& last_point3() const override { return m_prepared->spans.back().geometry.points.back(); }
     // Detect direct writes through legacy ExtrusionPath's public derived view.
     void validate_derived_view() const;

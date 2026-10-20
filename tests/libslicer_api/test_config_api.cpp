@@ -450,7 +450,7 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     const auto cut_to_contact = config->value("fiber_cut_to_contact_length");
     const auto prefeed_extra = config->value("fiber_prefeed_extra_length");
     const auto z_hop_height = config->value("fiber_z_hop_height");
-    const auto source_split_length = config->value("fiber_start_length");
+    const auto landing_length = config->value("fiber_landing_length");
     const auto landing_speed = config->value("fiber_landing_speed");
     const auto start_speed = config->value("fiber_start_speed");
     const auto minimum_effective = config->value("fiber_minimum_effective_length");
@@ -462,7 +462,7 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     REQUIRE(cut_to_contact.has_value());
     REQUIRE(prefeed_extra.has_value());
     REQUIRE(z_hop_height.has_value());
-    REQUIRE(source_split_length.has_value());
+    REQUIRE(landing_length.has_value());
     REQUIRE(landing_speed.has_value());
     REQUIRE(start_speed.has_value());
     REQUIRE(minimum_effective.has_value());
@@ -476,8 +476,8 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     CHECK(*cut_to_contact == "23");
     CHECK(*prefeed_extra == "0.5");
     CHECK(*z_hop_height == "2");
-    CHECK(*source_split_length == "0");
-    CHECK_FALSE(config->value("fiber_landing_length").has_value());
+    CHECK(*landing_length == "2");
+    CHECK_FALSE(config->value("fiber_start_length").has_value());
     CHECK(*landing_speed == "3");
     CHECK(*start_speed == "10");
     CHECK(*minimum_effective == "0.5");
@@ -1702,7 +1702,7 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
         {"fiber_prefeed_extra_length", "0.5"},
         {"fiber_prefeed_speed", "10"},
         {"fiber_z_hop_height", "2"},
-        {"fiber_start_length", "0"},
+        {"fiber_landing_length", "0"},
         {"fiber_landing_speed", "3"},
         {"fiber_adhesion_dwell_ms", "25"},
         {"fiber_start_stabilization_length", "2"},
@@ -3278,7 +3278,7 @@ std::unique_ptr<libslicer::Library> mask_library()
         {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"},
         {"infill_combination", "0"}, {"interface_shells", "0"},
         {"fiber_minimum_path_length", "1"}, {"fiber_minimum_effective_length", "0"},
-        {"fiber_cut_to_contact_length", "2"}, {"fiber_start_length", "0"},
+        {"fiber_cut_to_contact_length", "2"}, {"fiber_landing_length", "0"},
         {"fiber_width", "0.8"},
         {"outer_reinforced_perimeters_counts", "1"},
         {"fiber_contour_bend_radius", "0"}, {"fiber_infill_bend_radius", "0"},

@@ -693,7 +693,8 @@ std::string GCodeWriter::set_speed(double F, const std::string &comment, const s
 std::string GCodeWriter::travel_to_xy(const Vec2d &point, const std::string &comment,
                                      std::optional<double> speed_limit_mm_s)
 {
-    const Vec3d previous_machine = machine_position(m_pos);
+    const Vec3d previous_machine = speed_limit_mm_s ?
+        quantized_machine_position(get_emitted_position()) : machine_position(m_pos);
     const bool position_unknown = !this->is_current_position_clear();
     m_pos(0) = point(0);
     m_pos(1) = point(1);
@@ -708,7 +709,8 @@ std::string GCodeWriter::travel_to_xy(const Vec2d &point, const std::string &com
     auto speed = m_is_first_layer
         ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value;
     speed = limited_travel_speed(speed, speed_limit_mm_s,
-        position_unknown || (machine.head<2>() - previous_machine.head<2>()).squaredNorm() > 0);
+        position_unknown || ((speed_limit_mm_s?quantized_machine_position(m_pos):machine).head<2>() -
+            previous_machine.head<2>()).squaredNorm() > 0);
     w.emit_f(speed * 60.0);
     //BBS
     w.emit_comment(GCodeWriter::full_gcode_comment, comment);
@@ -824,7 +826,9 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
     auto travel_speed =
         m_is_first_layer ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value;
     const bool has_xy_motion = !this->is_current_position_clear() ||
-        (machine_position(point).head<2>() - machine_position(m_pos).head<2>()).squaredNorm() > 0;
+        (speed_limit_mm_s ?
+            (quantized_machine_position(point).head<2>()-quantized_machine_position(get_emitted_position()).head<2>()).squaredNorm()>0 :
+            (machine_position(point).head<2>()-machine_position(m_pos).head<2>()).squaredNorm()>0);
     travel_speed = limited_travel_speed(travel_speed, speed_limit_mm_s, has_xy_motion);
 
     // Belt profiles disable Z hop. In belt mode the internal position remains in

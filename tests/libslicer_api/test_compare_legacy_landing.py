@@ -42,6 +42,22 @@ class EntryComparisonTests(unittest.TestCase):
         self.assertFalse(failures)
         self.assertEqual(checker.metadata_audit(rows)['checked'], 0)
 
+    def test_continuous_multi_segment_landing_keeps_feed_and_dwell_contract(self):
+        text = entry(extra=';CF_ENTRY contact_x=11 contact_y=10 landing_xy_length=1\n')
+        text = text.replace('G1 X11 Y10 Z.2 F180',
+                            'G1 X10.5 Y10 Z1.2 F180\nG1 X11 Y10 Z.2 F180')
+        rows, failures = self.failures(text)
+        self.assertFalse(failures)
+        self.assertEqual(len(rows[0]['landing']), 2)
+        self.assertEqual(checker.metadata_audit(rows)['checked'], 1)
+        self.assertFalse(checker.metadata_audit(rows)['failures'])
+
+    def test_route_metadata_cannot_hide_a_wrong_last_contact(self):
+        text = entry(extra=';CF_ENTRY contact_x=12 contact_y=10 landing_xy_length=1\n')
+        rows, failures = self.failures(text)
+        self.assertFalse(failures)
+        self.assertTrue(checker.metadata_audit(rows)['failures'])
+
     def test_small_extra_feed_is_never_ignored(self):
         rows, failures = self.failures(entry(extra='G1 E.1 F600\n'))
         self.assertEqual(rows[0]['extra_e'][0]['E'], .1)

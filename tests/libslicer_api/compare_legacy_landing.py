@@ -143,18 +143,21 @@ def audit(rows, contract=None):
         if len(dwell) != 1 or not same(dwell[0]['ms'], contract['dwell_ms']):
             issues.append('dwell_amount_or_count')
         if contract['hop_mm'] > 0:
-            if len(row['landing']) != 1:
-                issues.append('landing_must_be_one_XYZ_command')
+            motions = row['landing']
+            if not motions:
+                issues.append('landing_must_contain_XYZ_motion')
             else:
-                motion = row['landing'][0]
-                if motion['op'] != 'G1' or motion['has_E']:
-                    issues.append('landing_must_be_G1_without_E_word')
-                if not same(motion['F'], contract['landing_F']):
-                    issues.append('landing_feedrate')
-                if not same(motion['start'][2]-motion['end'][2], contract['hop_mm'], .001):
+                for motion in motions:
+                    if motion['op'] != 'G1' or motion['has_E']:
+                        issues.append('landing_must_be_G1_without_E_word')
+                    if not same(motion['F'], contract['landing_F']):
+                        issues.append('landing_feedrate')
+                    if motion['end'][2] > motion['start'][2]+1e-9:
+                        issues.append('landing_must_descend')
+                if not same(motions[0]['start'][2]-motions[-1]['end'][2], contract['hop_mm'], .001):
                     issues.append('landing_height')
                 if len(dwell) == 1 and powered is not None and not (
-                        prefeed and prefeed[0]['line'] < motion['line'] < dwell[0]['line'] < powered['line']):
+                        prefeed and prefeed[0]['line'] < motions[0]['line'] <= motions[-1]['line'] < dwell[0]['line'] < powered['line']):
                     issues.append('prefeed_landing_dwell_powered_order')
         else:
             if row['landing']:
@@ -173,6 +176,15 @@ def metadata_audit(rows, tolerance=.000501):
     failures, checked = [], 0
     for row in rows:
         source = row['source']
+        route = ('contact_x', 'contact_y', 'landing_xy_length')
+        if all(key in source for key in route) and row['landing']:
+            checked += 1
+            actual_end = row['landing'][-1]['end'][:2]
+            expected_end = [source['contact_x'], source['contact_y']]
+            xy_length = sum(math.dist(m['start'][:2], m['end'][:2]) for m in row['landing'])
+            if any(abs(x-y) > tolerance for x,y in zip(actual_end, expected_end)) or abs(xy_length-source['landing_xy_length']) > tolerance:
+                failures.append(dict(line=row['begin_line'], reason='metadata_route_differs_from_commands'))
+            continue
         required = ('start_x', 'start_y', 'first_x', 'first_y', 'source_station')
         if not all(key in source for key in required) or len(row['landing']) != 1:
             continue

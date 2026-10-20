@@ -4,6 +4,7 @@
 #include "ClipperUtils.hpp"
 #include "Extruder.hpp"
 #include "Flow.hpp"
+#include "ContinuousFiber/ContinuousFiberFillStrategy.hpp"
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -25,11 +26,10 @@ ExtrusionFiberPath::ExtrusionFiberPath(
         throw Slic3r::RuntimeError("Continuous fiber path requires finalized process data");
     m_display_purpose=display_purpose.value_or(fiber_purpose());
     m_prepared->validate();
-    polyline.points.clear();
-    if (m_prepared->entry.lowers() && m_prepared->entry.end_station_mm>0)
-        polyline.points={m_prepared->entry.source.start,m_prepared->entry.contact};
-    for (const auto& span : m_prepared->spans)
-        polyline.points.insert(polyline.points.end(), span.geometry.points.begin() + (polyline.points.empty() ? 0 : 1), span.geometry.points.end());
+    Polyline3 view;
+    if(m_prepared->entry.lowers()) view=m_prepared->entry.geometry;
+    for(const auto& span:m_prepared->spans) Geometry::append_with_arcs(view,span.geometry);
+    polyline=Geometry::sample_with_arcs(view,0.00005);
     mm3_per_mm = m_prepared->geometric_mm3_per_mm;
     width = m_prepared->width_mm;
     height = m_prepared->height_mm;
@@ -42,19 +42,63 @@ void ExtrusionFiberPath::reverse()
     throw Slic3r::RuntimeError("Continuous fiber paths cannot be reversed");
 }
 
+double ExtrusionFiberPath::total_volume() const
+{
+    return m_prepared->geometric_mm3_per_mm * m_prepared->total_depositing_length_mm();
+}
+
+namespace {
+// Re-sweep the deposited centerline for spacing/epsilon queries. Offsetting the
+// already-unioned physical footprint would change touching-strand topology.
+Polygons fiber_deposition_coverage(const PreparedFiberPath& prepared, double radius_mm)
+{
+    if (!(radius_mm>0)) return {};
+    Polyline depositing;
+    Polygons coverage;
+    const auto flush = [&] {
+        polygons_append(coverage,to_polygons(fiber_contour_coverage(depositing,radius_mm)));
+        depositing.points.clear();
+    };
+    const auto add = [&](const Polyline3& geometry) {
+        const auto points=Geometry::sample_with_arcs(geometry,ContourRoundingOptions{}.chord_tolerance_mm).to_polyline().points;
+        if (points.empty()) return;
+        if (!depositing.points.empty() && depositing.points.back()!=points.front()) flush();
+        depositing.points.insert(depositing.points.end(),
+            points.begin()+(depositing.points.empty()?0:1),points.end());
+    };
+    if (prepared.entry.lowers()) add(prepared.entry.geometry);
+    for (const auto& span:prepared.spans)
+        if (span.deposits_fiber()) add(span.geometry);
+    flush();
+    return to_polygons(union_ex(coverage));
+}
+}
+
+void ExtrusionFiberPath::polygons_covered_by_width(Polygons& out, float scaled_epsilon) const
+{
+    if (scaled_epsilon==0)
+        polygons_append(out,to_polygons(m_prepared->physical_coverage));
+    else
+        polygons_append(out,fiber_deposition_coverage(*m_prepared,
+            0.5*m_prepared->width_mm+unscale<double>(scaled_epsilon)));
+}
+
+void ExtrusionFiberPath::polygons_covered_by_spacing(Polygons& out, float scaled_epsilon) const
+{
+    const auto flow=Flow(m_prepared->width_mm,m_prepared->height_mm,0.f);
+    polygons_append(out,fiber_deposition_coverage(*m_prepared,
+        0.5*flow.spacing()+unscale<double>(scaled_epsilon)));
+}
+
 void ExtrusionFiberPath::validate_derived_view() const
 {
-    size_t position = 0;
-    if (m_prepared->entry.lowers() && m_prepared->entry.end_station_mm>0) {
-        if (polyline.points.size()<2 || polyline.points[0]!=m_prepared->entry.source.start ||
-            polyline.points[1]!=m_prepared->entry.contact)
-            throw Slic3r::RuntimeError("Finalized fiber entry was mutated through a legacy path API");
-        position=2;
-    }
-    for (const auto& span : m_prepared->spans)
-        for (size_t i = position == 0 ? 0 : 1; i < span.geometry.points.size(); ++i, ++position)
-            if (position >= polyline.points.size() || polyline.points[position] != span.geometry.points[i])
-                throw Slic3r::RuntimeError("Finalized fiber geometry was mutated through a legacy path API");
+    Polyline3 geometry;
+    if(m_prepared->entry.lowers()) geometry=m_prepared->entry.geometry;
+    for(const auto& span:m_prepared->spans) Geometry::append_with_arcs(geometry,span.geometry);
+    const auto expected=Geometry::sample_with_arcs(geometry,0.00005);
+    const size_t position=expected.points.size();
+    if(polyline.points!=expected.points || !polyline.fitting_result.empty())
+        throw Slic3r::RuntimeError("Finalized fiber geometry was mutated through a legacy path API");
     const auto expected_role = fiber_purpose() == FiberPathPurpose::Contour ? erContinuousFiberContour : erContinuousFiberInfill;
     if (position != polyline.points.size() || mm3_per_mm != m_prepared->geometric_mm3_per_mm ||
         width != m_prepared->width_mm || height != m_prepared->height_mm || role() != expected_role)

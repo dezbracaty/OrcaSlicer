@@ -42,7 +42,7 @@ struct ContinuousFiberConfig {
     double prefeed_extra_length_mm { 0.0 };
     double prefeed_speed_mm_s { 10.0 };
     double z_hop_height_mm { 0.0 };
-    double source_start_split_length_mm { 0.0 };
+    double landing_length_mm { 2.0 };
     double landing_speed_mm_s { 3.0 };
     int adhesion_dwell_ms { 0 };
     double start_speed_mm_s { 10.0 };

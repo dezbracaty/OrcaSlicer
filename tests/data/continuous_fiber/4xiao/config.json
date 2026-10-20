@@ -188,7 +188,7 @@
     "fiber_resin_fill_speed": "100",
     "fiber_resin_overlap": "0.05",
     "fiber_speed_sampling_length": "2",
-    "fiber_start_length": "0",
+    "fiber_landing_length": "2",
     "fiber_start_speed": "10",
     "fiber_start_stabilization_length": "0",
     "fiber_tail_max_speed": "10",

@@ -20,6 +20,12 @@ namespace {
 
 constexpr double interval_epsilon_mm = 1e-5;
 
+Polyline check_view(const Polyline3& path)
+{
+    return Geometry::sample_with_arcs(path,ContourRoundingOptions{}.chord_tolerance_mm).to_polyline();
+}
+
+
 struct SourceInterval {
     double begin_scaled { 0.0 };
     double end_scaled { 0.0 };
@@ -38,9 +44,10 @@ SegmentKey undirected_segment_key(const Point& a, const Point& b)
 
 // Keep semantic source vertices through seam selection and clipping. Command
 // normalization belongs after Finalizer has frozen the source entry. Exact
-// duplicate entry intent is retained separately in FiberSourceEntry.
+// Path entry is selected later from a complete analytic route.
 Polyline3 fiber_source_geometry(const Polyline3& input)
 {
+    if (!input.fitting_result.empty()) { Geometry::validate_with_arcs(input); return input; }
     Polyline3 result;
     for(const auto& point:input.points) {
         if(point.z()!=0)throw std::invalid_argument("Fiber LayerXY source has nonzero Z");
@@ -52,7 +59,7 @@ Polyline3 fiber_source_geometry(const Polyline3& input)
 FiberRejectionReason validate_path_geometry(
     const ExtrusionPath& path, bool check_intersections = true)
 {
-    const Polyline polyline = path.polyline.to_polyline();
+    const Polyline polyline = check_view(path.polyline);
     const Points& points = polyline.points;
     if (points.size() < 2 ||
         !std::isfinite(path.width) || path.width <= 0.0f ||
@@ -60,7 +67,7 @@ FiberRejectionReason validate_path_geometry(
         !std::isfinite(path.mm3_per_mm) || path.mm3_per_mm <= 0.0)
         return FiberRejectionReason::InvalidGeometry;
 
-    const double length_mm = unscale<double>(path.length());
+    const double length_mm = unscale<double>(scale_(Geometry::length_with_arcs_mm(path.polyline)));
     if (!std::isfinite(length_mm))
         return FiberRejectionReason::InvalidGeometry;
 
@@ -129,7 +136,7 @@ bool project_onto_source(
         const double squared_distance = (query - projection).squaredNorm();
         if (squared_distance < best_distance_squared) {
             best_distance_squared = squared_distance;
-            best_source_distance = cumulative[index] + parameter * std::sqrt(squared_length);
+            best_source_distance = cumulative[index] + parameter * (cumulative[index+1]-cumulative[index]);
         }
     }
 
@@ -140,38 +147,14 @@ bool project_onto_source(
     return true;
 }
 
-bool extract_subpath(
-    const Polyline3& source,
-    double begin_scaled,
-    double end_scaled,
-    Polyline3& output)
+bool extract_subpath(const Polyline3& source,double begin_scaled,double end_scaled,Polyline3& output)
 {
-    const double source_length = source.length();
-    begin_scaled = std::clamp(begin_scaled, 0.0, source_length);
-    end_scaled = std::clamp(end_scaled, 0.0, source_length);
-    if (end_scaled - begin_scaled <= SCALED_EPSILON)
-        return false;
-
-    Polyline3 remaining = source;
-    if (begin_scaled > SCALED_EPSILON) {
-        Polyline3 prefix;
-        Polyline3 suffix;
-        if (!source.split_at_length(begin_scaled, &prefix, &suffix))
-            return false;
-        remaining = std::move(suffix);
-    }
-
-    const double requested_length = end_scaled - begin_scaled;
-    if (requested_length + SCALED_EPSILON < remaining.length()) {
-        Polyline3 selected;
-        Polyline3 suffix;
-        if (!remaining.split_at_length(requested_length, &selected, &suffix))
-            return false;
-        output = std::move(selected);
-    } else {
-        output = std::move(remaining);
-    }
-    return output.points.size() >= 2;
+    const double total=Geometry::length_with_arcs_mm(source);
+    const double begin=std::clamp(unscale<double>(begin_scaled),0.,total);
+    const double end=std::clamp(unscale<double>(end_scaled),0.,total);
+    if(end<=begin) return false;
+    output=Geometry::slice_with_arcs_mm(source,begin,end);
+    return output.points.size()>=2;
 }
 
 std::vector<SourceInterval> partition_candidate(
@@ -180,17 +163,16 @@ std::vector<SourceInterval> partition_candidate(
     bool& mapping_valid)
 {
     mapping_valid = true;
-    const double total_length = path.length();
+    const double total_length = scale_(Geometry::length_with_arcs_mm(path.polyline));
     if (safe_centerline_domain.empty())
         return {{0.0, total_length, FiberAssignmentKind::Rejected, FiberRejectionReason::OutsideDomain}};
 
-    const Polyline source = path.polyline.to_polyline();
+    std::vector<double> analytic_stations;
+    const Polyline source = Geometry::sample_with_arcs(path.polyline,ContourRoundingOptions{}.chord_tolerance_mm,&analytic_stations).to_polyline();
     if (diff_pl(Polylines{source}, safe_centerline_domain).empty())
         return {{0.0, total_length, FiberAssignmentKind::AcceptedFiber, FiberRejectionReason::None}};
-    std::vector<double> cumulative(source.points.size(), 0.0);
-    for (size_t index = 1; index < source.points.size(); ++index)
-        cumulative[index] = cumulative[index - 1] +
-            (source.points[index] - source.points[index - 1]).cast<double>().norm();
+    std::vector<double> cumulative;
+    for (double station:analytic_stations) cumulative.push_back(scale_(station));
 
     Polylines clipped = intersection_pl(Polylines {source}, safe_centerline_domain);
     std::vector<SourceInterval> inside;
@@ -305,12 +287,12 @@ void rotate_reference(ExtrusionPath& path, std::vector<ContourArc>& arcs, std::v
 {
     if (!path.is_closed() || intervals.size()<2) return;
     const auto cut=std::find_if(intervals.begin(),intervals.end(),[](const auto& i){return i.kind==FiberAssignmentKind::Rejected;});
-    if (cut==intervals.end() || cut->end_scaled==path.length()) return;
-    const double seam=cut->end_scaled, length=path.length();
+    if (cut==intervals.end() || cut->end_scaled==scale_(Geometry::length_with_arcs_mm(path.polyline))) return;
+    const double seam=cut->end_scaled, length=scale_(Geometry::length_with_arcs_mm(path.polyline));
     Polyline3 prefix,suffix;
-    if (!path.polyline.split_at_length(seam,&prefix,&suffix))
+    if (!Geometry::split_at_length_with_arcs_mm(path.polyline,unscale<double>(seam),prefix,suffix))
         throw std::runtime_error("Cannot rotate clipped fiber reference");
-    suffix.points.insert(suffix.points.end(),std::next(prefix.points.begin()),prefix.points.end());
+    Geometry::append_with_arcs(suffix,prefix);
     path.polyline=std::move(suffix);
     auto rotated=trim_arcs(arcs,unscale<double>(seam),unscale<double>(length));
     auto head=trim_arcs(arcs,0,unscale<double>(seam));
@@ -326,7 +308,7 @@ void rotate_reference(ExtrusionPath& path, std::vector<ContourArc>& arcs, std::v
             shifted.back().end_scaled=part.end_scaled;
         else shifted.push_back(part);
     }
-    shifted.front().begin_scaled=0; shifted.back().end_scaled=path.length();
+    shifted.front().begin_scaled=0; shifted.back().end_scaled=scale_(Geometry::length_with_arcs_mm(path.polyline));
     intervals=std::move(shifted);
 }
 
@@ -468,7 +450,7 @@ FiberAssignmentAudit FiberValidationResult::audit_assignments() const
                     last = &span;
                 }
                 if (!first || first->geometry.points.empty() || last->geometry.points.empty() ||
-                    fragment->prepared->entry.source.start != last->geometry.points.back())
+                    fragment->prepared->entry.start != last->geometry.points.back())
                     ++audit.invalid_assignment_count;
             }
         }
@@ -554,7 +536,9 @@ FiberValidationResult FiberPathValidator::validate_impl(
         return found->second;
     };
 
-    // Keep half the final tolerance for integer clipping and subpath extraction.
+    // The rounded path's check chords need their sagitta allowance in addition
+    // to the half-tolerance clipping reserve. Their sum is the existing full
+    // geometry tolerance; the analytic source is never extended or gap-merged.
     std::map<double, ExPolygons> partition_domains;
     const auto partition_domain_for_width = [&](double width) -> const ExPolygons& {
         const auto& domain=centerline_domain_for_width(width);
@@ -562,7 +546,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
         auto found=partition_domains.find(width);
         if (found==partition_domains.end())
             found=partition_domains.emplace(width,offset_ex(domain,float(scale_(
-                0.5*ContourRoundingOptions{}.geometry_tolerance_mm)))).first;
+                (rounds_contours?1.0:0.5)*ContourRoundingOptions{}.geometry_tolerance_mm)))).first;
         return found->second;
     };
 
@@ -580,15 +564,23 @@ FiberValidationResult FiberPathValidator::validate_impl(
 
     const auto process_path = [&](const ExtrusionPath& input) {
         ExtrusionPath path(input);
-        std::optional<FiberSourceEntry> entry_source;
-        if (input.polyline.points.size()>1) entry_source=FiberSourceEntry::from(input.polyline);
         bool planar = true;
         // Source shaping may ignore other boundaries, but simplification must
         // not create a shortcut outside the physical domain and then clip it
         // as an unavailable interval during allocation.
         // Empty arc metadata permits normalization, but its non-null pointer
         // still identifies a whole generated path for containment below.
-        try { if (!source_arcs || source_arcs->empty()) path.polyline = fiber_source_geometry(input.polyline); }
+        try {
+            if (!source_arcs || source_arcs->empty()) path.polyline = fiber_source_geometry(input.polyline);
+            // Integer offsets can leave one-grid spurs in a linear candidate.
+            // Clean these before freezing source stations, with the existing
+            // domain-preserving normalizer. Never simplify analytic arcs.
+            if (!rounds_contours) {
+                const auto cleanup_domain=offset_ex(centerline_domain_for_width(path.width),
+                    float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
+                path.polyline = normalize_fiber_geometry(path.polyline, &cleanup_domain);
+            }
+        }
         catch (const std::invalid_argument&) { planar = false; }
         const FiberCandidateId candidate_id {domain_id, purpose, job_ordinal, path_ordinal++};
         FiberRejectionReason whole_path_reason = !planar ? FiberRejectionReason::InvalidGeometry :
@@ -617,14 +609,13 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 rounding_issues=std::move(rounded.issues);
             } else {
                 path.polyline=std::move(*rounded.path);
-                entry_source=FiberSourceEntry::from(path.polyline);
                 reference_arcs=std::move(rounded.arcs);
                 reference_bends=std::move(rounded.bends);
             }
         }
         if (whole_path_reason==FiberRejectionReason::None && requires_closed_loop &&
             bend_stabilization_length_mm>0) {
-            const auto stable=minimum_closed_loop_stable_length_mm(unscale<double>(path.length()),reference_bends);
+            const auto stable=minimum_closed_loop_stable_length_mm(unscale<double>(scale_(Geometry::length_with_arcs_mm(path.polyline))),reference_bends);
             if (stable) stability_detail="minimum_stable_path_mm="+std::to_string(*stable)+
                 "; required_mm="+std::to_string(bend_stabilization_length_mm);
             if (stable && *stable+interval_epsilon_mm<bend_stabilization_length_mm) {
@@ -634,14 +625,14 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 // The first bend then has the same stable entry as later bends.
                 // This changes the seam only; no point, radius or route is replanned.
                 const double seam=reference_bends.back().end_mm;
-                const double total=unscale<double>(path.length());
+                const double total=unscale<double>(scale_(Geometry::length_with_arcs_mm(path.polyline)));
                 const Point3 contact(reference_bends.back().exit_point,0);
                 const auto at=std::find(path.polyline.points.begin(),path.polyline.points.end()-1,contact);
                 if (at==path.polyline.points.end()-1)
                     throw std::runtime_error("Marked contour bend endpoint is absent from its path");
-                std::rotate(path.polyline.points.begin(),at,path.polyline.points.end()-1);
-                path.polyline.points.back()=path.polyline.points.front();
-                entry_source=FiberSourceEntry::from(path.polyline);
+                auto head=Geometry::slice_with_arcs_mm(path.polyline,0,seam);
+                auto tail=Geometry::slice_with_arcs_mm(path.polyline,seam,total);
+                Geometry::append_with_arcs(tail,head);path.polyline=std::move(tail);
                 // All marked arcs precede this seam, so their order is retained.
                 for (auto& arc:reference_arcs) {
                     arc.begin_mm+=total-seam;arc.end_distance_mm+=total-seam;
@@ -658,38 +649,36 @@ FiberValidationResult FiberPathValidator::validate_impl(
             if (source_arcs) {
                 // The generator already produces contained paths. Clipping an
                 // arc here would hide a generation error and break its routing.
-                if (!diff_pl(Polylines{path.polyline.to_polyline()}, *physical_centerline_domain).empty())
+                if (!diff_pl(Polylines{check_view(path.polyline)}, *physical_centerline_domain).empty())
                     throw std::runtime_error("Generated fiber infill leaves its centerline domain");
-                intervals={{0.0,path.length(),FiberAssignmentKind::AcceptedFiber,FiberRejectionReason::None}};
+                intervals={{0.0,scale_(Geometry::length_with_arcs_mm(path.polyline)),FiberAssignmentKind::AcceptedFiber,FiberRejectionReason::None}};
             } else if (requires_closed_loop) {
                 // Do not partition an exterior into printable strands. Geometry,
                 // occupancy and process validation belong to the entire loop;
                 // no coverage is committed until that single outcome succeeds.
                 if (!path.is_closed())
                     whole_path_reason=FiberRejectionReason::OpenOuterContour;
-                else if (!diff_pl(Polylines{path.polyline.to_polyline()}, partition_domain_for_width(path.width)).empty())
+                else if (!diff_pl(Polylines{check_view(path.polyline)}, partition_domain_for_width(path.width)).empty())
                     whole_path_reason=physical_centerline_domain &&
-                        diff_pl(Polylines{path.polyline.to_polyline()}, *physical_centerline_domain).empty() ?
+                        diff_pl(Polylines{check_view(path.polyline)}, *physical_centerline_domain).empty() ?
                         FiberRejectionReason::OccupiedContourRegion : FiberRejectionReason::UnavailableContourRegion;
                 else
-                    intervals={{0.0,path.length(),FiberAssignmentKind::AcceptedFiber,FiberRejectionReason::None}};
+                    intervals={{0.0,scale_(Geometry::length_with_arcs_mm(path.polyline)),FiberAssignmentKind::AcceptedFiber,FiberRejectionReason::None}};
             } else {
                 intervals=partition_candidate(path,partition_domain_for_width(path.width),mapping_valid);
                 if (!mapping_valid) whole_path_reason=FiberRejectionReason::IntervalMappingFailure;
                 else if (allocates_contour) {
-                    const auto old_first=path.polyline.points.front();
                     rotate_reference(path,reference_arcs,intervals);
-                    if (path.polyline.points.front()!=old_first) entry_source=FiberSourceEntry::from(path.polyline);
                 }
             }
         }
         if (whole_path_reason!=FiberRejectionReason::None)
-            intervals={{0.0,path.length(),FiberAssignmentKind::Rejected,whole_path_reason}};
+            intervals={{0.0,scale_(Geometry::length_with_arcs_mm(path.polyline)),FiberAssignmentKind::Rejected,whole_path_reason}};
         else if (intervals.empty())
-            intervals={{0.0,path.length(),FiberAssignmentKind::Rejected,FiberRejectionReason::OutsideDomain}};
+            intervals={{0.0,scale_(Geometry::length_with_arcs_mm(path.polyline)),FiberAssignmentKind::Rejected,FiberRejectionReason::OutsideDomain}};
         // Ownership is measured on the shaped reference curve, not falsely
         // projected back to the original polygon after rounding changed its length.
-        const double source_length_mm=unscale<double>(path.length());
+        const double source_length_mm=unscale<double>(scale_(Geometry::length_with_arcs_mm(path.polyline)));
         result.candidates.push_back({candidate_id,std::isfinite(source_length_mm)?source_length_mm:0.0,requires_closed_loop});
 
         struct PendingInterval { SourceInterval interval; size_t revision; };
@@ -715,7 +704,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 for (auto i=pieces.rbegin();i!=pieces.rend();++i) {
                     auto part=*i;
                     part.begin_scaled= i->begin_scaled==0 ? interval.begin_scaled : interval.begin_scaled+i->begin_scaled;
-                    part.end_scaled= i->end_scaled==fragment.length() ? interval.end_scaled : interval.begin_scaled+i->end_scaled;
+                    part.end_scaled= i->end_scaled==scale_(Geometry::length_with_arcs_mm(fragment.polyline)) ? interval.end_scaled : interval.begin_scaled+i->end_scaled;
                     pending.push_front({part,allocation_revision});
                 }
                 continue;
@@ -751,7 +740,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
             if (allocates_contour && assignment.reason==FiberRejectionReason::OutsideDomain) {
                 assignment.kind=FiberAssignmentKind::IntentionalVoid;
                 assignment.reason=physical_centerline_domain &&
-                    diff_pl(Polylines{assignment.centerline->polyline.to_polyline()},*physical_centerline_domain).empty() ?
+                    diff_pl(Polylines{check_view(assignment.centerline->polyline)},*physical_centerline_domain).empty() ?
                     FiberRejectionReason::OccupiedContourRegion : FiberRejectionReason::UnavailableContourRegion;
             }
             if (assignment.kind == FiberAssignmentKind::AcceptedFiber) {
@@ -772,8 +761,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 try {
                     const auto finish=make_independent_fiber_finish_route(*assignment.centerline,config,assignment.id);
                     finalized=FiberPathFinalizer::finalize(
-                        *assignment.centerline,allowed_domain,config,assignment.id,finish,arcs,final_domain,{}, {},
-                        interval.begin_scaled==0 ? entry_source : std::nullopt);
+                        *assignment.centerline,allowed_domain,config,assignment.id,finish,arcs,final_domain);
                 } catch (const std::invalid_argument& error) {
                     finalized.failure=FiberFinalizationFailure::InvalidParameter;
                     finalized.detail=error.what();
@@ -854,15 +842,11 @@ std::optional<Polygon> accepted_cycle(const FiberValidationResult& result, const
         accepted = &assignment;
     }
     if (!accepted) return std::nullopt;
-    Points points;
-    if (accepted->prepared->entry.lowers() && accepted->prepared->entry.end_station_mm>0)
-        points={accepted->prepared->entry.source.start.to_point(),accepted->prepared->entry.contact.to_point()};
-    for (const auto& span : accepted->prepared->spans) if (span.deposits_fiber()) {
-        const auto part = span.geometry.to_polyline().points;
-        if (part.empty()) continue;
-        if (!points.empty() && points.back() != part.front()) return std::nullopt;
-        points.insert(points.end(), part.begin() + (points.empty() ? 0 : 1), part.end());
-    }
+    Polyline3 geometry;
+    if(accepted->prepared->entry.lowers())geometry=accepted->prepared->entry.geometry;
+    for(const auto& span:accepted->prepared->spans)if(span.deposits_fiber())
+        Geometry::append_with_arcs(geometry,span.geometry);
+    Points points=check_view(geometry).points;
     if (points.size() < 4 || points.front() != points.back()) return std::nullopt;
     points.pop_back();
     Polygon polygon(std::move(points));
@@ -1146,6 +1130,7 @@ constexpr double gate_numeric_tie_mm=1e-9;
 struct FrozenRingView {
     const FiberFragmentAssignment* source;
     std::vector<double> stations {0};
+    Polyline3 check_view;
     Linesf segments;
     AABBTreeIndirect::Tree<2,double> index;
     double length;
@@ -1153,14 +1138,12 @@ struct FrozenRingView {
     explicit FrozenRingView(const FiberFragmentAssignment& value):source(&value),
         length(value.source_end_mm-value.source_begin_mm)
     {
-        const auto& points=value.centerline->polyline.points;
-        double scaled_station=0;
-        for (size_t i=1;i<points.size();++i) {
-            scaled_station+=(points[i]-points[i-1]).cast<double>().norm();
-            stations.push_back(unscale<double>(scaled_station));
+        check_view=Geometry::sample_with_arcs(value.centerline->polyline,
+            ContourRoundingOptions{}.chord_tolerance_mm,&stations);
+        const auto& points=check_view.points;
+        for (size_t i=1;i<points.size();++i)
             segments.emplace_back(points[i-1].head<2>().cast<double>()*SCALING_FACTOR,
                 points[i].head<2>().cast<double>()*SCALING_FACTOR);
-        }
         if (std::abs(stations.back()-length)>ContourRoundingOptions{}.geometry_tolerance_mm)
             throw std::invalid_argument("Frozen fiber source length differs from its geometry");
         stations.back()=length;
@@ -1172,30 +1155,15 @@ struct FrozenRingView {
         if (s>=length) return source->source_end_mm;
         return std::clamp(source->source_begin_mm+s,source->source_begin_mm,source->source_end_mm);
     }
-    Vec2d position(double s) const {
-        if (s<=0) return segments.front().a;
-        if (s>=length) return segments.back().b;
-        const size_t i=size_t(std::upper_bound(stations.begin(),stations.end(),s)-stations.begin()-1);
-        return segments[i].a+(s-stations[i])/(stations[i+1]-stations[i])*(segments[i].b-segments[i].a);
-    }
+    Vec2d position(double s) const {return at(s).head<2>().cast<double>()*SCALING_FACTOR;}
     Point3 at(double s) const {
-        const auto& points=source->centerline->polyline.points;
-        if (s<=0) return points.front();
-        if (s>=length) return points.back();
-        const size_t i=size_t(std::upper_bound(stations.begin(),stations.end(),s)-stations.begin()-1);
-        const double t=(s-stations[i])/(stations[i+1]-stations[i]);
-        const Vec3d p=points[i].cast<double>()+t*(points[i+1]-points[i]).cast<double>();
-        return Point3(p.x(),p.y(),0.0);
+        return Geometry::point_at_length_with_arcs_mm(source->centerline->polyline,std::clamp(s,0.,length));
     }
     Polyline3 interval(double begin,double end) const {
-        begin=std::clamp(begin,0.0,length);end=std::clamp(end,0.0,length);
-        Polyline3 line;line.points.push_back(at(begin));
-        const auto& points=source->centerline->polyline.points;
-        for (size_t i=1;i<points.size();++i) if (stations[i]>begin && stations[i]<end && points[i]!=line.points.back())
-            line.points.push_back(points[i]);
-        const auto last=at(end);if (last!=line.points.back()) line.points.push_back(last);
-        if (end<=begin || line.points.size()<2) throw std::invalid_argument("source_interval_below_coordinate_representation");
-        return line;
+        auto result=Geometry::slice_with_arcs_mm(source->centerline->polyline,
+            std::clamp(begin,0.,length),std::clamp(end,0.,length));
+        if(result.points.size()<2) throw std::invalid_argument("source_interval_below_coordinate_representation");
+        return result;
     }
 };
 
@@ -1248,8 +1216,8 @@ ChainGate nearest_ring_gate(const FrozenRingView& parent,const FrozenRingView& c
                             child.stations[j]+projection_fraction(pb,q)*lq,std::abs(cross2(t,q.a-p.a))});
                     }
                 }
-                const auto& pp=parent.source->centerline->polyline.points;
-                const auto& qp=child.source->centerline->polyline.points;
+                const auto& pp=parent.check_view.points;
+                const auto& qp=child.check_view.points;
                 if (Geometry::segments_intersect(pp[i].head<2>(),pp[i+1].head<2>(),qp[j].head<2>(),qp[j+1].head<2>())) distance=0;
                 return true;
             });
@@ -1283,7 +1251,9 @@ ChainGate nearest_ring_gate(const FrozenRingView& parent,const FrozenRingView& c
     std::pair<double,double> station{std::numeric_limits<double>::infinity(),0};
     for (const auto& contact:merged) station=std::min(station,std::make_pair(
         parent.wrap(0.5*(contact.p0+contact.p1)),child.wrap(0.5*(contact.q0+contact.q1))));
-    return {station.first,station.second,distance,parent.at(station.first),child.at(station.second)};
+    // The AABB/chord search selects candidates; publish exact points on the circles.
+    const Point3 p=parent.at(station.first),q=child.at(station.second);
+    return {station.first,station.second,unscale<double>((p-q).cast<double>().norm()),p,q};
 }
 
 ChainGate inherited_ring_gate(const FrozenRingView& parent,const FrozenRingView& child,double seam)
@@ -1303,7 +1273,9 @@ ChainGate inherited_ring_gate(const FrozenRingView& parent,const FrozenRingView&
             station=std::min(station,child.wrap(child.stations[i]+t*(child.stations[i+1]-child.stations[i])));
     }
     if (!std::isfinite(station)) throw std::invalid_argument("fixed_seam_projection_unavailable");
-    return {seam,station,distance,p,child.at(station)};
+    station=Geometry::project_with_arcs_mm(child.source->centerline->polyline,p);
+    const Point3 q=child.at(station);
+    return {seam,station,unscale<double>((p-q).cast<double>().norm()),p,q};
 }
 
 struct RingChainDraft {std::vector<size_t> sources;std::vector<double> seams;std::vector<size_t> links;};
@@ -1321,7 +1293,7 @@ void append_chain_geometry(Polyline3& into,const Polyline3& part)
 {
     if (part.points.size()<2 || (!into.points.empty() && into.points.back()!=part.points.front()))
         throw std::invalid_argument("disconnected_open_chain_piece");
-    into.points.insert(into.points.end(),part.points.begin()+(into.points.empty()?0:1),part.points.end());
+    Geometry::append_with_arcs(into,part);
 }
 
 std::vector<std::pair<double,double>> forward_source_intervals(const FrozenRingView& source,double start,double length)
@@ -1363,21 +1335,10 @@ void append_frozen_intervals(OpenChainGeometry& out,const FrozenRingView& source
         piece.source_begin_mm=source.canonical(range.first);piece.source_end_mm=source.canonical(range.second);
         piece.execution_begin_mm=begin;
         piece.display_purpose=source.source->display_purpose.value_or(source.source->id.parent.purpose);
-        std::vector<double> canonical{piece.source_begin_mm};
-        Point3 previous=geometry.points.front();
-        const auto& original=source.source->centerline->polyline.points;
-        for (size_t i=1;i<original.size();++i) if (source.stations[i]>range.first && source.stations[i]<range.second && original[i]!=previous) {
-            canonical.push_back(source.canonical(source.stations[i]));previous=original[i];
-        }
-        if (previous!=geometry.points.back()) canonical.push_back(piece.source_end_mm);
-        else canonical.back()=piece.source_end_mm;
-        if (canonical.size()!=geometry.points.size()) throw std::invalid_argument("source_chart_geometry_mismatch");
-        std::vector<std::pair<double,double>> chart;double position=begin;
-        for (size_t i=0;i<geometry.points.size();++i) {
-            if (i) position+=unscale<double>((geometry.points[i]-geometry.points[i-1]).cast<double>().norm());
-            chart.emplace_back(position,canonical[i]);
-        }
-        piece.execution_end_mm=position;
+        const double length=Geometry::length_with_arcs_mm(geometry);
+        piece.execution_end_mm=begin+length;
+        std::vector<std::pair<double,double>> chart{{begin,piece.source_begin_mm},
+            {piece.execution_end_mm,piece.source_end_mm}};
         piece.source_station_knots=std::make_shared<const std::vector<std::pair<double,double>>>(std::move(chart));
         out.pieces.push_back(piece);append_chain_geometry(out.path,geometry);
         if (!metadata) continue;
@@ -1477,7 +1438,7 @@ bool intersects_other_chains(const Polyline3& candidate,const std::vector<std::o
 {
     Linesf lines;std::vector<std::pair<Point,Point>> exact;
     for (size_t i=0;i<drafts.size();++i) if (drafts[i] && i!=replaced && i!=child) {
-        const auto path=build_open_chain(*drafts[i],sources,config).path.to_polyline();
+        const auto path=check_view(build_open_chain(*drafts[i],sources,config).path);
         for (size_t j=1;j<path.points.size();++j) {
             lines.emplace_back(path.points[j-1].cast<double>(),path.points[j].cast<double>());
             exact.emplace_back(path.points[j-1],path.points[j]);
@@ -1485,7 +1446,7 @@ bool intersects_other_chains(const Polyline3& candidate,const std::vector<std::o
     }
     if (lines.empty()) return false;
     const auto tree=AABBTreeLines::build_aabb_tree_over_indexed_lines(lines);
-    const auto tested=candidate.to_polyline();
+    const auto tested=check_view(candidate);
     for (size_t i=1;i<tested.points.size();++i) {
         const auto& a=tested.points[i-1];const auto& b=tested.points[i];
         AABBTreeIndirect::Tree<2,double>::BoundingBox box(a.cast<double>(),a.cast<double>());box.extend(b.cast<double>());
@@ -1499,10 +1460,7 @@ bool intersects_other_chains(const Polyline3& candidate,const std::vector<std::o
 
 std::vector<double> geometry_stations(const Polyline3& geometry)
 {
-    std::vector<double> result{0};
-    for (size_t i=1;i<geometry.points.size();++i)
-        result.push_back(result.back()+unscale<double>((geometry.points[i]-geometry.points[i-1]).cast<double>().norm()));
-    return result;
+    return Geometry::stations_with_arcs_mm(geometry);
 }
 
 void normalize_open_chain(OpenChainGeometry& geometry,const ExPolygons& domain)
@@ -1525,7 +1483,7 @@ Polyline3 actual_chain_deposition(const PreparedFiberPath& prepared)
 {
     Polyline3 result;
     if (prepared.entry.lowers() && prepared.entry.end_station_mm>0)
-        result.points={prepared.entry.source.start,prepared.entry.contact};
+        result=prepared.entry.geometry;
     for (const auto& span:prepared.spans) if (span.deposits_fiber()) append_chain_geometry(result,span.geometry);
     return result;
 }
@@ -1540,18 +1498,26 @@ ExPolygons chain_contour_keepout(const FiberChainExecution& chain,const Continuo
             0.5*chain.centerline.width+config.contour_infill_clearance_mm)));
         continuous.points.clear();
     };
-    if (chain.prepared->entry.lowers() && chain.prepared->entry.end_station_mm>0 &&
-        !chain.prepared->entry.pieces.empty() && chain.prepared->entry.pieces.front().display_purpose==FiberPathPurpose::Contour)
-        continuous.points={chain.prepared->entry.source.start.to_point(),chain.prepared->entry.contact.to_point()};
+    if (chain.prepared->entry.lowers()) for (const auto& piece:chain.prepared->entry.pieces) {
+        if (piece.display_purpose!=FiberPathPurpose::Contour) {flush();continue;}
+        const auto points=check_view(Geometry::slice_with_arcs_mm(chain.prepared->entry.geometry,
+            piece.execution_begin_mm,piece.execution_end_mm)).points;
+        if (!continuous.points.empty() && continuous.points.back()!=points.front()) flush();
+        continuous.points.insert(continuous.points.end(),points.begin()+(continuous.points.empty()?0:1),points.end());
+    }
     for (const auto& piece:chain.prepared->command_pieces) {
         const auto& span=chain.prepared->spans.at(piece.span_index);
         if (!span.deposits_fiber() || piece.origin.display_purpose!=FiberPathPurpose::Contour) {flush();continue;}
-        const auto points=span.geometry.to_polyline().points;
-        if (!continuous.points.empty() && continuous.points.back()!=points[piece.begin_edge]) flush();
-        continuous.points.insert(continuous.points.end(),points.begin()+piece.begin_edge+(continuous.points.empty()?0:1),
-            points.begin()+piece.end_edge+1);
+        const auto stations=Geometry::stations_with_arcs_mm(span.geometry);
+        const auto points=Geometry::sample_with_arcs(Geometry::slice_with_arcs_mm(span.geometry,
+            stations[piece.begin_edge],stations[piece.end_edge]),ContourRoundingOptions{}.chord_tolerance_mm).to_polyline().points;
+        if (!continuous.points.empty() && continuous.points.back()!=points.front()) flush();
+        continuous.points.insert(continuous.points.end(),points.begin()+(continuous.points.empty()?0:1),
+            points.end());
     }
-    flush();return union_ex(result);
+    flush();
+    return intersection_ex(fiber_material_offset(union_ex(result),chain.prepared->execution_deviation_mm),
+        chain.prepared->allowed_domain,ApplySafetyOffset::Yes);
 }
 
 double canonical_at(const FiberExecutionPiece& piece,double station)
@@ -1673,7 +1639,7 @@ bool FiberValidationResult::audit_open_chains() const
                 }
             }
             if (bridge_count+1!=chain.sources.size() || source_index+1!=chain.sources.size() ||
-                std::abs(station-unscale<double>(chain.centerline.length()))>interval_epsilon_mm) return false;
+                std::abs(station-unscale<double>(scale_(Geometry::length_with_arcs_mm(chain.centerline.polyline))))>interval_epsilon_mm) return false;
             for (const auto& slice:chain.sources) if (!same_ranges(expected[slice.source],observed[slice.source])) return false;
             for (const auto& entry_piece:chain.prepared->entry.pieces) {
                 const auto planned=std::find_if(chain.pieces.begin(),chain.pieces.end(),[&](const auto& piece) {
@@ -1815,10 +1781,10 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
                     if (intersects_other_chains(geometry.path,drafts,sources,config,root,choice.child))
                         throw std::invalid_argument("open_chain_intersects_another_source");
                     const auto domain=offset_ex(safe_domain(path.width),float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
-                    if (!diff_pl(Polylines{geometry.path.to_polyline()},domain).empty())
+                    if (!diff_pl(Polylines{check_view(geometry.path)},domain).empty())
                         throw std::invalid_argument("open_chain_outside_configured_material_clearance");
                     if (config.enforce_policy_boundary && config.policy_boundary && !config.policy_boundary->forbidden_core.empty() &&
-                        !intersection_ex(fiber_contour_coverage(geometry.path.to_polyline(),0.5*path.width),
+                        !intersection_ex(fiber_contour_coverage(check_view(geometry.path),0.5*path.width),
                             offset_ex(config.policy_boundary->forbidden_core,-4.0f),ApplySafetyOffset::No).empty())
                         throw std::invalid_argument("open_chain_crosses_policy_boundary");
                     if (!open_chain_stability(geometry.bends,config.concentric_corner_stabilization_length_mm))
@@ -1851,7 +1817,6 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
             if (draft.sources.size()==1) {
                 chain.centerline=*root.centerline;chain.prepared=root.prepared;
             } else {
-                const auto chain_entry=FiberSourceEntry::from(geometry.path);
                 normalize_open_chain(geometry,safe_domain(root.centerline->width));
                 if (!open_chain_stability(geometry.bends,config.concentric_corner_stabilization_length_mm))
                     throw std::invalid_argument("normalized_open_chain_bend_stabilization_too_short");
@@ -1871,7 +1836,7 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
                     finish.geometry=std::move(route.path);chain.finish_pieces=std::move(route.pieces);
                 }
                 const auto prepared=FiberPathFinalizer::finalize(chain.centerline,allowed_domain,config,root.id,finish,
-                    geometry.arcs,&safe_domain(chain.centerline.width),geometry.pieces,chain.finish_pieces,chain_entry);
+                    geometry.arcs,&safe_domain(chain.centerline.width),geometry.pieces,chain.finish_pieces);
                 if (!prepared.prepared) throw std::invalid_argument(std::string("open_chain_finalization_")+
                     fiber_rejection_reason_name(finalization_reason(prepared.failure))+": "+prepared.detail);
                 chain.prepared=prepared.prepared;
@@ -1890,7 +1855,7 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
         // including originals restored after rejected extension attempts.
         Linesf lines;std::vector<std::tuple<size_t,Point,Point>> exact;
         for (size_t i=0;i<actual_paths.size();++i) {
-            const auto path=actual_paths[i].to_polyline();
+            const auto path=check_view(actual_paths[i]);
             for (size_t j=1;j<path.points.size();++j) {
                 lines.emplace_back(path.points[j-1].cast<double>(),path.points[j].cast<double>());
                 exact.emplace_back(i,path.points[j-1],path.points[j]);

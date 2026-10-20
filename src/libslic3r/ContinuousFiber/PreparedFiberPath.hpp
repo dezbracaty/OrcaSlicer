@@ -6,6 +6,7 @@
 #include "../Polyline.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -46,20 +47,12 @@ struct FiberEdgeProcess {
     double feed_mm_per_xy_mm { 0.0 };
 };
 
-// Capture before numerical cleanup. A repeated first source vertex is an
-// intentional zero-length entry, not permission to use the next source edge.
-struct FiberSourceEntry {
-    Point3 start {Point3::Zero()}, end {Point3::Zero()};
-    static FiberSourceEntry from(const Polyline3& path) {
-        return {path.points.at(0), path.points.at(1)};
-    }
-};
-
-enum class FiberEntryMode : uint8_t { StraightLanding, VerticalLanding, PoweredFirstEdge };
+enum class FiberEntryMode : uint8_t { PathLanding, VerticalLanding, PoweredFirstEdge };
 
 struct FiberEntryPlan {
     FiberEntryMode mode {FiberEntryMode::PoweredFirstEdge};
-    FiberSourceEntry source;
+    Point3 start {Point3::Zero()};
+    Polyline3 geometry; // Analytic XY landing route; Z is applied during binding.
     Point3 contact {Point3::Zero()};
     double end_station_mm {0.0};
     // Landing owns [0,end_station]; spans start at contact. Source stations and
@@ -145,7 +138,16 @@ struct PreparedFiberPath {
     std::vector<FiberCommandPiece> command_pieces;
     FiberStartProcedure start_procedure;
     FiberEntryPlan entry;
+    // Conservative execution envelope, determined before material allocation.
+    double execution_deviation_mm {0.0};
+    double passive_length_error_mm {0.0};
+    double requested_passive_length_mm {0.0};
+    ExPolygons possible_coverage;
+    ExPolygons guaranteed_coverage;
+    ExPolygons uncertain_coverage;
     ExPolygons physical_coverage;
+    ExPolygons allowed_domain;
+    double outside_tolerance_mm2 {0.0};
     ExPolygons resin_exclusion;
     ExPolygons outside_domain;
     ExPolygons contour_to_infill_keepout;
@@ -167,14 +169,21 @@ struct BoundFiberExecutionPlan {
     unsigned physical_tool_id { 0 };
     double e_units_per_mm { 1.0 };
     std::vector<std::vector<double>> edge_dE;
+    std::vector<FiberMotionSpan> spans;
+    std::vector<std::vector<Vec3d>> writer_targets, machine_targets;
+    std::vector<std::vector<Vec2d>> arc_offsets;
+    std::vector<std::vector<EMovePathType>> command_types;
+    std::vector<std::vector<size_t>> source_primitives;
+    std::vector<std::vector<double>> command_stations_mm;
+    std::function<Vec2d(const Point&)> point_to_writer;
     double prefeed_dE { 0.0 };
     double prefeed_F { 0.0 };
     std::string cut_gcode;
     struct EntryMotion {
         Vec3d from {Vec3d::Zero()}, to {Vec3d::Zero()};
-        Vec3d writer_target {Vec3d::Zero()};
         double speed_mm_s {0.0};
         bool bound {false};
+        std::vector<Vec3d> writer_targets, machine_targets;
     } entry_motion;
 };
 
@@ -182,7 +191,7 @@ struct BoundFiberExecutionPlan {
 // check and the emitter consume this exact motion, never reconstruct its Z.
 void bind_fiber_entry_motion(BoundFiberExecutionPlan& plan, const GCodeWriter& writer, const Vec2d& start_xy,
     const Vec2d& contact_xy, double layer_z);
-std::string emit_fiber_landing(GCodeWriter& writer, const BoundFiberExecutionPlan& plan);
+
 
 // Available machine limits, not a model/deposition domain or a full collision
 // envelope. Positions are emitted G-code coordinates; XY limits describe the
@@ -191,13 +200,19 @@ struct FiberMachineMotionLimits {
     ExPolygons tip_xy;
     Vec2d command_to_tip_offset {Vec2d::Zero()};
     double maximum_z_mm {0};
+    Vec3d maximum_axis_speed_mm_s {Vec3d::Zero()}; // Zero disables that axis limit.
     void validate_move(const Vec3d& from, const Vec3d& to) const;
+    void validate_feedrate(const Vec3d& from, const Vec3d& to, double speed_mm_s,
+        EMovePathType type = EMovePathType::Linear_move, const Vec2d& center = Vec2d::Zero()) const;
 };
 
 BoundFiberExecutionPlan bind_fiber_execution(
     std::shared_ptr<const PreparedFiberPath> prepared,
     unsigned filament_id, unsigned extruder_id, unsigned physical_tool_id,
-    double e_units_per_mm, std::string cut_gcode);
+    double e_units_per_mm, std::string cut_gcode,
+    const GCodeWriter* writer = nullptr,
+    std::function<Vec2d(const Point&)> point_to_writer = {}, double layer_z = 0.0,
+    bool export_arcs = false);
 
 } // namespace Slic3r
 

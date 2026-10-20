@@ -17,6 +17,9 @@ struct FiberCoverageRecord {
     ExPolygons resin_domain;
     ExPolygons intentional_void;
     ExPolygons outside_domain;
+    bool has_execution_envelope {false};
+    ExPolygons guaranteed_fiber;
+    ExPolygons uncertain_fiber;
 };
 
 struct FiberCoverageAudit {
@@ -27,6 +30,9 @@ struct FiberCoverageAudit {
     double unassigned_area_mm2 { 0.0 };
     double unexpected_overlap_area_mm2 { 0.0 };
     double outside_area_mm2 { 0.0 };
+    double guaranteed_fiber_area_mm2 {0.0};
+    double uncertain_fiber_area_mm2 {0.0};
+    double invalid_execution_envelope_area_mm2 {0.0};
 };
 
 class FiberCoverageLedger {

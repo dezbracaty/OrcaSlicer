@@ -6370,6 +6370,17 @@ std::string GCode::ensure_fiber_pressure_advance_zero()
     return gcode;
 }
 
+std::string emit_fiber_landing(GCodeWriter& writer,const BoundFiberExecutionPlan& plan)
+{
+    if(!plan.prepared || !plan.prepared->entry.lowers() || !plan.entry_motion.bound)
+        throw std::invalid_argument("Unbound fiber landing motion");
+    std::string result=";FIBER_LANDING_BEGIN\n";
+    writer.set_speed(plan.entry_motion.speed_mm_s*60.0);
+    for(size_t i=1;i<plan.entry_motion.writer_targets.size();++i)
+        result+=writer.travel_to_bound_xyz(plan.entry_motion.writer_targets[i],plan.entry_motion.machine_targets[i]);
+    return result+";FIBER_LANDING_END\n";
+}
+
 std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::string& description, double /*speed*/)
 {
     if (!m_writer.filament())
@@ -6377,15 +6388,15 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     const auto tool = resolve_fiber_tool(m_config, m_writer.filament()->id());
     validate_fiber_cut_event(m_config.fiber_cut_gcode.value, fiber_machine_protocol(m_config));
     path.validate_derived_view();
-    auto bound = bind_fiber_execution(path.prepared_path(), tool.logical_filament_id,
-        tool.logical_extruder_id, tool.physical_tool_id, tool.e_units_per_mm, m_config.fiber_cut_gcode.value);
-    const PreparedFiberPath& prepared = *bound.prepared;
-    const bool connected_execution = !prepared.command_pieces.empty();
-    // Preserve the accepted source/transition coordinate grid throughout
-    // approach, landing, tail and finish as well as powered deposition.
-    const GCodeWriter::ScopedXYZPrecision xyz_precision(m_writer,
-        connected_execution ? 6 : m_writer.xyz_export_digits());
-    const Vec2d entry_start=point_to_gcode(prepared.entry.source.start.to_point());
+    const PreparedFiberPath& prepared=*path.prepared_path();
+    const bool connected_execution=!prepared.command_pieces.empty();
+    // Fiber analytic/process endpoints use the source's six-decimal coordinate grid.
+    const GCodeWriter::ScopedXYZPrecision xyz_precision(m_writer,6);
+    auto bound=bind_fiber_execution(path.prepared_path(),tool.logical_filament_id,
+        tool.logical_extruder_id,tool.physical_tool_id,tool.e_units_per_mm,m_config.fiber_cut_gcode.value,
+        &m_writer,[&](const Point& point){return point_to_gcode(point);},m_nominal_z,
+        m_config.enable_arc_fitting && !m_config.spiral_mode);
+    const Vec2d entry_start=point_to_gcode(prepared.entry.start.to_point());
     const Vec2d entry_contact=point_to_gcode(prepared.entry.contact.to_point());
     bind_fiber_entry_motion(bound,m_writer,entry_start,entry_contact,m_nominal_z);
     if (m_writer.filament()->effective_retracted() != 0.0 || m_writer.filament()->restart_extra() != 0.0)
@@ -6412,6 +6423,9 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     const auto& tool_heights = m_config.extruder_printable_height.values;
     if (bound.logical_extruder_id < tool_heights.size() && tool_heights[bound.logical_extruder_id] > 0)
         limits.maximum_z_mm = std::min(limits.maximum_z_mm, tool_heights[bound.logical_extruder_id]);
+    const ConfigOptionFloats* axes[]={&m_config.machine_max_speed_x,&m_config.machine_max_speed_y,&m_config.machine_max_speed_z};
+    for (int axis=0;axis<3;++axis)
+        if (!axes[axis]->values.empty()) limits.maximum_axis_speed_mm_s[axis]=axes[axis]->values.front();
     const auto validate_motion = [&](const Vec3d& from, const Vec3d& to) {
         try { limits.validate_move(from, to); }
         catch (const std::exception& error) {
@@ -6422,73 +6436,84 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
                 std::to_string(to.x()) + "," + std::to_string(to.y()) + "," + std::to_string(to.z()));
         }
     };
-    const Vec3d approach_from = connected_execution ?
-        m_writer.get_emitted_position() : m_writer.get_position();
-    // Quantization must not erase a motion or a process boundary.
-    for (const auto& span : prepared.spans)
-        for (size_t i = 1; i < span.geometry.points.size(); ++i) {
-            const Vec2d a = point_to_gcode(span.geometry.points[i-1].to_point());
-            const Vec2d b = point_to_gcode(span.geometry.points[i].to_point());
-            if (m_writer.quantize_xyz(a.x()) == m_writer.quantize_xyz(b.x()) &&
-                m_writer.quantize_xyz(a.y()) == m_writer.quantize_xyz(b.y()))
-                throw Slic3r::RuntimeError("Fiber edge disappears after G-code coordinate quantization");
-            validate_motion(Vec3d(a.x(), a.y(), m_nominal_z), Vec3d(b.x(), b.y(), m_nominal_z));
-        }
-    const Vec2d first_xy = entry_start;
-    validate_motion(Vec3d(first_xy.x(), first_xy.y(), m_nominal_z),
-                    m_writer.oriented_position(bound.entry_motion.from));
-    if (prepared.entry.lowers()) {
-        validate_motion(m_writer.oriented_position(bound.entry_motion.from),m_writer.oriented_position(bound.entry_motion.to));
-        const Vec3d delta=bound.entry_motion.to-bound.entry_motion.from;
-        const Vec3d velocity=delta.norm()>0 ? Vec3d(delta.normalized()*bound.entry_motion.speed_mm_s) : Vec3d::Zero();
-        const ConfigOptionFloats* axis_limits[]={&m_config.machine_max_speed_x,&m_config.machine_max_speed_y,&m_config.machine_max_speed_z};
-        for(int axis=0;axis<3;++axis)
-            if(!axis_limits[axis]->values.empty() && axis_limits[axis]->values.front()>0 &&
-               std::abs(velocity[axis])>axis_limits[axis]->values.front()+EPSILON)
-                throw Slic3r::RuntimeError("Bound fiber entry exceeds machine axis feedrate limit");
-    }
-
-    if (prepared.policy_boundary && !prepared.policy_boundary->forbidden_core.empty()) {
-        if (!m_print || !m_layer || prepared.id.parent.domain.object_id != m_layer->object()->id().id ||
-            prepared.id.parent.domain.layer_id != m_layer->id())
-            throw Slic3r::RuntimeError("Fiber policy boundary does not belong to the current export layer");
-        const Vec2d nozzle = EXTRUDER_CONFIG(extruder_offset);
-        const auto machine_tip = [&](const Vec3d& machine) {
-            const Vec3d oriented=m_writer.oriented_position(machine);
-            const Vec2d local=oriented.head<2>()+nozzle-m_origin;
-            return Point::new_scale(local.x(),local.y());
-        };
-        const auto emitted_tip = [&](const Point3& point, double z) {
-            const Vec2d xy=point_to_gcode(point.to_point());
-            return machine_tip(m_writer.quantized_machine_position(Vec3d(xy.x(),xy.y(),z)));
-        };
-        Polygons physical;
-        Polyline depositing;
-        if (prepared.entry.lowers()) {
-            depositing.points={machine_tip(bound.entry_motion.from),machine_tip(bound.entry_motion.to)};
-        }
-        const auto flush = [&] {
-            if (depositing.points.size() >= 2)
-                append(physical, to_polygons(fiber_contour_coverage(depositing, 0.5 * prepared.width_mm)));
-            depositing.points.clear();
-        };
-        for (const auto& span : prepared.spans) {
-            if (!span.deposits_fiber()) { flush(); continue; }
-            Points actual;
-            double distance = 0.0;
-            const double total = span.geometry.length();
-            for (std::size_t i = 0; i < span.geometry.points.size(); ++i) {
-                if (i) distance += (span.geometry.points[i] - span.geometry.points[i-1]).cast<double>().norm();
-                const double z = m_nominal_z;
-                actual.push_back(emitted_tip(span.geometry.points[i], z));
+    const Vec3d approach_from=m_writer.quantized_machine_position(m_writer.get_emitted_position());
+    const auto motion_points=[&](const Vec3d& from,const Vec3d& to,EMovePathType type,const Vec2d& ij) {
+        std::vector<Vec3d> points{from};
+        if(type==EMovePathType::Arc_move_cw || type==EMovePathType::Arc_move_ccw) {
+            const Vec2d center=from.head<2>()+ij,start=-ij,end=to.head<2>()-center;
+            if(start.norm()==0 || std::abs(start.norm()-end.norm())>prepared.execution_deviation_mm)
+                throw Slic3r::RuntimeError("Invalid emitted fiber circle");
+            double angle=std::atan2(start.x()*end.y()-start.y()*end.x(),start.dot(end));
+            if(type==EMovePathType::Arc_move_ccw && angle<=0)angle+=2*PI;
+            if(type==EMovePathType::Arc_move_cw && angle>=0)angle-=2*PI;
+            const double step=2*std::acos(std::clamp(1-ContourRoundingOptions{}.chord_tolerance_mm/start.norm(),-1.,1.));
+            if(step<=0 || std::abs(angle)/step>1000000)throw Slic3r::RuntimeError("Fiber arc checking budget exceeded");
+            const size_t count=std::max(size_t(1),size_t(std::ceil(std::abs(angle)/step)));
+            const double theta=std::atan2(start.y(),start.x());
+            for(size_t i=1;i<count;++i) {
+                const double t=double(i)/count,a=theta+t*angle;
+                const Vec2d p=center+start.norm()*Vec2d(std::cos(a),std::sin(a));
+                points.emplace_back(p.x(),p.y(),from.z()+t*(to.z()-from.z()));
             }
-            if (!depositing.points.empty() && depositing.points.back() != actual.front()) flush();
-            depositing.points.insert(depositing.points.end(),
-                actual.begin() + (depositing.points.empty() ? 0 : 1), actual.end());
         }
-        flush();
-        if (!intersection_ex(union_ex(physical), offset_ex(prepared.policy_boundary->forbidden_core, -4.0f),
-                     ApplySafetyOffset::No).empty())
+        points.push_back(to);return points;
+    };
+    const auto check_points=[&](const std::vector<Vec3d>& points,double speed,
+            EMovePathType type=EMovePathType::Linear_move,Vec2d center=Vec2d::Zero()) {
+        const bool arc=type==EMovePathType::Arc_move_cw || type==EMovePathType::Arc_move_ccw;
+        auto arc_limits=limits;
+        if(arc) arc_limits.tip_xy=offset_ex(limits.tip_xy,-float(scale_(ContourRoundingOptions{}.chord_tolerance_mm)));
+        if(arc && speed>0) limits.validate_feedrate(points.front(),points.back(),speed,type,center);
+        for(size_t i=1;i<points.size();++i) {
+            if(arc)arc_limits.validate_move(points[i-1],points[i]);else validate_motion(points[i-1],points[i]);
+            limits.validate_feedrate(points[i-1],points[i],speed);
+        }
+    };
+    const auto bound_points=[&](size_t span,size_t edge) {
+        return motion_points(bound.machine_targets[span][edge],bound.machine_targets[span][edge+1],
+            bound.command_types[span][edge],bound.arc_offsets[span][edge]);
+    };
+    if(prepared.entry.lowers())check_points(bound.entry_motion.machine_targets,bound.entry_motion.speed_mm_s);
+    for(size_t si=0;si<bound.spans.size();++si)
+        for(size_t edge=0;edge<bound.spans[si].edges.size();++edge)
+            check_points(bound_points(si,edge),bound.spans[si].edges[edge].speed_mm_s,
+                bound.command_types[si][edge],
+                bound.machine_targets[si][edge].head<2>()+bound.arc_offsets[si][edge]);
+
+    // All executed deposition must fit the envelope used by Fill, regardless of
+    // whether the writer emits native arcs or a controlled G1 approximation.
+    const Vec2d nozzle=EXTRUDER_CONFIG(extruder_offset);
+    const auto machine_tip=[&](const Vec3d& machine) {
+        const Vec3d oriented=m_writer.oriented_position(machine);
+        const Vec2d local=oriented.head<2>()+nozzle-m_origin;
+        return Point::new_scale(local.x(),local.y());
+    };
+    Polyline depositing;
+    if(prepared.entry.lowers())for(const auto& point:bound.entry_motion.machine_targets) {
+        const Point tip=machine_tip(point);
+        if(depositing.points.empty() || tip!=depositing.points.back())depositing.points.push_back(tip);
+    }
+    for(size_t si=0;si<bound.spans.size();++si)if(bound.spans[si].deposits_fiber())
+        for(size_t edge=0;edge<bound.spans[si].edges.size();++edge)
+            for(const auto& point:bound_points(si,edge)) {
+                const Point tip=machine_tip(point);
+                if(depositing.points.empty() || tip!=depositing.points.back())depositing.points.push_back(tip);
+            }
+    const auto actual_coverage=fiber_contour_coverage(depositing,0.5*prepared.width_mm);
+    const auto numeric_envelope=offset_ex(prepared.possible_coverage,4.0f);
+    if(!diff_ex(actual_coverage,numeric_envelope,ApplySafetyOffset::No).empty())
+        throw Slic3r::RuntimeError("Executed fiber deposition exceeds its allocated material envelope");
+    if(!diff_ex(prepared.guaranteed_coverage,offset_ex(actual_coverage,4.0f),ApplySafetyOffset::No).empty())
+        throw Slic3r::RuntimeError("Executed fiber deposition does not meet its guaranteed coverage");
+    const auto actual_outside=diff_ex(actual_coverage,prepared.allowed_domain,ApplySafetyOffset::Yes);
+    const double actual_outside_mm2=std::abs(area(actual_outside))*SCALING_FACTOR*SCALING_FACTOR;
+    if(actual_outside_mm2>prepared.outside_tolerance_mm2)
+        throw Slic3r::RuntimeError("Executed fiber deposition exceeds its model boundary area budget");
+    if(prepared.policy_boundary && !prepared.policy_boundary->forbidden_core.empty()) {
+        if(!m_print || !m_layer || prepared.id.parent.domain.object_id!=m_layer->object()->id().id ||
+            prepared.id.parent.domain.layer_id!=m_layer->id())
+            throw Slic3r::RuntimeError("Fiber policy boundary does not belong to the current export layer");
+        if(!intersection_ex(actual_coverage,offset_ex(prepared.policy_boundary->forbidden_core,-4.0f),ApplySafetyOffset::No).empty())
             throw Slic3r::RuntimeError("Machine-rounded fiber deposition crosses its policy boundary");
     }
 
@@ -6509,12 +6534,13 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     gcode += ";TYPE:" + std::string(path.display_purpose() == FiberPathPurpose::Contour ?
         "Continuous fiber contour" : "Continuous fiber infill") + "\n";
     {
-        const Vec2d first_end=point_to_gcode(prepared.entry.source.end.to_point());
         std::ostringstream row;row.imbue(std::locale::classic());row<<std::setprecision(17);
         row<<";CF_ENTRY mode="<<unsigned(prepared.entry.mode)
            <<" start_x="<<entry_start.x()<<" start_y="<<entry_start.y()
-           <<" first_x="<<first_end.x()<<" first_y="<<first_end.y()
-           <<" source_station="<<prepared.entry.end_station_mm<<"\n";
+           <<" contact_x="<<entry_contact.x()<<" contact_y="<<entry_contact.y()
+           <<" execution_begin=0 execution_end="<<prepared.entry.end_station_mm
+           <<" landing_xy_length="<<Geometry::length_with_arcs_mm(prepared.entry.geometry)
+           <<" z_height="<<prepared.start_procedure.z_hop_height_mm<<" feed=preloaded\n";
         gcode+=row.str();
     }
     size_t piece_cursor=0;
@@ -6536,15 +6562,21 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
                 std::to_string(unsigned(p.purpose))+"/"+std::to_string(p.job_ordinal)+"/"+
                 std::to_string(p.path_ordinal)+"/"+std::to_string(id.fragment_ordinal);
         };
+        const auto& owners=bound.source_primitives[span_index];
+        const size_t bound_begin=size_t(std::lower_bound(owners.begin(),owners.end(),command.begin_edge)-owners.begin());
+        const size_t bound_end=size_t(std::lower_bound(owners.begin(),owners.end(),command.end_edge)-owners.begin());
         std::ostringstream row;row.imbue(std::locale::classic());row<<std::setprecision(17);
         row<<";CF_PIECE occurrence="<<m_fiber_path_occurrence<<" span="<<span_index
-           <<" edge_begin="<<command.begin_edge<<" edge_end="<<command.end_edge
+           <<" primitive_begin="<<command.begin_edge<<" primitive_end="<<command.end_edge
            <<" kind="<<(origin.kind==FiberExecutionPieceKind::RetainedSource?"source":"transition")
            <<" source="<<identity(origin.source)<<" other_source="<<identity(origin.other_source)
            <<" source_begin="<<origin.source_begin_mm<<" source_end="<<origin.source_end_mm
            <<" direction=1 transition="<<origin.transition_id
            <<" planning_begin="<<origin.execution_begin_mm<<" planning_end="<<origin.execution_end_mm
-           <<" command_begin="<<command.command_begin_mm<<" command_end="<<command.command_end_mm<<"\n";
+           <<" analytic_begin="<<command.command_begin_mm<<" analytic_end="<<command.command_end_mm
+           <<" bound_command_begin="<<bound_begin<<" bound_command_end="<<bound_end
+           <<" command_begin="<<bound.command_stations_mm[span_index][bound_begin]
+           <<" command_end="<<bound.command_stations_mm[span_index][bound_end]<<"\n";
         gcode+=row.str();++piece_cursor;
     };
     const FiberStartProcedure& start = prepared.start_procedure;
@@ -6564,9 +6596,12 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             // the first process segment of this tool activation.
             m_fiber_first_approach_pending = false;
             gcode += m_writer.unlift();
-            const Point first = prepared.entry.source.start.to_point();
-            if (connected_execution || !m_last_pos_defined || m_last_pos.to_point() != first || m_need_change_layer_lift_z)
-                gcode += travel_to(first, path.role(), "move to first continuous fiber point", DBL_MAX, speed_limit);
+            const Point first = prepared.entry.start.to_point();
+            const Vec3d actual=m_writer.quantized_machine_position(m_writer.get_emitted_position());
+            const Vec3d target=m_writer.quantized_machine_position(Vec3d(entry_start.x(),entry_start.y(),m_nominal_z));
+            if(connected_execution || !m_last_pos_defined || m_last_pos.to_point()!=first || m_need_change_layer_lift_z ||
+                actual.head<2>()!=target.head<2>())
+                gcode+=travel_to(first,path.role(),"move to first continuous fiber point",DBL_MAX,speed_limit);
             gcode += m_writer.unlift();
             const double current_z = connected_execution ?
                 m_writer.get_emitted_position().z() : m_writer.get_position().z();
@@ -6607,12 +6642,17 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
             gcode += ";FIBER_START\n";
             break;
         case FiberActionType::MotionSpan: {
-            const auto& span = prepared.spans[action.span_index];
-            for (size_t edge = 0; edge < span.edges.size(); ++edge) {
-                emit_piece(action.span_index,edge);
-                gcode += m_writer.set_speed(span.edges[edge].speed_mm_s*60.0);
-                gcode += m_writer.extrude_to_xy(point_to_gcode(span.geometry.points[edge+1].to_point()),
-                    bound.edge_dE[action.span_index][edge], description, !span.actively_feeds_fiber());
+            const size_t si=action.span_index;
+            const auto& span=bound.spans[si];
+            for(size_t edge=0;edge<span.edges.size();++edge) {
+                emit_piece(si,bound.source_primitives[si][edge]);
+                gcode+=m_writer.set_speed(span.edges[edge].speed_mm_s*60.0);
+                const auto type=bound.command_types[si][edge];
+                if(type==EMovePathType::Arc_move_cw || type==EMovePathType::Arc_move_ccw)
+                    gcode+=m_writer.extrude_arc_to_xy(bound.writer_targets[si][edge+1].head<2>(),bound.arc_offsets[si][edge],
+                        bound.edge_dE[si][edge],type==EMovePathType::Arc_move_ccw,description,!span.actively_feeds_fiber());
+                else gcode+=m_writer.extrude_to_xy(bound.writer_targets[si][edge+1].head<2>(),
+                    bound.edge_dE[si][edge],description,!span.actively_feeds_fiber());
                 set_last_pos(span.geometry.points[edge+1]);
             }
             break;
@@ -6642,10 +6682,25 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     motion_reader.x() = float(approach_from.x());
     motion_reader.y() = float(approach_from.y());
     motion_reader.z() = float(approach_from.z());
-    motion_reader.parse_buffer(gcode, [&](GCodeReader& reader, const GCodeReader::GCodeLine& line) {
-        if ((line.cmd_is("G0") || line.cmd_is("G1")) && (line.has_x() || line.has_y() || line.has_z()))
-            validate_motion(Vec3d(reader.x(), reader.y(), reader.z()),
-                            Vec3d(line.new_X(reader), line.new_Y(reader), line.new_Z(reader)));
+    Vec3d text_position=approach_from;
+    bool after_cut=false;
+    motion_reader.parse_buffer(gcode,[&](GCodeReader&,const GCodeReader::GCodeLine& line) {
+        if(line.comment()=="FIBER_CUT")after_cut=true;
+        if(after_cut && line.has_e())throw Slic3r::RuntimeError("E command after fiber CUT");
+        if(!(line.cmd_is("G0") || line.cmd_is("G1") || line.cmd_is("G2") || line.cmd_is("G3")))return;
+        // GCodeReader's cached axes are float; read emitted coordinates as double
+        // so a six-digit process boundary is not re-quantized by this audit.
+        const auto value=[&](char axis,double fallback) {
+            const auto text=line.axis_pos(axis);return text.empty()?fallback:std::stod(std::string(text.substr(1)));
+        };
+        const Vec3d next(value('X',text_position.x()),value('Y',text_position.y()),value('Z',text_position.z()));
+        if(line.cmd_is("G2") || line.cmd_is("G3")) {
+            const auto type=line.cmd_is("G3")?EMovePathType::Arc_move_ccw:EMovePathType::Arc_move_cw;
+            const auto points=motion_points(text_position,next,type,
+                Vec2d(value('I',0),value('J',0)));
+            check_points(points,0,type);
+        } else if(line.has_x() || line.has_y() || line.has_z())validate_motion(text_position,next);
+        text_position=next;
     });
     // Force the next ordinary path to refresh its role and geometric metadata.
     m_last_extrusion_role = erNone;

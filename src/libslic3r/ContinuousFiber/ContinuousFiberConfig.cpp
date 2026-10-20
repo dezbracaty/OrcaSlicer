@@ -392,7 +392,7 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
         {"fiber_prefeed_extra_length", config.prefeed_extra_length_mm},
         {"fiber_prefeed_speed", config.prefeed_speed_mm_s},
         {"fiber_z_hop_height", config.z_hop_height_mm},
-        {"fiber_start_length", config.source_start_split_length_mm},
+        {"fiber_landing_length", config.landing_length_mm},
         {"fiber_landing_speed", config.landing_speed_mm_s},
         {"fiber_start_speed", config.start_speed_mm_s},
         {"fiber_start_stabilization_length", config.start_stabilization_length_mm},
@@ -497,7 +497,7 @@ static ContinuousFiberConfig resolve_region_fiber_config(
     result.prefeed_extra_length_mm = source.fiber_prefeed_extra_length.value;
     result.prefeed_speed_mm_s = source.fiber_prefeed_speed.value;
     result.z_hop_height_mm = source.fiber_z_hop_height.value;
-    result.source_start_split_length_mm = source.fiber_start_length.value;
+    result.landing_length_mm = source.fiber_landing_length.value;
     result.landing_speed_mm_s = source.fiber_landing_speed.value;
     result.adhesion_dwell_ms = std::max(0, source.fiber_adhesion_dwell_ms.value);
     result.start_speed_mm_s = source.fiber_start_speed.value;

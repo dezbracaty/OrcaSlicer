@@ -236,7 +236,7 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
                                  "fiber_prefeed_extra_length",
                                  "fiber_prefeed_speed",
                                  "fiber_z_hop_height",
-                                 "fiber_start_length",
+                                 "fiber_landing_length",
                                  "fiber_landing_speed",
                                  "fiber_adhesion_dwell_ms",
                                  "fiber_start_speed",

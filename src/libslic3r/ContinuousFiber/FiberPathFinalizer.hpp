@@ -71,8 +71,7 @@ public:
         const std::vector<ContourArc>& arcs = {},
         const ExPolygons* planned_centerline_domain = nullptr,
         const std::vector<FiberExecutionPiece>& pieces = {},
-        const std::vector<FiberExecutionPiece>& finish_pieces = {},
-        const std::optional<FiberSourceEntry>& source_entry = std::nullopt);
+        const std::vector<FiberExecutionPiece>& finish_pieces = {});
 };
 
 } // namespace Slic3r
