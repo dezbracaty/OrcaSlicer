@@ -1,0 +1,50 @@
+Fiber entry evidence tools
+
+compare_legacy_landing.py reads emitted G-code independently of CF_ENTRY source
+metadata. Its default strict mode requires uniquely corresponding entry commands
+to match. Contract mode checks prefeed/lowering/dwell/powered-feed procedure only;
+a contract pass does not establish matching coordinates or full-model equality.
+
+Examples, run from the slicer repository:
+
+python3 -m unittest discover -s tests/libslicer_api -p test_compare_legacy_landing.py
+python3 tests/libslicer_api/compare_legacy_landing.py standard.gcode current.gcode comparison.json
+python3 tests/libslicer_api/compare_legacy_landing.py standard.gcode old-output.gcode old-comparison.json --current-format legacy
+
+Strict mismatch exits with status 1. Do not replace this result with a contract
+pass when reporting compatibility. Pairing uses layer and prefeed position, not
+file order. Unmatched and ambiguous entries remain visible in the report.
+Unmarked old entries are detected from fiber role and a large E-only prefeed;
+this detection cannot establish completeness without an independent source trace.
+
+capture_legacy_entry.py copies a supplied Bulber tree into a new output directory
+and applies observation hooks to that copy. It records hashes of the source,
+diagnostic copy, model, standard, executable, trace, and emitted G-code. It never
+patches the supplied source tree or obtains path geometry from standard commands.
+
+python3 tests/libslicer_api/capture_legacy_entry.py --source /path/to/bulber/cfslicer --output /path/to/new-evidence --standard /path/to/standard.gcode --model /path/to/4xiao.stl --deps-prefix /path/to/legacy/dependencies
+
+The supplied source must have its own working legacy dependencies. The current
+diagnostic build targets macOS arm64. --prepare-only stops before building;
+--resume checks the frozen input and diagnostic hashes before continuing.
+The headless driver supplies the initialization normally supplied by the legacy
+application, including the Klipper machine classification and enum definitions.
+These bindings and ignored/unknown settings are recorded, not silently replaced.
+
+The driver uses a single-thread TBB arena without resetting the old global seam
+counter. Its scheduling is not claimed to match the original GUI. Instrumented
+parallel execution also changes scheduling and must not be described as an exact
+replay of the standard producer's thread order.
+
+Evidence interpretation
+
+- Real source trace: points produced by a complete legacy model slice.
+- Command replay: synthetic compatible inputs can demonstrate a local command
+  rule, but cannot establish the source geometry of a complete model.
+- Alternate legal seam replay: can explain a standard entry, but is not proof
+  that one unmodified full slice emitted all the standard entries together.
+- Model equivalence: requires a separate real-model correspondence check.
+
+The local source used during this investigation identified itself as Bulber
+1.3.5; the supplied standard identified its producer as CFSlicer 1.4.2. Do not
+assume those producer versions are identical.

@@ -637,11 +637,13 @@ Json evaluate_gap(const libslicer::ToolpathPreview& preview,const std::vector<Bl
     require(effective.at("generate_reinforced_infills")=="1" && effective.at("reinforced_infill_density")=="100%","Gap acceptance requires enabled 100% infill");
     require(effective.at("fiber_width")=="1" && effective.at("reinforced_infill_pattern")=="rectilinear" &&
         effective.at("fiber_infill_bend_radius")=="0" && effective.at("fiber_contour_bend_radius")=="0" && effective.at("fiber_contour_infill_clearance")=="0","Unexpected gap acceptance geometry");
-    const double budget=std::stod(effective.at("fiber_landing_length").get<std::string>())+
-        std::stod(effective.at("fiber_start_stabilization_length").get<std::string>())+
-        std::stod(effective.at("fiber_minimum_effective_length").get<std::string>())+
-        std::stod(effective.at("fiber_cut_to_contact_length").get<std::string>());
-    require(std::abs(budget-25.5)<1e-9,"Unexpected fiber process budget");
+    const auto budget=[&]() {
+        const double height=std::stod(effective.at("fiber_z_hop_height").get<std::string>());
+        const double entry=height>0?std::stod(effective.at("fiber_landing_length").get<std::string>()):0;
+        return entry+std::stod(effective.at("fiber_start_stabilization_length").get<std::string>())+
+            std::stod(effective.at("fiber_minimum_effective_length").get<std::string>())+
+            std::stod(effective.at("fiber_cut_to_contact_length").get<std::string>());
+    };
     Json result={{"passed",true},{"layers",Json::array()},{"geometry_tolerance_mm",gap_final_error},{"reference_tolerance_mm",gap_reference_error}};
     size_t resin_segments=0;for(const auto& segment:preview.segments)if(segment.extrusion_role==libslicer::ToolpathExtrusionRole::ResinInfill && segment.deposition==libslicer::ToolpathDepositionKind::Thermoplastic)++resin_segments;
     require(resin_segments>0,"Fixture must retain ordinary resin leftover deposition");result["resin_segments"]=resin_segments;
@@ -685,7 +687,7 @@ Json evaluate_gap(const libslicer::ToolpathPreview& preview,const std::vector<Bl
             for(const auto& diagnostic:preview.fiber_fill_diagnostics)if(int(diagnostic.layer_index)+1==layer &&
                 diagnostic.component_id==source->component_id && !diagnostic.contour && diagnostic.kind==libslicer::FiberDiagnosticKind::RejectedPath) {
                 Path points;for(const auto& p:diagnostic.points)points.push_back({p.x,p.y});
-                check_short_rejection(points,diagnostic.reason,std::stod(effective.at("fiber_minimum_path_length").get<std::string>()),budget);
+                check_short_rejection(points,diagnostic.reason,std::stod(effective.at("fiber_minimum_path_length").get<std::string>()),budget());
                 paths.push_back({std::move(points),false});
             }
             auto checked=check_gap_domain(centerlines,paths,angle,{217.5,177.5},1,gap_final_error);
@@ -902,8 +904,13 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
                 {"detail",diagnostic.reason}});
         }
     for(const auto& segment:result.preview->segments)if(segment.extrusion_role==libslicer::ToolpathExtrusionRole::ResinInfill && segment.deposition==libslicer::ToolpathDepositionKind::Thermoplastic)++resin;
-    const double budget=std::stod(effective.at("fiber_landing_length").get<std::string>())+std::stod(effective.at("fiber_start_stabilization_length").get<std::string>())+
-        std::stod(effective.at("fiber_minimum_effective_length").get<std::string>())+std::stod(effective.at("fiber_cut_to_contact_length").get<std::string>());
+    const auto budget=[&]() {
+        const double height=std::stod(effective.at("fiber_z_hop_height").get<std::string>());
+        const double entry=height>0?std::stod(effective.at("fiber_landing_length").get<std::string>()):0;
+        return entry+std::stod(effective.at("fiber_start_stabilization_length").get<std::string>())+
+            std::stod(effective.at("fiber_minimum_effective_length").get<std::string>())+
+            std::stod(effective.at("fiber_cut_to_contact_length").get<std::string>());
+    };
     std::set<std::pair<size_t,size_t>> seen;
     for(const auto& source:result.preview->fiber_fill_diagnostics)if(source.kind==libslicer::FiberDiagnosticKind::OriginalContourRegion) {
         const size_t layer=source.layer_index+1;++sources;require(seen.emplace(layer,source.component_id).second,"Duplicate source region");require(!source.boundaries.empty(),"Missing source region");
@@ -917,7 +924,7 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
             else {paths.push_back({block.points,true});for(const auto& part:Slic3r::intersection_pl(Slic3r::Polylines{integer_path(block.points)},window))central+=Slic3r::unscale<double>(part.length());}
         }
         for(const auto& d:result.preview->fiber_fill_diagnostics)if(d.layer_index+1==layer && d.component_id==source.component_id && !d.contour && d.kind==libslicer::FiberDiagnosticKind::RejectedPath) {
-            Path points;for(auto p:d.points)points.push_back({p.x,p.y});check_short_rejection(points,d.reason,std::stod(effective.at("fiber_minimum_path_length").get<std::string>()),budget);
+            Path points;for(auto p:d.points)points.push_back({p.x,p.y});check_short_rejection(points,d.reason,std::stod(effective.at("fiber_minimum_path_length").get<std::string>()),budget());
             if(points.size()>1 && !Slic3r::intersection_pl(Slic3r::Polylines{integer_path(points)},window).empty())central_short_rejection=true;
         }
         const auto keepout=Slic3r::intersection_ex(Slic3r::union_ex(occupied),Slic3r::ExPolygons{area},Slic3r::ApplySafetyOffset::Yes);
@@ -1147,6 +1154,10 @@ Json prepared_json(const Slic3r::PreparedFiberPath& path)
         {"outside_domain",fiber_regions_json(path.outside_domain)},
         {"contour_to_infill_keepout",fiber_regions_json(path.contour_to_infill_keepout)},
         {"policy_boundary",{{"present",bool(path.policy_boundary)},{"forbidden_core",Json::array()},{"requires_resin_first",false}}}};
+    row["entry"]={{"mode",int(path.entry.mode)},{"source_start",{Slic3r::unscale<double>(path.entry.start.x()),Slic3r::unscale<double>(path.entry.start.y())}},
+        {"contact",{Slic3r::unscale<double>(path.entry.contact.x()),Slic3r::unscale<double>(path.entry.contact.y())}},
+        {"end_station_mm",path.entry.end_station_mm},{"pieces",Json::array()}};
+    for(const auto& piece:path.entry.pieces)row["entry"]["pieces"].push_back(piece_json(piece));
     if(path.policy_boundary) {
         row["policy_boundary"]["forbidden_core"]=fiber_regions_json(path.policy_boundary->forbidden_core);
         row["policy_boundary"]["requires_resin_first"]=path.policy_boundary->requires_resin_first;

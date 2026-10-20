@@ -406,9 +406,9 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
         throw std::invalid_argument("Invalid continuous fiber layer interval or adhesion dwell");
     if (config.cut_to_contact_length_mm + config.prefeed_extra_length_mm > 0)
         check(config.prefeed_speed_mm_s, "fiber_prefeed_speed", true);
-    if (config.z_hop_height_mm > 0 || config.landing_length_mm > 0)
+    if (config.z_hop_height_mm > 0)
         check(config.landing_speed_mm_s, "fiber_landing_speed", true);
-    if (config.start_stabilization_length_mm > 0)
+    if (config.start_stabilization_length_mm > 0 || config.z_hop_height_mm == 0)
         check(config.start_speed_mm_s, "fiber_start_speed", true);
     if (config.cut_to_contact_length_mm > 0) {
         check(config.tail_min_speed_mm_s, "fiber_tail_min_speed", true);
@@ -426,6 +426,8 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
     check(contour ? config.contour_feed_ratio : config.infill_feed_ratio, "fiber feed ratio", true);
     check(contour ? config.contour_feed_correction : config.infill_feed_correction, "fiber feed correction", true);
     check(contour ? config.contour_acceleration_mm_s2 : config.infill_acceleration_mm_s2, "fiber acceleration", true);
+    if (is_rectilinear_fiber_infill(config, purpose) && finish_strategy != FiberFinishStrategy::TangentExtension)
+        throw std::invalid_argument("Rectilinear fiber infill requires a tangent finish strategy");
     if (finish_strategy != FiberFinishStrategy::LoopOverlap && finish_strategy != FiberFinishStrategy::TangentExtension)
         throw std::invalid_argument("Fiber finish requires an explicit loop or tangent strategy");
     const bool loop_finish = finish_strategy == FiberFinishStrategy::LoopOverlap;

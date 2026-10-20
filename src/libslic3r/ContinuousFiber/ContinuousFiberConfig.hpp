@@ -42,7 +42,7 @@ struct ContinuousFiberConfig {
     double prefeed_extra_length_mm { 0.0 };
     double prefeed_speed_mm_s { 10.0 };
     double z_hop_height_mm { 0.0 };
-    double landing_length_mm { 0.0 };
+    double landing_length_mm { 2.0 };
     double landing_speed_mm_s { 3.0 };
     int adhesion_dwell_ms { 0 };
     double start_speed_mm_s { 10.0 };
@@ -87,6 +87,11 @@ struct ContinuousFiberConfig {
         return enabled() && layer_interval > 0 && layer_id % size_t(layer_interval) == 0;
     }
 };
+
+inline bool is_rectilinear_fiber_infill(const ContinuousFiberConfig& config, FiberPathPurpose purpose)
+{
+    return purpose == FiberPathPurpose::Infill && config.infill_pattern == ipRectilinear;
+}
 
 bool fiber_concentric_uses_contour_process(const PrintRegionConfig& config);
 // The returned configuration owns geometry/process only. Display cutoff N is

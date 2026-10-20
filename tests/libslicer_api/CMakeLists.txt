@@ -20,6 +20,14 @@ set_property(TARGET libslicer_api_tests PROPERTY FOLDER "tests")
 orcaslicer_copy_test_dlls()
 orcaslicer_discover_tests(libslicer_api_tests)
 
+# Standard-library-only regressions for the independent entry comparison tool.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME FiberEntryComparisonChecker COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+        -s "${CMAKE_CURRENT_SOURCE_DIR}" -p test_compare_legacy_landing.py)
+    set_tests_properties(FiberEntryComparisonChecker PROPERTIES LABELS "fiber_entry_comparison" TIMEOUT 20)
+endif()
+
 # Shared 4xiao model runner for the closed-outer, infill-gap, and rounded-path regressions.
 add_executable(fiber_4xiao_acceptance fiber_4xiao_acceptance.cpp)
 target_compile_features(fiber_4xiao_acceptance PRIVATE cxx_std_17)

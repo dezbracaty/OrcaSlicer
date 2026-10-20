@@ -2042,6 +2042,14 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                         append_expolygons(contour_mask,fiber_contour_coverage(contour_run,0.5*prepared.width_mm));
                     contour_run.points.clear();
                 };
+                if (prepared.entry.lowers()) for (const auto& piece:prepared.entry.pieces) {
+                    if (piece.display_purpose!=FiberPathPurpose::Contour) {has_infill=true;flush();continue;}
+                    has_contour=true;
+                    const auto points=Geometry::sample_with_arcs(Geometry::slice_with_arcs_mm(prepared.entry.geometry,
+                        piece.execution_begin_mm,piece.execution_end_mm),ContourRoundingOptions{}.chord_tolerance_mm).to_polyline().points;
+                    if (!contour_run.points.empty() && contour_run.points.back()!=points.front()) flush();
+                    contour_run.points.insert(contour_run.points.end(),points.begin()+(contour_run.points.empty()?0:1),points.end());
+                }
                 for (const auto& piece:prepared.command_pieces) {
                     const auto& span=prepared.spans[piece.span_index];
                     if (!span.deposits_fiber()) continue;
@@ -2049,15 +2057,18 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                         has_infill=true;flush();continue;
                     }
                     has_contour=true;
-                    const auto points=span.geometry.to_polyline().points;
-                    if (!contour_run.points.empty() && contour_run.points.back()!=points[piece.begin_edge]) flush();
+                    const auto stations=Geometry::stations_with_arcs_mm(span.geometry);
+                    const auto points=Geometry::sample_with_arcs(Geometry::slice_with_arcs_mm(span.geometry,
+                        stations[piece.begin_edge],stations[piece.end_edge]),ContourRoundingOptions{}.chord_tolerance_mm).to_polyline().points;
+                    if (!contour_run.points.empty() && contour_run.points.back()!=points.front()) flush();
                     contour_run.points.insert(contour_run.points.end(),
-                        points.begin()+piece.begin_edge+(contour_run.points.empty()?0:1),points.begin()+piece.end_edge+1);
+                        points.begin()+(contour_run.points.empty()?0:1),points.end());
                 }
                 flush();
                 if (has_contour)
                     append_expolygons(coverage.accepted_contour_exclusion,has_infill?
-                        intersection_ex(union_ex(contour_mask),prepared.resin_exclusion):prepared.resin_exclusion);
+                        intersection_ex(fiber_material_offset(union_ex(contour_mask),prepared.execution_deviation_mm),
+                            prepared.resin_exclusion):prepared.resin_exclusion);
             }
             coverage.accepted_contour_exclusion=intersection_ex(union_ex(coverage.accepted_contour_exclusion),
                 contour_result.resin_exclusion);
@@ -2066,6 +2077,20 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         coverage.accepted_contour_exclusion=union_ex(coverage.accepted_contour_exclusion);
         coverage.accepted_infill_exclusion=union_ex(coverage.accepted_infill_exclusion);
     }
+    coverage.has_execution_envelope=true;
+    const auto record_envelope=[&](const FiberValidationResult& validation) {
+        const auto add=[&](const PreparedFiberPath& prepared) {
+            append_expolygons(coverage.guaranteed_fiber,prepared.guaranteed_coverage);
+        };
+        if(!validation.chain_executions.empty()) {
+            for(const auto& execution:validation.chain_executions)add(*execution.prepared);
+        } else for(const auto& assignment:validation.assignments)if(assignment.prepared)add(*assignment.prepared);
+    };
+    record_envelope(contour_result);record_envelope(infill_result);
+    coverage.guaranteed_fiber=union_ex(coverage.guaranteed_fiber);
+    const auto allocated_fiber=union_ex(coverage.accepted_contour_exclusion,coverage.accepted_infill_exclusion);
+    coverage.guaranteed_fiber=intersection_ex(coverage.guaranteed_fiber,allocated_fiber);
+    coverage.uncertain_fiber=diff_ex(allocated_fiber,coverage.guaranteed_fiber);
     coverage.outside_domain = contour_result.outside_domain;
     append_expolygons(coverage.outside_domain, infill_result.outside_domain);
     coverage.outside_domain = union_ex(coverage.outside_domain);
@@ -2313,15 +2338,19 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
             << " resin_area_mm2=" << audit.resin_area_mm2
             << " intentional_void_area_mm2=" << audit.intentional_void_area_mm2
             << " unassigned_area_mm2=" << audit.unassigned_area_mm2
-            << " unexpected_overlap_area_mm2=" << audit.unexpected_overlap_area_mm2;
+            << " unexpected_overlap_area_mm2=" << audit.unexpected_overlap_area_mm2
+            << " guaranteed_fiber_area_mm2=" << audit.guaranteed_fiber_area_mm2
+            << " uncertain_fiber_area_mm2=" << audit.uncertain_fiber_area_mm2
+            << " invalid_execution_envelope_area_mm2=" << audit.invalid_execution_envelope_area_mm2;
         // Outside-domain tolerance is enforced per finalized physical path by
         // FiberPathFinalizer. The layer value above is an aggregate diagnostic;
         // comparing its sum with one path's tolerance would report false errors
         // when several individually valid paths have small numerical residuals.
-        if (audit.unassigned_area_mm2 > 0.01 || audit.unexpected_overlap_area_mm2 > 0.01)
+        if (audit.unassigned_area_mm2 > 0.01 || audit.unexpected_overlap_area_mm2 > 0.01 || audit.invalid_execution_envelope_area_mm2 > 0.01)
             throw Slic3r::RuntimeError("Continuous fiber coverage audit failed: unassigned=" +
                 std::to_string(audit.unassigned_area_mm2) + " mm2, overlap=" +
-                std::to_string(audit.unexpected_overlap_area_mm2) + " mm2");
+                std::to_string(audit.unexpected_overlap_area_mm2) + " mm2, invalid_execution_envelope=" +
+                std::to_string(audit.invalid_execution_envelope_area_mm2) + " mm2");
     }
     transaction.commit(*this);
 

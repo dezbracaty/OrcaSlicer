@@ -22,6 +22,7 @@
 #include <assert.h>
 #include <regex>
 #include <charconv>
+#include <cstdlib>
 #include <string>
 #include <system_error>
 
@@ -37,7 +38,7 @@
 static const float DEFAULT_TOOLPATH_WIDTH = 0.4f;
 static const float DEFAULT_TOOLPATH_HEIGHT = 0.2f;
 
-static const float INCHES_TO_MM = 25.4f;
+static constexpr double INCHES_TO_MM = 25.4;
 static const float MMMIN_TO_MMSEC = 1.0f / 60.0f;
 static const float DRAW_ARC_TOLERANCE = 0.0125f;            //0.0125mm tolerance for drawing arc
 
@@ -54,6 +55,46 @@ static const int   DEFAULT_FILAMENT_VITRIFICATION_TEMPERATURE = 0;
 static const Slic3r::Vec3f DEFAULT_EXTRUDER_OFFSET = Slic3r::Vec3f::Zero();
 
 namespace Slic3r {
+
+namespace {
+// Shared position state must retain literal precision across material changes.
+// Match GCodeReader's word boundaries and last-valid-word rule, without changing
+// its public float cache or promoting display/time-planning data to double.
+std::optional<double> read_axis_double(const GCodeReader::GCodeLine& line, char axis)
+{
+    const std::string& raw = line.raw();
+    const auto end_word = [](char c) {
+        return c == ' ' || c == '\t' || c == ';' || c == '\r' || c == '\n' || c == 0;
+    };
+    const char* c = raw.c_str();
+    const char* end = c + raw.size();
+    while (*c == ' ' || *c == '\t') ++c;
+    while (!end_word(*c)) ++c; // command
+    std::optional<double> result;
+    while (true) {
+        while (*c == ' ' || *c == '\t') ++c;
+        if (*c == ';' || *c == '\r' || *c == '\n' || *c == 0) break;
+        if (*c == axis) {
+            const char* begin = c + 1;
+            // R is not a cached Reader axis. Preserve its character-parameter
+            // strtod grammar (including R+1) and first-valid-word semantics.
+            if (axis == 'R') {
+                char* parsed_end = nullptr;
+                const double value = std::strtod(begin, &parsed_end);
+                if (end_word(*parsed_end)) return value;
+            }
+            else {
+                double value = 0;
+                const auto parsed = fast_float::from_chars(begin, end, value);
+                if (parsed.ptr != begin && end_word(*parsed.ptr)) result = value;
+            }
+        }
+        while (!end_word(*c)) ++c;
+    }
+    return result;
+}
+}
+
 
 const std::vector<std::string> GCodeProcessor::Reserved_Tags = {
     " FEATURE: ",
@@ -458,8 +499,8 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
                     const float feedrate = curr_move.feedrate; //  ORCA: set feedrate to the gcode feed rate to prevent visualiser from
                                                                 // displaying erroneous speed transition when actual speed/actual flow views are NOT selected.
                                                                 // interpolate ? lerp(prev_move.feedrate, curr_move.feedrate, t) : curr_move.feedrate;
-                    const float width = interpolate ? lerp(prev_move.width, curr_move.width, t) : curr_move.width;
-                    const float height = interpolate ? lerp(prev_move.height, curr_move.height, t) : curr_move.height;
+                    const float width = interpolate && curr_move.fiber_occurrence==0 ? lerp(prev_move.width, curr_move.width, t) : curr_move.width;
+                    const float height = interpolate && curr_move.fiber_occurrence==0 ? lerp(prev_move.height, curr_move.height, t) : curr_move.height;
                     // ORCA: Fix issue with flow rate changes being visualized incorrectly
                     const float mm3_per_mm = curr_move.mm3_per_mm;
                     const float fan_speed = interpolate ? lerp(prev_move.fan_speed, curr_move.fan_speed, t) : curr_move.fan_speed;
@@ -489,8 +530,8 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
                     const float feedrate = curr_move.feedrate; //  ORCA: set feedrate to the gcode feed rate to prevent visualiser from
                                                                 // displaying erroneous speed transition when actual speed/actual flow views are NOT selected.
                                                                 // interpolate ? lerp(prev_move.feedrate, curr_move.feedrate, t) : curr_move.feedrate;
-                    const float width = interpolate ? lerp(prev_move.width, curr_move.width, t) : curr_move.width;
-                    const float height = interpolate ? lerp(prev_move.height, curr_move.height, t) : curr_move.height;
+                    const float width = interpolate && curr_move.fiber_occurrence==0 ? lerp(prev_move.width, curr_move.width, t) : curr_move.width;
+                    const float height = interpolate && curr_move.fiber_occurrence==0 ? lerp(prev_move.height, curr_move.height, t) : curr_move.height;
                     // ORCA: Fix issue with flow rate changes being visualized incorrectly
                     const float mm3_per_mm = curr_move.mm3_per_mm;
                     const float fan_speed = interpolate ? lerp(prev_move.fan_speed, curr_move.fan_speed, t) : curr_move.fan_speed;
@@ -3836,13 +3877,11 @@ void GCodeProcessor::process_G0(const GCodeReader::GCodeLine& line)
 void GCodeProcessor::process_G1(const GCodeReader::GCodeLine& line, const std::optional<unsigned int>& remaining_internal_g1_lines)
 {
     std::array<std::optional<double>, 4> g1_axes = { std::nullopt, std::nullopt, std::nullopt, std::nullopt };
-    if (line.has_x()) g1_axes[X] = (double)line.x();
-    if (line.has_y()) g1_axes[Y] = (double)line.y();
-    if (line.has_z()) g1_axes[Z] = (double)line.z();
-    if (line.has_e()) g1_axes[E] = (double)line.e();
+    for (unsigned char axis = X; axis <= E; ++axis)
+        g1_axes[axis] = read_axis_double(line, "XYZE"[axis]);
     std::optional<double> g1_feedrate = std::nullopt;
     if (line.has_f()) g1_feedrate = (double)line.f();
-    process_G1(g1_axes, g1_feedrate);
+    process_G1(g1_axes, g1_feedrate, G1DiscretizationOrigin::G1, remaining_internal_g1_lines);
 }
 
 void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes, const std::optional<double>& feedrate,
@@ -4253,7 +4292,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
                 m_end_position[X] = pos.x(); m_end_position[Y] = pos.y(); m_end_position[Z] = pos.z();
             };
 
-            const Vec3f curr_pos(m_end_position[X], m_end_position[Y], m_end_position[Z]);
+            const AxisCoords curr_pos = m_end_position;
             //BBS: m_result.moves.back().position has plate offset, must minus plate offset before calculate the real seam position
             const Vec3f new_pos = m_result.moves.back().position - m_extruder_offsets[filament_id] - plate_offset;
             const std::optional<Vec3f> first_vertex = m_seams_detector.get_first_vertex();
@@ -4262,7 +4301,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
             if ((new_pos - *first_vertex).squaredNorm() < 0.0625f) {
                 set_end_position(0.5f * (new_pos + *first_vertex) + m_z_offset * Vec3f::UnitZ());
                 store_move_vertex(EMoveType::Seam);
-                set_end_position(curr_pos);
+                m_end_position = curr_pos;
             }
 
             m_seams_detector.activate(false);
@@ -4291,8 +4330,8 @@ void GCodeProcessor::process_VG1(const GCodeReader::GCodeLine& line)
             is_relative |= (m_e_local_positioning_type == EPositioningType::Relative);
 
         if (lineG1.has(Slic3r::Axis(axis))) {
-            float lengthsScaleFactor = (m_units == EUnits::Inches) ? INCHES_TO_MM : 1.0f;
-            float ret = lineG1.value(Slic3r::Axis(axis)) * lengthsScaleFactor;
+            const double lengthsScaleFactor = (m_units == EUnits::Inches) ? INCHES_TO_MM : 1.0;
+            const double ret = *read_axis_double(lineG1, "XYZE"[axis]) * lengthsScaleFactor;
             return is_relative ? m_start_position[axis] + ret : m_origin[axis] + ret;
         }
         else
@@ -4591,15 +4630,16 @@ void GCodeProcessor::process_VG1(const GCodeReader::GCodeLine& line)
 void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool clockwise)
 {
     enum class EFitting { None, IJ, R };
-    std::string_view axis_pos_I;
-    std::string_view axis_pos_J;
+    const auto i_offset = read_axis_double(line, 'I');
+    const auto j_offset = read_axis_double(line, 'J');
+    const auto radius_value = read_axis_double(line, 'R');
     EFitting fitting = EFitting::None;
     if (line.has('R')) {
+        if (!radius_value) return;
         fitting = EFitting::R;
     } else {
-        axis_pos_I = line.axis_pos('I');
-        axis_pos_J = line.axis_pos('J');
-        if (! axis_pos_I.empty() || ! axis_pos_J.empty())
+        if ((line.has('I') && !i_offset) || (line.has('J') && !j_offset)) return;
+        if (i_offset || j_offset)
             fitting = EFitting::IJ;
     }
 
@@ -4617,34 +4657,29 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
     }
 
     // relative center
-    Vec3f rel_center = Vec3f::Zero();
+    Vec3d rel_center = Vec3d::Zero();
+    const double units_to_mm = (m_units == EUnits::Inches) ? INCHES_TO_MM : 1.0;
 #ifndef NDEBUG
     double radius = 0.0;
 #endif // NDEBUG
     if (fitting == EFitting::R) {
-        float r;
-        if (!line.has_value('R', r) || r == 0.0f)
+        const double r = *radius_value * units_to_mm;
+        if (r == 0.0)
             return;
 #ifndef NDEBUG
         radius = (double)std::abs(r);
 #endif // NDEBUG
-        const Vec2f start_pos((float)m_start_position[X], (float)m_start_position[Y]);
-        const Vec2f end_pos((float)end_position[X], (float)end_position[Y]);
-        const Vec2f c = Geometry::ArcWelder::arc_center(start_pos, end_pos, r, !clockwise);
+        const Vec2d start_pos(m_start_position[X], m_start_position[Y]);
+        const Vec2d end_pos(end_position[X], end_position[Y]);
+        const Vec2d c = Geometry::ArcWelder::arc_center(start_pos, end_pos, r, !clockwise);
         rel_center.x() = c.x() - m_start_position[X];
         rel_center.y() = c.y() - m_start_position[Y];
     }
     else {
         assert(fitting == EFitting::IJ);
-        if (! axis_pos_I.empty() && ! line.has_value(axis_pos_I, rel_center.x()))
-            return;
-        if (! axis_pos_J.empty() && ! line.has_value(axis_pos_J, rel_center.y()))
-            return;
+        rel_center.x() = i_offset.value_or(0.0) * units_to_mm;
+        rel_center.y() = j_offset.value_or(0.0) * units_to_mm;
     }
-
-    // scale center, if needed
-    if (m_units == EUnits::Inches)
-        rel_center *= INCHES_TO_MM;
 
     struct Arc
     {
@@ -4694,7 +4729,7 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
     }
 
     // updates extrusion from line
-    std::optional<float> extrusion;
+    std::optional<double> extrusion;
     if (line.has_e())
         extrusion = end_position[E] - m_start_position[E];
 
@@ -4720,13 +4755,11 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
 
     auto adjust_target = [this, area_filament_cross_section](const AxisCoords& target, const AxisCoords& prev_position) {
         AxisCoords ret = target;
-        if (m_global_positioning_type == EPositioningType::Relative) {
-            for (unsigned char a = X; a <= E; ++a) {
-                ret[a] -= prev_position[a];
-            }
+        for (unsigned char a = X; a <= E; ++a) {
+            const bool relative = m_global_positioning_type == EPositioningType::Relative ||
+                (a == E && m_e_local_positioning_type == EPositioningType::Relative);
+            ret[a] -= relative ? prev_position[a] : m_origin[a];
         }
-        else if (m_e_local_positioning_type == EPositioningType::Relative)
-            ret[E] -= prev_position[E];
 
         // if (m_use_volumetric_e)
         //     ret[E] *= area_filament_cross_section;
@@ -4739,7 +4772,7 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
     };
 
     auto internal_only_g1_line = [this](const AxisCoords& target, bool has_z, const std::optional<float>& feedrate,
-        const std::optional<float>& extrusion, const std::optional<unsigned int>& remaining_internal_g1_lines = std::nullopt) {
+        const std::optional<double>& extrusion, const std::optional<unsigned int>& remaining_internal_g1_lines = std::nullopt) {
           std::array<std::optional<double>, 4> g1_axes = { target[X], target[Y], std::nullopt, std::nullopt };
           std::optional<double> g1_feedrate = std::nullopt;
           if (has_z)
@@ -4775,7 +4808,7 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
             const float cos_T = cos(theta_per_segment);
             const float sin_T = sin(theta_per_segment);
             const float z_per_segment = arc.delta_z() * inv_segments;
-            const float extruder_per_segment = (extrusion.has_value()) ? *extrusion * inv_segments : 0.0f;
+            const double extruder_per_segment = (extrusion.has_value()) ? *extrusion / double(segments) : 0.0;
 
             static const size_t N_ARC_CORRECTION = 25;
             size_t arc_recalc_count = N_ARC_CORRECTION;
@@ -4916,21 +4949,20 @@ void GCodeProcessor::process_G29(const GCodeReader::GCodeLine& line)
 void GCodeProcessor::process_G10(const GCodeReader::GCodeLine& line)
 {
     // Emulate G1 retract, decrement G1 count as it's will be incremented in process_G1, but it's fake G1
-    GCodeReader::GCodeLine g10;
-    g10.set(Axis::E, -this->m_parser.config().retraction_length.get_at(m_extruder_id));
-    g10.set(Axis::F,  this->m_parser.config().retraction_speed.get_at(m_extruder_id) * 60);
+    const auto& config = m_parser.config();
     --m_g1_line_id;
-    process_G1(g10);
+    process_G1({std::nullopt, std::nullopt, std::nullopt, -config.retraction_length.get_at(m_extruder_id)},
+        config.retraction_speed.get_at(m_extruder_id) * 60);
 }
 
 void GCodeProcessor::process_G11(const GCodeReader::GCodeLine& line)
 {
     // Emulate G1 unretract, decrement G1 count as it's will be incremented in process_G1, but it's fake G1
-    GCodeReader::GCodeLine g11;
-    g11.set(Axis::E, this->m_parser.config().retraction_length.get_at(m_extruder_id) + this->m_parser.config().retract_restart_extra.get_at(m_extruder_id));
-    g11.set(Axis::F, this->m_parser.config().deretraction_speed.get_at(m_extruder_id) * 60);
+    const auto& config = m_parser.config();
     --m_g1_line_id;
-    process_G1(g11);
+    process_G1({std::nullopt, std::nullopt, std::nullopt,
+        config.retraction_length.get_at(m_extruder_id) + config.retract_restart_extra.get_at(m_extruder_id)},
+        config.deretraction_speed.get_at(m_extruder_id) * 60);
 }
 
 void GCodeProcessor::process_G20(const GCodeReader::GCodeLine& line)
@@ -4993,28 +5025,28 @@ void GCodeProcessor::process_G91(const GCodeReader::GCodeLine& line)
 
 void GCodeProcessor::process_G92(const GCodeReader::GCodeLine& line)
 {
-    float lengths_scale_factor = (m_units == EUnits::Inches) ? INCHES_TO_MM : 1.0f;
+    const double lengths_scale_factor = (m_units == EUnits::Inches) ? INCHES_TO_MM : 1.0;
     bool any_found = false;
 
     if (line.has_x()) {
-        m_origin[X] = m_end_position[X] - line.x() * lengths_scale_factor;
+        m_origin[X] = m_end_position[X] - *read_axis_double(line, 'X') * lengths_scale_factor;
         any_found = true;
     }
 
     if (line.has_y()) {
-        m_origin[Y] = m_end_position[Y] - line.y() * lengths_scale_factor;
+        m_origin[Y] = m_end_position[Y] - *read_axis_double(line, 'Y') * lengths_scale_factor;
         any_found = true;
     }
 
     if (line.has_z()) {
-        m_origin[Z] = m_end_position[Z] - line.z() * lengths_scale_factor;
+        m_origin[Z] = m_end_position[Z] - *read_axis_double(line, 'Z') * lengths_scale_factor;
         any_found = true;
     }
 
     if (line.has_e()) {
         // extruder coordinate can grow to the point where its float representation does not allow for proper addition with small increments,
         // we set the value taken from the G92 line as the new current position for it
-        m_end_position[E] = line.e() * lengths_scale_factor;
+        m_end_position[E] = *read_axis_double(line, 'E') * lengths_scale_factor;
         any_found = true;
     }
     else
@@ -5445,7 +5477,7 @@ void GCodeProcessor::process_M402(const GCodeReader::GCodeLine& line)
 
     bool has_xyz = !(line.has('X') || line.has('Y') || line.has('Z'));
 
-    float p = FLT_MAX;
+    double p = FLT_MAX;
     for (unsigned char a = X; a <= Z; ++a) {
         if (has_xyz || line.has(a)) {
             p = m_cached_position.position[a];
@@ -5458,12 +5490,12 @@ void GCodeProcessor::process_M402(const GCodeReader::GCodeLine& line)
     if (p != FLT_MAX)
         m_start_position[E] = p;
 
-    p = FLT_MAX;
-    if (!line.has_value(4, p))
-        p = m_cached_position.feedrate;
+    float feedrate = FLT_MAX;
+    if (!line.has_value(4, feedrate))
+        feedrate = m_cached_position.feedrate;
 
-    if (p != FLT_MAX)
-        m_feedrate = p;
+    if (feedrate != FLT_MAX)
+        m_feedrate = feedrate;
 }
 
 void GCodeProcessor::process_M566(const GCodeReader::GCodeLine& line)
@@ -6108,7 +6140,7 @@ double GCodeProcessor::extract_absolute_position_on_axis(Axis axis, const GCodeR
             is_relative |= (m_e_local_positioning_type == EPositioningType::Relative);
 
         const double lengthsScaleFactor = (m_units == EUnits::Inches) ? double(INCHES_TO_MM) : 1.0;
-        double ret = line.value(Slic3r::Axis(axis)) * lengthsScaleFactor;
+        const double ret = *read_axis_double(line, "XYZE"[axis]) * lengthsScaleFactor;
         // if (axis == E && m_use_volumetric_e)
         //     ret /= area_filament_cross_section;
         return is_relative ? m_start_position[axis] + ret : m_origin[axis] + ret;

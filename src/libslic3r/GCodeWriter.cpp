@@ -63,16 +63,38 @@ double GCodeWriter::quantize_xyz(double value) const
     return GCodeFormatter::quantize(value, m_xyz_export_digits);
 }
 
+Vec3d GCodeWriter::quantized_machine_position(const Vec3d& oriented) const
+{
+    Vec3d machine=machine_position(oriented);
+    for(int axis=0;axis<3;++axis) machine[axis]=quantize_xyz(machine[axis]);
+    return machine;
+}
+
+Vec3d GCodeWriter::oriented_position(const Vec3d& machine) const
+{
+    Vec3d oriented=m_belt_coordinates ?
+        m_belt_coordinates->world_to_oriented(m_belt_coordinates->machine_to_world(machine)) : machine;
+    oriented.x()+=m_x_offset;oriented.y()+=m_y_offset;
+    return oriented;
+}
+
 Vec3d GCodeWriter::get_emitted_position() const
 {
     Vec3d machine = machine_position(m_pos);
     for (size_t axis = 0; axis < 3; ++axis)
         machine[axis] = GCodeFormatter::quantize(machine[axis], m_position_export_digits[axis]);
-    Vec3d oriented = m_belt_coordinates ?
-        m_belt_coordinates->world_to_oriented(m_belt_coordinates->machine_to_world(machine)) : machine;
-    oriented.x() += m_x_offset;
-    oriented.y() += m_y_offset;
-    return oriented;
+    return oriented_position(machine);
+}
+
+std::string GCodeWriter::travel_to_bound_xyz(const Vec3d& oriented,const Vec3d& machine)
+{
+    if (!oriented.allFinite() || !machine.allFinite() || quantized_machine_position(oriented)!=machine)
+        throw std::invalid_argument("Bound XYZ differs from the writer machine transform");
+    m_pos=oriented;m_lifted=0;m_position_export_digits.fill(m_xyz_export_digits);
+    GCodeG1Formatter command(m_xyz_export_digits);
+    command.emit_xyz(machine);
+    command.emit_f(m_current_speed);
+    return command.string();
 }
 
 void GCodeWriter::apply_print_config(const PrintConfig &print_config)
@@ -671,7 +693,8 @@ std::string GCodeWriter::set_speed(double F, const std::string &comment, const s
 std::string GCodeWriter::travel_to_xy(const Vec2d &point, const std::string &comment,
                                      std::optional<double> speed_limit_mm_s)
 {
-    const Vec3d previous_machine = machine_position(m_pos);
+    const Vec3d previous_machine = speed_limit_mm_s ?
+        quantized_machine_position(get_emitted_position()) : machine_position(m_pos);
     const bool position_unknown = !this->is_current_position_clear();
     m_pos(0) = point(0);
     m_pos(1) = point(1);
@@ -686,7 +709,8 @@ std::string GCodeWriter::travel_to_xy(const Vec2d &point, const std::string &com
     auto speed = m_is_first_layer
         ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value;
     speed = limited_travel_speed(speed, speed_limit_mm_s,
-        position_unknown || (machine.head<2>() - previous_machine.head<2>()).squaredNorm() > 0);
+        position_unknown || ((speed_limit_mm_s?quantized_machine_position(m_pos):machine).head<2>() -
+            previous_machine.head<2>()).squaredNorm() > 0);
     w.emit_f(speed * 60.0);
     //BBS
     w.emit_comment(GCodeWriter::full_gcode_comment, comment);
@@ -802,7 +826,9 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
     auto travel_speed =
         m_is_first_layer ? this->config.get_abs_value("initial_layer_travel_speed") : this->config.travel_speed.value;
     const bool has_xy_motion = !this->is_current_position_clear() ||
-        (machine_position(point).head<2>() - machine_position(m_pos).head<2>()).squaredNorm() > 0;
+        (speed_limit_mm_s ?
+            (quantized_machine_position(point).head<2>()-quantized_machine_position(get_emitted_position()).head<2>()).squaredNorm()>0 :
+            (machine_position(point).head<2>()-machine_position(m_pos).head<2>()).squaredNorm()>0);
     travel_speed = limited_travel_speed(travel_speed, speed_limit_mm_s, has_xy_motion);
 
     // Belt profiles disable Z hop. In belt mode the internal position remains in

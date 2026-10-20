@@ -491,7 +491,10 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
             const auto& tail = rows[visits[after_last_visit - 1].row].scans[visits[after_last_visit - 1].scan];
             append_point({after_last_visit == first_visit + 1 || links[after_last_visit - 2].direction < 0 ?
                 tail.hi : tail.lo, rows[visits[after_last_visit - 1].row].y});
-            if (path.geometry.points.size() > 1) result.paths.push_back(std::move(path));
+            if (path.geometry.points.size() > 1) {
+                continuous_fiber_detail::bind_contour_arcs(path.geometry,path.arcs);
+                result.paths.push_back(std::move(path));
+            }
         };
         for (const auto& [first_visit, after_last_visit] : chunks)
             emit(first_visit, after_last_visit);

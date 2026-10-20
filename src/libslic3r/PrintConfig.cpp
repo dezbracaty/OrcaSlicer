@@ -1231,11 +1231,12 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionFloat(0.0));
 
     def = this->add("fiber_landing_length", coFloat);
-    def->label = L("Fiber landing length");
+    def->label = L("Fiber landing path length");
+    def->tooltip = L("XY distance traveled along the complete fiber path while lowering to the layer. Independent of Z-hop height and powered start stabilization.");
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;
-    def->set_default_value(new ConfigOptionFloat(0.0));
+    def->set_default_value(new ConfigOptionFloat(2.0));
 
     def = this->add("fiber_landing_speed", coFloat);
     def->label = L("Fiber landing speed");
@@ -1274,6 +1275,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("fiber_finish_extension_length", coFloat);
     def->label = L("Fiber finish extension length");
+    def->tooltip = L("Non-depositing travel along the final tangent after rectilinear fiber infill or an open fiber contour reaches its planned endpoint. Does not change the cutter-to-contact tail or cut position.");
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;

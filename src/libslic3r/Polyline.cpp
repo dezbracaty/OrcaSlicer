@@ -6,6 +6,8 @@
 #include "Polygon.hpp"
 #include <iostream>
 #include <utility>
+#include <stdexcept>
+#include <limits>
 
 namespace Slic3r {
 
@@ -1041,3 +1043,292 @@ void Polyline3::append_fitting_result_after_append_polyline(const Polyline3& src
     }
 }
 }
+
+
+namespace Slic3r::Geometry {
+namespace {
+bool analytic_arc(const PathFittingData& p)
+{
+    return p.path_type == EMovePathType::Arc_move_cw || p.path_type == EMovePathType::Arc_move_ccw;
+}
+
+template<class Visitor> void visit_analytic(const Polyline3& path, Visitor&& visitor)
+{
+    if (path.fitting_result.empty()) {
+        for (size_t i=1;i<path.points.size();++i)
+            visitor(PathFittingData{i-1,i,EMovePathType::Linear_move,ArcSegment{}});
+    } else for (const auto& record:path.fitting_result) {
+        if (analytic_arc(record)) visitor(record);
+        else for (size_t i=record.start_point_index+1;i<=record.end_point_index;++i)
+            visitor(PathFittingData{i-1,i,EMovePathType::Linear_move,ArcSegment{}});
+    }
+}
+
+double primitive_length(const Polyline3& path,const PathFittingData& p)
+{
+    return unscale<double>(analytic_arc(p) ? p.arc_data.length :
+        (path.points[p.end_point_index]-path.points[p.start_point_index]).cast<double>().norm());
+}
+
+Vec2d primitive_xy(const Polyline3& path,const PathFittingData& p,double t)
+{
+    if (analytic_arc(p)) {
+        const auto& a=p.arc_data;
+        const double angle=a.polar_start_theta+t*a.angle_radians;
+        return a.center.cast<double>()+a.radius*Vec2d(std::cos(angle),std::sin(angle));
+    }
+    return (1-t)*path.points[p.start_point_index].head<2>().cast<double>()+
+        t*path.points[p.end_point_index].head<2>().cast<double>();
+}
+
+Point3 primitive_point(const Polyline3& path,const PathFittingData& p,double t)
+{
+    if (t<=1e-12) return path.points[p.start_point_index];
+    if (t>=1-1e-12) return path.points[p.end_point_index];
+    const Vec2d point=primitive_xy(path,p,t);
+    return Point3(coord_t(std::llround(point.x())),coord_t(std::llround(point.y())),coord_t(0));
+}
+
+double arc_fraction(const ArcSegment& a,const Point3& point)
+{
+    const Vec2d v=point.head<2>().cast<double>()-a.center.cast<double>();
+    const double theta=std::atan2(v.y(),v.x());
+    double angle=a.direction==ArcDirection::Arc_Dir_CCW ? theta-a.polar_start_theta : a.polar_start_theta-theta;
+    angle=std::fmod(angle+4*PI,2*PI);
+    return angle/std::abs(a.angle_radians);
+}
+
+void append_primitive(Polyline3& path,Point3 from,Point3 to,const PathFittingData& original)
+{
+    if (from==to) return;
+    if (path.points.empty()) path.points.push_back(from);
+    if (path.points.back()!=from) throw std::invalid_argument("Discontinuous analytic path: previous="+
+        std::to_string(path.points.back().x())+","+std::to_string(path.points.back().y())+" next="+
+        std::to_string(from.x())+","+std::to_string(from.y()));
+    const size_t index=path.points.size()-1;
+    path.points.push_back(to);
+    auto record=original;
+    record.start_point_index=index;record.end_point_index=index+1;
+    if (analytic_arc(record)) {
+        const auto& a=original.arc_data;
+        record.arc_data=ArcSegment(a.center,a.radius,from.to_point(),to.to_point(),a.direction);
+        if (!record.arc_data.is_valid()) throw std::invalid_argument("Degenerate analytic subarc");
+    }
+    path.fitting_result.push_back(std::move(record));
+}
+}
+
+void validate_with_arcs(const Polyline3& path)
+{
+    for (const auto& point:path.points)
+        if (point.z()!=0) throw std::invalid_argument("Analytic LayerXY path has nonzero Z");
+    if (path.fitting_result.empty()) return;
+    size_t previous=0;
+    for (const auto& p:path.fitting_result) {
+        if (p.start_point_index!=previous || p.end_point_index<=previous || p.end_point_index>=path.points.size())
+            throw std::invalid_argument("Analytic fitting records do not partition the path");
+        if (analytic_arc(p)) {
+            const auto& a=p.arc_data;
+            const auto expected=p.path_type==EMovePathType::Arc_move_ccw?ArcDirection::Arc_Dir_CCW:ArcDirection::Arc_Dir_CW;
+            if (!a.is_valid() || !std::isfinite(a.radius) || a.radius<=0 || !std::isfinite(a.length) || a.length<=0 ||
+                a.direction!=expected || a.start_point!=path.points[previous].to_point() ||
+                a.end_point!=path.points[p.end_point_index].to_point())
+                throw std::invalid_argument("Invalid analytic arc fitting data");
+            double fraction=0;
+            for (size_t i=previous;i<=p.end_point_index;++i) {
+                const double radius=(path.points[i].head<2>().cast<double>()-a.center.cast<double>()).norm();
+                if (std::abs(radius-a.radius)>scale_(0.0001))
+                    throw std::invalid_argument("Analytic arc point is off its circle");
+                const double t=i==previous?0:i==p.end_point_index?1:arc_fraction(a,path.points[i]);
+                if (t+1e-7<fraction || t>1+1e-7) throw std::invalid_argument("Unordered analytic arc points");
+                fraction=t;
+            }
+        } else if (p.path_type!=EMovePathType::Linear_move)
+            throw std::invalid_argument("Unsupported analytic move type");
+        previous=p.end_point_index;
+    }
+    if (previous+1!=path.points.size()) throw std::invalid_argument("Incomplete analytic fitting data");
+}
+
+std::vector<double> stations_with_arcs_mm(const Polyline3& path)
+{
+    validate_with_arcs(path);
+    std::vector<double> stations(path.points.size(),0);
+    double station=0;
+    visit_analytic(path,[&](const PathFittingData& p) {
+        const double length=primitive_length(path,p);
+        for (size_t i=p.start_point_index+1;i<=p.end_point_index;++i)
+            stations[i]=station+length*(i==p.end_point_index?1:arc_fraction(p.arc_data,path.points[i]));
+        station+=length;
+    });
+    return stations;
+}
+
+double length_with_arcs_mm(const Polyline3& path)
+{
+    validate_with_arcs(path);
+    double result=0;visit_analytic(path,[&](const PathFittingData& p){result+=primitive_length(path,p);});
+    return result;
+}
+
+Point3 point_at_length_with_arcs_mm(const Polyline3& path,double station)
+{
+    if (!std::isfinite(station) || path.points.empty()) throw std::invalid_argument("Invalid analytic station");
+    validate_with_arcs(path);
+    Point3 result=path.points.back();double offset=0;bool found=false;
+    visit_analytic(path,[&](const PathFittingData& p) {
+        const double length=primitive_length(path,p);
+        if (!found && station<=offset+length) {
+            result=primitive_point(path,p,length>0?std::clamp((station-offset)/length,0.,1.):0);found=true;
+        }
+        offset+=length;
+    });
+    return result;
+}
+
+Vec2d tangent_at_length_with_arcs_mm(const Polyline3& path,double station,bool incoming)
+{
+    validate_with_arcs(path);
+    Vec2d result=Vec2d::Zero();double offset=0;bool found=false;
+    visit_analytic(path,[&](const PathFittingData& p) {
+        const double length=primitive_length(path,p);
+        if (!found && (station<offset+length || (incoming && station<=offset+length))) {
+            if (analytic_arc(p)) {
+                const auto& a=p.arc_data;
+                const double angle=a.polar_start_theta+std::clamp((station-offset)/length,0.,1.)*a.angle_radians;
+                result=(a.direction==ArcDirection::Arc_Dir_CCW?1.:-1.)*Vec2d(-std::sin(angle),std::cos(angle));
+            } else {
+                result=(path.points[p.end_point_index]-path.points[p.start_point_index]).head<2>().cast<double>();
+                if (result.squaredNorm()>0) result.normalize();
+            }
+            found=true;
+        }
+        offset+=length;
+    });
+    if (!found && !path.points.empty() && station>=offset && offset>0)
+        return tangent_at_length_with_arcs_mm(path,offset,true);
+    return result;
+}
+
+double project_with_arcs_mm(const Polyline3& path,const Point3& point,double minimum)
+{
+    validate_with_arcs(path);
+    const double total = length_with_arcs_mm(path);
+    if (path.points.empty() || !std::isfinite(minimum) || minimum < 0 || minimum > total)
+        throw std::invalid_argument("Invalid analytic projection range");
+    double offset=0,best=std::numeric_limits<double>::infinity(),station=minimum;
+    visit_analytic(path,[&](const PathFittingData& p) {
+        const double length=primitive_length(path,p);
+        if (length>0 && offset+length>=minimum) {
+            const double first = std::clamp((minimum-offset)/length,0.,1.);
+            const auto consider = [&](double t) {
+                // Compare analytic positions before quantization. Otherwise
+                // rounding a diagonal circle point can break an exact tie.
+                const double error=(point.head<2>().cast<double>()-primitive_xy(path,p,t)).squaredNorm();
+                const double candidate=offset+t*length;
+                const double roundoff=8*std::numeric_limits<double>::epsilon()*
+                    std::max({1.,error,std::isfinite(best)?best:0.});
+                if (error<best-roundoff || (std::abs(error-best)<=roundoff && candidate<station)) {
+                    best=error;station=candidate;
+                }
+            };
+            if (analytic_arc(p)) {
+                // Compare endpoints of the allowed subarc, not the original
+                // endpoints followed by clamping the selected one.
+                consider(first);
+                consider(1.);
+                const double t=arc_fraction(p.arc_data,point);
+                if (t>=first && t<=1.) consider(t);
+            } else {
+                const Vec2d d=(path.points[p.end_point_index]-path.points[p.start_point_index]).head<2>().cast<double>();
+                const double t=(point-path.points[p.start_point_index]).head<2>().cast<double>().dot(d)/d.squaredNorm();
+                consider(std::clamp(t,first,1.));
+            }
+        }
+        offset+=length;
+    });
+    return station;
+}
+
+Polyline3 slice_with_arcs_mm(const Polyline3& path,double begin,double end)
+{
+    validate_with_arcs(path);
+    const double total=length_with_arcs_mm(path);
+    if (!std::isfinite(begin) || !std::isfinite(end) || begin<0 || end<begin || end>total+1e-7)
+        throw std::invalid_argument("Invalid analytic slice range");
+    Polyline3 result;double offset=0;
+    visit_analytic(path,[&](const PathFittingData& p) {
+        const double length=primitive_length(path,p);
+        const double a=std::max(begin,offset),b=std::min(end,offset+length);
+        if (b>a && length>0) {
+            // Preserve a shared source endpoint before division: subtracting a
+            // large station from the end of a tiny arc can perturb t enough to
+            // re-project an integer endpoint onto a neighbouring coordinate.
+            const Point3 from=a==offset?path.points[p.start_point_index]:primitive_point(path,p,(a-offset)/length);
+            const Point3 to=b==offset+length?path.points[p.end_point_index]:primitive_point(path,p,(b-offset)/length);
+            append_primitive(result,from,to,p);
+        }
+        offset+=length;
+    });
+    if (result.points.empty() && !path.points.empty()) result.points.push_back(point_at_length_with_arcs_mm(path,begin));
+    return result;
+}
+
+bool split_at_length_with_arcs_mm(const Polyline3& path,double station,Polyline3& before,Polyline3& after)
+{
+    const double length=length_with_arcs_mm(path);
+    if (!std::isfinite(station) || station<0 || station>length) return false;
+    before=slice_with_arcs_mm(path,0,station);after=slice_with_arcs_mm(path,station,length);return true;
+}
+
+void append_with_arcs(Polyline3& destination,const Polyline3& source)
+{
+    validate_with_arcs(source);
+    if (source.points.empty()) return;
+    if (destination.points.empty()) {
+        destination=source;
+        if(destination.fitting_result.empty())
+            for(size_t i=1;i<destination.points.size();++i)
+                destination.fitting_result.push_back({i-1,i,EMovePathType::Linear_move,ArcSegment{}});
+        return;
+    }
+    validate_with_arcs(destination);
+    if (destination.points.back()!=source.points.front()) throw std::invalid_argument("Analytic append has a gap");
+    if (destination.fitting_result.empty())
+        for (size_t i=1;i<destination.points.size();++i)
+            destination.fitting_result.push_back({i-1,i,EMovePathType::Linear_move,ArcSegment{}});
+    const size_t offset=destination.points.size()-1;
+    destination.points.insert(destination.points.end(),source.points.begin()+1,source.points.end());
+    visit_analytic(source,[&](PathFittingData p) {
+        p.start_point_index+=offset;p.end_point_index+=offset;destination.fitting_result.push_back(std::move(p));
+    });
+}
+
+Polyline3 sample_with_arcs(const Polyline3& path,double error,std::vector<double>* stations)
+{
+    validate_with_arcs(path);
+    if (!std::isfinite(error) || error<=0) throw std::invalid_argument("Invalid analytic sampling error");
+    Polyline3 sampled;double offset=0;if (stations) stations->clear();
+    if (path.points.empty()) return sampled;
+    sampled.points.push_back(path.points.front());if (stations) stations->push_back(0);
+    visit_analytic(path,[&](const PathFittingData& p) {
+        const double length=primitive_length(path,p);
+        size_t count=1;
+        if (analytic_arc(p)) {
+            const double radius=unscale<double>(p.arc_data.radius);
+            const double angle=2*std::acos(std::clamp(1-error/radius,-1.,1.));
+            if (angle<=0 || std::abs(p.arc_data.angle_radians)/angle>1000000)
+                throw std::length_error("Analytic sampling exceeds its budget");
+            count=std::max(size_t(1),size_t(std::ceil(std::abs(p.arc_data.angle_radians)/angle)));
+        }
+        for (size_t i=1;i<=count;++i) {
+            const Point3 point=primitive_point(path,p,double(i)/count);
+            if (point==sampled.points.back()) {if (stations) stations->back()=offset+length*double(i)/count;continue;}
+            sampled.points.push_back(point);if (stations) stations->push_back(offset+length*double(i)/count);
+        }
+        offset+=length;
+    });
+    return sampled;
+}
+
+} // namespace Slic3r::Geometry
