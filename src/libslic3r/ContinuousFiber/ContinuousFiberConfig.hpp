@@ -18,10 +18,13 @@ class Layer;
 class LayerRegion;
 struct FiberPolicyBoundary;
 
-const std::array<std::string_view, 39>& fiber_mask_parameter_keys();
+const std::array<std::string_view, 42>& fiber_mask_parameter_keys();
 bool is_fiber_mask_parameter(std::string_view key);
 
 struct ContinuousFiberConfig {
+    bool connect_adjacent_rings { false };
+    double connection_tail_trim_widths {1.5};
+    double connection_head_trim_widths {1.0};
     bool contour_enabled { false };
     bool contour_include_holes { true };
     bool infill_enabled { false };
@@ -39,7 +42,7 @@ struct ContinuousFiberConfig {
     double prefeed_extra_length_mm { 0.0 };
     double prefeed_speed_mm_s { 10.0 };
     double z_hop_height_mm { 0.0 };
-    double landing_length_mm { 0.0 };
+    double landing_length_mm { 2.0 };
     double landing_speed_mm_s { 3.0 };
     int adhesion_dwell_ms { 0 };
     double start_speed_mm_s { 10.0 };
@@ -84,6 +87,11 @@ struct ContinuousFiberConfig {
         return enabled() && layer_interval > 0 && layer_id % size_t(layer_interval) == 0;
     }
 };
+
+inline bool is_rectilinear_fiber_infill(const ContinuousFiberConfig& config, FiberPathPurpose purpose)
+{
+    return purpose == FiberPathPurpose::Infill && config.infill_pattern == ipRectilinear;
+}
 
 bool fiber_concentric_uses_contour_process(const PrintRegionConfig& config);
 // The returned configuration owns geometry/process only. Display cutoff N is

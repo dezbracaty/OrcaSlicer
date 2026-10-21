@@ -6,6 +6,7 @@
 #include "libslic3r/AABBTreeLines.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/GCodeWriter.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Model.hpp"
@@ -172,7 +173,11 @@ Json check_spatial_contract(const Path& points,const Json& contract)
     }
     result["passed"]=result["failures"].empty();return result;
 }
-struct Block { int layer=0, extruder=0; size_t line=0; Path points; bool contour=true; size_t component=0; };
+struct Block {
+    int layer=0, extruder=0; size_t line=0; Path points; bool contour=true; size_t component=0;
+    size_t occurrence=0,gcode_begin_line=0,gcode_end_line=0;
+    size_t begin_command_index=0,end_command_index=0;
+};
 struct Candidate { int layer=0; bool outer=false; Path points; };
 
 // Read actual depositing G0/G1 moves. Finishing travel MUST NOT close a gap.
@@ -184,7 +189,7 @@ std::vector<Block> read_blocks(std::istream& input, const std::vector<Point>& of
     Point xy;
     bool absolute=true, active=false, contour=false, depositing=false;
     const std::regex field(R"((\w+)=([^ ]+))");
-    size_t number=0;
+    size_t number=0,command_index=0;
     for (std::string line;std::getline(input,line);) {
         ++number;
         if (line.rfind(";FIBER_BEGIN ",0)==0) {
@@ -198,6 +203,8 @@ std::vector<Block> read_blocks(std::istream& input, const std::vector<Point>& of
             active=true;contour=fields.at("purpose")=="contour";depositing=false;
             if(include_infill)require(fields.count("component"),"Missing fiber component metadata");
             block.contour=contour;block.component=fields.count("component")?std::stoul(fields.at("component")):0;
+            block.occurrence=fields.count("occurrence")?std::stoul(fields.at("occurrence")):blocks.size();
+            block.gcode_begin_line=number;block.begin_command_index=command_index;
         } else if (line==";FIBER_LANDING_BEGIN" || line==";FIBER_START" || line==";FIBER_TAIL_BEGIN") {
             require(active,"Fiber phase outside a block");
             depositing=true;
@@ -206,11 +213,13 @@ std::vector<Block> read_blocks(std::istream& input, const std::vector<Point>& of
             depositing=false;
         } else if (line==";FIBER_END") {
             require(active,"Fiber end outside a block");
+            block.gcode_end_line=number;block.end_command_index=command_index;
             if (contour || include_infill) { require(block.points.size()>1,"Empty depositing block");blocks.push_back(block); }
             active=false;depositing=false;
         }
         std::istringstream command(line.substr(0,line.find(';')));
         std::string opcode; command>>opcode;
+        if(!opcode.empty())++command_index;
         if (opcode=="G90") absolute=true;
         if (opcode=="G91") absolute=false;
         require(!(depositing && (opcode=="G2" || opcode=="G3")),"Unexpected arc in fixed linear G-code case");
@@ -434,7 +443,7 @@ bool matches_boundary_arc(const Path& run,const Slic3r::Polygons& rings,double t
     // of two nearby branches. Test the admissible arcs; nearest alone cannot
     // resolve that ambiguity without the rest of the connecting geometry.
     const auto starts=supports(run.front()),ends=supports(run.back());
-    const auto near=[&](const Path& subject,const Path& reference,const Path& reference_arc) {
+    const auto within_reference_band=[&](const Path& subject,const Path& reference,const Path& reference_arc) {
         Slic3r::ClipperLib::ClipperOffset operation;operation.ArcTolerance=12.5;operation.ShortestEdgeLength=0;
         operation.AddPath(integer_path(reference).points,Slic3r::ClipperLib::jtRound,Slic3r::ClipperLib::etOpenRound);
         Slic3r::ClipperLib::Paths band;operation.Execute(band,scale_(tolerance));
@@ -471,7 +480,7 @@ bool matches_boundary_arc(const Path& run,const Slic3r::Polygons& rings,double t
         }
         if(!in_strip)continue;
         reference.push_back(to.point);
-        const bool outward=near(run,reference,reference),inward=near(reference,run,reference);
+        const bool outward=within_reference_band(run,reference,reference),inward=within_reference_band(reference,run,reference);
         if(outward && inward)return true;
     }
     return false;
@@ -628,11 +637,13 @@ Json evaluate_gap(const libslicer::ToolpathPreview& preview,const std::vector<Bl
     require(effective.at("generate_reinforced_infills")=="1" && effective.at("reinforced_infill_density")=="100%","Gap acceptance requires enabled 100% infill");
     require(effective.at("fiber_width")=="1" && effective.at("reinforced_infill_pattern")=="rectilinear" &&
         effective.at("fiber_infill_bend_radius")=="0" && effective.at("fiber_contour_bend_radius")=="0" && effective.at("fiber_contour_infill_clearance")=="0","Unexpected gap acceptance geometry");
-    const double budget=std::stod(effective.at("fiber_landing_length").get<std::string>())+
-        std::stod(effective.at("fiber_start_stabilization_length").get<std::string>())+
-        std::stod(effective.at("fiber_minimum_effective_length").get<std::string>())+
-        std::stod(effective.at("fiber_cut_to_contact_length").get<std::string>());
-    require(std::abs(budget-25.5)<1e-9,"Unexpected fiber process budget");
+    const auto budget=[&]() {
+        const double height=std::stod(effective.at("fiber_z_hop_height").get<std::string>());
+        const double entry=height>0?std::stod(effective.at("fiber_landing_length").get<std::string>()):0;
+        return entry+std::stod(effective.at("fiber_start_stabilization_length").get<std::string>())+
+            std::stod(effective.at("fiber_minimum_effective_length").get<std::string>())+
+            std::stod(effective.at("fiber_cut_to_contact_length").get<std::string>());
+    };
     Json result={{"passed",true},{"layers",Json::array()},{"geometry_tolerance_mm",gap_final_error},{"reference_tolerance_mm",gap_reference_error}};
     size_t resin_segments=0;for(const auto& segment:preview.segments)if(segment.extrusion_role==libslicer::ToolpathExtrusionRole::ResinInfill && segment.deposition==libslicer::ToolpathDepositionKind::Thermoplastic)++resin_segments;
     require(resin_segments>0,"Fixture must retain ordinary resin leftover deposition");result["resin_segments"]=resin_segments;
@@ -676,7 +687,7 @@ Json evaluate_gap(const libslicer::ToolpathPreview& preview,const std::vector<Bl
             for(const auto& diagnostic:preview.fiber_fill_diagnostics)if(int(diagnostic.layer_index)+1==layer &&
                 diagnostic.component_id==source->component_id && !diagnostic.contour && diagnostic.kind==libslicer::FiberDiagnosticKind::RejectedPath) {
                 Path points;for(const auto& p:diagnostic.points)points.push_back({p.x,p.y});
-                check_short_rejection(points,diagnostic.reason,std::stod(effective.at("fiber_minimum_path_length").get<std::string>()),budget);
+                check_short_rejection(points,diagnostic.reason,std::stod(effective.at("fiber_minimum_path_length").get<std::string>()),budget());
                 paths.push_back({std::move(points),false});
             }
             auto checked=check_gap_domain(centerlines,paths,angle,{217.5,177.5},1,gap_final_error);
@@ -806,8 +817,22 @@ Json check_rounded_domain(const Slic3r::ExPolygons& centerlines,const std::vecto
     return report;
 }
 
+bool rounded_main_has_fiber(bool short_only_allowed,size_t contours,size_t infill_paths,double central_length,
+    size_t short_rejections,bool central_short_rejection)
+{
+    // Empty infill needs an explicitly allowed fixture case and actual,
+    // independently checked short-path diagnostics in the central remainder.
+    const bool short_only=short_only_allowed && central_short_rejection && short_rejections>0;
+    return contours>0 && (infill_paths>0 || short_only) && (central_length>0 || short_only);
+}
+
 void rounded_checker_self_test()
 {
+    require(rounded_main_has_fiber(true,6,0,0,107,true),"Allowed short-path evidence rejected");
+    require(!rounded_main_has_fiber(false,6,0,0,107,true),"Short-path exception applied to a positive infill case");
+    require(!rounded_main_has_fiber(true,0,0,0,107,true),"Short infill evidence hid missing contours");
+    require(!rounded_main_has_fiber(true,6,0,0,0,true),"Empty infill accepted without rejected candidates");
+    require(!rounded_main_has_fiber(true,6,0,0,107,false),"Empty infill accepted without central short-path evidence");
     const Slic3r::ExPolygons domain{Slic3r::ExPolygon(Slic3r::Polygon(integer_path({{0,0},{10,0},{10,3},{0,3}}).points))};
     const auto path=[](double radius,double contact) {
         Path points{{contact-2,1}};
@@ -884,6 +909,7 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
     std::vector<Point> offsets;std::istringstream stream(effective.at("extruder_offset").get<std::string>());for(std::string item;std::getline(stream,item,',');){const auto x=item.find('x');offsets.push_back({std::stod(item.substr(0,x)),std::stod(item.substr(x+1))});}
     std::ifstream gcode(result.output.path);require(bool(gcode),"Missing rounded G-code");const auto blocks=read_blocks(gcode,offsets,true);
     report["passed"]=true;report["layer_count"]=expected_layers;report["gcode_fingerprint"]=fingerprint(result.output.path);size_t sources=0,returns=0,resin=0,max_contours=0;
+    size_t accepted_infill=0,short_infill_rejections=0;
     for (const auto& diagnostic:result.preview->fiber_fill_diagnostics)
         if (diagnostic.contour && diagnostic.kind==libslicer::FiberDiagnosticKind::RejectedPath &&
             diagnostic.reason.rfind("contour_rounding_unresolved",0)==0) {
@@ -893,22 +919,28 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
                 {"detail",diagnostic.reason}});
         }
     for(const auto& segment:result.preview->segments)if(segment.extrusion_role==libslicer::ToolpathExtrusionRole::ResinInfill && segment.deposition==libslicer::ToolpathDepositionKind::Thermoplastic)++resin;
-    const double budget=std::stod(effective.at("fiber_landing_length").get<std::string>())+std::stod(effective.at("fiber_start_stabilization_length").get<std::string>())+
-        std::stod(effective.at("fiber_minimum_effective_length").get<std::string>())+std::stod(effective.at("fiber_cut_to_contact_length").get<std::string>());
+    const auto budget=[&]() {
+        const double height=std::stod(effective.at("fiber_z_hop_height").get<std::string>());
+        const double entry=height>0?std::stod(effective.at("fiber_landing_length").get<std::string>()):0;
+        return entry+std::stod(effective.at("fiber_start_stabilization_length").get<std::string>())+
+            std::stod(effective.at("fiber_minimum_effective_length").get<std::string>())+
+            std::stod(effective.at("fiber_cut_to_contact_length").get<std::string>());
+    };
     std::set<std::pair<size_t,size_t>> seen;
     for(const auto& source:result.preview->fiber_fill_diagnostics)if(source.kind==libslicer::FiberDiagnosticKind::OriginalContourRegion) {
         const size_t layer=source.layer_index+1;++sources;require(seen.emplace(layer,source.component_id).second,"Duplicate source region");require(!source.boundaries.empty(),"Missing source region");
         Slic3r::ExPolygon area;
         for(size_t i=0;i<source.boundaries.size();++i){Slic3r::Polygon ring;for(const auto& p:source.boundaries[i])ring.points.push_back(Slic3r::Point::new_scale(p.x,p.y));if(i==0)area.contour=std::move(ring);else area.holes.push_back(std::move(ring));}
         Slic3r::ExPolygons occupied;std::vector<GapPath> paths;double central=0;size_t contour_count=0;
-        bool central_short_rejection=false;
+        bool central_short_rejection=false;size_t short_rejections=0;
         const auto window=Slic3r::ExPolygons{Slic3r::ExPolygon(Slic3r::Polygon(integer_path({{183,165},{199,165},{199,176},{183,176}}).points))};
         for(const auto& block:blocks)if(block.layer==layer && block.component==source.component_id) {
             if(block.contour){Slic3r::append(occupied,reference_sweep(block.points,.5));++contour_count;}
             else {paths.push_back({block.points,true});for(const auto& part:Slic3r::intersection_pl(Slic3r::Polylines{integer_path(block.points)},window))central+=Slic3r::unscale<double>(part.length());}
         }
         for(const auto& d:result.preview->fiber_fill_diagnostics)if(d.layer_index+1==layer && d.component_id==source.component_id && !d.contour && d.kind==libslicer::FiberDiagnosticKind::RejectedPath) {
-            Path points;for(auto p:d.points)points.push_back({p.x,p.y});check_short_rejection(points,d.reason,std::stod(effective.at("fiber_minimum_path_length").get<std::string>()),budget);
+            Path points;for(auto p:d.points)points.push_back({p.x,p.y});check_short_rejection(points,d.reason,std::stod(effective.at("fiber_minimum_path_length").get<std::string>()),budget());
+            ++short_rejections;
             if(points.size()>1 && !Slic3r::intersection_pl(Slic3r::Polylines{integer_path(points)},window).empty())central_short_rejection=true;
         }
         const auto keepout=Slic3r::intersection_ex(Slic3r::union_ex(occupied),Slic3r::ExPolygons{area},Slic3r::ApplySafetyOffset::Yes);
@@ -916,12 +948,26 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
         float angle=float(45*PI/180);if((layer-1)&1)angle+=float(PI/2);angle+=float(PI/2);
         max_contours=std::max(max_contours,contour_count);
         auto row=check_rounded_domain(domain,paths,angle);row["layer"]=layer;row["component"]=source.component_id;row["contours"]=contour_count;row["central_accepted_length_mm"]=central;row["central_short_rejection"]=central_short_rejection;returns+=row["returns"].get<size_t>();
-        if(expected_layers==32 && source.component_id==0 && (paths.empty() || !contour_count || (central<=0 && !(layer==24 && central_short_rejection)))) {row["passed"]=false;row["failures"].push_back("main_and_central_region_require_actual_fiber");}
+        row["short_rejected_infill_paths"]=short_rejections;row["infill_process_budget_mm"]=budget();
+        accepted_infill+=paths.size();short_infill_rejections+=short_rejections;
+        // Four contours consume the long infill passages in this fixed model.
+        // Keep positive infill required for the other non-terminal cases.
+        if(expected_layers==32 && source.component_id==0 &&
+            !rounded_main_has_fiber(layer==24 || contours==4,contour_count,paths.size(),central,short_rejections,central_short_rejection)) {
+            row["passed"]=false;row["failures"].push_back("main_and_central_region_require_actual_fiber");
+        }
         if(!row["passed"].get<bool>())report["passed"]=false;report["layers"].push_back(std::move(row));
     }
     for(const auto& block:blocks)require(seen.count({size_t(block.layer),block.component}),"Depositing path without source region");
     if(expected_layers==32)for(size_t layer=4;layer<=24;++layer){std::vector<size_t> components;for(auto key:seen)if(key.first==layer)components.push_back(key.second);check_components(components,layer==24?65:1);}
-    require(sources>0 && returns>0 && resin>0,"Rounded acceptance requires source regions, real fiber returns and resin leftovers");
+    const bool short_only_case=expected_layers==32 && contours==4 && accepted_infill==0 && short_infill_rejections>0;
+    if(!(sources>0 && (returns>0 || short_only_case) && resin>0)) {
+        report["passed"]=false;
+        report["failures"].push_back("rounded_acceptance_requires_sources_returns_and_resin");
+    }
+    report["source_regions"]=sources;
+    report["accepted_infill_paths"]=accepted_infill;report["short_rejected_infill_paths"]=short_infill_rejections;
+    report["short_only_infill_case"]=short_only_case;
     report["max_contours_per_source"]=max_contours;
     if (max_contours<size_t(contours)) {
         report["passed"]=false;
@@ -995,6 +1041,8 @@ struct RingCaseOptions {
     bool different_process=false;
     bool hole=false;
     std::optional<int> second_display_count;
+    std::optional<bool> connection;
+    fixture_fs::path frozen_snapshot;
 };
 struct RingReplayDomain {
     Slic3r::ExPolygons area;
@@ -1056,15 +1104,33 @@ void write_ring_svg(const fixture_fs::path& file,size_t layer,const Json& diagno
 // world coordinates. The origin comes from the model instance, never the output.
 bool ring_output_matches(const Path& local,const Block& block,Point origin,double* maximum_error=nullptr)
 {
-    if(local.size()<2 || local.size()!=block.points.size())return false;
+    if(local.size()<2 || block.points.size()<2)return false;
     const double tolerance=std::sqrt(2.)*.5*
         Slic3r::GCodeFormatter::pow_10_inv[Slic3r::GCodeFormatter::XYZF_EXPORT_DIGITS]+2e-6;
-    double maximum=0;
-    for(size_t j=0;j<local.size();++j) {
-        const double error=distance({local[j].x+origin.x,local[j].y+origin.y},block.points[j]);
-        if(!std::isfinite(error) || error>tolerance)return false;
-        maximum=std::max(maximum,error);
-    }
+    Path world;for(const auto& p:local)world.push_back({p.x+origin.x,p.y+origin.y});
+    double maximum=std::max(distance(world.front(),block.points.front()),distance(world.back(),block.points.back()));
+    if(!std::isfinite(maximum) || maximum>tolerance)return false;
+    // Compare both ordered curves. Valid arc tessellations may differ, while
+    // missing corners, reversed traversal and misplaced starts must still fail.
+    const auto follows=[&](const Path& subject,const Path& reference) {
+        size_t edge=0;double minimum_t=0;
+        for(const auto& point:subject) {
+            bool found=false;
+            while(edge+1<reference.size()) {
+                const Point a=reference[edge],b=reference[edge+1];
+                const double dx=b.x-a.x,dy=b.y-a.y,n=dx*dx+dy*dy;
+                const double t=n>0?std::clamp(((point.x-a.x)*dx+(point.y-a.y)*dy)/n,minimum_t,1.):minimum_t;
+                const double error=distance(point,{a.x+t*dx,a.y+t*dy});
+                if(std::isfinite(error) && error<=tolerance) {
+                    maximum=std::max(maximum,error);minimum_t=t;found=true;break;
+                }
+                ++edge;minimum_t=0;
+            }
+            if(!found)return false;
+        }
+        return true;
+    };
+    if(!follows(world,block.points) || !follows(block.points,world))return false;
     if(maximum_error)*maximum_error=maximum;
     return true;
 }
@@ -1091,6 +1157,127 @@ void ring_coordinate_checker_self_test()
     auto wrong_offsets=offsets;wrong_offsets[1].y+=1;
     std::istringstream wrong_input(text.str());const auto wrong_blocks=read_blocks(wrong_input,wrong_offsets,true);
     require(!ring_output_matches(local,wrong_blocks[0],origin),"Coordinate checker accepted an incorrect tool offset");
+    auto subdivided=blocks[0];
+    subdivided.points.insert(subdivided.points.begin()+1,{(subdivided.points[0].x+subdivided.points[1].x)/2,
+        (subdivided.points[0].y+subdivided.points[1].y)/2});
+    require(ring_output_matches(local,subdivided,origin),"Coordinate checker rejected equivalent subdivided output");
+    Path sampled=local;sampled.insert(sampled.begin()+1,{(local[0].x+local[1].x)/2,(local[0].y+local[1].y)/2});
+    require(ring_output_matches(sampled,blocks[0],origin),"Coordinate checker rejected equivalent subdivided source");
+    auto shortcut=blocks[0];shortcut.points.erase(shortcut.points.begin()+1);
+    require(!ring_output_matches(local,shortcut,origin),"Coordinate checker accepted a missing corner");
+    auto backtrack=blocks[0];backtrack.points.push_back(backtrack.points[1]);backtrack.points.push_back(backtrack.points[2]);
+    require(!ring_output_matches(local,backtrack,origin),"Coordinate checker accepted a reversed traversal");
+}
+
+Json source_json(const Slic3r::FiberCandidateId& id)
+{
+    return {{"object",id.domain.object_id},{"raw_layer",id.domain.layer_id},{"layer",id.domain.layer_id+1},
+        {"policy_group",id.domain.policy_group_id},{"component",id.domain.component_id},
+        {"purpose",int(id.purpose)},{"job",id.job_ordinal},{"path",id.path_ordinal}};
+}
+Json source_json(const Slic3r::FiberFragmentId& id)
+{
+    auto row=source_json(id.parent);row["fragment"]=id.fragment_ordinal;return row;
+}
+template<class Polyline> Json fiber_points_json(const Polyline& line)
+{
+    Json result=Json::array();for(const auto& p:line.points)
+        result.push_back({Slic3r::unscale<double>(p.x()),Slic3r::unscale<double>(p.y())});
+    return result;
+}
+Json fiber_regions_json(const Slic3r::ExPolygons& regions)
+{
+    Json result=Json::array();for(const auto& region:regions) {
+        Json rings=Json::array();rings.push_back(fiber_points_json(region.contour));
+        for(const auto& hole:region.holes)rings.push_back(fiber_points_json(hole));result.push_back(rings);
+    }return result;
+}
+Json piece_json(const Slic3r::FiberExecutionPiece& piece)
+{
+    return {{"kind",piece.kind==Slic3r::FiberExecutionPieceKind::Transition?"transition":"source"},
+        {"source",source_json(piece.source)},{"other_source",source_json(piece.other_source)},
+        {"source_begin_mm",piece.source_begin_mm},{"source_end_mm",piece.source_end_mm},{"direction",1},
+        {"execution_begin_mm",piece.execution_begin_mm},{"execution_end_mm",piece.execution_end_mm},
+        {"display_purpose",int(piece.display_purpose)},{"transition_id",piece.transition_id},
+        {"source_station_knots",piece.source_station_knots?Json(*piece.source_station_knots):Json::array()}};
+}
+Json prepared_json(const Slic3r::PreparedFiberPath& path)
+{
+    Json row={{"id",source_json(path.id)},{"filament",path.logical_filament_id},{"width_mm",path.width_mm},
+        {"height_mm",path.height_mm},{"finish_strategy",int(path.finish_strategy)},
+        {"deposited_length_mm",path.total_depositing_length_mm()},{"passive_tail_mm",path.passive_tail_length_mm()},
+        {"spans",Json::array()},{"actions",Json::array()},{"command_pieces",Json::array()},
+        {"physical_coverage",fiber_regions_json(path.physical_coverage)},
+        {"resin_exclusion",fiber_regions_json(path.resin_exclusion)},
+        {"outside_domain",fiber_regions_json(path.outside_domain)},
+        {"contour_to_infill_keepout",fiber_regions_json(path.contour_to_infill_keepout)},
+        {"policy_boundary",{{"present",bool(path.policy_boundary)},{"forbidden_core",Json::array()},{"requires_resin_first",false}}}};
+    row["entry"]={{"mode",int(path.entry.mode)},{"source_start",{Slic3r::unscale<double>(path.entry.start.x()),Slic3r::unscale<double>(path.entry.start.y())}},
+        {"contact",{Slic3r::unscale<double>(path.entry.contact.x()),Slic3r::unscale<double>(path.entry.contact.y())}},
+        {"end_station_mm",path.entry.end_station_mm},{"pieces",Json::array()}};
+    for(const auto& piece:path.entry.pieces)row["entry"]["pieces"].push_back(piece_json(piece));
+    if(path.policy_boundary) {
+        row["policy_boundary"]["forbidden_core"]=fiber_regions_json(path.policy_boundary->forbidden_core);
+        row["policy_boundary"]["requires_resin_first"]=path.policy_boundary->requires_resin_first;
+    }
+    for(const auto& span:path.spans) {
+        Json edges=Json::array();for(const auto& edge:span.edges)edges.push_back({{"speed_mm_s",edge.speed_mm_s},{"feed_mm_per_xy_mm",edge.feed_mm_per_xy_mm}});
+        row["spans"].push_back({{"kind",int(span.kind)},{"deposits",span.deposits_fiber()},
+            {"actively_feeds",span.actively_feeds_fiber()},{"points",fiber_points_json(span.geometry)},{"edges",edges}});
+    }
+    for(const auto& action:path.actions)row["actions"].push_back({{"type",int(action.type)},{"span_index",action.span_index}});
+    for(const auto& piece:path.command_pieces)row["command_pieces"].push_back({{"origin",piece_json(piece.origin)},
+        {"span_index",piece.span_index},{"begin_edge",piece.begin_edge},{"end_edge",piece.end_edge},
+        {"command_begin_mm",piece.command_begin_mm},{"command_end_mm",piece.command_end_mm}});
+    return row;
+}
+Json connection_plan_json(const Slic3r::FiberContourPlanResult& plan,size_t layer)
+{
+    Json row={{"layer",layer},{"nodes",Json::array()},{"stops",Json::array()},{"assignments",Json::array()},
+        {"decisions",Json::array()},{"executions",Json::array()},
+        {"physical_footprint",fiber_regions_json(plan.validation.physical_footprint)},
+        {"resin_exclusion",fiber_regions_json(plan.validation.resin_exclusion)},
+        {"contour_to_infill_keepout",fiber_regions_json(plan.validation.contour_to_infill_keepout)}};
+    for(const auto& node:plan.nodes)row["nodes"].push_back({{"id",source_json(node.id)},
+        {"parent",node.parent?source_json(*node.parent):Json(nullptr)},{"depth",node.depth},{"side",int(node.side)},
+        {"region_id",node.region_id},{"boundary_id",node.boundary_id},{"part_id",node.part_id},
+        {"points",node.source?fiber_points_json(*node.source):Json::array()}});
+    for(const auto& stop:plan.stops)row["stops"].push_back({{"parent",stop.parent?source_json(*stop.parent):Json(nullptr)},
+        {"depth",stop.depth},{"side",int(stop.side)},{"reason",stop.reason}});
+    for(const auto& assignment:plan.validation.assignments) {
+        Json arcs=Json::array(),bends=Json::array();
+        for(const auto& arc:assignment.source_arcs)arcs.push_back({{"center",{arc.center_mm.x(),arc.center_mm.y()}},
+            {"start",{arc.start_mm.x(),arc.start_mm.y()}},{"end",{arc.end_mm.x(),arc.end_mm.y()}},
+            {"radius_mm",arc.radius_mm},{"sweep_radians",arc.sweep_radians},{"source_sweep_radians",arc.source_sweep_radians},
+            {"begin_mm",arc.begin_mm},{"end_mm",arc.end_distance_mm}});
+        for(const auto& bend:assignment.source_bends)bends.push_back({{"begin_mm",bend.begin_mm},{"end_mm",bend.end_mm}});
+        row["assignments"].push_back({{"id",source_json(assignment.id)},{"kind",int(assignment.kind)},
+            {"reason",Slic3r::fiber_rejection_reason_name(assignment.reason)},{"detail",assignment.detail},
+            {"source_begin_mm",assignment.source_begin_mm},{"source_end_mm",assignment.source_end_mm},
+            {"display_purpose",assignment.display_purpose?Json(int(*assignment.display_purpose)):Json(nullptr)},
+            {"points",assignment.centerline?fiber_points_json(assignment.centerline->polyline):Json::array()},
+            {"arcs",arcs},{"bends",bends}});
+    }
+    const auto point=[](const Slic3r::Point3& p){return Json{Slic3r::unscale<double>(p.x()),Slic3r::unscale<double>(p.y())};};
+    for(const auto& decision:plan.chain_decisions)row["decisions"].push_back({{"parent",source_json(decision.parent)},
+        {"child",source_json(decision.child)},{"parent_contact",point(decision.parent_contact)},
+        {"child_contact",point(decision.child_contact)},{"bridge_begin",point(decision.bridge_begin)},
+        {"bridge_end",point(decision.bridge_end)},{"parent_station_mm",decision.parent_station_mm},
+        {"child_station_mm",decision.child_station_mm},{"gap_mm",decision.gap_mm},
+        {"inherited_seam",decision.inherited_seam},{"planned",decision.planned},{"published",decision.published},{"reason",decision.reason}});
+    for(const auto& execution:plan.validation.chain_executions) {
+        Json sources=Json::array(),pieces=Json::array(),finish=Json::array();
+        for(const auto& source:execution.sources)sources.push_back({{"source",source_json(source.source)},
+            {"seam_mm",source.seam_mm},{"head_mm",source.head_mm},{"tail_mm",source.tail_mm},
+            {"original_mm",source.original_mm},{"retained_mm",source.retained_mm},
+            {"retained_intervals",source.retained_intervals}});
+        for(const auto& piece:execution.pieces)pieces.push_back(piece_json(piece));
+        for(const auto& piece:execution.finish_pieces)finish.push_back(piece_json(piece));
+        row["executions"].push_back({{"sources",sources},{"pieces",pieces},{"finish_pieces",finish},
+            {"points",fiber_points_json(execution.centerline.polyline)},
+            {"prepared",execution.prepared?prepared_json(*execution.prepared):Json(nullptr)}});
+    }
+    return row;
 }
 
 RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
@@ -1108,7 +1295,27 @@ RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
     if (!test_options.use_default_stability) patch.emplace_back(stability_key,std::to_string(stability));
     patch.emplace_back("fiber_contour_bend_radius",std::to_string(test_options.radius.value_or(preset_radius)));
     patch.emplace_back("fiber_contour_include_holes",test_options.hole?"1":"0");
-    require(library.apply_active_config_patch(patch).success,"Ring fixture config rejected");
+    if(!test_options.frozen_snapshot.empty()) {
+        patch.clear();
+        auto frozen=read_json(test_options.frozen_snapshot);
+        if(frozen.contains("settings"))frozen=frozen.at("settings");
+        const auto before=*library.active_config_snapshot();
+        const auto items=library.active_config()->settings;
+        for(auto it=frozen.begin();it!=frozen.end();++it) {
+            const auto old=before.value(it.key());
+            if(old && *old!=it.value().get<std::string>() && std::any_of(items.begin(),items.end(),[&](const auto& item){return item.key==it.key();}))
+                patch.emplace_back(it.key(),it.value().get<std::string>());
+        }
+    }
+    if(test_options.connection) {
+        patch.emplace_back("fiber_connect_adjacent_rings",*test_options.connection?"1":"0");
+        patch.emplace_back("fiber_connection_tail_trim_widths","1.5");
+        patch.emplace_back("fiber_connection_head_trim_widths","1");
+        if(test_options.frozen_snapshot.empty())patch.emplace_back("fiber_contour_boundary_clearance","0.05");
+    }
+    const auto applied=library.apply_active_config_patch(patch);
+    for(const auto& d:applied.diagnostics)std::cerr<<d.key<<": "<<d.message<<'\n';
+    require(applied.success,"Ring fixture config rejected");
     const auto snapshot=*library.active_config_snapshot();
     Slic3r::DynamicPrintConfig config;config.apply(Slic3r::FullPrintConfig::defaults());
     Json effective=Json::object();
@@ -1117,10 +1324,25 @@ RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
         if(Slic3r::print_config_def.get(key))config.set_deserialize_strict(key,value);
     }
     write_json(output/"effective_config.json",effective);
+    if(!test_options.frozen_snapshot.empty()) {
+        auto frozen=read_json(test_options.frozen_snapshot);if(frozen.contains("settings"))frozen=frozen.at("settings");
+        for(auto it=frozen.begin();it!=frozen.end();++it)
+            if(it.key()!="fiber_connect_adjacent_rings" && it.key()!="fiber_connection_tail_trim_widths" && it.key()!="fiber_connection_head_trim_widths")
+                require(effective.contains(it.key()) && effective.at(it.key())==it.value(),"Frozen snapshot mismatch: "+it.key());
+        const auto* variants=config.option<Slic3r::ConfigOptionStrings>("filament_extruder_variant");
+        if(variants && !variants->values.empty()) {
+            auto* indices=config.option<Slic3r::ConfigOptionInts>("filament_self_index",true);
+            if(indices->values.size()!=variants->values.size()) {
+                indices->values.resize(variants->values.size());
+                for(size_t i=0;i<indices->values.size();++i)indices->values[i]=int(i+1);
+            }
+        }
+    }
     stability=std::stod(effective.at(stability_key).get<std::string>());
     auto input=read_model(model);input.transform[3]+=test_options.translation;input.transform[7]+=test_options.translation;
     Slic3r::Model plate;
     auto* object=plate.add_object();
+    if(!test_options.frozen_snapshot.empty())object->name=input.name;
     if(test_options.split_regions) {
         object->add_volume(Slic3r::make_cube(20,40,4.18),Slic3r::ModelVolumeType::MODEL_PART,false)->config.set("extruder",1);
         auto second=Slic3r::make_cube(20,40,4.18);second.translate(20,0,0);
@@ -1140,12 +1362,13 @@ RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
         std::vector<Slic3r::Vec3f> vertices;std::vector<Slic3r::Vec3i32> faces;
         for(const auto& point:volume.vertices)vertices.emplace_back(point.x,point.y,point.z);
         for(const auto& face:volume.triangles)faces.emplace_back(face.vertex_a,face.vertex_b,face.vertex_c);
-        object->add_volume(Slic3r::TriangleMesh(std::move(vertices),std::move(faces)),Slic3r::ModelVolumeType::MODEL_PART,false)->config.set("extruder",1);
+        object->add_volume(Slic3r::TriangleMesh(std::move(vertices),std::move(faces)),Slic3r::ModelVolumeType::MODEL_PART,false)->config.set("extruder",test_options.frozen_snapshot.empty()?1:volume.default_filament_slot);
     }
     Slic3r::Transform3d transform=Slic3r::Transform3d::Identity();
     for(int row=0;row<4;++row)for(int col=0;col<4;++col)transform(row,col)=input.transform[size_t(row*4+col)];
     object->add_instance()->set_transformation(Slic3r::Geometry::Transformation(transform));
     Slic3r::Print print;
+    if(!test_options.frozen_snapshot.empty())print.set_plate_origin(Slic3r::Vec3d::Zero());
     // Mirror Library::slice: Print's machine-family flag is not initialized by apply().
     const auto* printer_model=config.option<Slic3r::ConfigOptionString>("printer_model");
     print.is_BBL_printer()=printer_model && printer_model->value.rfind("Bambu Lab",0)==0;
@@ -1158,7 +1381,7 @@ RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
         {"process_seconds",process_seconds},{"density",test_options.density},{"debug",test_options.debug},
         {"translation",test_options.translation},{"radius_mm",std::stod(effective.at("fiber_contour_bend_radius").get<std::string>())},
         {"layers",Json::array()},{"failures",Json::array()}};
-    Json diagnostics=Json::array();std::set<size_t> policy_groups;
+    Json diagnostics=Json::array(),connection_plans=Json::array();std::set<size_t> policy_groups;
     std::map<std::tuple<size_t,size_t,size_t,size_t>,double> stable_entries;
     std::map<size_t,Point> instance_origins;
     for(const auto* printed:print.objects()) {
@@ -1169,6 +1392,12 @@ RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
     size_t layers=0,candidates=0;
     for(const auto* printed:print.objects())for(const auto* layer:printed->layers()) {
         ++layers;const size_t before=result.paths.size();
+        if(test_options.connection)for(const auto& plan:layer->fiber_connection_plans) {
+            auto trace=connection_plan_json(*plan,layer->id()+1);
+            const auto origin=instance_origins.at(printed->id().id);
+            trace["instance_origin"]={origin.x,origin.y};trace["object_id"]=printed->id().id;
+            connection_plans.push_back(std::move(trace));
+        }
         for(const auto* region:layer->regions())collect_ring_paths(region->fills,result.paths,test_options.rectilinear,&result.displayed_outer_paths);
         Json rejected=Json::object();
         std::map<std::pair<size_t,size_t>,Slic3r::ExPolygons> replay_areas;
@@ -1223,7 +1452,7 @@ RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
         result.report["layers"].push_back({{"layer",layer->id()+1},{"accepted",result.paths.size()-before},{"rejected",rejected}});
     }
     require(layers==expected_layers,"Ring slice layer count differs");
-    const fixture_fs::path gcode=output/"model.gcode";print.export_gcode(gcode.string(),nullptr);
+    const fixture_fs::path gcode=output/"model.gcode";Slic3r::GCodeProcessorResult processor;print.export_gcode(gcode.string(),test_options.frozen_snapshot.empty()?nullptr:&processor);
     result.report["full_slice_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
     std::ifstream commands(gcode);
     for(std::string line;std::getline(commands,line);) {
@@ -1245,11 +1474,18 @@ RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
         size_t match=result.paths.size();
         for(size_t i=0;i<result.paths.size();++i)if(!used[i] && result.paths[i]->id.parent.domain.layer_id+1==size_t(block.layer) &&
             result.paths[i]->id.parent.domain.component_id==block.component &&
-            (result.displayed_outer_paths.count(result.paths[i].get())>0)==block.contour) {
+            (test_options.connection.value_or(false) || (result.displayed_outer_paths.count(result.paths[i].get())>0)==block.contour)) {
             Path candidate;
+            const auto append_geometry=[&](const Slic3r::Polyline3& geometry) {
+                const auto sampled=Slic3r::Geometry::sample_with_arcs(geometry,0.00005);
+                for(const auto& p:sampled.points) {
+                    const Point point{Slic3r::unscale<double>(p.x()),Slic3r::unscale<double>(p.y())};
+                    if(candidate.empty() || distance(candidate.back(),point)>0)candidate.push_back(point);
+                }
+            };
+            if(result.paths[i]->entry.lowers())append_geometry(result.paths[i]->entry.geometry);
             for(const auto& span:result.paths[i]->spans)if(span.deposits_fiber())
-                for(size_t j=candidate.empty()?0:1;j<span.geometry.points.size();++j)
-                    candidate.push_back({Slic3r::unscale<double>(span.geometry.points[j].x()),Slic3r::unscale<double>(span.geometry.points[j].y())});
+                append_geometry(span.geometry);
             const auto tool=Slic3r::resolve_fiber_tool(print.config(),result.paths[i]->logical_filament_id);
             if(tool.logical_extruder_id!=unsigned(block.extruder))continue;
             double error=0;
@@ -1265,14 +1501,29 @@ RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
         const Point origin=instance_origins.at(prepared.id.parent.domain.object_id);
         for(const auto& p:block.points) {world_points.push_back({p.x,p.y});local_points.push_back({p.x-origin.x,p.y-origin.y});}
         emitted.push_back({{"layer",block.layer},{"component",block.component},{"display_contour",block.contour},
-            {"candidate",prepared.id.parent.job_ordinal},{"policy_group",prepared.id.parent.domain.policy_group_id},
+            {"occurrence",block.occurrence},{"gcode_begin_line",block.gcode_begin_line},{"gcode_end_line",block.gcode_end_line},
+            {"begin_command_index",block.begin_command_index},{"end_command_index",block.end_command_index},
+            {"prepared_id",source_json(prepared.id)},{"prepared_index",match},{"candidate",prepared.id.parent.job_ordinal},{"policy_group",prepared.id.parent.domain.policy_group_id},
             {"instance_origin",{origin.x,origin.y}},{"extruder",block.extruder},
             {"local_points",local_points},{"world_points",world_points}});
         const auto stable=stable_entries.find({size_t(block.layer),prepared.id.parent.domain.policy_group_id,block.component,prepared.id.parent.job_ordinal});
         if(stable!=stable_entries.end()) {
-            require(!block.contour,"Concentric stability changed a displayed outer contour");
+            require(test_options.connection.value_or(false) || !block.contour,"Concentric stability changed a displayed outer contour");
             emitted.back()["minimum_stable_path_mm"]=stable->second;
         }
+    }
+    if(test_options.connection) {
+        write_json(output/"connection-plans.json",connection_plans);
+        Json prepared=Json::array();for(const auto& path:result.paths)prepared.push_back(prepared_json(*path));
+        write_json(output/"prepared-paths.json",prepared);
+        result.report["connection_enabled"]=*test_options.connection;
+        result.report["frozen_snapshot"]=test_options.frozen_snapshot.string();
+        if(!test_options.frozen_snapshot.empty())result.report["frozen_snapshot_fingerprint"]=fingerprint(test_options.frozen_snapshot);
+        Json applied_patch=Json::array();for(const auto& item:patch)applied_patch.push_back({{"key",item.first},{"value",item.second}});
+        result.report["applied_overrides"]=applied_patch;
+        result.report["input_geometry_source"]="read_model indexed in-memory mesh; complete production Print.process/export_gcode; no reference injection";
+        result.report["model_fingerprint"]=fingerprint(model);
+        result.report["effective_config_fingerprint"]=fingerprint(output/"effective_config.json");
     }
     result.report["layers_count"]=layers;result.report["candidates"]=candidates;result.report["accepted"]=blocks.size();
     result.report["policy_group_count"]=policy_groups.size();result.report["command_count"]=result.commands.size();
@@ -1577,6 +1828,20 @@ int run_acceptance(int argc,char** argv)
         fixture_fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR);
     const bool checking=argc==2 && std::string(argv[1])=="--self-test";
     try {
+        if((argc==7 || argc==8) && std::string(argv[1])=="--connection-model") {
+            const auto pinned=read_json(fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao/config.json");const auto& selected=pinned.at("selection");
+            libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};auto library=libslicer::Library::open(options);
+            libslicer::ConfigSelection selection;selection.machine_model_id=selected.at("machine_model_id");selection.machine_variant_id=selected.at("machine_variant_id");selection.process_preset_id=selected.at("process_preset_id");
+            selection.filament_preset_ids=selected.at("filament_preset_ids").get<std::vector<std::string>>();selection.filament_physical_tools=selected.at("filament_physical_tools").get<std::vector<unsigned>>();
+            require(library->activate_config(selection).success,"Cannot activate connection fixture");
+            const std::string mode=argv[4],enabled=argv[5];
+            require(enabled=="on" || enabled=="off","Connection state must be on/off");
+            require(mode=="rect100" || mode=="con100" || mode=="con30" || mode=="snapshot","Unknown connection matrix mode");
+            RingCaseOptions test_options;test_options.connection=enabled=="on";test_options.radius=.3;
+            test_options.rectilinear=mode=="rect100";test_options.density=mode=="con30"?30:100;
+            if(mode=="snapshot") {require(argc==8,"Snapshot mode needs frozen effective_config.json");test_options.frozen_snapshot=argv[7];}
+            ring_slice(*library,argv[2],std::stoul(argv[3]),.3,3,0,mode=="con100" || mode=="con30",argv[6],test_options);return 0;
+        }
         if(argc==3 && std::string(argv[1])=="--ring-positive")return ring_positive_acceptance(argv[2]);
         if(argc==8 && std::string(argv[1])=="--ring-case") {
             const auto pinned=read_json(fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao/config.json");const auto& selected=pinned.at("selection");

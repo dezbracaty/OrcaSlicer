@@ -352,6 +352,23 @@ private:
 
 typedef std::vector<Polyline3> Polylines3;
 
+namespace Geometry {
+// Explicit analytic LayerXY operations. Unlike MultiPoint::length and the
+// legacy split API, fitting_result arcs contribute their true arc length.
+void validate_with_arcs(const Polyline3& path);
+std::vector<double> stations_with_arcs_mm(const Polyline3& path);
+double length_with_arcs_mm(const Polyline3& path);
+Point3 point_at_length_with_arcs_mm(const Polyline3& path, double station_mm);
+Vec2d tangent_at_length_with_arcs_mm(const Polyline3& path, double station_mm, bool incoming = false);
+double project_with_arcs_mm(const Polyline3& path, const Point3& point, double minimum_station_mm = 0.0);
+Polyline3 slice_with_arcs_mm(const Polyline3& path, double begin_mm, double end_mm);
+bool split_at_length_with_arcs_mm(const Polyline3& path, double station_mm, Polyline3& before, Polyline3& after);
+void append_with_arcs(Polyline3& destination, const Polyline3& source);
+// Sampling is a derived check/output view, never a replacement for the path.
+Polyline3 sample_with_arcs(const Polyline3& path, double error_mm,
+                          std::vector<double>* analytic_stations_mm = nullptr);
+}
+
 }
 
 #endif

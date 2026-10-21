@@ -6,6 +6,7 @@
 #include "ContinuousFiberFillStrategy.hpp"
 
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace Slic3r {
@@ -14,6 +15,14 @@ class ExtrusionPath;
 // Error-bounded short-edge and collinear normalization. Preserves
 // endpoints/seam; this geometry becomes the source for length and coverage.
 Polyline3 normalize_fiber_geometry(const Polyline3& input, const ExPolygons* centerline_domain = nullptr);
+
+// Keep every source/bridge seam as an exact knot. Source ranges are unchanged;
+// execution stations are rebound to the normalized geometry. The optional map
+// records the old station of every returned knot for arc/bend rebinding.
+Polyline3 normalize_fiber_chain_geometry(
+    const Polyline3& input, std::vector<FiberExecutionPiece>& pieces,
+    const ExPolygons* centerline_domain = nullptr,
+    std::vector<double>* original_stations_mm = nullptr);
 
 enum class FiberFinalizationFailure : uint8_t {
     None,
@@ -35,7 +44,8 @@ struct FiberFinalizationResult {
 
 // Source geometry for non-depositing motion. The caller selects the strategy;
 // command preparation happens once in the Finalizer, together with other spans.
-// A zero request still carries LoopOverlap or TangentExtension explicitly.
+// Rectilinear infill uses TangentExtension. Zero requests have no route and
+// retain the selected policy; finish never changes the depositing endpoint.
 struct FiberFinishRoute {
     Polyline3 geometry;
     FiberFinishStrategy strategy {FiberFinishStrategy::None};
@@ -59,7 +69,9 @@ public:
         const FiberFragmentId& id,
         const FiberFinishRoute& finish,
         const std::vector<ContourArc>& arcs = {},
-        const ExPolygons* planned_centerline_domain = nullptr);
+        const ExPolygons* planned_centerline_domain = nullptr,
+        const std::vector<FiberExecutionPiece>& pieces = {},
+        const std::vector<FiberExecutionPiece>& finish_pieces = {});
 };
 
 } // namespace Slic3r

@@ -64,6 +64,69 @@ libslicer::SliceObjectInput binary_stl_on_bed(const std::string& path)
     return result;
 }
 
+// Independently integrate owned feed from exported decimal E commands.
+struct ActualFiberFeed {
+    double total_mm {0.0};
+    std::size_t command_count {0};
+    std::size_t path_count {0};
+};
+ActualFiberFeed actual_fiber_feed(const std::string& gcode)
+{
+    ActualFiberFeed result;
+    long double e_position=0, total=0, units=1;
+    bool relative_e=false, relative_xyz=false, inside=false, owned_feed=false;
+    std::istringstream input(gcode);
+    for(std::string line;std::getline(input,line);) {
+        if(line.rfind(";FIBER_BEGIN ",0)==0) {
+            REQUIRE_FALSE(inside);
+            inside=true;owned_feed=false;++result.path_count;
+            const auto start=line.find(" e_units_per_mm=");
+            REQUIRE(start!=std::string::npos);
+            units=std::stold(line.substr(start+16));
+            REQUIRE(std::isfinite(units));REQUIRE(units>0);
+        } else if(line==";FIBER_PREFEED_BEGIN" || line==";FIBER_START") {
+            REQUIRE(inside);owned_feed=true;
+        } else if(line==";FIBER_PREFEED_END" || line==";FIBER_CUT") {
+            REQUIRE(inside);owned_feed=false;
+        } else if(line==";FIBER_END") {
+            REQUIRE(inside);inside=false;owned_feed=false;
+        }
+        std::istringstream command(line.substr(0,line.find(';')));
+        std::string opcode;command>>opcode;
+        if(opcode=="M82")relative_e=false;
+        if(opcode=="M83")relative_e=true;
+        if(opcode=="G90")relative_xyz=false;
+        if(opcode=="G91")relative_xyz=true;
+        const bool move=opcode=="G0" || opcode=="G1" || opcode=="G2" || opcode=="G3";
+        if(!move && opcode!="G92")continue;
+        std::optional<long double> e_word;
+        bool axis_found=false;
+        for(std::string word;command>>word;) {
+            if(word.size()<2)continue;
+            if(std::string("XYZE").find(word[0])!=std::string::npos)axis_found=true;
+            if(word[0]=='E')e_word=std::stold(word.substr(1));
+        }
+        if(opcode=="G92") {
+            if(e_word)e_position=*e_word;
+            else if(!axis_found)e_position=0;
+            continue;
+        }
+        if(!e_word)continue;
+        const long double target=relative_e || relative_xyz ? e_position+*e_word : *e_word;
+        const long double delta=target-e_position;
+        if(inside) {
+            REQUIRE(owned_feed);
+            REQUIRE(delta>0);
+            total+=delta/units;
+            ++result.command_count;
+        }
+        e_position=target;
+    }
+    REQUIRE_FALSE(inside);
+    result.total_mm=static_cast<double>(total);
+    return result;
+}
+
 const libslicer::SettingItem* find_item(const std::vector<libslicer::SettingItem>& items, std::string_view key)
 {
     for (const auto& item : items) {
@@ -131,7 +194,9 @@ TEST_CASE("configuration exposes one grouped settings snapshot", "[libslicer_api
     for (const auto& item : items) {
         INFO(item.key);
         const bool conditionally_hidden = item.key == "fiber_concentric_corner_stabilization_length" ||
-            item.key == "fiber_corner_stabilization_length" || item.key == "fiber_infill_angle_sequence";
+            item.key == "fiber_corner_stabilization_length" || item.key == "fiber_infill_angle_sequence" ||
+            item.key == "fiber_finish_extension_length" || item.key == "fiber_finish_overlap_length" ||
+            item.key == "fiber_finish_motion_speed";
         CHECK(item.visible == !conditionally_hidden);
         CHECK(unique_keys.insert(item.key).second);
     }
@@ -412,6 +477,7 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     CHECK(*prefeed_extra == "0.5");
     CHECK(*z_hop_height == "2");
     CHECK(*landing_length == "2");
+    CHECK_FALSE(config->value("fiber_start_length").has_value());
     CHECK(*landing_speed == "3");
     CHECK(*start_speed == "10");
     CHECK(*minimum_effective == "0.5");
@@ -530,6 +596,7 @@ TEST_CASE("CFSYS original machine scripts produce real fiber G-code and reimport
     INFO(activation_diagnostics);
     REQUIRE(activated.success);
     std::optional<double> reference_feed;
+    std::optional<ActualFiberFeed> reference_actual_feed;
     for (bool relative_e : {false, true}) {
         INFO("relative_e=" << relative_e);
         REQUIRE(library->apply_active_config_patch({{"use_relative_e_distances", relative_e ? "1" : "0"}}).success);
@@ -588,6 +655,17 @@ TEST_CASE("CFSYS original machine scripts produce real fiber G-code and reimport
             cursor += 11;
         }
         REQUIRE(cuts > 0);
+        const auto actual_feed=actual_fiber_feed(gcode);
+        CHECK(actual_feed.path_count==cuts);
+        CHECK(actual_feed.total_mm==Catch::Approx(result.preview->statistics.total_fiber_feed_mm).margin(.02));
+        if(reference_actual_feed) {
+            CHECK(actual_feed.path_count==reference_actual_feed->path_count);
+            CHECK(actual_feed.command_count==reference_actual_feed->command_count);
+            CHECK(actual_feed.total_mm==Catch::Approx(reference_actual_feed->total_mm).margin(.05));
+            std::cout<<"[FiberFeedQuantization] slot="<<fiber_slot<<" absolute="<<std::setprecision(12)
+                <<reference_actual_feed->total_mm<<" relative="<<actual_feed.total_mm
+                <<" difference="<<actual_feed.total_mm-reference_actual_feed->total_mm<<'\n';
+        } else reference_actual_feed=actual_feed;
         std::istringstream commands(gcode);
         std::string line;
         double acceleration = 0;
@@ -1204,7 +1282,7 @@ TEST_CASE("fiber fill debug is opt-in and does not change print output", "[libsl
     std::filesystem::remove(debug.output.path);
 }
 
-TEST_CASE("CFSYS default finish permits internal fiber output on T1", "[libslicer_api][fiber][fiber-infill-output]")
+TEST_CASE("CFSYS rectilinear fiber keeps the cut tail before non-depositing finish on T1", "[libslicer_api][fiber][fiber-infill-output]")
 {
     const unsigned fiber_slot = GENERATE(1u, 4u);
     const bool relative_e = GENERATE(false, true);
@@ -1266,7 +1344,7 @@ TEST_CASE("CFSYS default finish permits internal fiber output on T1", "[libslice
             if (infill) {
                 CHECK(powered > 0);
                 CHECK(tail == Catch::Approx(23).margin(0.03));
-                CHECK(finish == Catch::Approx(23).margin(0.003));
+                CHECK(finish == Catch::Approx(23).margin(0.03));
             }
             infill = false; phase.clear();
         }
@@ -1333,29 +1411,227 @@ TEST_CASE("CFSYS default finish permits internal fiber output on T1", "[libslice
     if (request.output_gcode_path.empty()) { std::error_code ec; std::filesystem::remove(result.output.path,ec); }
 }
 
-TEST_CASE("CFSYS rejects a finish outside machine limits instead of dropping fiber", "[libslicer_api][fiber][fiber-motion-limit]")
+TEST_CASE("CFSYS rectilinear infill changes only non-depositing finish with extension", "[libslicer_api][fiber][fiber-rectilinear-finish]")
+{
+    const bool relative_e=GENERATE(false,true);
+    libslicer::LibraryOptions options;
+    options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id="CFSYS Alpha500 Printer";selection.machine_variant_id="0.4";
+    selection.process_preset_id="CCF&CIRON @CFSYS";
+    selection.filament_preset_ids={"CFSYS CIRON","CFSYS CCF"};selection.filament_physical_tools={0,1};
+    struct Proof {
+        std::vector<std::array<double,3>> depositing;
+        std::vector<std::string> feed_commands;
+        std::array<double,3> cut{};
+        double tail=0,finish=0;
+        size_t cuts=0;
+    };
+    std::vector<Proof> reference;
+    for(const std::string extension:{"0","23"}) {
+        CAPTURE(extension,relative_e);
+        REQUIRE(library->activate_config(selection,{{"generate_reinforced_infills","1"},
+            {"generate_reinforced_perimeters","0"},{"reinforced_infill_pattern","rectilinear"},
+            {"fiber_finish_extension_length",extension},{"use_relative_e_distances",relative_e?"1":"0"}}).success);
+        libslicer::SliceRequest request;request.objects.push_back(fiber_infill_block());
+        request.config=*library->active_config_snapshot();
+        const auto result=library->slice(request);
+        for(const auto& d:result.diagnostics)UNSCOPED_INFO(d.message);
+        REQUIRE(result.success);REQUIRE(result.preview);
+        std::ifstream input(result.output.path);REQUIRE(input.good());
+        std::vector<Proof> proofs;
+        bool active=false,cut=false,absolute=true;
+        std::string phase,line;double x=0,y=0,z=0;
+        while(std::getline(input,line)) {
+            if(line.rfind(";FIBER_BEGIN ",0)==0) {
+                REQUIRE_FALSE(active);
+                CHECK(line.find("purpose=infill ")!=std::string::npos);
+                active=true;cut=false;phase.clear();proofs.emplace_back();
+            } else if(line==";FIBER_LANDING_BEGIN")phase="landing";
+            else if(line==";FIBER_START") {CHECK_FALSE(cut);phase="powered";}
+            else if(line==";FIBER_CUT") {
+                REQUIRE(active);CHECK_FALSE(cut);cut=true;phase="tail";
+                ++proofs.back().cuts;proofs.back().cut={x,y,z};
+            } else if(line==";FIBER_FINISH_BEGIN")phase="finish";
+            else if(line==";FIBER_END") {REQUIRE(active);active=false;phase.clear();}
+            if(active && cut) {
+                CHECK(line!=";FIBER_START");
+                CHECK(line.rfind(";FIBER_PREFEED",0)!=0);
+                if(!line.empty() && line.front()!=';') {
+                    CHECK_FALSE(std::regex_search(line,std::regex(R"(\bE[-+0-9.])")));
+                    CHECK_FALSE(std::regex_search(line,std::regex(R"(^T[0-9])")));
+                }
+            }
+            std::istringstream fields(line);std::string cmd;fields>>cmd;
+            if(active && !cut && (cmd=="G0" || cmd=="G1") &&
+                std::regex_search(line,std::regex(R"(\bE[-+0-9.])")))
+                proofs.back().feed_commands.push_back(line);
+            if(cmd=="G90")absolute=true;if(cmd=="G91")absolute=false;
+            if(cmd!="G0" && cmd!="G1" && cmd!="G92")continue;
+            double nx=x,ny=y,nz=z;
+            for(std::string field;fields>>field;) {
+                if(field.front()==';')break;
+                if(field.size()<2 || std::string("XYZ").find(field.front())==std::string::npos)continue;
+                const double value=std::stod(field.substr(1));
+                if(field.front()=='X')nx=value+(absolute || cmd=="G92"?0:x);
+                if(field.front()=='Y')ny=value+(absolute || cmd=="G92"?0:y);
+                if(field.front()=='Z')nz=value+(absolute || cmd=="G92"?0:z);
+            }
+            if(active && cmd!="G92" && !phase.empty()) {
+                auto& proof=proofs.back();
+                const double distance=std::hypot(nx-x,ny-y);
+                if(phase=="finish") {
+                    CHECK(nz==Catch::Approx(z).margin(.0001));proof.finish+=distance;
+                } else {
+                    if(proof.depositing.empty())proof.depositing.push_back({x,y,z});
+                    if(distance>0)proof.depositing.push_back({nx,ny,nz});
+                    if(phase=="tail")proof.tail+=distance;
+                }
+            }
+            x=nx;y=ny;z=nz;
+        }
+        REQUIRE_FALSE(active);REQUIRE(proofs.size()>1);
+        for(const auto& proof:proofs) {
+            CHECK(proof.cuts==1);CHECK(proof.tail==Catch::Approx(23).margin(.03));
+            CHECK(proof.finish==Catch::Approx(std::stod(extension)).margin(.003));
+        }
+        if(reference.empty())reference=proofs;
+        else {
+            REQUIRE(proofs.size()==reference.size());
+            for(size_t i=0;i<proofs.size();++i) {
+                CHECK(proofs[i].depositing==reference[i].depositing);
+                CHECK(proofs[i].cut==reference[i].cut);
+                REQUIRE_FALSE(proofs[i].feed_commands.empty());
+                CHECK(proofs[i].feed_commands==reference[i].feed_commands);
+            }
+        }
+        const auto verify_preview=[&](const libslicer::ToolpathPreview& preview) {
+            std::set<std::uint64_t> infill_occurrences;
+            for(const auto& segment:preview.segments)
+                if(segment.extrusion_role==libslicer::ToolpathExtrusionRole::ContinuousFiberInfill)
+                    infill_occurrences.insert(segment.fiber_occurrence);
+            REQUIRE(infill_occurrences.size()==proofs.size());
+            std::map<std::uint64_t,double> finish_lengths;
+            for(const auto& segment:preview.segments) {
+                if(!infill_occurrences.count(segment.fiber_occurrence))continue;
+                if(segment.fiber_phase==libslicer::ToolpathFiberPhase::Tail ||
+                   segment.fiber_phase==libslicer::ToolpathFiberPhase::Finish)
+                    CHECK(segment.fiber_feed_delta_mm==0);
+                if(segment.fiber_phase!=libslicer::ToolpathFiberPhase::Finish)continue;
+                CHECK(segment.deposition==libslicer::ToolpathDepositionKind::None);
+                CHECK(segment.extrusion_role==libslicer::ToolpathExtrusionRole::None);
+                finish_lengths[segment.fiber_occurrence]+=std::hypot(segment.end_mm.x-segment.start_mm.x,segment.end_mm.y-segment.start_mm.y);
+            }
+            for(auto id:infill_occurrences)CHECK(finish_lengths[id]==Catch::Approx(std::stod(extension)).margin(.005));
+        };
+        verify_preview(*result.preview);
+        const auto imported=library->load_gcode_preview({result.output.path});
+        REQUIRE(imported.success);REQUIRE(imported.preview);verify_preview(*imported.preview);
+        input.close();
+        std::filesystem::remove(result.output.path);
+    }
+    // A non-depositing finish may leave the model, but never the machine.
+    REQUIRE(library->activate_config(selection,{{"generate_reinforced_infills","1"},
+        {"generate_reinforced_perimeters","0"},{"reinforced_infill_pattern","rectilinear"},
+        {"fiber_finish_extension_length","500"}}).success);
+    libslicer::SliceRequest excessive;excessive.objects.push_back(fiber_infill_block());
+    excessive.config=*library->active_config_snapshot();
+    const auto rejected=library->slice(excessive);
+    CHECK_FALSE(rejected.success);CHECK(rejected.output.path.empty());
+    CHECK(std::any_of(rejected.diagnostics.begin(),rejected.diagnostics.end(),[](const auto& d) {
+        return !d.warning && d.message.find("Fiber motion exceeds")!=std::string::npos;
+    }));
+}
+
+TEST_CASE("translated rectilinear finish respects final machine coordinates", "[libslicer_api][fiber-motion-limit][fiber-rectilinear-finish]")
 {
     libslicer::LibraryOptions options;
-    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
-    options.vendors = {"CFSYS"};
-    auto library = libslicer::Library::open(options);
+    options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);
     libslicer::ConfigSelection selection;
-    selection.machine_model_id = "CFSYS Alpha500 Printer";
-    selection.machine_variant_id = "0.4";
-    selection.process_preset_id = "CCF&CIRON @CFSYS";
-    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
-    selection.filament_physical_tools = {0,1};
-    REQUIRE(library->activate_config(selection, {{"generate_reinforced_infills","1"},
-        {"fiber_finish_extension_length","500"}}).success);
-    libslicer::SliceRequest request;
-    request.objects.push_back(fiber_infill_block());
-    request.config = *library->active_config_snapshot();
-    const auto result = library->slice(request);
-    CHECK_FALSE(result.success);
-    CHECK(result.output.path.empty());
-    CHECK(std::any_of(result.diagnostics.begin(), result.diagnostics.end(), [](const auto& d) {
-        return !d.warning && d.message.find("Fiber motion exceeds") != std::string::npos;
+    selection.machine_model_id="CFSYS Alpha500 Printer";selection.machine_variant_id="0.4";
+    selection.process_preset_id="CCF&CIRON @CFSYS";
+    selection.filament_preset_ids={"CFSYS CIRON","CFSYS CCF"};selection.filament_physical_tools={0,1};
+    REQUIRE(library->activate_config(selection,{{"generate_reinforced_infills","1"},
+        {"generate_reinforced_perimeters","0"},{"reinforced_infill_pattern","rectilinear"}}).success);
+    // Use a horizontal finish longer than the 60 mm source width. Determine
+    // its direction before translating: a zigzag need not end on the right.
+    REQUIRE(library->apply_active_config_patch({{"fiber_finish_extension_length","80"},
+        {"fiber_infill_angle_sequence","0"}}).success);
+    libslicer::SliceRequest centered;centered.center_on_build_plate=false;
+    centered.objects.push_back(fiber_infill_block());
+    centered.config=*library->active_config_snapshot();
+    const auto center=library->slice(centered);
+    REQUIRE(center.success);REQUIRE(center.preview);
+    const auto finish=std::find_if(center.preview->segments.begin(),center.preview->segments.end(),[](const auto& segment) {
+        return segment.fiber_phase==libslicer::ToolpathFiberPhase::Finish &&
+            std::abs(segment.end_mm.x-segment.start_mm.x)>70;
+    });
+    REQUIRE(finish!=center.preview->segments.end());
+    const double translation=finish->end_mm.x>finish->start_mm.x?227:-68;
+    std::filesystem::remove(center.output.path);
+    // The profile excludes x<27 and x>392. Source fits at x=327..387 or
+    // 32..92; only F crosses the usable area after the instance transform.
+    for(const auto* extension:{"0","80"}) {
+        REQUIRE(library->apply_active_config_patch({{"fiber_finish_extension_length",extension}}).success);
+        libslicer::SliceRequest shifted;shifted.center_on_build_plate=false;
+        auto object=fiber_infill_block();object.transform[3]=translation;
+        shifted.objects.push_back(std::move(object));shifted.config=*library->active_config_snapshot();
+        const auto result=library->slice(shifted);
+        CAPTURE(extension);
+        if(std::string(extension)=="0") {
+            std::string diagnostics;for(const auto& d:result.diagnostics)diagnostics+=d.message+"\n";
+            INFO(diagnostics);CAPTURE(translation);
+            REQUIRE(result.success);std::filesystem::remove(result.output.path);
+        } else {
+            CHECK_FALSE(result.success);CHECK(result.output.path.empty());
+            CHECK(std::any_of(result.diagnostics.begin(),result.diagnostics.end(),[](const auto& d) {
+                return !d.warning && d.message.find("Fiber motion exceeds")!=std::string::npos;
+            }));
+        }
+    }
+}
+
+TEST_CASE("CFSYS rejects fiber motion outside machine height limits", "[libslicer_api][fiber][fiber-motion-limit]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id="CFSYS Alpha500 Printer";selection.machine_variant_id="0.4";
+    selection.process_preset_id="CCF&CIRON @CFSYS";
+    selection.filament_preset_ids={"CFSYS CIRON","CFSYS CCF"};selection.filament_physical_tools={0,1};
+    REQUIRE(library->activate_config(selection,{{"generate_reinforced_infills","1"},
+        {"fiber_z_hop_height","600"}}).success);
+    libslicer::SliceRequest request;request.objects.push_back(fiber_infill_block());
+    request.config=*library->active_config_snapshot();
+    const auto result=library->slice(request);
+    CHECK_FALSE(result.success);CHECK(result.output.path.empty());
+    CHECK(std::any_of(result.diagnostics.begin(),result.diagnostics.end(),[](const auto& d) {
+        return !d.warning && d.message.find("Fiber motion exceeds")!=std::string::npos;
     }));
+}
+
+TEST_CASE("rectilinear infill exposes tangent finishing controls but not loop overlap", "[libslicer_api][fiber-rectilinear-finish]")
+{
+    auto config=libslicer::Config::defaults();
+    REQUIRE(config.apply_patch({{"generate_reinforced_perimeters","0"},{"generate_reinforced_infills","1"},
+        {"reinforced_infill_pattern","rectilinear"},{"fiber_finish_extension_length","23"}}).success);
+    auto items=config.settings();
+    for(const auto* key:{"fiber_finish_extension_length","fiber_finish_motion_speed"}) {
+        const auto* item=find_item(items,key);REQUIRE(item);CHECK(item->visible);CHECK(item->enabled);
+    }
+    REQUIRE(find_item(items,"fiber_finish_overlap_length"));
+    CHECK_FALSE(find_item(items,"fiber_finish_overlap_length")->visible);
+    CHECK(config.snapshot().value("fiber_finish_extension_length")=="23");
+    REQUIRE(config.set("generate_reinforced_perimeters","1").success);
+    items=config.settings();CHECK(find_item(items,"fiber_finish_extension_length")->visible);
+    REQUIRE(config.apply_patch({{"generate_reinforced_perimeters","0"},{"reinforced_infill_pattern","concentric"}}).success);
+    items=config.settings();
+    CHECK(find_item(items,"fiber_finish_extension_length")->visible);
+    CHECK(find_item(items,"fiber_finish_overlap_length")->visible);
+    CHECK(find_item(items,"fiber_finish_motion_speed")->enabled);
 }
 
 TEST_CASE("continuous fiber rejects a machine without a cut command", "[libslicer_api][fiber-missing-cut][slice]")
@@ -1427,7 +1703,7 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
         {"fiber_prefeed_extra_length", "0.5"},
         {"fiber_prefeed_speed", "10"},
         {"fiber_z_hop_height", "2"},
-        {"fiber_landing_length", "2"},
+        {"fiber_landing_length", "0"},
         {"fiber_landing_speed", "3"},
         {"fiber_adhesion_dwell_ms", "25"},
         {"fiber_start_stabilization_length", "2"},
@@ -3268,7 +3544,15 @@ bool same_resin_only_fiber_commands(const std::vector<MaskFiberCommands>& actual
     if (actual.size()!=expected.size()) return false;
     for (size_t i=0;i<actual.size();++i) {
         const auto& a=actual[i]; const auto& b=expected[i];
-        if (a.metadata!=b.metadata || a.phases!=b.phases || a.commands!=b.commands || a.feed.size()!=b.feed.size()) return false;
+        if (a.metadata!=b.metadata || a.phases!=b.phases || a.commands.size()!=b.commands.size() || a.feed.size()!=b.feed.size()) return false;
+        for(size_t command=0;command<a.commands.size();++command) {
+            const auto& x=a.commands[command];const auto& y=b.commands[command];
+            if(std::get<0>(x)!=std::get<0>(y) || std::get<2>(x)!=std::get<2>(y) || std::get<3>(x)!=std::get<3>(y))return false;
+            // Residual resin may introduce a tool activation before this same
+            // strand. Only the first approach then receives the configured cap;
+            // dedicated approach tests check that policy. Process speeds stay exact.
+            if((std::get<0>(x)!="approach" || std::get<3>(x)) && std::get<1>(x)!=std::get<1>(y))return false;
+        }
         const double units=std::stod(a.metadata.at("e_units_per_mm"));
         for (const auto& [phase,feed] : a.feed) {
             const auto found=b.feed.find(phase);
@@ -3382,7 +3666,7 @@ TEST_CASE("fiber mask scope is atomic and independent of inactive fiber presenta
 {
     auto config = libslicer::Config::defaults();
     const auto items = config.settings(libslicer::ConfigScope::FiberMask);
-    REQUIRE(items.size() == 39);
+    REQUIRE(items.size() == 42);
     std::set<std::string> keys;
     for (const auto& item : items) keys.insert(item.key);
     CHECK_FALSE(keys.count("fiber_mask_process"));
@@ -3922,7 +4206,18 @@ TEST_CASE("resin-only mask changes local residual use while preserving connected
     REQUIRE(same_resin_only_fiber_geometry(*actual.preview, *baseline.preview));
     const auto original = mask_fiber_commands(baseline.output.path);
     const auto changed = mask_fiber_commands(actual.output.path);
+    INFO("baseline="<<baseline.output.path<<" actual="<<actual.output.path);
     REQUIRE(same_resin_only_fiber_commands(changed, original));
+    auto wrong_speed=changed;
+    bool changed_speed=false;
+    for(auto& path:wrong_speed) {
+        for(auto& command:path.commands) if(std::get<0>(command)==";FIBER_START" && std::get<3>(command)) {
+            std::get<1>(command)+=1;changed_speed=true;break;
+        }
+        if(changed_speed)break;
+    }
+    REQUIRE(changed_speed);
+    CHECK_FALSE(same_resin_only_fiber_commands(wrong_speed,original));
     auto translated = *actual.preview;
     for (auto& segment : translated.segments) if (depositing_fiber(segment)) {
         segment.start_mm.x += .01; segment.end_mm.x += .01;
@@ -3997,4 +4292,21 @@ TEST_CASE("resin-only mask supplies zero-density wall-free core above a native b
     }
     CHECK(resin > 0);
     remove_slice(result);
+}
+
+TEST_CASE("open ring connection settings persist their explicit software trim multipliers", "[libslicer_api][config][fiber][OpenRingConnection]")
+{
+    auto config=libslicer::Config::defaults();
+    CHECK(config.snapshot().value("fiber_connect_adjacent_rings")=="0");
+    CHECK(config.snapshot().value("fiber_connection_tail_trim_widths")=="1.5");
+    CHECK(config.snapshot().value("fiber_connection_head_trim_widths")=="1");
+    REQUIRE(config.apply_patch(libslicer::ConfigScope::FiberMask,{{"fiber_connect_adjacent_rings","1"},
+        {"fiber_connection_tail_trim_widths","2.25"},{"fiber_connection_head_trim_widths","0"}}).success);
+    const auto snapshot=config.snapshot();
+    CHECK(snapshot.value("fiber_connect_adjacent_rings")=="1");
+    CHECK(snapshot.value("fiber_connection_tail_trim_widths")=="2.25");
+    CHECK(snapshot.value("fiber_connection_head_trim_widths")=="0");
+    const auto before=config.snapshot().values();
+    CHECK_FALSE(config.apply_patch(libslicer::ConfigScope::FiberMask,{{"fiber_connection_head_trim_widths","-1"}}).success);
+    CHECK(config.snapshot().values()==before);
 }

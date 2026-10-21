@@ -850,6 +850,7 @@ ContourRoundingResult validate_cycle(const std::vector<TangentSolution>& values,
     }
     if (!result.issues.empty()) { result.arcs.clear(); result.bends.clear(); return result; }
     result.path=Polyline3(output);
+    continuous_fiber_detail::bind_contour_arcs(*result.path,result.arcs,&result.bends);
     return result;
 }
 
@@ -1197,10 +1198,10 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
         report(budget_exhausted,ContourRoundingFailure::SearchBudgetExceeded);
         return result;
     }
-    Polyline output=result.path->to_polyline();
+    Polyline3 output=*result.path;
     Points original=source.points; original.pop_back();
     if (Polygon(original).is_clockwise()) {
-        const double length=unscale<double>(output.length());
+        const double length=Geometry::length_with_arcs_mm(output);
         output.reverse(); std::reverse(result.arcs.begin(),result.arcs.end());
         std::reverse(result.bends.begin(),result.bends.end());
         for (auto& bend:result.bends) {
@@ -1214,7 +1215,7 @@ ContourRoundingResult solve_ring(const Polyline& source,const ExPolygons& domain
             arc.end_distance_mm=length-arc.begin_mm; arc.begin_mm=start;
         }
     }
-    result.path=Polyline3(output);
+    result.path=std::move(output);
     return result;
 }
 } // namespace
@@ -1410,6 +1411,7 @@ ContourRoundingResult assemble_outer(const std::vector<Vec2d>& p,
         }
     }
     result.path=Polyline3(output);
+    continuous_fiber_detail::bind_contour_arcs(*result.path,result.arcs,&result.bends);
     return result;
 }
 
@@ -1770,3 +1772,61 @@ ExPolygons ContinuousFiberFillStrategy::build_resin_area(
 }
 
 } // namespace Slic3r
+
+
+namespace Slic3r::continuous_fiber_detail {
+void bind_contour_arcs(Polyline3& path,std::vector<ContourArc>& arcs,std::vector<ContourBend>* bends)
+{
+    if (arcs.empty()) return;
+    std::vector<double> old(path.points.size(),0);
+    for (size_t i=1;i<old.size();++i) old[i]=old[i-1]+unscale<double>((path.points[i]-path.points[i-1]).cast<double>().norm());
+    path.fitting_result.clear();size_t previous=0;
+    const auto nearest=[&](const Vec2d& p,size_t first) {
+        size_t result=first;double best=std::numeric_limits<double>::infinity();
+        for(size_t i=first;i<path.points.size();++i) {
+            const double d=(path.points[i].head<2>().cast<double>()-p/SCALING_FACTOR).squaredNorm();
+            if(d<best){best=d;result=i;}
+            if(d<=4) break;
+        }
+        if(best>std::pow(scale_(0.0001),2)) throw std::invalid_argument("Solver arc endpoint is absent from its path");
+        return result;
+    };
+    for (const auto& arc:arcs) {
+        const size_t begin=nearest(arc.start_mm,previous),end=nearest(arc.end_mm,begin+1);
+        if(begin>previous) path.fitting_result.push_back({previous,begin,EMovePathType::Linear_move,{}});
+        ArcSegment a(Point::new_scale(arc.center_mm.x(),arc.center_mm.y()),scale_(arc.radius_mm),
+            path.points[begin].to_point(),path.points[end].to_point(),
+            arc.sweep_radians>0?ArcDirection::Arc_Dir_CCW:ArcDirection::Arc_Dir_CW);
+        path.fitting_result.push_back({begin,end,arc.sweep_radians>0?EMovePathType::Arc_move_ccw:EMovePathType::Arc_move_cw,a});
+        previous=end;
+    }
+    if(previous+1<path.points.size()) path.fitting_result.push_back({previous,path.points.size()-1,EMovePathType::Linear_move,{}});
+    const auto stations=Geometry::stations_with_arcs_mm(path);
+    const auto remap=[&](double station) {
+        auto next=std::lower_bound(old.begin(),old.end(),station);
+        size_t i=next==old.end()?old.size()-1:size_t(next-old.begin());
+        if(i && std::abs(old[i-1]-station)<std::abs(old[i]-station))--i;
+        return stations[i];
+    };
+    if(bends) for(auto& bend:*bends){bend.begin_mm=remap(bend.begin_mm);bend.end_mm=remap(bend.end_mm);}
+    auto derived=arc_metadata(path);
+    if(derived.size()!=arcs.size())throw std::invalid_argument("Solver arc metadata was lost");
+    for(size_t i=0;i<derived.size();++i)
+        derived[i].source_sweep_radians=arcs[i].source_sweep_radians!=0?
+            arcs[i].source_sweep_radians:arcs[i].sweep_radians;
+    arcs=std::move(derived);
+}
+
+std::vector<ContourArc> arc_metadata(const Polyline3& path)
+{
+    std::vector<ContourArc> result;const auto stations=Geometry::stations_with_arcs_mm(path);
+    for(const auto& p:path.fitting_result) if(p.path_type==EMovePathType::Arc_move_cw || p.path_type==EMovePathType::Arc_move_ccw) {
+        const auto& a=p.arc_data;ContourArc arc;
+        arc.center_mm=a.center.cast<double>()*SCALING_FACTOR;arc.radius_mm=unscale<double>(a.radius);
+        arc.start_mm=a.start_point.cast<double>()*SCALING_FACTOR;arc.end_mm=a.end_point.cast<double>()*SCALING_FACTOR;
+        arc.begin_mm=stations[p.start_point_index];arc.end_distance_mm=stations[p.end_point_index];
+        arc.sweep_radians=arc.source_sweep_radians=a.angle_radians;result.push_back(arc);
+    }
+    return result;
+}
+}

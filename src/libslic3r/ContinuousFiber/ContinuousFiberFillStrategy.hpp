@@ -19,7 +19,8 @@ struct ContourRoundingOptions {
     double geometry_tolerance_mm {0.0001};
 };
 
-// Analytic arc plus its interval on the discretized result, not the source ring.
+// Solver arc description and downstream bend-speed metadata. Published path
+// geometry uses Orca fitting_result as its geometric source of truth.
 struct ContourArc {
     Vec2d center_mm, start_mm, end_mm;
     double radius_mm {0.0}, sweep_radians {0.0};
@@ -102,6 +103,11 @@ ContourRoundingResult search_contour_partitions(std::vector<CornerGroup> initial
 }
 
 } // namespace continuous_fiber_detail
+
+namespace continuous_fiber_detail {
+void bind_contour_arcs(Polyline3& path, std::vector<ContourArc>& arcs, std::vector<ContourBend>* bends = nullptr);
+std::vector<ContourArc> arc_metadata(const Polyline3& path);
+}
 
 const char* contour_rounding_failure_name(ContourRoundingFailure reason);
 

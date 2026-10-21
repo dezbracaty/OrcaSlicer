@@ -957,6 +957,28 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("Generate fiber contour loops around closed holes in the fiber region. Disabling this option keeps holes excluded from all material paths and does not change fiber infill patterns.");
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("fiber_connect_adjacent_rings", coBool);
+    def->label = L("Connect adjacent fiber rings");
+    def->category = L("Continuous fiber");
+    def->tooltip = L("Connect accepted neighboring rings with one forward bridge and one local seam per ring. Branches remain separate paths.");
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("fiber_connection_tail_trim_widths", coFloat);
+    def->label = L("Fiber connection tail trim");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("line widths");
+    def->tooltip = L("Trim this multiple of the fiber width before the local seam. This is a connection setting, not a device limit.");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(1.5));
+
+    def = this->add("fiber_connection_head_trim_widths", coFloat);
+    def->label = L("Fiber connection head trim");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("line widths");
+    def->tooltip = L("Trim this multiple of the fiber width after the local seam. The first source of a chain has no head trim.");
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
     def = this->add("outer_reinforced_perimeters_counts", coInt);
     def->label = L("Continuous fiber contour count");
     def->category = L("Continuous fiber");
@@ -1209,11 +1231,12 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionFloat(0.0));
 
     def = this->add("fiber_landing_length", coFloat);
-    def->label = L("Fiber landing length");
+    def->label = L("Fiber landing path length");
+    def->tooltip = L("XY distance traveled along the complete fiber path while lowering to the layer. Independent of Z-hop height and powered start stabilization.");
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;
-    def->set_default_value(new ConfigOptionFloat(0.0));
+    def->set_default_value(new ConfigOptionFloat(2.0));
 
     def = this->add("fiber_landing_speed", coFloat);
     def->label = L("Fiber landing speed");
@@ -1252,6 +1275,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("fiber_finish_extension_length", coFloat);
     def->label = L("Fiber finish extension length");
+    def->tooltip = L("Non-depositing travel along the final tangent after rectilinear fiber infill or an open fiber contour reaches its planned endpoint. Does not change the cutter-to-contact tail or cut position.");
     def->category = L("Continuous fiber");
     def->sidetext = L("mm");
     def->min = 0;

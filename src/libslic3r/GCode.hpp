@@ -38,6 +38,10 @@
 
 namespace Slic3r {
 
+struct BoundFiberExecutionPlan;
+std::string emit_fiber_landing(GCodeWriter& writer,const BoundFiberExecutionPlan& plan);
+
+
 // Forward declarations.
 class GCode;
 

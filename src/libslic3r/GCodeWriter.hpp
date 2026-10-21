@@ -2,6 +2,7 @@
 #define slic3r_GCodeWriter_hpp_
 
 #include "libslic3r.h"
+#include <array>
 #include <string>
 #include <charconv>
 #include "Extruder.hpp"
@@ -107,6 +108,24 @@ public:
     const Vec3d& get_position() const { return m_pos; }
     Vec3d&       get_position() { return m_pos; }
     void        set_position(const Vec3d& in) { m_pos = in; }
+    // Formatting precision is local to one writer and never changes its position.
+    // Remember each emitted axis independently: an XY move does not round Z.
+    class ScopedXYZPrecision {
+    public:
+        ScopedXYZPrecision(GCodeWriter& writer, size_t digits);
+        ~ScopedXYZPrecision() noexcept;
+        ScopedXYZPrecision(const ScopedXYZPrecision&) = delete;
+        ScopedXYZPrecision& operator=(const ScopedXYZPrecision&) = delete;
+    private:
+        GCodeWriter& m_writer;
+        size_t m_previous_digits;
+    };
+    size_t      xyz_export_digits() const { return m_xyz_export_digits; }
+    double      quantize_xyz(double value) const;
+    Vec3d       get_emitted_position() const;
+    Vec3d       quantized_machine_position(const Vec3d& oriented) const;
+    Vec3d       oriented_position(const Vec3d& machine) const;
+    std::string travel_to_bound_xyz(const Vec3d& oriented, const Vec3d& machine);
     double      get_zhop() const { return m_lifted; }
 
     //BBS: set offset for gcode writer
@@ -179,6 +198,8 @@ public:
     double          m_to_lift;
     LiftType        m_to_lift_type;
     Vec3d           m_pos = Vec3d::Zero();
+    size_t          m_xyz_export_digits = 3;
+    std::array<size_t, 3> m_position_export_digits {{3, 3, 3}};
     //BBS: this flag is used to indicate whether the m_pos is real.
     //A example that of the first move, the m_pos is zero, but the real position of extruder doesn't
     //Pos must be clear after the first xyz travel move
@@ -215,7 +236,7 @@ public:
 
 class GCodeFormatter {
 public:
-    GCodeFormatter() {
+    explicit GCodeFormatter(size_t xyz_digits = XYZF_EXPORT_DIGITS) : m_xyz_export_digits(xyz_digits) {
         this->buf_end = buf + buflen;
         this->ptr_err.ptr = this->buf;
     }
@@ -250,22 +271,22 @@ public:
     void emit_axis(const char axis, const double v, size_t digits);
 
     void emit_xy(const Vec2d &point) {
-        this->emit_axis('X', point.x(), XYZF_EXPORT_DIGITS);
-        this->emit_axis('Y', point.y(), XYZF_EXPORT_DIGITS);
+        this->emit_axis('X', point.x(), m_xyz_export_digits);
+        this->emit_axis('Y', point.y(), m_xyz_export_digits);
     }
 
     void emit_xyz(const Vec3d &point) {
-        this->emit_axis('X', point.x(), XYZF_EXPORT_DIGITS);
-        this->emit_axis('Y', point.y(), XYZF_EXPORT_DIGITS);
+        this->emit_axis('X', point.x(), m_xyz_export_digits);
+        this->emit_axis('Y', point.y(), m_xyz_export_digits);
         this->emit_z(point.z());
     }
 
     void emit_z(const double z) {
-        this->emit_axis('Z', z, XYZF_EXPORT_DIGITS);
+        this->emit_axis('Z', z, m_xyz_export_digits);
     }
 
     void emit_y(const double y) {
-        this->emit_axis('Y', y, XYZF_EXPORT_DIGITS);
+        this->emit_axis('Y', y, m_xyz_export_digits);
     }
 
     void emit_e(double v) {
@@ -277,8 +298,8 @@ public:
     }
     //BBS
     void emit_ij(const Vec2d &point) {
-        this->emit_axis('I', point.x(), XYZF_EXPORT_DIGITS);
-        this->emit_axis('J', point.y(), XYZF_EXPORT_DIGITS);
+        this->emit_axis('I', point.x(), m_xyz_export_digits);
+        this->emit_axis('J', point.y(), m_xyz_export_digits);
     }
 
     void emit_string(const std::string &s) {
@@ -299,6 +320,7 @@ public:
     }
 
 protected:
+    size_t                          m_xyz_export_digits;
     static constexpr const size_t   buflen = 256;
     char                            buf[buflen];
     char* buf_end;
@@ -307,7 +329,7 @@ protected:
 
 class GCodeG1Formatter : public GCodeFormatter {
 public:
-    GCodeG1Formatter() {
+    explicit GCodeG1Formatter(size_t xyz_digits = XYZF_EXPORT_DIGITS) : GCodeFormatter(xyz_digits) {
         this->buf[0] = 'G';
         this->buf[1] = '1';
         this->buf_end = buf + buflen;
@@ -320,7 +342,7 @@ public:
 
 class GCodeG2G3Formatter : public GCodeFormatter {
 public:
-    GCodeG2G3Formatter(bool is_ccw) {
+    explicit GCodeG2G3Formatter(bool is_ccw, size_t xyz_digits = XYZF_EXPORT_DIGITS) : GCodeFormatter(xyz_digits) {
         this->buf[0] = 'G';
         this->buf[1] = is_ccw ? '3' : '2';
         this->buf_end = buf + buflen;

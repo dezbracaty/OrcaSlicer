@@ -60,6 +60,31 @@ struct FiberFragmentAssignment {
     std::optional<ExtrusionPath> centerline;
     std::shared_ptr<const PreparedFiberPath> prepared;
     std::optional<FiberPathPurpose> display_purpose;
+    std::vector<ContourArc> source_arcs;
+    std::vector<ContourBend> source_bends;
+};
+
+struct FiberChainSourceSlice {
+    FiberFragmentId source;
+    double seam_mm {0.0}, head_mm {0.0}, tail_mm {0.0};
+    double original_mm {0.0}, retained_mm {0.0};
+    std::vector<std::pair<double,double>> retained_intervals;
+};
+
+struct FiberChainExecution {
+    ExtrusionPath centerline;
+    std::vector<FiberChainSourceSlice> sources;
+    std::vector<FiberExecutionPiece> pieces, finish_pieces;
+    std::shared_ptr<const PreparedFiberPath> prepared;
+};
+
+struct FiberChainDecision {
+    FiberFragmentId parent, child;
+    Point3 parent_contact {Point3::Zero()}, child_contact {Point3::Zero()};
+    Point3 bridge_begin {Point3::Zero()}, bridge_end {Point3::Zero()};
+    double parent_station_mm {0.0}, child_station_mm {0.0}, gap_mm {0.0};
+    bool inherited_seam {false}, planned {false}, published {false};
+    std::string reason;
 };
 
 struct FiberCandidateExtent {
@@ -90,10 +115,14 @@ struct FiberValidationResult {
     ExPolygons outside_domain;
     ExPolygons contour_to_infill_keepout;
     ExtrusionRole output_role { erNone };
+    // When published, contains every accepted execution exactly once, including
+    // untouched single sources. Empty means the original assignments are used.
+    std::vector<FiberChainExecution> chain_executions;
 
     size_t accepted_count() const;
     size_t rejected_count() const;
     FiberAssignmentAudit audit_assignments() const;
+    bool audit_open_chains() const;
     void release_to(ExtrusionEntitiesPtr& destination);
 };
 
@@ -117,12 +146,16 @@ struct FiberContourPlanResult {
     FiberValidationResult validation;
     std::vector<FiberContourPlanNode> nodes;
     std::vector<FiberContourBranchStop> stops;
+    std::vector<FiberChainDecision> chain_decisions;
     bool audit_lineage() const;
     void set_display_cutoff(size_t contour_depths);
 };
 
 class FiberPathValidator {
 public:
+    static void plan_open_ring_chains(FiberContourPlanResult& plan,
+        const ExPolygons& allowed_domain, const ContinuousFiberConfig& config,
+        bool collect_debug = false);
     static FiberContourPlanResult plan_contours(
         const ExPolygons& original_area, const ContinuousFiberConfig& config,
         const FiberDomainId& domain_id, bool collect_debug = false,
