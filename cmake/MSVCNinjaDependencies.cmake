@@ -1,9 +1,10 @@
 include_guard(GLOBAL)
 
 # Ninja parses /showIncludes output to maintain header dependencies. Probe the
-# compiler's actual byte prefix because localized MSVC installations may ignore
-# VSLANG and older CMake versions can decode UTF-8 diagnostics as the ANSI code
-# page. Apply this only to standalone libslicer builds; an embedding project is
+# compiler's actual prefix because localized MSVC installations may ignore
+# VSLANG. Decode it through CMake's Windows-aware AUTO mode so the value remains
+# valid UTF-8 internally even when CMake Tools runs without an attached console.
+# Apply this only to standalone libslicer builds; an embedding project is
 # responsible for its own compiler launcher and dependency configuration.
 if(MSVC AND CMAKE_GENERATOR MATCHES "^Ninja" AND
    CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
@@ -17,7 +18,7 @@ if(MSVC AND CMAKE_GENERATOR MATCHES "^Ninja" AND
             "${CMAKE_CXX_COMPILER}" /nologo /showIncludes /c
             "${_probe_dir}/probe.cpp" "/Fo${_probe_dir}/probe.obj"
         RESULT_VARIABLE _probe_result OUTPUT_VARIABLE _probe_output
-        ERROR_VARIABLE _probe_error ENCODING NONE)
+        ERROR_VARIABLE _probe_error ENCODING AUTO)
     if(NOT _probe_result EQUAL 0)
         message(FATAL_ERROR
             "MSVC dependency probe failed: ${_probe_output}${_probe_error}")
