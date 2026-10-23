@@ -293,6 +293,7 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/BBL.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Ideaformer.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/CFSYS.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/P3.json"
     DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/profiles"
 )
 install(CODE
@@ -304,6 +305,7 @@ install(DIRECTORY
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/BBL"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Ideaformer"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/CFSYS"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/P3"
     DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}/profiles"
 )
 install(FILES

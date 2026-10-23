@@ -1,0 +1,18 @@
+{
+    "name": "P3",
+    "version": "02.00.00.00",
+    "force_update": "0",
+    "description": "P3 six tool docks with one shared extruder and heater; candidate slicing profile pending machine acceptance",
+    "machine_model_list": [
+        {"name": "P3", "sub_path": "machine/P3.json"}
+    ],
+    "machine_list": [
+        {"name": "P3 0.4 nozzle", "sub_path": "machine/P3 0.4 nozzle.json"}
+    ],
+    "process_list": [
+        {"name": "0.20mm Standard @P3", "sub_path": "process/0.20mm Standard @P3.json"}
+    ],
+    "filament_list": [
+        {"name": "Generic PLA @P3", "sub_path": "filament/Generic PLA @P3.json"}
+    ]
+}
