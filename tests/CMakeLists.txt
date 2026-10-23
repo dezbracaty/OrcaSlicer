@@ -24,25 +24,25 @@ if (APPLE)
     target_link_libraries(test_common INTERFACE "-liconv -framework IOKit" "-framework CoreFoundation" -lc++)
 endif()
 
-# Copies runtime DLLs next to each test executable. Handles both single-config
-# generators (CMAKE_BUILD_TYPE set) and multi-config generators (Ninja
-# Multi-Config, Visual Studio) where CMAKE_BUILD_TYPE is empty and DLLs must
-# land in every per-config output directory.
-function(orcaslicer_copy_test_dlls)
+# Deploy linked DLLs, including the API's private dependencies, before Catch2
+# discovery. Vendored GMP has no CMake DLL target; include its runtime explicitly.
+function(orcaslicer_copy_test_dlls TARGET)
     if (NOT WIN32)
         return()
     endif()
-    set(_configs ${CMAKE_CONFIGURATION_TYPES})
-    if (NOT _configs)
-        set(_configs "${CMAKE_BUILD_TYPE}")
+    set(_runtime_dlls "$<REMOVE_DUPLICATES:$<TARGET_RUNTIME_DLLS:${TARGET}>;$<TARGET_RUNTIME_DLLS:libslicer_api>>")
+    # An API DLL implementation can change without changing its import library.
+    get_target_property(_links ${TARGET} LINK_LIBRARIES)
+    if("libslicer::libslicer" IN_LIST _links)
+        set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS "$<TARGET_FILE:libslicer_api>")
     endif()
-    foreach(_cfg IN LISTS _configs)
-        if (_cfg STREQUAL "Debug")
-            orcaslicer_copy_dlls(COPY_DLLS "Debug" "d" _unused_dlls)
-        else()
-            orcaslicer_copy_dlls(COPY_DLLS "${_cfg}" "" _unused_dlls)
-        endif()
-    endforeach()
+    add_custom_command(TARGET ${TARGET} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${GMP_ROOT}/bin/libgmp-10.dll"
+            "${_runtime_dlls}"
+            "$<TARGET_FILE_DIR:${TARGET}>"
+        COMMAND_EXPAND_LISTS
+        VERBATIM)
 endfunction()
 
 # Register Catch2 tags as CTest labels so `ctest -L`/`-LE` can filter by tag.

@@ -1528,6 +1528,7 @@ TEST_CASE("CFSYS rectilinear infill changes only non-depositing finish with exte
         verify_preview(*result.preview);
         const auto imported=library->load_gcode_preview({result.output.path});
         REQUIRE(imported.success);REQUIRE(imported.preview);verify_preview(*imported.preview);
+        input.close();
         std::filesystem::remove(result.output.path);
     }
     // A non-depositing finish may leave the model, but never the machine.

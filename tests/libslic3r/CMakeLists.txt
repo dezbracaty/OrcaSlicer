@@ -40,6 +40,6 @@ target_link_libraries(${_TEST_NAME}_tests test_common libslic3r boost_libs Catch
 target_include_directories(${_TEST_NAME}_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 
-orcaslicer_copy_test_dlls()
+orcaslicer_copy_test_dlls(${_TEST_NAME}_tests)
 
 orcaslicer_discover_tests(${_TEST_NAME}_tests)

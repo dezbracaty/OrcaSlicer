@@ -17,7 +17,7 @@ target_compile_definitions(libslicer_api_tests PRIVATE
 )
 set_property(TARGET libslicer_api_tests PROPERTY FOLDER "tests")
 
-orcaslicer_copy_test_dlls()
+orcaslicer_copy_test_dlls(libslicer_api_tests)
 orcaslicer_discover_tests(libslicer_api_tests)
 
 # Standard-library-only regressions for the independent entry comparison tool.
@@ -37,6 +37,7 @@ target_compile_definitions(fiber_4xiao_acceptance PRIVATE
     LIBSLICER_TEST_RESOURCE_DIR="${CMAKE_SOURCE_DIR}/resources"
     LIBSLICER_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data"
     FIBER_ACCEPTANCE_OUTPUT_DIR="${CMAKE_CURRENT_BINARY_DIR}/4xiao-acceptance")
+orcaslicer_copy_test_dlls(fiber_4xiao_acceptance)
 add_test(NAME Fiber4xiaoClosedOuterChecker COMMAND fiber_4xiao_acceptance --self-test)
 set_tests_properties(Fiber4xiaoClosedOuterChecker PROPERTIES LABELS "fiber_closed_outer" TIMEOUT 10)
 

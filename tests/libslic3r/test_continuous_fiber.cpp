@@ -3274,7 +3274,9 @@ TEST_CASE("fiber intersection acceleration preserves exact segment decisions", "
         for (size_t i = 0; i < 24; ++i)
             path.polyline.points.push_back(Point3::new_scale(trial % 2 ? double(i) : coordinate(random), coordinate(random), 0));
         if (trial % 3 == 0) path.polyline.points.push_back(path.polyline.points.front());
-        const auto& points = path.polyline.to_polyline().points;
+        const Polyline source_polyline = path.polyline.to_polyline();
+        const auto& points = source_polyline.points;
+        REQUIRE(points.size() == path.polyline.points.size());
         bool intersects = false;
         for (size_t first = 0; first + 1 < points.size(); ++first)
             for (size_t second = first + 2; second + 1 < points.size(); ++second) {
@@ -3284,6 +3286,8 @@ TEST_CASE("fiber intersection acceleration preserves exact segment decisions", "
         const auto result = FiberPathValidator::validate({&path}, {rectangle(-10, -10, 60, 60)}, {},
             FiberPathPurpose::Infill, erContinuousFiberInfill, {});
         REQUIRE(result.assignments.size() == 1);
+        CAPTURE(trial, intersects, points.size(), path.polyline.points.size());
+        INFO(result.assignments.front().detail);
         CHECK(result.assignments.front().reason == (intersects ? FiberRejectionReason::SelfIntersection : FiberRejectionReason::None));
     }
 }
@@ -3799,6 +3803,97 @@ TEST_CASE("zero radius generated paths retain whole candidate validation and nor
     CHECK_FALSE(intersection_ex(resin,ExPolygons{rectangle(30,0,32,2)}).empty());
     candidates.paths.front().geometry.points.back().x()+=scale_(100.);
     CHECK_THROWS(FiberPathValidator::validate_infill(candidates,material,config,{1,0,0,0}));
+}
+
+TEST_CASE("generated infill below extraction resolution retains a short-path assignment",
+          "[ContinuousFiber][BoundaryInfill][ExtractionResolution]")
+{
+    const ExPolygons domain{rectangle(0,0,50,20)};
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(.8f,.2f,.4f);
+    config.landing_length_mm=2;
+    config.cut_to_contact_length_mm=23;
+    config.minimum_effective_length_mm=.5;
+    FiberInfillCandidates candidates;
+    candidates.centerline_domain=domain;
+    const Point3 first=Point3::new_scale(5,5,0);
+    Polyline3 geometry;
+    // The actual failure measured sqrt(70^2+69^2) scaled units: 0.000098290386 mm.
+    geometry.points={first,Point3(first+Point3(70,69,0))};
+    candidates.paths.push_back({geometry,{}});
+    const FiberDomainId id{7,218,0,2};
+
+    SECTION("below, equal to, and above the extraction threshold") {
+        const coord_t length=GENERATE(coord_t(99),coord_t(100),coord_t(101));
+        candidates.paths.front().geometry.points.back()=Point3(first+Point3(length,coord_t(0),coord_t(0)));
+        const auto result=FiberPathValidator::validate_infill(candidates,domain,config,id);
+        REQUIRE(result.assignments.size()==1);
+        CHECK(result.assignments.front().reason==(length<=SCALED_EPSILON ?
+            FiberRejectionReason::TooShort : FiberRejectionReason::ProcessBudgetTooShort));
+        CHECK(result.audit_assignments().valid());
+    }
+    SECTION("a normal printable path remains accepted") {
+        candidates.paths.front().geometry=straight_path(5,5,45,5).polyline;
+        const auto result=FiberPathValidator::validate_infill(candidates,domain,config,id);
+        REQUIRE(result.accepted_count()==1);
+        CHECK(result.audit_assignments().valid());
+        CHECK_FALSE(result.resin_exclusion.empty());
+    }
+    SECTION("invalid process parameters remain fatal") {
+        config.minimum_path_length_mm=std::numeric_limits<double>::quiet_NaN();
+        REQUIRE_THROWS_WITH(FiberPathValidator::validate_infill(candidates,domain,config,id),
+            Catch::Matchers::ContainsSubstring("invalid_parameter"));
+    }
+    SECTION("an empty material domain remains fatal") {
+        REQUIRE_THROWS_WITH(FiberPathValidator::validate_infill(candidates,{},config,id),
+            Catch::Matchers::ContainsSubstring("invalid_geometry"));
+    }
+    SECTION("a nonplanar path with analytic metadata remains fatal") {
+        candidates.paths.front().geometry.points.front().z()=1;
+        candidates.paths.front().geometry.points.back().z()=1;
+        candidates.paths.front().arcs.emplace_back();
+        REQUIRE_THROWS_WITH(FiberPathValidator::validate_infill(candidates,domain,config,id),
+            Catch::Matchers::ContainsSubstring("invalid_geometry"));
+    }
+    SECTION("a zero-length candidate remains fatal") {
+        candidates.paths.front().geometry.points.back()=first;
+        REQUIRE_THROWS_WITH(FiberPathValidator::validate_infill(candidates,domain,config,id),
+            Catch::Matchers::ContainsSubstring("invalid_geometry"));
+    }
+    SECTION("invalid flow remains fatal") {
+        config.infill_flow=Flow(.8f,0.f,.4f);
+        REQUIRE_THROWS(FiberPathValidator::validate_infill(candidates,domain,config,id));
+    }
+    SECTION("nonplanar contour validation keeps its original rejection") {
+        auto path=straight_path(5,5,5.00007,5.000069);
+        path.polyline.points.front().z()=1;
+        path.polyline.points.back().z()=1;
+        const auto result=FiberPathValidator::validate({&path},domain,config,
+            FiberPathPurpose::Contour,erContinuousFiberContour,id);
+        REQUIRE(result.assignments.size()==1);
+        CHECK(result.assignments.front().reason==FiberRejectionReason::InvalidGeometry);
+    }
+    SECTION("an original out-of-domain rejection is not reclassified as short") {
+        const Point3 outside=Point3::new_scale(60,5,0);
+        candidates.paths.front().geometry.points={outside,Point3(outside+Point3(70,69,0))};
+        REQUIRE_THROWS(FiberPathValidator::validate_infill(candidates,domain,config,id));
+    }
+    SECTION("the reproduced short path retains its complete interval and resin area") {
+        const auto result=FiberPathValidator::validate_infill(candidates,domain,config,id);
+        REQUIRE(result.candidates.size()==1);
+        REQUIRE(result.assignments.size()==1);
+        const auto& assignment=result.assignments.front();
+        CHECK(assignment.kind==FiberAssignmentKind::Rejected);
+        CHECK(assignment.reason==FiberRejectionReason::TooShort);
+        CHECK(assignment.id.parent.domain==id);
+        CHECK(assignment.source_begin_mm==0);
+        CHECK(assignment.source_end_mm==Catch::Approx(unscale<double>(geometry.length())));
+        CHECK_FALSE(assignment.prepared);
+        CHECK(result.audit_assignments().valid());
+        CHECK(result.physical_footprint.empty());
+        CHECK(result.resin_exclusion.empty());
+        CHECK(ContinuousFiberFillStrategy::build_resin_area(domain,result.resin_exclusion)==domain);
+    }
 }
 
 TEST_CASE("contour clearance and infill half width are applied once", "[ContinuousFiber][BoundaryInfill]")
@@ -4689,7 +4784,8 @@ TEST_CASE("strict infill policy rejection remains a nonfatal resin fallback", "[
         config.outside_tolerance_mm2=0;
         candidates.paths.push_back({straight_path(5,19.601,45,19.601).polyline,{}});
         REQUIRE_THROWS_WITH(FiberPathValidator::validate_infill(candidates,domain,config,id),
-            "Generated fiber infill failed preparation: finalized_path_outside_domain; ");
+            Catch::Matchers::ContainsSubstring("Generated fiber infill failed preparation: finalized_path_outside_domain;") &&
+            Catch::Matchers::ContainsSubstring("layer=62"));
     }
     SECTION("policy failure retains exact-ID fallback even with zero outside tolerance") {
         config.outside_tolerance_mm2=0;

@@ -443,7 +443,7 @@ bool matches_boundary_arc(const Path& run,const Slic3r::Polygons& rings,double t
     // of two nearby branches. Test the admissible arcs; nearest alone cannot
     // resolve that ambiguity without the rest of the connecting geometry.
     const auto starts=supports(run.front()),ends=supports(run.back());
-    const auto near=[&](const Path& subject,const Path& reference,const Path& reference_arc) {
+    const auto within_reference_band=[&](const Path& subject,const Path& reference,const Path& reference_arc) {
         Slic3r::ClipperLib::ClipperOffset operation;operation.ArcTolerance=12.5;operation.ShortestEdgeLength=0;
         operation.AddPath(integer_path(reference).points,Slic3r::ClipperLib::jtRound,Slic3r::ClipperLib::etOpenRound);
         Slic3r::ClipperLib::Paths band;operation.Execute(band,scale_(tolerance));
@@ -480,7 +480,7 @@ bool matches_boundary_arc(const Path& run,const Slic3r::Polygons& rings,double t
         }
         if(!in_strip)continue;
         reference.push_back(to.point);
-        const bool outward=near(run,reference,reference),inward=near(reference,run,reference);
+        const bool outward=within_reference_band(run,reference,reference),inward=within_reference_band(reference,run,reference);
         if(outward && inward)return true;
     }
     return false;
@@ -817,8 +817,22 @@ Json check_rounded_domain(const Slic3r::ExPolygons& centerlines,const std::vecto
     return report;
 }
 
+bool rounded_main_has_fiber(bool short_only_allowed,size_t contours,size_t infill_paths,double central_length,
+    size_t short_rejections,bool central_short_rejection)
+{
+    // Empty infill needs an explicitly allowed fixture case and actual,
+    // independently checked short-path diagnostics in the central remainder.
+    const bool short_only=short_only_allowed && central_short_rejection && short_rejections>0;
+    return contours>0 && (infill_paths>0 || short_only) && (central_length>0 || short_only);
+}
+
 void rounded_checker_self_test()
 {
+    require(rounded_main_has_fiber(true,6,0,0,107,true),"Allowed short-path evidence rejected");
+    require(!rounded_main_has_fiber(false,6,0,0,107,true),"Short-path exception applied to a positive infill case");
+    require(!rounded_main_has_fiber(true,0,0,0,107,true),"Short infill evidence hid missing contours");
+    require(!rounded_main_has_fiber(true,6,0,0,0,true),"Empty infill accepted without rejected candidates");
+    require(!rounded_main_has_fiber(true,6,0,0,107,false),"Empty infill accepted without central short-path evidence");
     const Slic3r::ExPolygons domain{Slic3r::ExPolygon(Slic3r::Polygon(integer_path({{0,0},{10,0},{10,3},{0,3}}).points))};
     const auto path=[](double radius,double contact) {
         Path points{{contact-2,1}};
@@ -895,6 +909,7 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
     std::vector<Point> offsets;std::istringstream stream(effective.at("extruder_offset").get<std::string>());for(std::string item;std::getline(stream,item,',');){const auto x=item.find('x');offsets.push_back({std::stod(item.substr(0,x)),std::stod(item.substr(x+1))});}
     std::ifstream gcode(result.output.path);require(bool(gcode),"Missing rounded G-code");const auto blocks=read_blocks(gcode,offsets,true);
     report["passed"]=true;report["layer_count"]=expected_layers;report["gcode_fingerprint"]=fingerprint(result.output.path);size_t sources=0,returns=0,resin=0,max_contours=0;
+    size_t accepted_infill=0,short_infill_rejections=0;
     for (const auto& diagnostic:result.preview->fiber_fill_diagnostics)
         if (diagnostic.contour && diagnostic.kind==libslicer::FiberDiagnosticKind::RejectedPath &&
             diagnostic.reason.rfind("contour_rounding_unresolved",0)==0) {
@@ -917,7 +932,7 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
         Slic3r::ExPolygon area;
         for(size_t i=0;i<source.boundaries.size();++i){Slic3r::Polygon ring;for(const auto& p:source.boundaries[i])ring.points.push_back(Slic3r::Point::new_scale(p.x,p.y));if(i==0)area.contour=std::move(ring);else area.holes.push_back(std::move(ring));}
         Slic3r::ExPolygons occupied;std::vector<GapPath> paths;double central=0;size_t contour_count=0;
-        bool central_short_rejection=false;
+        bool central_short_rejection=false;size_t short_rejections=0;
         const auto window=Slic3r::ExPolygons{Slic3r::ExPolygon(Slic3r::Polygon(integer_path({{183,165},{199,165},{199,176},{183,176}}).points))};
         for(const auto& block:blocks)if(block.layer==layer && block.component==source.component_id) {
             if(block.contour){Slic3r::append(occupied,reference_sweep(block.points,.5));++contour_count;}
@@ -925,6 +940,7 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
         }
         for(const auto& d:result.preview->fiber_fill_diagnostics)if(d.layer_index+1==layer && d.component_id==source.component_id && !d.contour && d.kind==libslicer::FiberDiagnosticKind::RejectedPath) {
             Path points;for(auto p:d.points)points.push_back({p.x,p.y});check_short_rejection(points,d.reason,std::stod(effective.at("fiber_minimum_path_length").get<std::string>()),budget());
+            ++short_rejections;
             if(points.size()>1 && !Slic3r::intersection_pl(Slic3r::Polylines{integer_path(points)},window).empty())central_short_rejection=true;
         }
         const auto keepout=Slic3r::intersection_ex(Slic3r::union_ex(occupied),Slic3r::ExPolygons{area},Slic3r::ApplySafetyOffset::Yes);
@@ -932,12 +948,26 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
         float angle=float(45*PI/180);if((layer-1)&1)angle+=float(PI/2);angle+=float(PI/2);
         max_contours=std::max(max_contours,contour_count);
         auto row=check_rounded_domain(domain,paths,angle);row["layer"]=layer;row["component"]=source.component_id;row["contours"]=contour_count;row["central_accepted_length_mm"]=central;row["central_short_rejection"]=central_short_rejection;returns+=row["returns"].get<size_t>();
-        if(expected_layers==32 && source.component_id==0 && (paths.empty() || !contour_count || (central<=0 && !(layer==24 && central_short_rejection)))) {row["passed"]=false;row["failures"].push_back("main_and_central_region_require_actual_fiber");}
+        row["short_rejected_infill_paths"]=short_rejections;row["infill_process_budget_mm"]=budget();
+        accepted_infill+=paths.size();short_infill_rejections+=short_rejections;
+        // Four contours consume the long infill passages in this fixed model.
+        // Keep positive infill required for the other non-terminal cases.
+        if(expected_layers==32 && source.component_id==0 &&
+            !rounded_main_has_fiber(layer==24 || contours==4,contour_count,paths.size(),central,short_rejections,central_short_rejection)) {
+            row["passed"]=false;row["failures"].push_back("main_and_central_region_require_actual_fiber");
+        }
         if(!row["passed"].get<bool>())report["passed"]=false;report["layers"].push_back(std::move(row));
     }
     for(const auto& block:blocks)require(seen.count({size_t(block.layer),block.component}),"Depositing path without source region");
     if(expected_layers==32)for(size_t layer=4;layer<=24;++layer){std::vector<size_t> components;for(auto key:seen)if(key.first==layer)components.push_back(key.second);check_components(components,layer==24?65:1);}
-    require(sources>0 && returns>0 && resin>0,"Rounded acceptance requires source regions, real fiber returns and resin leftovers");
+    const bool short_only_case=expected_layers==32 && contours==4 && accepted_infill==0 && short_infill_rejections>0;
+    if(!(sources>0 && (returns>0 || short_only_case) && resin>0)) {
+        report["passed"]=false;
+        report["failures"].push_back("rounded_acceptance_requires_sources_returns_and_resin");
+    }
+    report["source_regions"]=sources;
+    report["accepted_infill_paths"]=accepted_infill;report["short_rejected_infill_paths"]=short_infill_rejections;
+    report["short_only_infill_case"]=short_only_case;
     report["max_contours_per_source"]=max_contours;
     if (max_contours<size_t(contours)) {
         report["passed"]=false;
@@ -1074,15 +1104,33 @@ void write_ring_svg(const fixture_fs::path& file,size_t layer,const Json& diagno
 // world coordinates. The origin comes from the model instance, never the output.
 bool ring_output_matches(const Path& local,const Block& block,Point origin,double* maximum_error=nullptr)
 {
-    if(local.size()<2 || local.size()!=block.points.size())return false;
+    if(local.size()<2 || block.points.size()<2)return false;
     const double tolerance=std::sqrt(2.)*.5*
         Slic3r::GCodeFormatter::pow_10_inv[Slic3r::GCodeFormatter::XYZF_EXPORT_DIGITS]+2e-6;
-    double maximum=0;
-    for(size_t j=0;j<local.size();++j) {
-        const double error=distance({local[j].x+origin.x,local[j].y+origin.y},block.points[j]);
-        if(!std::isfinite(error) || error>tolerance)return false;
-        maximum=std::max(maximum,error);
-    }
+    Path world;for(const auto& p:local)world.push_back({p.x+origin.x,p.y+origin.y});
+    double maximum=std::max(distance(world.front(),block.points.front()),distance(world.back(),block.points.back()));
+    if(!std::isfinite(maximum) || maximum>tolerance)return false;
+    // Compare both ordered curves. Valid arc tessellations may differ, while
+    // missing corners, reversed traversal and misplaced starts must still fail.
+    const auto follows=[&](const Path& subject,const Path& reference) {
+        size_t edge=0;double minimum_t=0;
+        for(const auto& point:subject) {
+            bool found=false;
+            while(edge+1<reference.size()) {
+                const Point a=reference[edge],b=reference[edge+1];
+                const double dx=b.x-a.x,dy=b.y-a.y,n=dx*dx+dy*dy;
+                const double t=n>0?std::clamp(((point.x-a.x)*dx+(point.y-a.y)*dy)/n,minimum_t,1.):minimum_t;
+                const double error=distance(point,{a.x+t*dx,a.y+t*dy});
+                if(std::isfinite(error) && error<=tolerance) {
+                    maximum=std::max(maximum,error);minimum_t=t;found=true;break;
+                }
+                ++edge;minimum_t=0;
+            }
+            if(!found)return false;
+        }
+        return true;
+    };
+    if(!follows(world,block.points) || !follows(block.points,world))return false;
     if(maximum_error)*maximum_error=maximum;
     return true;
 }
@@ -1109,6 +1157,16 @@ void ring_coordinate_checker_self_test()
     auto wrong_offsets=offsets;wrong_offsets[1].y+=1;
     std::istringstream wrong_input(text.str());const auto wrong_blocks=read_blocks(wrong_input,wrong_offsets,true);
     require(!ring_output_matches(local,wrong_blocks[0],origin),"Coordinate checker accepted an incorrect tool offset");
+    auto subdivided=blocks[0];
+    subdivided.points.insert(subdivided.points.begin()+1,{(subdivided.points[0].x+subdivided.points[1].x)/2,
+        (subdivided.points[0].y+subdivided.points[1].y)/2});
+    require(ring_output_matches(local,subdivided,origin),"Coordinate checker rejected equivalent subdivided output");
+    Path sampled=local;sampled.insert(sampled.begin()+1,{(local[0].x+local[1].x)/2,(local[0].y+local[1].y)/2});
+    require(ring_output_matches(sampled,blocks[0],origin),"Coordinate checker rejected equivalent subdivided source");
+    auto shortcut=blocks[0];shortcut.points.erase(shortcut.points.begin()+1);
+    require(!ring_output_matches(local,shortcut,origin),"Coordinate checker accepted a missing corner");
+    auto backtrack=blocks[0];backtrack.points.push_back(backtrack.points[1]);backtrack.points.push_back(backtrack.points[2]);
+    require(!ring_output_matches(local,backtrack,origin),"Coordinate checker accepted a reversed traversal");
 }
 
 Json source_json(const Slic3r::FiberCandidateId& id)
@@ -1418,9 +1476,16 @@ RingSlice ring_slice(libslicer::Library& library,const fixture_fs::path& model,
             result.paths[i]->id.parent.domain.component_id==block.component &&
             (test_options.connection.value_or(false) || (result.displayed_outer_paths.count(result.paths[i].get())>0)==block.contour)) {
             Path candidate;
+            const auto append_geometry=[&](const Slic3r::Polyline3& geometry) {
+                const auto sampled=Slic3r::Geometry::sample_with_arcs(geometry,0.00005);
+                for(const auto& p:sampled.points) {
+                    const Point point{Slic3r::unscale<double>(p.x()),Slic3r::unscale<double>(p.y())};
+                    if(candidate.empty() || distance(candidate.back(),point)>0)candidate.push_back(point);
+                }
+            };
+            if(result.paths[i]->entry.lowers())append_geometry(result.paths[i]->entry.geometry);
             for(const auto& span:result.paths[i]->spans)if(span.deposits_fiber())
-                for(size_t j=candidate.empty()?0:1;j<span.geometry.points.size();++j)
-                    candidate.push_back({Slic3r::unscale<double>(span.geometry.points[j].x()),Slic3r::unscale<double>(span.geometry.points[j].y())});
+                append_geometry(span.geometry);
             const auto tool=Slic3r::resolve_fiber_tool(print.config(),result.paths[i]->logical_filament_id);
             if(tool.logical_extruder_id!=unsigned(block.extruder))continue;
             double error=0;
