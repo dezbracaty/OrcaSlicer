@@ -12,6 +12,8 @@
 #include <vector>
 
 namespace Slic3r {
+void audit_fiber_execution_connections(const std::map<FiberFragmentId,CompiledFiberPath>& paths);
+
 
 enum class FiberAssignmentKind : uint8_t {
     AcceptedFiber,

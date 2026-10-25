@@ -4,6 +4,10 @@
 #include "FiberSource.hpp"
 #include "../ExPolygon.hpp"
 #include "../Polyline.hpp"
+#include "../GCodeWriter.hpp"
+#include <stdexcept>
+#include <limits>
+#include <map>
 
 #include <cstdint>
 #include <functional>
@@ -123,7 +127,99 @@ struct FiberPolicyBoundary {
     bool requires_resin_first { false };
 };
 
-struct PreparedFiberPath {
+enum class FiberExecutionFailure : uint8_t { InvalidPlan, Transform, Quantization, TailBudget, Feed, Motion, Coverage, Context };
+class FiberExecutionError : public std::runtime_error {
+public:
+    explicit FiberExecutionError(const std::string& message,FiberExecutionFailure kind=FiberExecutionFailure::InvalidPlan)
+        :std::runtime_error(message),failure(kind) {}
+    FiberExecutionError(const FiberExecutionError& cause,size_t instance,const FiberFragmentId& source,unsigned tool)
+        :std::runtime_error(std::string(cause.what())+": instance="+std::to_string(instance)+
+            " object="+std::to_string(source.parent.domain.object_id)+" layer="+std::to_string(source.parent.domain.layer_id)+
+            " path="+std::to_string(source.parent.path_ordinal)+" physical_tool="+std::to_string(tool)),
+         failure(cause.failure),instance_id(instance),path(source),physical_tool_id(tool) {}
+    FiberExecutionFailure failure {FiberExecutionFailure::InvalidPlan};
+    size_t instance_id {0};
+    FiberFragmentId path;
+    unsigned physical_tool_id {std::numeric_limits<unsigned>::max()};
+};
+
+struct FiberPlacement {
+    size_t instance_id {0}, object_id {0};
+    Vec2d origin {Vec2d::Zero()};
+};
+
+// Geometry inputs are independent of physical tool assignment and machine frame.
+class FiberGeometryCoverageCache;
+std::shared_ptr<FiberGeometryCoverageCache> make_fiber_geometry_coverage_cache();
+struct FiberGeometryCoverageCacheStatistics {size_t hits{0},misses{0},entries{0},retained_bytes{0};};
+FiberGeometryCoverageCacheStatistics fiber_geometry_coverage_cache_statistics(const std::shared_ptr<FiberGeometryCoverageCache>&);
+struct FiberGeometryContext {
+    PrintConfig config;
+    bool export_arcs {false};
+    std::shared_ptr<FiberGeometryCoverageCache> coverage_cache;
+};
+
+// Task-owned snapshot. No mutable Writer is retained by planning workers.
+struct FiberMachineMotionLimits;
+struct FiberExecutionContext {
+    PrintConfig config;
+    GCodeCoordinateTransform transform;
+    std::vector<FiberPlacement> placements;
+    std::vector<std::shared_ptr<const FiberMachineMotionLimits>> machine_limits;
+    bool export_arcs {false};
+    bool check_machine {true};
+};
+
+struct FrozenFiberCommand {
+    Vec2d target {Vec2d::Zero()};
+    double dE {0}, speed_mm_s {0}, station_mm {0};
+    uint32_t source_primitive {0};
+    int32_t arc_index {-1};
+};
+struct FrozenFiberArc { Vec2d ij {Vec2d::Zero()}; bool ccw {false}; };
+struct FrozenFiberSpan {
+    Vec2d from {Vec2d::Zero()};
+    FiberMotionKind kind {FiberMotionKind::PoweredDepositing};
+    std::vector<FrozenFiberCommand> commands;
+};
+struct FiberMachineMotionLimits {
+    ExPolygons tip_xy;
+    ExPolygons line_xy, arc_xy, arc_line_xy; // Precomputed once, never offset per emitted edge.
+    Vec2d command_to_tip_offset {Vec2d::Zero()};
+    double maximum_z_mm {0};
+    Vec3d maximum_axis_speed_mm_s {Vec3d::Zero()}; // Zero disables that axis limit.
+    void prepare();
+    void validate_motion(const Vec3d& from, const Vec3d& to, double speed, EMovePathType type, const Vec2d& ij) const;
+    void validate_move(const Vec3d& from, const Vec3d& to) const;
+    void validate_feedrate(const Vec3d& from, const Vec3d& to, double speed_mm_s,
+        EMovePathType type = EMovePathType::Linear_move, const Vec2d& center = Vec2d::Zero()) const;
+};
+
+struct FrozenFiberCommands {
+    std::vector<FrozenFiberSpan> spans;
+    std::vector<FrozenFiberArc> arcs;
+};
+bool equal_fiber_commands(const FrozenFiberCommands& a,const FrozenFiberCommands& b);
+
+struct FrozenFiberExecution {
+    FiberPlacement placement;
+    unsigned logical_filament_id {0}, logical_extruder_id {0}, physical_tool_id {0};
+    double e_units_per_mm {1}, layer_z {0}, prefeed_dE {0}, prefeed_F {0};
+    double source_deviation_mm {0};
+    Vec2d nozzle_offset {Vec2d::Zero()};
+    // Quantized relative targets are shared only after full command equality.
+    Vec2d command_origin {Vec2d::Zero()};
+    std::shared_ptr<const FrozenFiberCommands> commands;
+    const std::vector<FrozenFiberSpan>& spans() const { return commands->spans; }
+    const std::vector<FrozenFiberArc>& arcs() const { return commands->arcs; }
+    Vec3d machine_target(const Vec2d& relative) const;
+    std::vector<Vec3d> entry_targets;
+    std::vector<double> entry_stations_mm;
+    Vec3d entry_start {Vec3d::Zero()};
+    std::shared_ptr<const FiberMachineMotionLimits> limits;
+};
+
+struct FiberPathDraft {
     FiberFragmentId id;
     unsigned logical_filament_id { 0 };
     FiberFinishStrategy finish_strategy { FiberFinishStrategy::None };
@@ -143,16 +239,23 @@ struct PreparedFiberPath {
     double passive_length_error_mm {0.0};
     double requested_passive_length_mm {0.0};
     ExPolygons possible_coverage;
-    ExPolygons guaranteed_coverage;
-    ExPolygons uncertain_coverage;
+    // Set union of correctly oriented inner components; overlaps are intentional.
+    // Materialize with a NonZero boolean before area or canonical polygon queries.
+    ExPolygons guaranteed_components;
     ExPolygons physical_coverage;
     ExPolygons allowed_domain;
     double outside_tolerance_mm2 {0.0};
     ExPolygons resin_exclusion;
     ExPolygons outside_domain;
     ExPolygons contour_to_infill_keepout;
+    ExPolygons contour_resin_exclusion;
 
     std::shared_ptr<const FiberPolicyBoundary> policy_boundary;
+    std::shared_ptr<const FiberGeometryContext> geometry_context;
+    std::shared_ptr<const Polyline> reference_deposition;
+    // Inclusive reference endpoint + semantic span group (entry=0, span=i+1).
+    std::vector<std::pair<size_t,size_t>> reference_groups;
+    std::shared_ptr<const Polyline3> expected_legacy_view;
 
     double total_depositing_length_mm() const;
     double passive_tail_length_mm() const;
@@ -162,57 +265,116 @@ struct PreparedFiberPath {
     void validate() const;
 };
 
-struct BoundFiberExecutionPlan {
-    std::shared_ptr<const PreparedFiberPath> prepared;
-    unsigned logical_filament_id { 0 };
-    unsigned logical_extruder_id { 0 };
-    unsigned physical_tool_id { 0 };
-    double e_units_per_mm { 1.0 };
-    std::vector<std::vector<double>> edge_dE;
-    std::vector<FiberMotionSpan> spans;
-    std::vector<std::vector<Vec3d>> writer_targets, machine_targets;
-    std::vector<std::vector<Vec2d>> arc_offsets;
-    std::vector<std::vector<EMovePathType>> command_types;
-    std::vector<std::vector<size_t>> source_primitives;
-    std::vector<std::vector<double>> command_stations_mm;
-    std::function<Vec2d(const Point&)> point_to_writer;
-    double prefeed_dE { 0.0 };
-    double prefeed_F { 0.0 };
-    std::string cut_gcode;
-    struct EntryMotion {
-        Vec3d from {Vec3d::Zero()}, to {Vec3d::Zero()};
-        double speed_mm_s {0.0};
-        bool bound {false};
-        std::vector<Vec3d> writer_targets, machine_targets;
-    } entry_motion;
+class FiberPathFinalizer;
+// Published plans cannot be default constructed, copied into a mutable object,
+// or edited through the legacy extrusion view. Only Finalizer can publish.
+class PreparedFiberPath final {
+    const FiberPathDraft m_data;
+    explicit PreparedFiberPath(FiberPathDraft&& data) : m_data(std::move(data)),
+        id(m_data.id),
+        logical_filament_id(m_data.logical_filament_id),
+        finish_strategy(m_data.finish_strategy),
+        acceleration_mm_s2(m_data.acceleration_mm_s2),
+        geometric_mm3_per_mm(m_data.geometric_mm3_per_mm),
+        width_mm(m_data.width_mm),
+        height_mm(m_data.height_mm),
+        spans(m_data.spans),
+        actions(m_data.actions),
+        command_pieces(m_data.command_pieces),
+        start_procedure(m_data.start_procedure),
+        entry(m_data.entry),
+        execution_deviation_mm(m_data.execution_deviation_mm),
+        passive_length_error_mm(m_data.passive_length_error_mm),
+        requested_passive_length_mm(m_data.requested_passive_length_mm),
+        possible_coverage(m_data.possible_coverage),
+        guaranteed_components(m_data.guaranteed_components),
+        physical_coverage(m_data.physical_coverage),
+        allowed_domain(m_data.allowed_domain),
+        outside_tolerance_mm2(m_data.outside_tolerance_mm2),
+        resin_exclusion(m_data.resin_exclusion),
+        outside_domain(m_data.outside_domain),
+        contour_to_infill_keepout(m_data.contour_to_infill_keepout),
+        contour_resin_exclusion(m_data.contour_resin_exclusion),
+        policy_boundary(m_data.policy_boundary),
+        geometry_context(m_data.geometry_context),
+        reference_deposition(m_data.reference_deposition),
+        reference_groups(m_data.reference_groups),
+        expected_legacy_view(m_data.expected_legacy_view) {}
+    friend class FiberPathFinalizer;
+public:
+    PreparedFiberPath(const PreparedFiberPath&)=delete;
+    PreparedFiberPath& operator=(const PreparedFiberPath&)=delete;
+    const FiberPathDraft& draft() const { return m_data; }
+    const decltype(FiberPathDraft::id)& id;
+    const decltype(FiberPathDraft::logical_filament_id)& logical_filament_id;
+    const decltype(FiberPathDraft::finish_strategy)& finish_strategy;
+    const decltype(FiberPathDraft::acceleration_mm_s2)& acceleration_mm_s2;
+    const decltype(FiberPathDraft::geometric_mm3_per_mm)& geometric_mm3_per_mm;
+    const decltype(FiberPathDraft::width_mm)& width_mm;
+    const decltype(FiberPathDraft::height_mm)& height_mm;
+    const decltype(FiberPathDraft::spans)& spans;
+    const decltype(FiberPathDraft::actions)& actions;
+    const decltype(FiberPathDraft::command_pieces)& command_pieces;
+    const decltype(FiberPathDraft::start_procedure)& start_procedure;
+    const decltype(FiberPathDraft::entry)& entry;
+    const decltype(FiberPathDraft::execution_deviation_mm)& execution_deviation_mm;
+    const decltype(FiberPathDraft::passive_length_error_mm)& passive_length_error_mm;
+    const decltype(FiberPathDraft::requested_passive_length_mm)& requested_passive_length_mm;
+    const decltype(FiberPathDraft::possible_coverage)& possible_coverage;
+    const decltype(FiberPathDraft::guaranteed_components)& guaranteed_components;
+    const decltype(FiberPathDraft::physical_coverage)& physical_coverage;
+    const decltype(FiberPathDraft::allowed_domain)& allowed_domain;
+    const decltype(FiberPathDraft::outside_tolerance_mm2)& outside_tolerance_mm2;
+    const decltype(FiberPathDraft::resin_exclusion)& resin_exclusion;
+    const decltype(FiberPathDraft::outside_domain)& outside_domain;
+    const decltype(FiberPathDraft::contour_to_infill_keepout)& contour_to_infill_keepout;
+    const decltype(FiberPathDraft::contour_resin_exclusion)& contour_resin_exclusion;
+    const decltype(FiberPathDraft::policy_boundary)& policy_boundary;
+    const decltype(FiberPathDraft::geometry_context)& geometry_context;
+    const decltype(FiberPathDraft::reference_deposition)& reference_deposition;
+    const decltype(FiberPathDraft::reference_groups)& reference_groups;
+    const decltype(FiberPathDraft::expected_legacy_view)& expected_legacy_view;
+    double total_depositing_length_mm() const { return m_data.total_depositing_length_mm(); }
+    double passive_tail_length_mm() const { return m_data.passive_tail_length_mm(); }
+    void validate() const { m_data.validate(); }
 };
 
-// Bind once after the instance transform and writer quantization. Every machine
-// check and the emitter consume this exact motion, never reconstruct its Z.
-void bind_fiber_entry_motion(BoundFiberExecutionPlan& plan, const GCodeWriter& writer, const Vec2d& start_xy,
-    const Vec2d& contact_xy, double layer_z);
-
-
-// Available machine limits, not a model/deposition domain or a full collision
-// envelope. Positions are emitted G-code coordinates; XY limits describe the
-// tool tip, hence command_to_tip_offset is applied before the check.
-struct FiberMachineMotionLimits {
-    ExPolygons tip_xy;
-    Vec2d command_to_tip_offset {Vec2d::Zero()};
-    double maximum_z_mm {0};
-    Vec3d maximum_axis_speed_mm_s {Vec3d::Zero()}; // Zero disables that axis limit.
-    void validate_move(const Vec3d& from, const Vec3d& to) const;
-    void validate_feedrate(const Vec3d& from, const Vec3d& to, double speed_mm_s,
-        EMovePathType type = EMovePathType::Linear_move, const Vec2d& center = Vec2d::Zero()) const;
+struct FiberExecutionStatistics {
+    size_t compiled_candidates {0}, translated_coverage {0}, swept_coverage {0};
+};
+struct CompiledFiberPath {
+    std::shared_ptr<const PreparedFiberPath> geometry;
+    std::shared_ptr<const FiberExecutionContext> context;
+    std::vector<std::shared_ptr<const FrozenFiberExecution>> variants;
+    const FrozenFiberExecution& execution(size_t instance_id) const;
+};
+struct FiberExecutionPlanTable {
+    uint64_t geometry_generation {0}, execution_generation {0};
+    std::vector<int> filament_map;
+    std::map<FiberFragmentId,CompiledFiberPath> paths;
+    FiberExecutionStatistics statistics;
 };
 
-BoundFiberExecutionPlan bind_fiber_execution(
-    std::shared_ptr<const PreparedFiberPath> prepared,
-    unsigned filament_id, unsigned extruder_id, unsigned physical_tool_id,
-    double e_units_per_mm, std::string cut_gcode,
-    const GCodeWriter* writer = nullptr,
-    std::function<Vec2d(const Point&)> point_to_writer = {}, double layer_z = 0.0,
-    bool export_arcs = false);
+double fiber_reference_chord_tolerance(const FiberPathDraft& draft,const FiberMotionSpan& span);
+std::pair<ExPolygons,ExPolygons> fiber_geometry_coverage_bounds(const FiberPathDraft& draft);
+bool certify_fiber_coverage(const PreparedFiberPath& prepared,const FrozenFiberExecution& execution,
+    const FiberExecutionContext& context);
+Polylines fiber_geometry_contour_runs(const FiberPathDraft& prepared);
+
+FrozenFiberExecution compile_fiber_execution(const FiberPathDraft& draft,
+    const FiberExecutionContext& context, const FiberPlacement& placement, double layer_z,
+    const std::function<void()>& cancel = {});
+// Keep the published geometry/material contract and requested context intact.
+// A native arc that cannot be represented on the command grid may use a fully
+// certified G1 representation; ordinary G1 compilation retains its schedule.
+FrozenFiberExecution compile_certified_fiber_execution(const PreparedFiberPath& prepared,
+    const FiberExecutionContext& context, const FiberPlacement& placement, double layer_z,
+    FiberExecutionStatistics& statistics, const std::function<void()>& cancel = {});
+Polyline frozen_fiber_deposition(const FrozenFiberExecution& execution,
+    const FiberExecutionContext& context);
+Polylines frozen_fiber_contour_runs(const FiberPathDraft& prepared,const FrozenFiberExecution& execution,
+    const FiberExecutionContext& context);
+std::shared_ptr<const FiberMachineMotionLimits> fiber_machine_limits(const PrintConfig& config,unsigned extruder);
 
 } // namespace Slic3r
 

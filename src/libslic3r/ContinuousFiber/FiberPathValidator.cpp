@@ -1,4 +1,5 @@
 #include "FiberPathValidator.hpp"
+#include "../PrintBase.hpp"
 
 #include "../ClipperUtils.hpp"
 #include "../Geometry.hpp"
@@ -582,7 +583,9 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 path.polyline = normalize_fiber_geometry(path.polyline, &cleanup_domain);
             }
         }
-        catch (const std::invalid_argument&) { planar = false; }
+        catch (const FiberExecutionError&) { throw; }
+    catch (const CanceledException&) { throw; }
+    catch (const std::invalid_argument&) { planar = false; }
         const FiberCandidateId candidate_id {domain_id, purpose, job_ordinal, path_ordinal++};
         FiberRejectionReason whole_path_reason = !planar ? FiberRejectionReason::InvalidGeometry :
             validate_path_geometry(path, !rounds_contours);
@@ -748,7 +751,9 @@ FiberValidationResult FiberPathValidator::validate_impl(
                     validate_fiber_process_config(config, purpose, FiberFinishStrategy::TangentExtension);
                     assignment.reason = FiberRejectionReason::TooShort;
                     assignment.detail = "Infill interval is below path extraction resolution";
-                } catch (const std::invalid_argument& error) {
+                } catch (const FiberExecutionError&) { throw; }
+    catch (const CanceledException&) { throw; }
+    catch (const std::invalid_argument& error) {
                     assignment.reason = FiberRejectionReason::InvalidParameter;
                     assignment.detail = error.what();
                 }
@@ -800,7 +805,9 @@ FiberValidationResult FiberPathValidator::validate_impl(
                     const auto finish=make_independent_fiber_finish_route(*assignment.centerline,config,assignment.id);
                     finalized=FiberPathFinalizer::finalize(
                         *assignment.centerline,allowed_domain,config,assignment.id,finish,arcs,final_domain);
-                } catch (const std::invalid_argument& error) {
+                } catch (const FiberExecutionError&) { throw; }
+    catch (const CanceledException&) { throw; }
+    catch (const std::invalid_argument& error) {
                     finalized.failure=FiberFinalizationFailure::InvalidParameter;
                     finalized.detail=error.what();
                 }
@@ -1524,45 +1531,23 @@ void normalize_open_chain(OpenChainGeometry& geometry,const ExPolygons& domain)
     for (auto& bend:geometry.bends) {bend.begin=station(bend.begin);bend.end=station(bend.end);}
 }
 
-Polyline3 actual_chain_deposition(const PreparedFiberPath& prepared)
+Polyline3 source_chain_deposition(const PreparedFiberPath& prepared)
 {
     Polyline3 result;
-    if (prepared.entry.lowers() && prepared.entry.end_station_mm>0)
-        result=prepared.entry.geometry;
-    for (const auto& span:prepared.spans) if (span.deposits_fiber()) append_chain_geometry(result,span.geometry);
+    if(prepared.entry.lowers())result=prepared.entry.geometry;
+    for(const auto& span:prepared.spans)if(span.deposits_fiber())append_chain_geometry(result,span.geometry);
     return result;
+}
+
+std::vector<Polyline3> actual_chain_deposition(const PreparedFiberPath& prepared)
+{
+    return {source_chain_deposition(prepared)};
 }
 
 ExPolygons chain_contour_keepout(const FiberChainExecution& chain,const ContinuousFiberConfig& config)
 {
-    if (chain.prepared->command_pieces.empty()) return chain.pieces.front().display_purpose==FiberPathPurpose::Contour?
-        chain.prepared->contour_to_infill_keepout:ExPolygons{};
-    Polygons result;Polyline continuous;
-    const auto flush=[&] {
-        if (continuous.points.size()>1) append(result,to_polygons(fiber_contour_coverage(continuous,
-            0.5*chain.centerline.width+config.contour_infill_clearance_mm)));
-        continuous.points.clear();
-    };
-    if (chain.prepared->entry.lowers()) for (const auto& piece:chain.prepared->entry.pieces) {
-        if (piece.display_purpose!=FiberPathPurpose::Contour) {flush();continue;}
-        const auto points=check_view(Geometry::slice_with_arcs_mm(chain.prepared->entry.geometry,
-            piece.execution_begin_mm,piece.execution_end_mm)).points;
-        if (!continuous.points.empty() && continuous.points.back()!=points.front()) flush();
-        continuous.points.insert(continuous.points.end(),points.begin()+(continuous.points.empty()?0:1),points.end());
-    }
-    for (const auto& piece:chain.prepared->command_pieces) {
-        const auto& span=chain.prepared->spans.at(piece.span_index);
-        if (!span.deposits_fiber() || piece.origin.display_purpose!=FiberPathPurpose::Contour) {flush();continue;}
-        const auto stations=Geometry::stations_with_arcs_mm(span.geometry);
-        const auto points=Geometry::sample_with_arcs(Geometry::slice_with_arcs_mm(span.geometry,
-            stations[piece.begin_edge],stations[piece.end_edge]),ContourRoundingOptions{}.chord_tolerance_mm).to_polyline().points;
-        if (!continuous.points.empty() && continuous.points.back()!=points.front()) flush();
-        continuous.points.insert(continuous.points.end(),points.begin()+(continuous.points.empty()?0:1),
-            points.end());
-    }
-    flush();
-    return intersection_ex(fiber_material_offset(union_ex(result),chain.prepared->execution_deviation_mm),
-        chain.prepared->allowed_domain,ApplySafetyOffset::Yes);
+    if(chain.prepared->command_pieces.empty() && chain.pieces.front().display_purpose!=FiberPathPurpose::Contour)return {};
+    return chain.prepared->contour_to_infill_keepout;
 }
 
 double canonical_at(const FiberExecutionPiece& piece,double station)
@@ -1728,7 +1713,9 @@ bool FiberValidationResult::audit_open_chains() const
                 if (!chain.finish_pieces.empty() && chain.prepared->finish_strategy!=FiberFinishStrategy::LoopOverlap) return false;
             }
         }
-    } catch (const std::exception&) {return false;}
+    } catch (const FiberExecutionError&) { throw; }
+    catch (const CanceledException&) { throw; }
+    catch (const std::exception&) {return false;}
     return visited.size()==frozen.size();
 }
 
@@ -1805,7 +1792,9 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
                     decision.inherited_seam=inherited;decision.parent_contact=gate.parent;decision.child_contact=gate.child;
                     decision.parent_station_mm=parent.canonical(gate.parent_station);decision.child_station_mm=child.canonical(gate.child_station);
                     decision.gap_mm=gate.distance;choices.push_back({edge.first,edge.second,gate});
-                } catch (const std::exception& error) {decision.reason=error.what();}
+                } catch (const FiberExecutionError&) { throw; }
+    catch (const CanceledException&) { throw; }
+    catch (const std::exception& error) {decision.reason=error.what();}
             }
             std::sort(choices.begin(),choices.end(),[&](const auto& a,const auto& b){
                 return std::make_tuple(a.gate.distance,sources[a.child].source->id,a.gate.parent_station,a.gate.child_station)<
@@ -1839,14 +1828,16 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
                     for (size_t j=choice_index+1;j<choices.size();++j)
                         plan.chain_decisions[choices[j].decision].reason="one_successor_separate_root";
                     break;
-                } catch (const std::exception& error) {decision.reason=error.what();}
+                } catch (const FiberExecutionError&) { throw; }
+    catch (const CanceledException&) { throw; }
+    catch (const std::exception& error) {decision.reason=error.what();}
             }
             if (!extended) break;
         }
     }
     if (std::none_of(drafts.begin(),drafts.end(),[](const auto& draft){return draft && draft->sources.size()>1;})) return;
     FiberValidationResult publish;publish.assignments=original.assignments;publish.output_role=original.output_role;
-    std::vector<Polyline3> actual_paths;std::vector<bool> connected;
+    std::vector<std::vector<Polyline3>> actual_variants;std::vector<bool> connected;
     std::string failed;
     try {
         // Publication follows the same depth/ID root order used for selecting
@@ -1887,9 +1878,10 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
                 chain.prepared=prepared.prepared;
             }
             chain.sources=std::move(geometry.sources);chain.pieces=std::move(geometry.pieces);
-            actual_paths.push_back(actual_chain_deposition(*chain.prepared));connected.push_back(draft.sources.size()>1);
-            if (connected.back()) {
-                const ExtrusionPath actual(actual_paths.back(),chain.centerline);
+            // Every placement is audited below in its own canonical frame.
+            actual_variants.push_back(actual_chain_deposition(*chain.prepared));connected.push_back(draft.sources.size()>1);
+            if (connected.back())for(const auto& route:actual_variants.back()) {
+                const ExtrusionPath actual(route,chain.centerline);
                 const auto reason=validate_path_geometry(actual);
                 if (actual.is_closed() || reason!=FiberRejectionReason::None)
                     throw std::invalid_argument(std::string("open_chain_actual_")+fiber_rejection_reason_name(reason));
@@ -1898,9 +1890,11 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
         }
         // Recheck every changed execution against all actual prepared paths,
         // including originals restored after rejected extension attempts.
+        for(size_t placement=0;!actual_variants.empty() && placement<actual_variants.front().size();++placement) {
         Linesf lines;std::vector<std::tuple<size_t,Point,Point>> exact;
-        for (size_t i=0;i<actual_paths.size();++i) {
-            const auto path=check_view(actual_paths[i]);
+        for (size_t i=0;i<actual_variants.size();++i) {
+            if(actual_variants[i].size()!=actual_variants.front().size())throw FiberExecutionError("Fiber chain placement sets differ");
+            const auto path=check_view(actual_variants[i][placement]);
             for (size_t j=1;j<path.points.size();++j) {
                 lines.emplace_back(path.points[j-1].cast<double>(),path.points[j].cast<double>());
                 exact.emplace_back(i,path.points[j-1],path.points[j]);
@@ -1914,7 +1908,24 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
                 if (std::get<0>(other)!=std::get<0>(exact[i])) hit=Geometry::segments_intersect(
                     std::get<1>(exact[i]),std::get<2>(exact[i]),std::get<1>(other),std::get<2>(other));
                 return !hit;});
-            if (hit) throw std::invalid_argument("open_chain_actual_domain_crossing");
+            if(hit) {
+                // Preserve an existing connection-candidate rejection. Only a
+                // crossing introduced by final machine execution is fatal.
+                bool source_crossing=false;
+                const auto source_a=check_view(source_chain_deposition(*publish.chain_executions[std::get<0>(exact[i])].prepared));
+                for(size_t other=0;other<publish.chain_executions.size() && !source_crossing;++other) {
+                    if(other==std::get<0>(exact[i]))continue;
+                    const auto source_b=check_view(source_chain_deposition(*publish.chain_executions[other].prepared));
+                    for(size_t a=1;a<source_a.points.size() && !source_crossing;++a)
+                        for(size_t b=1;b<source_b.points.size();++b)
+                            if(Geometry::segments_intersect(source_a.points[a-1],source_a.points[a],source_b.points[b-1],source_b.points[b])) {
+                                source_crossing=true;break;
+                            }
+                }
+                if(source_crossing)throw std::invalid_argument("open_chain_actual_domain_crossing");
+                throw FiberExecutionError("open_chain_actual_domain_crossing");
+            }
+        }
         }
         if (!publish.audit_open_chains()) throw std::invalid_argument("open_chain_source_or_command_audit_failed");
         for (const auto& chain:publish.chain_executions) {
@@ -1923,7 +1934,9 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
         }
         publish.physical_footprint=union_ex(publish.physical_footprint);publish.resin_exclusion=union_ex(publish.resin_exclusion);
         publish.outside_domain=union_ex(publish.outside_domain);publish.contour_to_infill_keepout=union_ex(publish.contour_to_infill_keepout);
-    } catch (const std::exception& error) {failed=error.what();}
+    } catch (const FiberExecutionError&) { throw; }
+    catch (const CanceledException&) { throw; }
+    catch (const std::exception& error) {failed=error.what();}
     if (!failed.empty()) {
         for (auto& decision:plan.chain_decisions) if (decision.planned)
             decision.reason="planned_but_domain_reverted: "+failed;
@@ -1933,6 +1946,57 @@ void FiberPathValidator::plan_open_ring_chains(FiberContourPlanResult& plan,cons
     original.resin_exclusion=std::move(publish.resin_exclusion);original.outside_domain=std::move(publish.outside_domain);
     original.contour_to_infill_keepout=std::move(publish.contour_to_infill_keepout);
     for (auto& decision:plan.chain_decisions) if (decision.planned) {decision.published=true;decision.reason="connected";}
+}
+
+void audit_fiber_execution_connections(const std::map<FiberFragmentId,CompiledFiberPath>& paths)
+{
+    // Only connected routes issue queries below. With none present, rebuilding
+    // every actual/reference polyline and its obstacle tree serves no check.
+    // Keep the complete original obstacle set whenever any route is connected.
+    if(std::none_of(paths.begin(),paths.end(),[](const auto& item) {
+        return !item.second.variants.empty() && !item.second.geometry->command_pieces.empty();
+    }))return;
+    struct Route {const PreparedFiberPath* source;Polyline actual,reference;bool connected;};
+    std::map<std::pair<FiberDomainId,size_t>,std::vector<Route>> groups;
+    for(const auto& item:paths)for(const auto& variant:item.second.variants) {
+        const auto& geometry=*item.second.geometry;
+        auto actual=frozen_fiber_deposition(*variant,*item.second.context);
+        const bool connected=!geometry.command_pieces.empty();
+        if(connected) {
+            ExtrusionPath check(erContinuousFiberInfill,geometry.geometric_mm3_per_mm,geometry.width_mm,geometry.height_mm);
+            check.polyline=Polyline3(actual);
+            if(check.is_closed() || validate_path_geometry(check)!=FiberRejectionReason::None)
+                throw FiberExecutionError("Machine execution invalidates an accepted open connection",FiberExecutionFailure::Coverage);
+        }
+        groups[{geometry.id.parent.domain,variant->placement.instance_id}].push_back(
+            {&geometry,std::move(actual),check_view(source_chain_deposition(geometry)),connected});
+    }
+    for(const auto& group:groups) {
+        const auto& routes=group.second;Linesf lines;std::vector<std::tuple<size_t,Point,Point>> exact;
+        for(size_t i=0;i<routes.size();++i)for(size_t j=1;j<routes[i].actual.points.size();++j) {
+            const auto& a=routes[i].actual.points[j-1];const auto& b=routes[i].actual.points[j];
+            lines.emplace_back(a.cast<double>(),b.cast<double>());exact.emplace_back(i,a,b);
+        }
+        const auto tree=AABBTreeLines::build_aabb_tree_over_indexed_lines(lines);
+        std::set<std::pair<size_t,size_t>> crossings;
+        for(size_t i=0;i<lines.size();++i)if(routes[std::get<0>(exact[i])].connected) {
+            AABBTreeIndirect::Tree<2,double>::BoundingBox box(lines[i].a,lines[i].a);box.extend(lines[i].b);
+            AABBTreeIndirect::traverse(tree,[&](const auto& node){return box.intersects(node.bbox);},[&](const auto& node) {
+                const auto& a=exact[i];const auto& b=exact[node.idx];
+                if(std::get<0>(a)!=std::get<0>(b) && Geometry::segments_intersect(
+                    std::get<1>(a),std::get<2>(a),std::get<1>(b),std::get<2>(b)))
+                    crossings.insert(std::minmax(std::get<0>(a),std::get<0>(b)));
+                return true;
+            });
+        }
+        for(const auto& pair:crossings) {
+            bool existed=false;
+            const auto& a=routes[pair.first].reference;const auto& b=routes[pair.second].reference;
+            for(size_t i=1;i<a.points.size() && !existed;++i)for(size_t j=1;j<b.points.size();++j)
+                if(Geometry::segments_intersect(a.points[i-1],a.points[i],b.points[j-1],b.points[j])){existed=true;break;}
+            if(!existed)throw FiberExecutionError("Machine execution introduced a crossing between accepted fiber paths",FiberExecutionFailure::Coverage);
+        }
+    }
 }
 
 } // namespace Slic3r

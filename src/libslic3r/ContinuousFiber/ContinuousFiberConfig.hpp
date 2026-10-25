@@ -17,11 +17,14 @@ inline constexpr int fiber_contour_depth_limit = 100;
 class Layer;
 class LayerRegion;
 struct FiberPolicyBoundary;
+struct FiberGeometryContext;
 
 const std::array<std::string_view, 42>& fiber_mask_parameter_keys();
 bool is_fiber_mask_parameter(std::string_view key);
+bool is_fiber_execution_parameter(std::string_view key);
 
 struct ContinuousFiberConfig {
+    std::shared_ptr<const FiberGeometryContext> geometry_context;
     bool connect_adjacent_rings { false };
     double connection_tail_trim_widths {1.5};
     double connection_head_trim_widths {1.0};

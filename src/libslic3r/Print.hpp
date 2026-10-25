@@ -22,6 +22,7 @@
 
 #include <Eigen/Geometry>
 
+#include <atomic>
 #include <functional>
 #include <set>
 
@@ -35,6 +36,11 @@ class ModelObject;
 class Print;
 class PrintObject;
 class SupportLayer;
+struct FiberEarlyExecutionBatch;
+struct FiberExecutionReuseStatistics {
+    size_t early_compile_calls {0}, early_successful_variants {0}, early_failed_compile_calls {0};
+    size_t reused_variants {0}, late_compile_calls {0}, late_successful_variants {0}, late_failed_compile_calls {0};
+};
 // BBS
 class TreeSupportData;
 class TreeSupport;
@@ -327,6 +333,7 @@ public:
     // Trafo with the center_offset() applied after the transformation, to center the object in XY before slicing.
     Transform3d                  trafo_centered() const
         { Transform3d t = this->trafo(); t.pretranslate(Vec3d(- unscale<double>(m_center_offset.x()), - unscale<double>(m_center_offset.y()), 0)); return t; }
+    const std::shared_ptr<const FiberGeometryContext>& fiber_geometry_context() const { return m_fiber_geometry_context; }
     const PrintInstances&        instances() const      { return m_instances; }
     PrintInstances &instances() { return m_instances; }
 
@@ -480,7 +487,7 @@ public:
     void                    config_apply_only(const ConfigBase &other, const t_config_option_keys &keys, bool ignore_nonexistent = false) { m_config.apply_only(other, keys, ignore_nonexistent); }
     PrintBase::ApplyStatus  set_instances(PrintInstances &&instances);
     // Invalidates the step, and its depending steps in PrintObject and Print.
-    bool                    invalidate_step(PrintObjectStep step);
+    bool                    invalidate_step(PrintObjectStep step, bool invalidate_fiber = true);
     // Invalidates all PrintObject and Print steps.
     bool                    invalidate_all_steps();
     // Invalidate steps based on a set of parameters changed.
@@ -495,7 +502,7 @@ public:
 private:
     void make_perimeters();
     void prepare_infill();
-    void infill();
+    void infill(std::shared_ptr<FiberEarlyExecutionBatch> early = {});
     void ironing();
     bool need_z_contouring() const;
     void contour_z();
@@ -574,6 +581,9 @@ private:
     // BBS: per object skirt
     ExtrusionEntityCollection               m_skirt;
 
+    // Survives context removal when fiber is disabled, until Fill and its successors complete.
+    std::atomic_bool m_fiber_fill_rebuild_required {false};
+    std::shared_ptr<const FiberGeometryContext> m_fiber_geometry_context;
     PrintObject*                            m_shared_object{ nullptr };
 
     
@@ -949,8 +959,7 @@ public:
     const PrintConfig&          config() const { return m_config; }
     bool                        is_belt_printer() const noexcept
         { return m_config.printer_structure.value == PrinterStructure::psBelt; }
-    void                        set_belt_coordinate_system(BeltCoordinateSystem coordinates)
-        { m_belt_coordinate_system = std::move(coordinates); }
+    void                        set_belt_coordinate_system(BeltCoordinateSystem coordinates);
     const BeltCoordinateSystem* belt_coordinate_system() const noexcept
         { return m_belt_coordinate_system ? &*m_belt_coordinate_system : nullptr; }
     const PrintObjectConfig&    default_object_config() const { return m_default_object_config; }
@@ -1060,7 +1069,26 @@ public:
     const ToolOrdering&         get_tool_ordering() const { return m_wipe_tower_data.tool_ordering; }
 
     //BBS: plate's origin related functions
-    void set_plate_origin(Vec3d origin) { m_origin = origin; }
+    void set_plate_origin(Vec3d origin);
+    // Region/state-only query: never traverse extrusion entities or clone configuration.
+    // Remains true through fiber-disable cleanup and canceled/incomplete fiber runs.
+    bool fiber_execution_required() const;
+    void prepare_fiber_geometry_contexts();
+    std::vector<int> fiber_locked_filament_map() const;
+    std::vector<int> certified_fiber_filament_map() const;
+    std::shared_ptr<const FiberExecutionPlanTable> fiber_execution_plans() const;
+    FiberExecutionReuseStatistics fiber_execution_reuse_statistics() const;
+    bool fiber_execution_plans_current(const std::shared_ptr<const FiberExecutionPlanTable>& table) const;
+    void with_current_fiber_execution_plans(const std::shared_ptr<const FiberExecutionPlanTable>&,
+        const std::function<void()>& action) const;
+    bool invalidate_all_steps();
+    void invalidate_fiber_execution_plans(bool geometry);
+    struct ResolvedFilamentMapping {
+        DynamicPrintConfig original, full, overrides;
+        PrintConfig config;
+    };
+    static ResolvedFilamentMapping resolve_filament_mapping(const DynamicPrintConfig& original,
+        const PrintConfig& current,const std::vector<int>& mapping);
     const Vec3d get_plate_origin() const { return m_origin; }
     //BBS: export gcode from previous gcode file from 3mf
     void set_gcode_file_ready();
@@ -1138,7 +1166,7 @@ public:
 
 protected:
     // Invalidates the step, and its depending steps in Print.
-    bool                invalidate_step(PrintStep step);
+    bool                invalidate_step(PrintStep step, bool invalidate_fiber = true);
 
 private:
     //BBS
@@ -1156,6 +1184,30 @@ private:
     Polygons            first_layer_islands() const;
 
     PrintConfig                             m_config;
+    std::atomic_bool m_fiber_lifecycle_active {false};
+    std::vector<int> m_fiber_locked_filament_map;
+    mutable std::mutex m_fiber_execution_mutex;
+    uint64_t m_fiber_geometry_generation {0}, m_fiber_execution_generation {0};
+    std::shared_ptr<const FiberExecutionPlanTable> m_fiber_execution_plans;
+    std::shared_ptr<FiberExecutionPlanTable> m_fiber_selected_plans;
+    FiberExecutionReuseStatistics m_fiber_execution_reuse_statistics;
+    std::shared_ptr<FiberGeometryCoverageCache> m_fiber_geometry_coverage_cache;
+    struct FiberRunToken {
+        uint64_t geometry, execution;
+        DynamicPrintConfig original;
+        PrintConfig config;
+        std::shared_ptr<const FiberExecutionContext> early_context;
+        std::map<const PrintObject*,std::shared_ptr<FiberEarlyExecutionBatch>> early_batches;
+        FiberExecutionReuseStatistics reuse_statistics;
+    };
+    bool fiber_printing_enabled() const;
+    FiberRunToken begin_fiber_run();
+    void prepare_fiber_early_batches(FiberRunToken& token);
+    static bool prepare_fiber_early_slots(FiberEarlyExecutionBatch& batch,size_t count);
+    void compile_fiber_early_layer(FiberEarlyExecutionBatch& batch,const Layer& layer,size_t index);
+    static void finish_fiber_early_batch(FiberEarlyExecutionBatch& batch);
+    void prepare_fiber_tool_candidates(FiberRunToken& token);
+    void finalize_fiber_executions(const FiberRunToken& token);
     std::optional<BeltCoordinateSystem>     m_belt_coordinate_system;
     PrintObjectConfig                       m_default_object_config;
     PrintRegionConfig                       m_default_region_config;
@@ -1198,7 +1250,7 @@ private:
     std::vector<unsigned int> m_slice_used_filaments_first_layer;
 
     //BBS: plate's origin
-    Vec3d   m_origin;
+    Vec3d   m_origin {Vec3d::Zero()};
     //BBS: modified_count
     int     m_modified_count {0};
     //BBS

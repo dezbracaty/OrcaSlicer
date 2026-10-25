@@ -610,6 +610,10 @@ protected:
         { return m_state.invalidate_multiple(step_begin, step_end, this->cancel_callback()); }
     bool            invalidate_steps(std::initializer_list<PrintStepEnum> il)
         { return m_state.invalidate_multiple(il.begin(), il.end(), this->cancel_callback()); }
+    // Worker-local recovery only: the caller must hold state_mutex(), and no
+    // other processing thread may be running. Never ask the host to join us.
+    bool            invalidate_steps_without_cancel(std::initializer_list<PrintStepEnum> il)
+        { return m_state.invalidate_multiple(il.begin(), il.end(), [](){}); }
     bool            invalidate_all_steps()
         { return m_state.invalidate_all(this->cancel_callback()); }
 
@@ -652,6 +656,10 @@ protected:
         { return m_state.invalidate_multiple(step_begin, step_end, PrintObjectBase::cancel_callback(m_print)); }
     bool            invalidate_steps(std::initializer_list<PrintObjectStepEnum> il)
         { return m_state.invalidate_multiple(il.begin(), il.end(), PrintObjectBase::cancel_callback(m_print)); }
+    // Worker-local recovery only, under the owning Print's state_mutex().
+    // The caller is the sole processing thread, so no host cancellation is due.
+    bool            invalidate_steps_without_cancel(std::initializer_list<PrintObjectStepEnum> il)
+        { return m_state.invalidate_multiple(il.begin(), il.end(), [](){}); }
     bool            invalidate_all_steps()
         { return m_state.invalidate_all(PrintObjectBase::cancel_callback(m_print)); }
     bool            invalidate_all_steps_without_cancel()

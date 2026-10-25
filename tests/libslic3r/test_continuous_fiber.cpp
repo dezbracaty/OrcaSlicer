@@ -1,6 +1,7 @@
 #include <catch2/catch_all.hpp>
 
 #include "libslic3r/ContinuousFiber/FiberIsland.hpp"
+#include "libslic3r/ContinuousFiber/FiberCoverageLedger.hpp"
 #include "libslic3r/ContinuousFiber/FiberPathFinalizer.hpp"
 #include "libslic3r/ContinuousFiber/FiberPathValidator.hpp"
 #include "libslic3r/ContinuousFiber/FiberPolicyKey.hpp"
@@ -21,6 +22,7 @@
 #include <nlopt.hpp>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <regex>
 #include <sstream>
 #include <nlohmann/json.hpp>
@@ -28,6 +30,33 @@
 using namespace Slic3r;
 
 namespace {
+
+std::shared_ptr<FiberExecutionContext> fiber_fixture_context()
+{
+    auto context=std::make_shared<FiberExecutionContext>();
+    context->check_machine=false;context->placements={{0,0,Vec2d::Zero()}};
+    auto& c=context->config;
+    c.filament_process_type.values.assign(8,"continuous_fiber");
+    c.filament_map.values={1,2,3,4,5,6,7,8};c.physical_extruder_map.values={0,1,2,3,4,5,6,7};
+    c.toolhead_process_capabilities.values.assign(8,"continuous_fiber");
+    c.toolhead_fiber_protocol_id.values.assign(8,"linear-e-v1");c.toolhead_fiber_e_units_per_mm.values.assign(8,1.);
+    c.extruder_offset.values.assign(8,Vec2d::Zero());
+    return context;
+}
+FrozenFiberExecution compile_fixture(std::shared_ptr<const PreparedFiberPath> prepared,unsigned filament,
+    unsigned extruder,unsigned physical,double units,const std::string& cut,const GCodeWriter* writer=nullptr,
+    std::function<Vec2d(const Point&)> unused={},double z=0,bool native=false)
+{
+    if(!prepared || prepared->logical_filament_id!=filament || cut.empty() || unused)
+        throw std::invalid_argument("Invalid explicit fiber compiler fixture");
+    auto context=fiber_fixture_context();
+    context->config.filament_map.values.at(filament)=int(extruder+1);
+    std::swap(context->config.physical_extruder_map.values.at(extruder),context->config.physical_extruder_map.values.at(physical));
+    context->config.toolhead_fiber_e_units_per_mm.values.at(physical)=units;
+    context->export_arcs=native;
+    if(writer)context->transform=writer->coordinate_transform();
+    return compile_fiber_execution(prepared->draft(),*context,context->placements.front(),z);
+}
 
 ExPolygon rectangle(double x0, double y0, double x1, double y1)
 {
@@ -241,10 +270,10 @@ TEST_CASE("rectilinear finish extends motion without moving the cut or depositin
         CHECK(diff_ex(baseline.prepared->physical_coverage,prepared.physical_coverage).empty());
         CHECK(diff_ex(prepared.resin_exclusion,baseline.prepared->resin_exclusion).empty());
         CHECK(diff_ex(baseline.prepared->resin_exclusion,prepared.resin_exclusion).empty());
-        const auto bound=bind_fiber_execution(result.prepared,0,0,0,1.,";cut");
+        const auto bound=compile_fixture(result.prepared,0,0,0,1.,";cut");
         for(size_t i=0;i<prepared.spans.size();++i)
             if(!prepared.spans[i].actively_feeds_fiber())
-                for(double e:bound.edge_dE[i])CHECK(e==0);
+                for(const auto& command:bound.spans()[i].commands)CHECK(command.dE==0);
     }
     config.finish_extension_length_mm=23;
     const auto bent=path_from_points({{0,5},{80,5},{80,15}});
@@ -441,7 +470,7 @@ TEST_CASE("continuous fiber cut tail is finalized before coverage", "[Continuous
     CHECK(actions[8].type == FiberActionType::FiberDepleted);
     CHECK(actions[9].type == FiberActionType::Finish);
     CHECK(actions[10].type == FiberActionType::End);
-    auto invalid = *result.prepared;
+    auto invalid = result.prepared->draft();
     std::swap(invalid.actions[4], invalid.actions[5]);
     CHECK_THROWS(invalid.validate());
 }
@@ -833,15 +862,15 @@ TEST_CASE("fiber feed is independent of plastic flow geometry and binds hardware
     candidate.width *= 2;
     const auto b = finalize_independent(candidate, domain, config, test_id());
     REQUIRE(b.prepared);
-    const auto bound_a = bind_fiber_execution(a.prepared, 0, 1, 3, 2.0, ";cut");
-    const auto bound_b = bind_fiber_execution(b.prepared, 0, 1, 3, 2.0, ";cut");
+    const auto bound_a = compile_fixture(a.prepared, 0, 1, 3, 2.0, ";cut");
+    const auto bound_b = compile_fixture(b.prepared, 0, 1, 3, 2.0, ";cut");
     double sum_a = 0, sum_b = 0;
-    for (const auto& span : bound_a.edge_dE) for (double e : span) sum_a += e;
-    for (const auto& span : bound_b.edge_dE) for (double e : span) sum_b += e;
+    for (const auto& span : bound_a.spans()) for (const auto& command : span.commands) sum_a += command.dE;
+    for (const auto& span : bound_b.spans()) for (const auto& command : span.commands) sum_b += command.dE;
     CHECK(sum_a == Catch::Approx(20*1.02*1.05*2));
     CHECK(sum_b == Catch::Approx(sum_a));
-    CHECK_THROWS(bind_fiber_execution(a.prepared, 1, 1, 3, 2.0, ";cut"));
-    CHECK_THROWS(bind_fiber_execution(a.prepared, 0, 1, 3, 0.0, ";cut"));
+    CHECK_THROWS(compile_fixture(a.prepared, 1, 1, 3, 2.0, ";cut"));
+    CHECK_THROWS(compile_fixture(a.prepared, 0, 1, 3, 0.0, ";cut"));
 }
 
 TEST_CASE("fiber E quantization carries residuals before cut only", "[ContinuousFiber][feed]")
@@ -853,7 +882,7 @@ TEST_CASE("fiber E quantization carries residuals before cut only", "[Continuous
     const auto result=finalize_independent(straight_path(0,5,100,5),{rectangle(-5,0,110,15)},config,id);
     REQUIRE(result.prepared);
     const double units=GENERATE(.5,1.,2.);
-    const auto bound=bind_fiber_execution(result.prepared,0,0,0,units,";cut");
+    const auto bound=compile_fixture(result.prepared,0,0,0,units,";cut");
     double ideal=result.prepared->start_procedure.prefeed_length_mm*units;
     double emitted=bound.prefeed_dE,naive=bound.prefeed_dE;
     size_t fed_edges=0;
@@ -862,11 +891,11 @@ TEST_CASE("fiber E quantization carries residuals before cut only", "[Continuous
         for(size_t e=0;e<span.edges.size();++e){
             const double length=unscale<double>((span.geometry.points[e+1]-span.geometry.points[e]).cast<double>().norm());
             const double delta=length*span.edges[e].feed_mm_per_xy_mm*units;
-            ideal+=delta;naive+=GCodeFormatter::quantize_e(delta);emitted+=bound.edge_dE[s][e];
+            ideal+=delta;naive+=GCodeFormatter::quantize_e(delta);emitted+=bound.spans()[s].commands[e].dE;
             if(span.actively_feeds_fiber()){
-                CHECK(bound.edge_dE[s][e]>0);++fed_edges;
+                CHECK(bound.spans()[s].commands[e].dE>0);++fed_edges;
                 CHECK(emitted==Catch::Approx(ideal).margin(.0000051));
-            }else CHECK(bound.edge_dE[s][e]==0);
+            }else CHECK(bound.spans()[s].commands[e].dE==0);
         }
     }
     CHECK(fed_edges>7000);
@@ -1019,6 +1048,169 @@ TEST_CASE("fiber motion checks real tool coordinates exclusions and height", "[C
     CHECK_NOTHROW(limits.validate_move(Vec3d(19,0,0), Vec3d(119,0,0)));
 }
 
+TEST_CASE("fiber machine line certificates retain the original Clipper decision",
+    "[ContinuousFiber][machine-motion][MachineMoveCertificate]")
+{
+    // The oracle is the pre-certificate implementation, including the actual
+    // Clipper operation. It deliberately contains no copy of the fast proof.
+    const auto original_validate = [](const FiberMachineMotionLimits& limits, const Vec3d& from, const Vec3d& to) {
+        if (limits.tip_xy.empty() || !limits.command_to_tip_offset.allFinite() ||
+            !std::isfinite(limits.maximum_z_mm) || limits.maximum_z_mm <= 0)
+            throw std::runtime_error("Fiber machine motion limits are unavailable");
+        Points xy;
+        for (const Vec3d& p : {from, to}) {
+            if (!p.allFinite() || p.z() < 0 || p.z() > limits.maximum_z_mm ||
+                p.head<2>().cwiseAbs().maxCoeff() > 1000000.0)
+                throw std::runtime_error("Fiber motion exceeds machine Z/coordinate limits");
+            const Vec2d tip = p.head<2>() + limits.command_to_tip_offset;
+            const Point point = Point::new_scale(tip.x(), tip.y());
+            if (!std::any_of(limits.tip_xy.begin(), limits.tip_xy.end(),
+                [&](const ExPolygon& area) { return area.contains(point); }))
+                throw std::runtime_error("Fiber motion exceeds the configured tool working area");
+            xy.push_back(point);
+        }
+        if (xy.front() != xy.back() && total_length(diff_pl(Polylines{Polyline(std::move(xy))},
+            limits.line_xy.empty() ? offset_ex(limits.tip_xy, 1.0f) : limits.line_xy)) > scale_(0.00001))
+            throw std::runtime_error("Fiber motion crosses a configured machine exclusion area");
+    };
+    const auto outcome = [](const auto& operation) -> std::string {
+        try { operation(); return {}; }
+        catch (const std::exception& error) { return error.what(); }
+    };
+    const auto compare = [&](const FiberMachineMotionLimits& limits, const Vec3d& from, const Vec3d& to,
+        int expected_accept = -1) {
+        CAPTURE(from.x(), from.y(), from.z(), to.x(), to.y(), to.z());
+        const std::string original = outcome([&] { original_validate(limits, from, to); });
+        CHECK(outcome([&] { limits.validate_move(from, to); }) == original);
+        if (expected_accept >= 0)
+            CHECK(original.empty() == bool(expected_accept));
+    };
+    FiberMachineMotionLimits limits;
+    limits.tip_xy = {rectangle(-100,-100,500,500)};
+    limits.command_to_tip_offset = Vec2d::Zero();
+    limits.maximum_z_mm = 100;
+    limits.prepare();
+
+    SECTION("real concave machine domain includes both interior and crossing moves") {
+        ExPolygon domain;
+        domain.contour = Polygon::new_scale({{392,350},{435,350},{435,355},{0,355},
+            {0,350},{27,350},{27,0},{392,0}});
+        limits.tip_xy = {domain};
+        limits.prepare();
+        compare(limits, {200,170,1}, {270,199,1}, 1);
+        compare(limits, {10,352,1}, {425,352,1}, 1);
+        // Both endpoints are inside the concave polygon, but its notch is not.
+        compare(limits, {10,352,1}, {40,340,1}, 0);
+        compare(limits, {10,352,1}, {44,348,1}, 1);
+        std::reverse(limits.line_xy.front().contour.points.begin(), limits.line_xy.front().contour.points.end());
+        compare(limits, {270,199,1}, {200,170,1}, 1);
+        limits.command_to_tip_offset = {-19,0};
+        compare(limits, {219,170,1}, {289,199,1}, 1);
+    }
+    SECTION("boundary vertices and one grid offsets retain original tolerances") {
+        limits.tip_xy = {rectangle(0,0,100,100)};
+        limits.prepare();
+        compare(limits, {0,0,1}, {100,0,1}, 1);
+        compare(limits, {0,0,1}, {100,100,1}, 1);
+        limits.tip_xy = {rectangle(-10,-10,110,110)};
+        limits.line_xy = {rectangle(0,0,100,100)};
+        for (const int grid : {-1,0,1}) {
+            compare(limits, {20,grid*SCALING_FACTOR,1}, {80,grid*SCALING_FACTOR,1});
+            compare(limits, {grid*SCALING_FACTOR,grid*SCALING_FACTOR,1}, {50,50,1});
+        }
+        for (const int outside_grid : {1,9,10,11,20})
+            compare(limits, {-outside_grid*SCALING_FACTOR,50,1}, {1,50,1}, outside_grid <= 10);
+        // This segment is inside, although its box touches the sloped edge box.
+        ExPolygon triangle;
+        triangle.contour = Polygon::new_scale({{0,0},{100,0},{0,100}});
+        limits.line_xy = {triangle};
+        compare(limits, {10,10,1}, {20,20,1}, 1);
+    }
+    SECTION("holes and multiple components keep full segment checks") {
+        limits.tip_xy = {rectangle_with_hole(0,0,100,100,40,40,60,60)};
+        limits.prepare();
+        compare(limits, {30,50,1}, {70,50,1}, 0);
+        compare(limits, {10,10,1}, {30,30,1}, 1);
+        limits.tip_xy = {rectangle(0,0,10,10), rectangle(20,0,30,10)};
+        limits.prepare();
+        compare(limits, {5,5,1}, {25,5,1}, 0);
+        compare(limits, {21,1,1}, {29,9,1}, 1);
+    }
+    SECTION("public degenerate self crossing and repeated contours retain NonZero semantics") {
+        const std::vector<Points> contours {
+            {}, {{0,0}}, {{0,0},Point::new_scale(100,0)},
+            {{0,0},Point::new_scale(50,0),Point::new_scale(100,0)},
+            {{0,0},Point::new_scale(100,100),Point::new_scale(0,100),Point::new_scale(100,0)}
+        };
+        for (const Points& points : contours) {
+            limits.line_xy = {ExPolygon(Polygon(points))};
+            compare(limits, {25,10,1}, {30,10,1});
+            compare(limits, {25,50,1}, {75,50,1});
+        }
+        const Points loop = rectangle(0,0,100,100).contour.points;
+        Points repeated = loop;
+        repeated.insert(repeated.end(), loop.begin(), loop.end());
+        limits.line_xy = {ExPolygon(Polygon(repeated))};
+        compare(limits, {25,50,1}, {75,50,1}, 1); // Even parity, nonzero winding.
+        repeated.insert(repeated.end(), loop.begin(), loop.end());
+        limits.line_xy = {ExPolygon(Polygon(repeated))};
+        compare(limits, {25,50,1}, {75,50,1}, 1);
+        Points cancelled = loop;
+        cancelled.insert(cancelled.end(), loop.rbegin(), loop.rend());
+        limits.line_xy = {ExPolygon(Polygon(cancelled))};
+        compare(limits, {25,50,1}, {75,50,1}, 0);
+    }
+    SECTION("safe arithmetic range limits only the certificate") {
+        for (const coord_t extent : {coord_t(ClipperLib::loRange), coord_t(ClipperLib::loRange)+1}) {
+            ExPolygon domain;
+            domain.contour.points = {{-extent,-extent},{extent,-extent},{extent,extent},{-extent,extent}};
+            limits.tip_xy = {domain};
+            limits.line_xy = {domain};
+            const double near_edge = (extent-10)*SCALING_FACTOR;
+            compare(limits, {near_edge,0,1}, {near_edge-SCALING_FACTOR,1,1}, 1);
+            compare(limits, {-near_edge,0,1}, {-near_edge+SCALING_FACTOR,-1,1}, 1);
+            compare(limits, {-1000,-1000,1}, {1000,1000,1}, 1);
+        }
+        limits.tip_xy = {rectangle(0,0,100,100)};
+        limits.line_xy.front().contour.points = {{0,0},{ClipperLib::hiRange+1,0},
+            Point(coord_t(ClipperLib::hiRange+1),coord_t(scale_(100))),Point::new_scale(0,100)};
+        compare(limits, {20,20,1}, {80,80,1}, 0); // Preserve Clipper's range exception.
+        compare(limits, {20,20,1}, {20,20,1}, 1); // Original zero-XY short circuit.
+    }
+    SECTION("public line domain changes are observed on every call") {
+        limits.tip_xy = {rectangle(0,0,100,100)};
+        limits.prepare();
+        compare(limits, {20,50,1}, {80,50,1}, 1);
+        limits.line_xy = {rectangle_with_hole(0,0,100,100,40,40,60,60)};
+        compare(limits, {20,50,1}, {80,50,1}, 0);
+        limits.line_xy = {rectangle(0,0,10,100)};
+        compare(limits, {20,50,1}, {80,50,1}, 0);
+        limits.line_xy.clear();
+        compare(limits, {0,0,1}, {100,0,1}, 1);
+        limits.prepare();
+        compare(limits, {20,50,1}, {80,50,1}, 1);
+    }
+    SECTION("tool offset finite coordinate and height guards remain mandatory") {
+        limits.tip_xy = {rectangle(0,0,100,100)};
+        limits.prepare();
+        limits.command_to_tip_offset = {-19,0};
+        compare(limits, {24,5,1}, {97,5,1}, 1);
+        compare(limits, {24,5,1}, {120,5,1}, 0);
+        compare(limits, {24,5,99}, {24,5,101}, 0);
+        compare(limits, {24,5,-1}, {24,5,1}, 0);
+        compare(limits, {24,5,1}, {1000001,5,1}, 0);
+        compare(limits, {24,5,1}, {std::numeric_limits<double>::infinity(),5,1}, 0);
+        limits.command_to_tip_offset.x() = std::numeric_limits<double>::quiet_NaN();
+        compare(limits, {24,5,1}, {97,5,1}, 0);
+        limits.command_to_tip_offset = Vec2d::Zero();
+        limits.maximum_z_mm = std::numeric_limits<double>::quiet_NaN();
+        compare(limits, {24,5,1}, {97,5,1}, 0);
+        limits.maximum_z_mm = 100;
+        limits.tip_xy.clear();
+        compare(limits, {24,5,1}, {97,5,1}, 0);
+    }
+}
+
 TEST_CASE("fiber arc feedrate limits follow command direction independently of chord samples",
     "[ContinuousFiber][NativeArc][machine-motion]")
 {
@@ -1103,10 +1295,11 @@ TEST_CASE("fiber LayerXY and immutable entity contracts reject mutation", "[Cont
     CHECK_NOTHROW(fiber.validate_derived_view());
     base.polyline.points.front().x() += 1;
     CHECK_THROWS(fiber.validate_derived_view());
-    auto broken = std::make_shared<PreparedFiberPath>(*result.prepared);
+    auto broken = std::make_unique<FiberPathDraft>(result.prepared->draft());
     broken->spans.front().edges.pop_back();
-    CHECK_THROWS(bind_fiber_execution(broken, 0, 0, 0, 1, ";cut"));
-    auto quantized = std::make_shared<PreparedFiberPath>(*result.prepared);
+    const auto context=fiber_fixture_context();
+    CHECK_THROWS(compile_fiber_execution(*broken,*context,context->placements.front(),0));
+    auto quantized = std::make_unique<FiberPathDraft>(result.prepared->draft());
     auto& edge_points = quantized->spans.front().geometry.points;
     edge_points[1] = edge_points[0] + Point3(scale_(0.0000001), scale_(0.0000001), 0.0);
     CHECK_THROWS(quantized->validate());
@@ -1659,6 +1852,7 @@ TEST_CASE("retired fiber edge filters are ignored when reading old configs", "[C
 #include "libslic3r/ClipperUtils.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <future>
 
 TEST_CASE("contour tangent rounding retains the frozen layer 54 main loop", "[ContinuousFiber][ContourRounding]")
 {
@@ -3028,12 +3222,12 @@ TEST_CASE("closed contour audit rejects broken centerlines and depositing sequen
     // A closed reference or a closing finish move must not hide an open
     // depositing sequence after process preparation.
     broken=result;
-    auto prepared=std::make_shared<PreparedFiberPath>(*broken.assignments.front().prepared);
+    auto prepared=std::make_unique<FiberPathDraft>(broken.assignments.front().prepared->draft());
     for (auto span=prepared->spans.rbegin();span!=prepared->spans.rend();++span)
         if (span->deposits_fiber()) { span->geometry.points.back().x()+=scale_(.1); break; }
-    broken.assignments.front().prepared=std::move(prepared);
     REQUIRE(broken.assignments.front().centerline->is_closed());
-    CHECK_FALSE(broken.audit_assignments().valid());
+    CHECK_THROWS(prepared->validate());
+    STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<PreparedFiberPath>);
 }
 
 TEST_CASE("outer generation preserves whole loops inside the physical domain", "[ContinuousFiber][closed-outer]")
@@ -3283,7 +3477,7 @@ TEST_CASE("fiber intersection acceleration preserves exact segment decisions", "
                 if (first == 0 && second + 2 == points.size() && points.front() == points.back()) continue;
                 intersects |= Geometry::segments_intersect(points[first], points[first + 1], points[second], points[second + 1]);
             }
-        const auto result = FiberPathValidator::validate({&path}, {rectangle(-10, -10, 60, 60)}, {},
+        const auto result = FiberPathValidator::validate({&path}, {rectangle(-10, -10, 60, 60)}, ContinuousFiberConfig{},
             FiberPathPurpose::Infill, erContinuousFiberInfill, {});
         REQUIRE(result.assignments.size() == 1);
         CAPTURE(trial, intersects, points.size(), path.polyline.points.size());
@@ -4236,7 +4430,7 @@ TEST_CASE("strict policy boundary rejects physical protrusion without changing b
     CHECK(rejected.failure == FiberFinalizationFailure::PolicyBoundaryRejected);
     const auto accepted = finalize_independent(straight_path(5, 0.41, 45, 0.41), domain, config, test_id());
     REQUIRE(accepted.prepared);
-    CHECK(accepted.prepared->policy_boundary == context);
+    CHECK(accepted.prepared->policy_boundary->forbidden_core == context->forbidden_core);
     // With identical policy and planning domains, the accepted footprint is inside both.
     CHECK(accepted.prepared->outside_domain.empty());
 }
@@ -4255,7 +4449,7 @@ TEST_CASE("strict policy boundary distinguishes planning reserve from the effect
     const auto candidate = straight_path(5, 0.4095, 45, 0.4095);
     const auto accepted = finalize_independent(candidate, planning, config, test_id(), {}, &planning);
     REQUIRE(accepted.prepared);
-    CHECK(accepted.prepared->policy_boundary == context);
+    CHECK(accepted.prepared->policy_boundary->forbidden_core == context->forbidden_core);
     CHECK_FALSE(diff_ex(accepted.prepared->physical_coverage, offset_ex(planning, 4.f),
                         ApplySafetyOffset::No).empty());
     CHECK(diff_ex(accepted.prepared->physical_coverage, offset_ex(policy, 4.f),
@@ -4332,7 +4526,7 @@ DynamicPrintConfig masked_print_config()
 }
 }
 
-TEST_CASE("CFSYS final export limits only first approaches and restores material PA", "[ContinuousFiber][fiber-approach][cfsys]")
+TEST_CASE("CFSYS final export limits only first approaches and restores material PA", "[ContinuousFiber][fiber-approach][cfsys][OrcaIsolation]")
 {
     auto config = masked_print_config();
     for (const auto& [key, value] : std::vector<std::pair<std::string, std::string>>{
@@ -4453,23 +4647,34 @@ TEST_CASE("CFSYS final export limits only first approaches and restores material
         size_t paths = 0;
         bool in_approach = false, second_moves = false;
         double f = 0;
-        Vec2d previous=Vec2d::Zero();
-        const std::regex xy_axis("(?:^| )([XY])([-0-9.]+)");
+        Vec3d previous=Vec3d::Zero();
+        const std::regex xy_axis("(?:^| )([XYZ])([-0-9.]+)");
         while (std::getline(input, line)) {
             if (line.find(";FIBER_BEGIN ") == 0) { ++paths; in_approach = true; }
             if (std::regex_search(line, match, feed)) f = std::stod(match[1]);
-            Vec2d target=previous;
+            Vec3d target=previous;
             for(auto it=std::sregex_iterator(line.begin(),line.end(),xy_axis);it!=std::sregex_iterator();++it)
-                target[(*it)[1].str()=="X"?0:1]=std::stod((*it)[2]);
+                target[(*it)[1].str()=="X"?0:(*it)[1].str()=="Y"?1:2]=std::stod((*it)[2]);
             if (in_approach && line.find("G1 ") == 0 &&
                 (line.find('X') != std::string::npos || line.find('Y') != std::string::npos)) {
                 if(paths==1) {
                     // Resin used three decimal places; align its rounded end
                     // to the fiber's six-decimal source before the first arc.
-                    CHECK((target-previous).norm()<=std::sqrt(2.)*.001);
+                    CHECK((target-previous).head<2>().norm()<=std::sqrt(2.)*.001);
                     CHECK(f<=3600);
                 }
-                if (paths == 2) { CHECK(f == Catch::Approx(21000)); second_moves = true; }
+                if(paths==2) {
+                    const Vec3d delta=target-previous;
+                    double expected_speed=350;
+                    const char* axis_keys[]={"machine_max_speed_x","machine_max_speed_y","machine_max_speed_z"};
+                    for(int axis=0;axis<3;++axis) {
+                        const double limit=config.option<ConfigOptionFloats>(axis_keys[axis])->get_at(0);
+                        if(limit>0 && std::abs(delta[axis])>0)expected_speed=std::min(expected_speed,limit*delta.norm()/std::abs(delta[axis]));
+                    }
+                    // The second approach is free of the first-tool cap and
+                    // still obeys the exact XYZ command's machine axis limits.
+                    CHECK(f==Catch::Approx(expected_speed*60).margin(.0011));second_moves=true;
+                }
             }
             previous=target;
             if (line == ";FIBER_PREFEED_BEGIN") in_approach = false;
@@ -4480,12 +4685,17 @@ TEST_CASE("CFSYS final export limits only first approaches and restores material
     }
     config.set_deserialize_strict("pressure_advance", "0.05,0.2");
     print.apply(model, config);
+    // Execution changes revoke the old table. The forbidden PA must now fail
+    // during process certification as well as the defensive export preflight.
+    REQUIRE_THROWS_AS(print.process(),FiberExecutionError);
+    CHECK_FALSE(print.fiber_execution_plans());
     print.set_gcode_file_invalidated();
     REQUIRE_THROWS_WITH(generator.do_export(&print, output.string().c_str(), &result),
-        "CFSYS fiber requires pressure_advance=0 for used filament 1 on physical tool 1");
+        "Fiber execution table is missing or invalidated; process must complete before export");
     // A disabled setting with a saved nonzero value must not block export.
     config.set_deserialize_strict("enable_pressure_advance", "1,0");
     print.apply(model, config);
+    REQUIRE_NOTHROW(print.process());
     print.set_gcode_file_invalidated();
     REQUIRE_NOTHROW(generator.do_export(&print, output.string().c_str(), &result));
     // Nonzero enabled PA on an inventory slot that is never used for fiber
@@ -4726,33 +4936,32 @@ TEST_CASE("masked material order validates only the effective native rule", "[Co
         REQUIRE(strict_paths>0);
         REQUIRE(rounded_edges>0);
         REQUIRE(negative_control);
-        SECTION("emitter rejects an invalid published policy boundary") {
-            bool replaced = false;
-            std::function<void(ExtrusionEntity*&)> corrupt = [&](ExtrusionEntity*& entity) {
-                if (replaced) return;
-                if (auto* collection = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
-                    for (auto*& child : collection->entities) corrupt(child);
-                } else if (const auto* fiber = dynamic_cast<const ExtrusionFiberPath*>(entity)) {
-                    auto prepared = std::make_shared<PreparedFiberPath>(*fiber->prepared_path());
-                    auto boundary = std::make_shared<FiberPolicyBoundary>();
-                    boundary->forbidden_core = {rectangle(-1000,-1000,1000,1000)};
-                    prepared->policy_boundary = boundary;
-                    auto replacement = std::make_unique<ExtrusionFiberPath>(*fiber, fiber->role(), prepared, fiber->display_purpose());
-                    delete entity;
-                    entity = replacement.release();
-                    replaced = true;
+        SECTION("finalizer rejects a foreign policy before publishing") {
+            bool checked=false;
+            for(auto* layer:print.objects().front()->layers())for(auto* region:layer->regions()) {
+                auto policy=resolve_continuous_fiber_config(*layer,*region);
+                auto boundary=std::make_shared<FiberPolicyBoundary>();
+                boundary->forbidden_core={rectangle(-1000,-1000,1000,1000)};
+                policy.policy_boundary=boundary;policy.enforce_policy_boundary=true;
+                std::vector<const ExtrusionFiberPath*> fibers;
+                const auto collect=[&](const auto& self,const ExtrusionEntity& entity)->void {
+                    if(const auto* fiber=dynamic_cast<const ExtrusionFiberPath*>(&entity))fibers.push_back(fiber);
+                    else if(const auto* collection=dynamic_cast<const ExtrusionEntityCollection*>(&entity))
+                        for(const auto* child:collection->entities)self(self,*child);
+                };
+                collect(collect,region->fills);
+                for(const auto* fiber:fibers) {
+                    ExtrusionPath source(*fiber);source.polyline={};
+                    const auto& prepared=*fiber->prepared_path();
+                    if(prepared.entry.lowers())source.polyline=prepared.entry.geometry;
+                    for(const auto& span:prepared.spans)if(span.deposits_fiber())Geometry::append_with_arcs(source.polyline,span.geometry);
+                    const auto rejected=finalize_independent(source,prepared.allowed_domain,policy,prepared.id);
+                    CHECK_FALSE(rejected.prepared);checked=true;break;
                 }
-            };
-            for (auto* layer : print.objects().front()->layers())
-                for (auto* region : layer->regions())
-                    for (auto*& entity : region->fills.entities) corrupt(entity);
-            REQUIRE(replaced);
-            const auto path = std::filesystem::temp_directory_path() / "fiber-mask-invalid-boundary.gcode";
-            REQUIRE_THROWS_WITH(print.export_gcode(path.string(), nullptr),
-                "Machine-rounded fiber deposition crosses its policy boundary");
-            std::error_code error;
-            std::filesystem::remove(path, error);
-            std::filesystem::remove(path.string() + ".tmp", error);
+                if(checked)break;
+            }
+            REQUIRE(checked);
+            STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<PreparedFiberPath>);
         }
     }
 }
@@ -4801,7 +5010,7 @@ TEST_CASE("nested masked fiber groups emit the prepared materials rather than re
 {
     auto config = masked_print_config();
     for (const auto& [key,value] : std::vector<std::pair<std::string,std::string>>{
-        {"filament_map","1,2,3"}, {"filament_colour","#FFFFFF;#000000;#FF0000"},
+        {"filament_map","1,2,3"}, {"filament_printable","7,7,7"}, {"filament_colour","#FFFFFF;#000000;#FF0000"},
         {"flush_volumes_matrix","0,0,0,0,0,0,0,0,0"},
         {"filament_diameter","1.75,1.75,1.75"}, {"nozzle_diameter","0.4,0.4,0.4"},
         {"filament_process_type","thermoplastic;continuous_fiber;continuous_fiber"},
@@ -4891,7 +5100,7 @@ TEST_CASE("nested masked groups preserve ordinary role materials and ordered bra
 {
     auto config = masked_print_config();
     for (const auto& [key, value] : std::vector<std::pair<std::string, std::string>>{
-        {"filament_map", "1,2,3,4"}, {"filament_colour", "#FFFFFF;#00FF00;#FF0000;#000000"},
+        {"filament_map", "1,2,3,4"}, {"filament_printable", "15,15,15,15"}, {"filament_colour", "#FFFFFF;#00FF00;#FF0000;#000000"},
         {"flush_volumes_matrix", "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"},
         {"filament_diameter", "1.75,1.75,1.75,1.75"}, {"nozzle_diameter", "0.4,0.4,0.4,0.4"},
         {"filament_process_type", "thermoplastic;thermoplastic;thermoplastic;continuous_fiber"},
@@ -5250,6 +5459,66 @@ TEST_CASE("open ring chain retains one forward arc and one local seam per source
     for(auto* entity:output)delete entity;
 }
 
+TEST_CASE("execution connection audit retains independent obstacles whenever a connected route exists",
+    "[ContinuousFiber][OpenRingConnection][ConnectionAudit]")
+{
+    const int scenario=GENERATE(0,1,2,3);
+    CAPTURE(scenario);
+    auto config=open_ring_config();config.cut_to_contact_length_mm=2;
+    auto plan=open_ring_plan(config);FiberPathValidator::plan_open_ring_chains(plan,{rectangle(0,0,50,40)},config,true);
+    REQUIRE(plan.validation.chain_executions.size()==1);
+    const auto connected=plan.validation.chain_executions.front().prepared;
+    REQUIRE(connected);REQUIRE_FALSE(connected->command_pieces.empty());REQUIRE_FALSE(connected->entry.lowers());
+    auto context=fiber_fixture_context();
+    const auto compile=[&](const std::shared_ptr<const PreparedFiberPath>& geometry) {
+        CompiledFiberPath result;result.geometry=geometry;result.context=context;
+        result.variants.push_back(std::make_shared<const FrozenFiberExecution>(
+            compile_fiber_execution(geometry->draft(),*context,context->placements.front(),.2)));
+        return result;
+    };
+    auto independent_id=test_id();independent_id.parent.domain=connected->id.parent.domain;
+    independent_id.parent.purpose=FiberPathPurpose::Infill;
+    ContinuousFiberConfig independent_config;independent_config.cut_to_contact_length_mm=2;
+    const auto independent=finalize_independent(straight_path(60,10,90,10),
+        {rectangle(55,5,95,15)},independent_config,independent_id).prepared;
+    REQUIRE(independent);REQUIRE(independent->command_pieces.empty());
+    std::map<FiberFragmentId,CompiledFiberPath> paths;
+    paths.emplace(independent->id,compile(independent));
+    if(scenario==0) {
+        CHECK_NOTHROW(audit_fiber_execution_connections({}));
+        // The pre-existing contract ignores an entry with no variants, even
+        // without a geometry pointer. Do not dereference that unused entry.
+        auto empty_id=independent_id;empty_id.parent.domain.policy_group_id+=100;
+        paths.emplace(empty_id,CompiledFiberPath{});
+        CHECK_NOTHROW(audit_fiber_execution_connections(paths));
+        return;
+    }
+    paths.emplace(connected->id,compile(connected));
+    REQUIRE(paths.size()==2);
+    CHECK_NOTHROW(audit_fiber_execution_connections(paths));
+    if(scenario==1) {
+        auto changed=std::make_shared<FrozenFiberExecution>(*paths.at(independent->id).variants.front());
+        changed->command_origin.x()-=60; // Source remains outside; actual moves across the ring.
+        paths.at(independent->id).variants={changed};
+        CHECK_THROWS_AS(audit_fiber_execution_connections(paths),FiberExecutionError);
+    }
+    if(scenario==2) {
+        auto changed=std::make_shared<FrozenFiberExecution>(*paths.at(independent->id).variants.front());
+        changed->command_origin.x()-=60;changed->placement.instance_id+=1;
+        paths.at(independent->id).variants={changed};
+        CHECK_NOTHROW(audit_fiber_execution_connections(paths));
+    }
+    if(scenario==3) {
+        auto changed=std::make_shared<FrozenFiberExecution>(*paths.at(connected->id).variants.front());
+        auto commands=std::make_shared<FrozenFiberCommands>(*changed->commands);
+        const auto last=std::find_if(commands->spans.rbegin(),commands->spans.rend(),
+            [](const auto& span){return span.kind!=FiberMotionKind::NonDepositingFinish && !span.commands.empty();});
+        REQUIRE(last!=commands->spans.rend());last->commands.back().target=commands->spans.front().from;
+        changed->commands=commands;paths.at(connected->id).variants={changed};
+        CHECK_THROWS_AS(audit_fiber_execution_connections(paths),FiberExecutionError);
+    }
+}
+
 TEST_CASE("open ring connection off and no candidates preserve original prepared paths", "[ContinuousFiber][OpenRingConnection]")
 {
     auto config=open_ring_config();
@@ -5272,8 +5541,9 @@ TEST_CASE("open ring rejected extension restores the terminal role and untouched
     auto plan=open_ring_plan(config,domain);REQUIRE(plan.validation.assignments.size()==3);
     // A child with a different material must not borrow the inherited seam or receive a bridge.
     auto& foreign=plan.validation.assignments.back();
-    auto foreign_prepared=std::make_shared<PreparedFiberPath>(*foreign.prepared);
-    foreign_prepared->logical_filament_id+=1;foreign.prepared=foreign_prepared;
+    auto foreign_config=config;foreign_config.contour_material=foreign.prepared->logical_filament_id+2;
+    const auto foreign_result=finalize_independent(*foreign.centerline,domain,foreign_config,foreign.id);
+    REQUIRE(foreign_result.prepared);foreign.prepared=foreign_result.prepared;
     REQUIRE(plan.audit_lineage());
     const auto frozen=foreign.prepared;
     FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
@@ -5458,8 +5728,9 @@ TEST_CASE("open chain first-edge rejection leaves no inherited seam on the next 
     // Keep the second edge eligible while blocking the first through its real
     // source identity. No failed parent contact may initialize source1's seam.
     auto& first=plan.validation.assignments.front();
-    auto prepared=std::make_shared<PreparedFiberPath>(*first.prepared);
-    prepared->logical_filament_id+=1;first.prepared=prepared;
+    auto first_config=config;first_config.contour_material=first.prepared->logical_filament_id+2;
+    const auto first_result=finalize_independent(*first.centerline,domain,first_config,first.id);
+    REQUIRE(first_result.prepared);first.prepared=first_result.prepared;
     REQUIRE(plan.audit_lineage());
     FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
     REQUIRE_FALSE(plan.validation.chain_executions.empty());
@@ -5591,7 +5862,7 @@ TEST_CASE("fiber route landing preserves historical prefeed and dwell procedure"
         const auto result=finalize_independent(candidate,{rectangle(0,0,500,500)},config,test_id());
         INFO(result.detail);REQUIRE(result.prepared);
         CHECK(result.prepared->entry.end_station_mm==2);
-        const auto bound=bind_fiber_execution(result.prepared,0,0,0,1,"S0");
+        const auto bound=compile_fixture(result.prepared,0,0,0,1,"S0");
         CHECK(bound.prefeed_dE==Catch::Approx(row.at("prefeed").get<double>()).margin(.000005));
         CHECK(bound.prefeed_F==600);
         const auto& actions=result.prepared->actions;
@@ -5639,12 +5910,10 @@ TEST_CASE("landing ignores duplicate and machine-rounded zero first source edges
     const auto candidate=path_from_points({{10,10},{10+first,10},{60,10}});
     const auto result=finalize_independent(candidate,{rectangle(0,0,70,20)},config,test_id());
     CAPTURE(first);INFO(result.detail);REQUIRE(result.prepared);CHECK(result.prepared->entry.end_station_mm==2);
-    auto bound=bind_fiber_execution(result.prepared,result.prepared->logical_filament_id,0,0,1,"S0");
-    PrintConfig machine;GCodeWriter writer;writer.apply_print_config(machine);
-    bind_fiber_entry_motion(bound,writer,Vec2d(10,10),Vec2d(12,10),.54);
-    CHECK(bound.entry_motion.to.x()-bound.entry_motion.from.x()==2);
-    CHECK(bound.prepared->entry.end_station_mm==2);
-    CHECK(bound.entry_motion.to.z()==.54);
+    const auto bound=compile_fixture(result.prepared,result.prepared->logical_filament_id,0,0,1,"S0",nullptr,{},.54);
+    CHECK(bound.entry_targets.back().x()-bound.entry_targets.front().x()==2);
+    CHECK(result.prepared->entry.end_station_mm==2);
+    CHECK(bound.entry_targets.back().z()==Catch::Approx(.54).margin(1e-12));
 }
 
 TEST_CASE("legacy landing rejects cut overlap but cuts at an existing vertex", "[ContinuousFiber][LegacyLanding]")
@@ -5665,20 +5934,22 @@ TEST_CASE("fiber landing binds after plate and belt transforms exactly once", "[
     auto candidate=path_from_points({{10,10},{10.00051,10},{60,10}});
     const auto result=finalize_independent(candidate,{rectangle(0,0,70,20)},config,test_id());
     REQUIRE(result.prepared);
-    auto bound=bind_fiber_execution(result.prepared,result.prepared->logical_filament_id,0,0,1,"S0");
     PrintConfig machine;GCodeWriter writer;writer.apply_print_config(machine);writer.set_extruders({0});writer.toolchange(0);
     writer.set_xy_offset(.00049,0);
     const bool belted=GENERATE(false,true);
     if(belted){const auto belt=BeltCoordinateSystem::create(45,250);writer.set_belt_coordinate_system(&belt);}
-    bind_fiber_entry_motion(bound,writer,Vec2d(10,10),Vec2d(10.00051,10),.54);
-    CHECK(bound.entry_motion.to.x()==12.0); // The route follows the configured 2mm, not the tiny first edge.
+    const auto bound=compile_fixture(result.prepared,result.prepared->logical_filament_id,0,0,1,"S0",&writer,{},.54);
+    CHECK(bound.entry_targets.back().x()==Catch::Approx(11.99951).margin(1e-12)); // The route follows the configured 2mm, not the tiny first edge.
     writer.set_position(Vec3d(10,10,2.54));
-    const auto text=emit_fiber_landing(writer,bound);
+    const GCodeWriter::ScopedXYZPrecision precision(writer,6);
+    std::string text;
+    for(size_t i=1;i<bound.entry_targets.size();++i)text+=writer.emit_frozen_fiber_motion(bound.entry_targets[i],0,
+        result.prepared->start_procedure.landing_speed_mm_s,EMovePathType::Linear_move,Vec2d::Zero(),true);
     INFO(text);
     CHECK(text.find(" E")==std::string::npos);
-    CHECK(text.find("X12 Y")!=std::string::npos);
-    CHECK((writer.quantized_machine_position(writer.get_position())-bound.entry_motion.to).norm()<1e-10);
-    CHECK((writer.get_emitted_position()-writer.oriented_position(bound.entry_motion.to)).norm()<1e-10);
+    CHECK(text.find("X11.99951 Y")!=std::string::npos);
+    CHECK((writer.quantized_machine_position(writer.get_position())-bound.entry_targets.back()).norm()<1e-10);
+    CHECK((writer.get_emitted_position()-writer.oriented_position(bound.entry_targets.back())).norm()<1e-10);
 }
 
 
@@ -5752,17 +6023,17 @@ TEST_CASE("fiber landing follows an arc and binding preserves cut tail without E
     REQUIRE(dwell!=h0.prepared->actions.end());REQUIRE(dwell!=h0.prepared->actions.begin());
     CHECK((dwell-1)->type==FiberActionType::MotionSpan);
     for(bool native:{false,true}) {
-        const auto bound=bind_fiber_execution(result.prepared,0,0,0,1,"M400\nS0\nM400\n",nullptr,{},0,native);
+        const auto bound=compile_fixture(result.prepared,0,0,0,1,"M400\nS0\nM400\n",nullptr,{},0,native);
         size_t arcs=0;
-        for(size_t s=0;s<bound.spans.size();++s) {
-            if(native) CHECK(bound.spans[s].geometry.points==prepared.spans[s].geometry.points);
-            for(size_t e=0;e<bound.spans[s].edges.size();++e) {
-                const auto owner=bound.source_primitives[s][e];
+        for(size_t s=0;s<bound.spans().size();++s) {
+            if(native) CHECK(bound.spans()[s].commands.size()==prepared.spans[s].edges.size());
+            for(size_t e=0;e<bound.spans()[s].commands.size();++e) {
+                const auto& command=bound.spans()[s].commands[e];
+                const auto owner=command.source_primitive;
                 REQUIRE(owner<prepared.spans[s].edges.size());
-                CHECK(bound.spans[s].edges[e].speed_mm_s==prepared.spans[s].edges[owner].speed_mm_s);
-                CHECK(bound.spans[s].edges[e].feed_mm_per_xy_mm==prepared.spans[s].edges[owner].feed_mm_per_xy_mm);
-                if(bound.command_types[s][e]==EMovePathType::Arc_move_ccw)++arcs;
-                if(!bound.spans[s].actively_feeds_fiber())CHECK(bound.edge_dE[s][e]==0);
+                CHECK(command.speed_mm_s==prepared.spans[s].edges[owner].speed_mm_s);
+                if(command.arc_index>=0 && bound.arcs()[command.arc_index].ccw)++arcs;
+                if(!prepared.spans[s].actively_feeds_fiber())CHECK(command.dE==0);
             }
         }
         CHECK((arcs>0)==native);
@@ -6111,4 +6382,1309 @@ TEST_CASE("fiber finalization preserves a tiny arc after a large station", "[Con
             CHECK(unscale<double>(record.arc_data.length)==Catch::Approx(.00005*PI).margin(1e-9));
         }
     CHECK(arcs==1);
+}
+
+TEST_CASE("frozen geometry is certified for each late placement", "[ContinuousFiber][Finalization]")
+{
+    auto context=fiber_fixture_context();
+    context->placements={{101,7,Vec2d(100.0000004,80.0000003)},{202,8,Vec2d(120.0000008,90.0000007)}};
+    context->config.extruder_offset.values[0]=Vec2d(7.1234567,-2.7654321);
+    context->transform.xy_offset=Vec2d(20.1234567,10.7654321);
+    auto config=ContinuousFiberConfig{};
+    config.cut_to_contact_length_mm=23;config.z_hop_height_mm=2;
+    const auto source=path_from_points({{10,10},{60,10},{60,40},{10,40}});
+    const ExPolygons domain{rectangle(0,0,70,50)};
+    const auto finalized=finalize_independent(source,domain,config,test_id());
+    REQUIRE(finalized.prepared);const auto& prepared=*finalized.prepared;
+    CompiledFiberPath compiled;compiled.geometry=finalized.prepared;compiled.context=context;
+    for(const auto& placement:context->placements)
+        compiled.variants.push_back(std::make_shared<const FrozenFiberExecution>(
+            compile_fiber_execution(prepared.draft(),*context,placement,.54)));
+    REQUIRE(compiled.variants.size()==2);
+    for(size_t id:{101,202}) {
+        const auto& execution=compiled.execution(id);
+        CHECK_NOTHROW(certify_fiber_coverage(prepared,execution,*context));
+        CHECK(execution.source_deviation_mm<=prepared.execution_deviation_mm);
+        const auto footprint=fiber_contour_coverage(frozen_fiber_deposition(execution,*context),.5*source.width);
+        CHECK(diff_ex(footprint,offset_ex(prepared.possible_coverage,4.f),ApplySafetyOffset::No).empty());
+        CHECK(diff_ex(prepared.guaranteed_components,offset_ex(footprint,4.f),ApplySafetyOffset::No).empty());
+        double passive=0;
+        for(const auto& span:execution.spans()) {
+            Vec2d from=span.from;
+            for(const auto& command:span.commands) {
+                if(span.kind==FiberMotionKind::PassiveDepositingAfterCut) {
+                    CHECK(command.dE==0);passive+=(command.target-from).norm();
+                }
+                from=command.target;
+            }
+        }
+        CHECK(passive==Catch::Approx(23).margin(prepared.passive_length_error_mm));
+    }
+    CHECK_THROWS_AS(compiled.execution(303),FiberExecutionError);
+    STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<PreparedFiberPath>);
+}
+
+TEST_CASE("fiber writer checks actual intermediate commands and restores its hook", "[ContinuousFiber][Finalization]")
+{
+    PrintConfig config;GCodeWriter writer;writer.apply_print_config(config);writer.set_extruders({0});writer.toolchange(0);
+    const GCodeWriter::ScopedXYZPrecision precision(writer,6);
+    writer.set_position(Vec3d(10.1234564,10.2345674,3.1234564));writer.set_current_position_clear(false);
+    std::vector<std::pair<Vec3d,Vec3d>> checked;
+    {
+        const GCodeWriter::ScopedFiberMotionCheck check(writer,[&](const Vec3d& from,const Vec3d& to,
+            EMovePathType,const Vec2d&,double,double) {checked.emplace_back(from,to);});
+        writer.travel_to_xyz(Vec3d(12.3456784,15.4567894,4.5678914),"unknown position",true);
+    }
+    REQUIRE(checked.size()==2); // Actual XY followed by actual Z.
+    CHECK(checked[0].second==checked[1].first);
+    CHECK(checked[0].second.z()==Catch::Approx(GCodeFormatter::quantize(3.1234564,3)).margin(1e-12));
+    CHECK(checked[1].second.z()==GCodeFormatter::quantize(4.5678914,6));
+    const auto count=checked.size();writer.travel_to_xy(Vec2d(13,16));CHECK(checked.size()==count);
+    {
+        const GCodeWriter::ScopedFiberMotionCheck check(writer,[](const Vec3d&,const Vec3d&,
+            EMovePathType,const Vec2d&,double,double){throw std::runtime_error("rejected intermediate motion");});
+        CHECK_THROWS_WITH(writer.travel_to_z(5,"rejected Z",true),"rejected intermediate motion");
+    }
+    CHECK_NOTHROW(writer.travel_to_z(6,"ordinary travel restored",true));
+    Vec2d observed_ij=Vec2d::Zero();
+    {
+        const GCodeWriter::ScopedFiberMotionCheck check(writer,[&](const Vec3d&,const Vec3d&,
+            EMovePathType,const Vec2d& ij,double,double){observed_ij=ij;});
+        writer.extrude_arc_to_xy(Vec2d(14,16),Vec2d(.1234567,.7654321),0,true);
+    }
+    CHECK(observed_ij==Vec2d(GCodeFormatter::quantize(.1234567,6),GCodeFormatter::quantize(.7654321,6)));
+}
+
+TEST_CASE("fiber contexts include layer aliases and invalidate moved cached placements", "[ContinuousFiber][Finalization]")
+{
+    auto config=masked_print_config();config.set_deserialize_strict("filament_printable","3,3");
+    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("top_shell_thickness","0");
+    config.set_deserialize_strict("bottom_shell_thickness","0");
+    Model model;auto* first=model.add_object();first->add_volume(make_cube(20,20,2));
+    first->add_instance()->set_offset(Vec3d(60.0000004,60.0000003,0));
+    first->config.set_key_value("extruder",new ConfigOptionInt(1));
+    auto* alias=model.add_object(*first);
+    auto shared_mesh=first->volumes.front()->mesh_ptr();alias->volumes.front()->set_mesh(shared_mesh);
+    alias->instances.front()->set_offset(Vec3d(100.0000008,60.0000007,0));
+    Print print;print.set_plate_origin(Vec3d::Zero());print.apply(model,config);print.process();
+    REQUIRE(print.objects().size()==2);
+    REQUIRE(print.objects()[1]->get_shared_object()==print.objects()[0]);
+    const auto old_context=print.objects().front()->fiber_geometry_context();
+    REQUIRE(old_context);CHECK(print.objects()[1]->fiber_geometry_context()==old_context);
+    const auto old_table=print.fiber_execution_plans();REQUIRE(old_table);
+    alias->instances.front()->set_offset(Vec3d(110.0000008,60.0000007,0));
+    print.apply(model,config);
+    CHECK_FALSE(print.fiber_execution_plans_current(old_table));
+    print.process(nullptr,true);
+    const auto moved_table=print.fiber_execution_plans();REQUIRE(moved_table);
+    CHECK(moved_table!=old_table);
+    REQUIRE_FALSE(moved_table->paths.empty());
+    const auto& compiled=moved_table->paths.begin()->second;
+    REQUIRE(compiled.variants.size()==2);
+    const auto& moved=compiled.execution(alias->instances.front()->id().id);
+    const auto& previous=old_table->paths.begin()->second.execution(alias->instances.front()->id().id);
+    CHECK(moved.placement.origin.x()>previous.placement.origin.x()+9);
+    print.set_plate_origin(Vec3d(1.1234567,2.7654321,0));
+    CHECK_FALSE(print.fiber_execution_plans_current(moved_table));
+    CHECK(print.objects().front()->is_step_done(posInfill));
+    print.process(nullptr,true);
+    CHECK(print.fiber_execution_plans()->paths.begin()->second.context->transform.xy_offset==Vec2d(1.1234567,2.7654321));
+}
+
+TEST_CASE("fixed fiber Fill results are reused only for their exact run inputs", "[ContinuousFiber][OrcaIsolation][FiberEarlyExecution]")
+{
+    const int scenario=GENERATE(0,1,2,3); // fixed, auto, changed Z, early height failures
+    const bool shared_alias=GENERATE(false,true);
+    CAPTURE(scenario,shared_alias);
+    auto config=masked_print_config();
+    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("top_shell_thickness","0");config.set_deserialize_strict("bottom_shell_thickness","0");
+    config.set_deserialize_strict("filament_printable","3,3");
+    config.set_deserialize_strict("extruder_printable_height","100,100");
+    auto* areas=new ConfigOptionPointsGroups;const Vec2ds bed{{0,0},{200,0},{200,200},{0,200}};
+    areas->values={bed,bed};config.set_key_value("extruder_printable_area",areas);
+    if(scenario==1) {
+        config.set_key_value("filament_map_mode",new ConfigOptionEnum<FilamentMapMode>(fmmAutoForFlush));
+        config.set_key_value("toolhead_filament_capacity",new ConfigOptionInts);
+        config.set_deserialize_strict("filament_slots_bound_to_physical_tools","0");
+    }
+    if(scenario==3) {
+        config.set_deserialize_strict("extruder_printable_height","100,0.3");
+        config.set_deserialize_strict("fiber_z_hop_height","0");
+    }
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,1));
+    object->config.set_key_value("extruder",new ConfigOptionInt(1));
+    object->add_instance()->set_offset(Vec3d(60,60,0));
+    object->add_instance()->set_offset(Vec3d(85,60,0));
+    if(shared_alias) {
+        auto* alias=model.add_object(*object);auto mesh=object->volumes.front()->mesh_ptr();alias->volumes.front()->set_mesh(mesh);
+        alias->instances[0]->set_offset(Vec3d(110,60,0));alias->instances[1]->set_offset(Vec3d(135,60,0));
+    }
+    Print print;print.is_BBL_printer()=false;print.set_plate_origin(Vec3d::Zero());print.apply(model,config);
+    bool changed_z=false;
+    print.set_status_callback([&](const PrintBase::SlicingStatus& status) {
+        if(scenario>=2 && status.percent==71 && !changed_z) {
+            changed_z=true;for(auto* layer:print.get_object(0)->layers()) {
+                if(scenario==3)layer->print_z*=.1;
+                else layer->print_z+=.01;
+            }
+        }
+    });
+    print.process();
+    if(scenario>=2)REQUIRE(changed_z);
+    if(shared_alias)REQUIRE(print.objects()[1]->get_shared_object()==print.objects()[0]);
+    const auto table=print.fiber_execution_plans();REQUIRE(table);REQUIRE_FALSE(table->paths.empty());
+    size_t variants=0;
+    for(const auto& item:table->paths) {
+        const auto& path=item.second;REQUIRE(path.variants.size()==(shared_alias?4:2));variants+=path.variants.size();
+        for(const auto& execution:path.variants) {
+            FiberExecutionStatistics oracle_stats;
+            const auto oracle=compile_certified_fiber_execution(*path.geometry,*path.context,
+                execution->placement,execution->layer_z,oracle_stats);
+            CHECK(equal_fiber_commands(*execution->commands,*oracle.commands));
+            CHECK(execution->entry_targets==oracle.entry_targets);
+            CHECK(execution->entry_start==oracle.entry_start);
+            CHECK(execution->prefeed_dE==oracle.prefeed_dE);CHECK(execution->prefeed_F==oracle.prefeed_F);
+        }
+    }
+    const auto cold=print.fiber_execution_reuse_statistics();
+    CHECK(cold.early_compile_calls==(scenario==1?0:variants));
+    CHECK(cold.early_successful_variants+cold.early_failed_compile_calls==cold.early_compile_calls);
+    if(scenario==3)CHECK(cold.early_failed_compile_calls>0);
+    else CHECK(cold.early_failed_compile_calls==0);
+    CHECK(cold.reused_variants==(scenario==0?variants:0));
+    CHECK(cold.late_compile_calls==(scenario==0?0:variants));
+    CHECK(cold.late_successful_variants==cold.late_compile_calls);CHECK(cold.late_failed_compile_calls==0);
+    // Cached Fill is never rerun just to populate an early table, including
+    // moved placements and execution-only configuration/frame changes.
+    SECTION("cached unchanged") {}
+    SECTION("cached instance moved") {
+        object->instances.front()->set_offset(Vec3d(65,60,0));print.apply(model,config);
+    }
+    SECTION("cached plate frame changed") {print.set_plate_origin(Vec3d(1.1234567,2.7654321,0));}
+    SECTION("cached machine conversion changed") {
+        config.set_deserialize_strict("toolhead_fiber_e_units_per_mm","1,2");print.apply(model,config);
+    }
+    print.set_status_silent();
+    REQUIRE(print.objects().front()->is_step_done(posInfill));
+    print.process(nullptr,true);
+    const auto cached=print.fiber_execution_reuse_statistics();
+    CHECK(cached.early_compile_calls==0);CHECK(cached.early_successful_variants==0);
+    CHECK(cached.early_failed_compile_calls==0);CHECK(cached.reused_variants==0);
+    CHECK(cached.late_compile_calls==variants);CHECK(cached.late_successful_variants==variants);
+}
+
+TEST_CASE("failed early fiber runs cannot publish or carry results into a restart", "[ContinuousFiber][OrcaIsolation][FiberEarlyExecution]")
+{
+    const int failure=GENERATE(0,1,2); // cancellation, successor exception, revoked epoch
+    auto config=masked_print_config();config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("top_shell_thickness","0");config.set_deserialize_strict("bottom_shell_thickness","0");
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,1));
+    object->add_instance()->set_offset(Vec3d(60,60,0));
+    Print print;print.is_BBL_printer()=false;print.set_plate_origin(Vec3d::Zero());print.apply(model,config);
+    bool interrupted=false;
+    print.set_status_callback([&](const PrintBase::SlicingStatus& status) {
+        if(!interrupted && status.percent==(failure==1?75:71)) {
+            interrupted=true;
+            REQUIRE(print.objects().front()->is_step_done(posInfill));
+            if(failure==0){print.cancel_internal();throw CanceledException();}
+            if(failure==1)throw std::runtime_error("successor failed after early fiber compilation");
+            print.invalidate_fiber_execution_plans(false);
+        }
+    });
+    CHECK_THROWS(print.process());REQUIRE(interrupted);CHECK_FALSE(print.fiber_execution_plans());
+    const auto revoked=print.fiber_execution_reuse_statistics();
+    CHECK(revoked.early_compile_calls==0);CHECK(revoked.reused_variants==0);CHECK(revoked.late_compile_calls==0);
+    GCode generator;
+    const auto filename=(boost::filesystem::temp_directory_path()/
+        boost::filesystem::unique_path("fiber-early-revoked-%%%%.gcode")).string();
+    CHECK_THROWS_AS(generator.do_export(&print,filename.c_str(),nullptr,nullptr),FiberExecutionError);
+    print.set_status_silent();print.restart();print.process(nullptr,true);
+    const auto recovered=print.fiber_execution_plans();REQUIRE(recovered);REQUIRE_FALSE(recovered->paths.empty());
+    size_t variants=0;for(const auto& item:recovered->paths)variants+=item.second.variants.size();
+    const auto stats=print.fiber_execution_reuse_statistics();
+    CHECK(stats.early_compile_calls+stats.late_compile_calls==variants);
+    CHECK(stats.reused_variants+stats.late_successful_variants==variants);
+}
+
+TEST_CASE("machine failures are evaluated after geometry finalization", "[ContinuousFiber][Finalization]")
+{
+    auto config=ContinuousFiberConfig{};
+    auto context=fiber_fixture_context();context->config.toolhead_fiber_e_units_per_mm.values.assign(8,1e-9);
+    auto candidate=straight_path(5,5,45,5);
+    const ExPolygons domain{rectangle(0,0,50,20)};
+    const auto result=finalize_independent(candidate,domain,config,test_id());
+    REQUIRE(result.prepared); // Geometry is independent of the machine's E precision.
+    CHECK_THROWS_AS(compile_fiber_execution(result.prepared->draft(),*context,context->placements.front(),0),FiberExecutionError);
+    CHECK_NOTHROW(FiberPathValidator::validate({&candidate},domain,config,FiberPathPurpose::Infill,
+        erContinuousFiberInfill,test_id().parent.domain));
+}
+
+TEST_CASE("resin-only cached processing keeps the ordinary stage lifecycle", "[ContinuousFiber][OrcaIsolation]")
+{
+    // A machine may retain a fiber tool and its settings while this task uses
+    // ordinary resin only. Hardware capability must not activate fiber work.
+    const bool fiber_hardware=GENERATE(false,true);
+    auto config=masked_print_config();
+    config.set_deserialize_strict("generate_reinforced_infills","0");
+    config.set_deserialize_strict("generate_reinforced_perimeters","0");
+    if(!fiber_hardware) {
+        config.set_deserialize_strict("filament_process_type","thermoplastic;thermoplastic");
+        config.set_deserialize_strict("toolhead_process_capabilities","thermoplastic;thermoplastic");
+    }
+    config.set_deserialize_strict("ironing_type","top");
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(12,12,.8));
+    object->add_instance()->set_offset(Vec3d(60,60,0));
+    Print print;print.set_plate_origin(Vec3d::Zero());print.apply(model,config);print.process();
+    REQUIRE(print.objects().size()==1);
+    const auto* sliced=print.objects().front();
+    const auto infill=sliced->step_state_with_timestamp(posInfill).timestamp;
+    const auto ironing=sliced->step_state_with_timestamp(posIroning).timestamp;
+    const auto wipe=print.step_state_with_timestamp(psWipeTower).timestamp;
+    REQUIRE(sliced->is_step_done(posInfill));REQUIRE(sliced->is_step_done(posIroning));
+    REQUIRE(print.is_step_done(psWipeTower));
+    CHECK_FALSE(print.fiber_execution_required());
+    CHECK_FALSE(sliced->fiber_geometry_context());CHECK_FALSE(print.fiber_execution_plans());
+    for(int retry=0;retry<2;++retry) {
+        print.process(nullptr,true);
+        CHECK(sliced->step_state_with_timestamp(posInfill).timestamp==infill);
+        CHECK(sliced->step_state_with_timestamp(posIroning).timestamp==ironing);
+        CHECK(print.step_state_with_timestamp(psWipeTower).timestamp==wipe);
+        CHECK_FALSE(sliced->fiber_geometry_context());CHECK_FALSE(print.fiber_execution_plans());
+    }
+    SECTION("ordinary export-only settings keep cached tool ordering") {
+        // These are G-code-only options in HEAD, but also belong to the fiber
+        // execution key. A resin task must retain the original invalidation.
+        const std::string key=GENERATE(std::string("printable_area"),std::string("pressure_advance"));
+        config.set_deserialize_strict(key,key=="printable_area"?"0x0,300x0,300x300,0x300":"0.07,0");
+        // Export has not run, so its state is already INVALID. HEAD reports a
+        // changed configuration without invalidating any completed stage.
+        CHECK(print.apply(model,config)==PrintBase::APPLY_STATUS_CHANGED);
+        REQUIRE(print.is_step_done(psWipeTower));
+        CHECK(print.step_state_with_timestamp(psWipeTower).timestamp==wipe);
+        print.process(nullptr,true);
+    }
+    SECTION("ordinary coordinate setters retain their original assignment behavior") {
+        print.set_plate_origin(Vec3d(1,2,0));
+        print.set_belt_coordinate_system(BeltCoordinateSystem::create(45,250));
+        REQUIRE(print.is_step_done(psWipeTower));
+        CHECK(print.step_state_with_timestamp(psWipeTower).timestamp==wipe);
+        print.process(nullptr,true);
+    }
+    CHECK(sliced->step_state_with_timestamp(posInfill).timestamp==infill);
+    CHECK(sliced->step_state_with_timestamp(posIroning).timestamp==ironing);
+    CHECK(print.step_state_with_timestamp(psWipeTower).timestamp==wipe);
+    CHECK_FALSE(sliced->fiber_geometry_context());CHECK_FALSE(print.fiber_execution_plans());
+    CHECK_FALSE(print.fiber_execution_required());
+}
+
+TEST_CASE("fiber coordinate invalidation preserves cached ironing and reports invalidation", "[ContinuousFiber][Finalization]")
+{
+    auto config=masked_print_config();config.set_deserialize_strict("ironing_type","top");
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,.8));
+    object->add_instance()->set_offset(Vec3d(60,60,0));
+    Print print;print.set_plate_origin(Vec3d::Zero());print.apply(model,config);print.process();
+    const auto ironing_length=[](const Print& target) {
+        double length=0;
+        const auto sum=[&](const auto& self,const ExtrusionEntity& entity)->void {
+            if(const auto* collection=dynamic_cast<const ExtrusionEntityCollection*>(&entity))
+                for(const auto* child:collection->entities)self(self,*child);
+            else if(entity.role()==erIroning)length+=entity.length();
+        };
+        for(const auto* object:target.objects())for(const auto* layer:object->layers())
+            for(const auto* region:layer->regions())sum(sum,region->fills);
+        return length;
+    };
+    const auto before=ironing_length(print);REQUIRE(before>0);
+    config.set_deserialize_strict("toolhead_fiber_e_units_per_mm","1,2");
+    CHECK(print.apply(model,config)==PrintBase::APPLY_STATUS_INVALIDATED);
+    CHECK(print.objects().front()->is_step_done(posInfill));
+    print.process(nullptr,true);
+    CHECK(ironing_length(print)==Catch::Approx(before).margin(1e-6));
+    config.set_deserialize_strict("extruder_offset","0x0,0.1234567x0.7654321");
+    CHECK(print.apply(model,config)==PrintBase::APPLY_STATUS_INVALIDATED);
+    print.process(nullptr,true);
+    Print fresh;fresh.set_plate_origin(Vec3d::Zero());fresh.apply(model,config);fresh.process();
+    CHECK(ironing_length(print)==Catch::Approx(ironing_length(fresh)).margin(1e-6));
+}
+
+TEST_CASE("disabling fiber rebuilds cached fills and ironing like a fresh resin print", "[ContinuousFiber][Finalization][OrcaIsolation]")
+{
+    auto config=masked_print_config();config.set_deserialize_strict("ironing_type","top");
+    config.set_deserialize_strict("generate_reinforced_perimeters","1");
+    config.set_deserialize_strict("reinforced_perimeters_filament","2");
+    config.set_deserialize_strict("fiber_contour_bend_radius","0.3");
+    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("top_shell_thickness","0");
+    config.set_deserialize_strict("bottom_shell_thickness","0");
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,2));
+    object->add_instance()->set_offset(Vec3d(60,60,0));
+    // Model::add_object(copy) supplies this key on the clone. Give the source
+    // the same explicit material so original shared-object equality applies.
+    object->config.set_key_value("extruder",new ConfigOptionInt(1));
+    auto* alias=model.add_object(*object);
+    auto shared_mesh=object->volumes.front()->mesh_ptr();
+    alias->volumes.front()->set_mesh(shared_mesh);
+    alias->instances.front()->set_offset(Vec3d(100,60,0));
+    size_t frontend_cancel_calls=0,retry_cancel_calls=0;
+    Print cached;cached.set_plate_origin(Vec3d::Zero());cached.apply(model,config);cached.process();
+    REQUIRE(cached.objects().size()==2);
+    REQUIRE(cached.objects()[1]->get_shared_object()==cached.objects()[0]);
+    REQUIRE(cached.objects()[0]->layers().front()==cached.objects()[1]->layers().front());
+    // Preserve entity order and exact points, so equal total length cannot hide stale paths.
+    const auto signature=[](const Print& print) {
+        std::ostringstream paths;
+        const auto visit=[&](const auto& self,const ExtrusionEntity& entity)->void {
+            if(const auto* collection=dynamic_cast<const ExtrusionEntityCollection*>(&entity)) {
+                paths<<"[";for(const auto* child:collection->entities)self(self,*child);paths<<"]";
+            } else {
+                paths<<int(entity.role())<<":";
+                for(const auto& point:entity.as_polyline().points)paths<<point.x()<<","<<point.y()<<";";
+            }
+        };
+        for(const auto* object:print.objects())for(const auto* layer:object->layers())
+            for(const auto* region:layer->regions())visit(visit,region->fills);
+        return paths.str();
+    };
+    const auto count_fiber=[](const Print& print) {
+        size_t count=0;
+        const auto visit=[&](const auto& self,const ExtrusionEntity& entity)->void {
+            if(const auto* collection=dynamic_cast<const ExtrusionEntityCollection*>(&entity))
+                for(const auto* child:collection->entities)self(self,*child);
+            else if(dynamic_cast<const ExtrusionFiberPath*>(&entity))++count;
+        };
+        for(const auto* object:print.objects())for(const auto* layer:object->layers())
+            for(const auto* region:layer->regions())visit(visit,region->fills);
+        return count;
+    };
+    REQUIRE(count_fiber(cached)>0);
+    config.set_deserialize_strict("generate_reinforced_infills","0");
+    config.set_deserialize_strict("generate_reinforced_perimeters","0");
+    cached.set_cancel_callback([&]{++frontend_cancel_calls;});
+    CHECK(cached.apply(model,config)==PrintBase::APPLY_STATUS_INVALIDATED);
+    REQUIRE(frontend_cancel_calls>0);
+    REQUIRE(cached.fiber_execution_required());
+    cached.set_cancel_callback([]{});
+    SECTION("resume after cancellation during infill simplification") {
+        // The original optimization callback is a real process boundary after
+        // Fill and ironing. Exercise the worker entrypoint and pending cleanup,
+        // without adding an ordinary callback solely for this regression.
+        bool interrupted=false;
+        cached.set_status_callback([&](const PrintBase::SlicingStatus& status) {
+            const auto* sliced=cached.objects().front();
+            if(status.percent==75 && !interrupted && sliced->is_step_done(posInfill) &&
+                sliced->is_step_done(posIroning) && !sliced->is_step_done(posSimplifyInfill)) {
+                interrupted=true;cached.cancel_internal();throw CanceledException();
+            }
+        });
+        CHECK_THROWS_AS(cached.process(nullptr,true),CanceledException);
+        REQUIRE(interrupted);
+        REQUIRE(cached.objects().front()->is_step_done(posInfill));
+        REQUIRE(cached.objects().front()->is_step_done(posIroning));
+        REQUIRE_FALSE(cached.objects().front()->is_step_done(posSimplifyInfill));
+        REQUIRE(cached.fiber_execution_required());
+        cached.set_status_silent();
+        cached.restart();
+        REQUIRE(count_fiber(cached)==0);
+        REQUIRE_FALSE(cached.fiber_execution_plans());
+        // Cancellation is cleared: this must fail because the active cleanup
+        // has no published table, even though its current fills are all resin.
+        const auto output=std::filesystem::temp_directory_path()/"fiber-pending-disable.gcode";
+        {std::ofstream existing(output);existing<<"previous completed output\n";}
+        GCode generator;GCodeProcessorResult result;
+        CHECK_THROWS_WITH(generator.do_export(&cached,output.string().c_str(),&result),
+            "Fiber execution table is missing or invalidated; process must complete before export");
+        std::ifstream preserved(output);std::string previous;
+        std::getline(preserved,previous);CHECK(previous=="previous completed output");
+        preserved.close();std::error_code error;std::filesystem::remove(output,error);
+    }
+    SECTION("normal cached rebuild") {}
+    // A host cancellation callback stops the worker. Local recovery must never
+    // invoke this frontend callback from inside the worker being recovered.
+    cached.set_cancel_callback([&]{++retry_cancel_calls;cached.cancel_internal();});
+    CHECK_NOTHROW(cached.process(nullptr,true));
+    CHECK(retry_cancel_calls==0);
+    cached.set_cancel_callback([]{});
+    CHECK_FALSE(cached.objects().front()->fiber_geometry_context());
+    CHECK_FALSE(cached.objects()[1]->fiber_geometry_context());
+    CHECK_FALSE(cached.fiber_execution_plans());
+    CHECK_FALSE(cached.fiber_execution_required());
+    CHECK(count_fiber(cached)==0);
+    Print fresh;fresh.set_plate_origin(Vec3d::Zero());fresh.apply(model,config);fresh.process();
+    CHECK(signature(cached)==signature(fresh));
+    const auto wipe=cached.step_state_with_timestamp(psWipeTower).timestamp;
+    const auto fills=signature(cached);
+    CHECK_NOTHROW(cached.process(nullptr,true));
+    CHECK_FALSE(cached.fiber_execution_plans());
+    CHECK(cached.step_state_with_timestamp(psWipeTower).timestamp==wipe);
+    CHECK(signature(cached)==fills);
+}
+
+TEST_CASE("fiber tasks with no accepted entities still require a completed execution table", "[ContinuousFiber][OrcaIsolation]")
+{
+    auto config=masked_print_config();
+    // Preserve enabled fiber policy while rejecting every short source. A
+    // finished empty task differs from an interrupted task missing its table.
+    config.set_deserialize_strict("fiber_minimum_path_length","10000");
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(12,12,.8));
+    object->add_instance()->set_offset(Vec3d(60,60,0));
+    Print print;print.is_BBL_printer()=false;print.set_plate_origin(Vec3d::Zero());print.apply(model,config);print.process();
+    REQUIRE(print.fiber_execution_required());
+    const auto table=print.fiber_execution_plans();REQUIRE(table);REQUIRE(table->paths.empty());
+    const auto output=std::filesystem::temp_directory_path()/"fiber-empty-certified-task.gcode";
+    GCode generator;GCodeProcessorResult result;
+    REQUIRE_NOTHROW(generator.do_export(&print,output.string().c_str(),&result));
+    const auto read_output=[&] {
+        std::ifstream input(output);
+        return std::string(std::istreambuf_iterator<char>(input),std::istreambuf_iterator<char>());
+    };
+    const auto completed=read_output();REQUIRE_FALSE(completed.empty());
+    CHECK(completed.find(";FIBER_BEGIN ")==std::string::npos);
+    print.set_plate_origin(Vec3d(1,0,0));
+    REQUIRE_FALSE(print.fiber_execution_plans());
+    CHECK_THROWS_WITH(generator.do_export(&print,output.string().c_str(),&result),
+        "Fiber execution table is missing or invalidated; process must complete before export");
+    CHECK(read_output()==completed);
+    std::error_code error;std::filesystem::remove(output,error);
+}
+
+TEST_CASE("fiber writer formats the checked feedrate for XYZ and every spiral segment", "[ContinuousFiber][Finalization]")
+{
+    PrintConfig config;config.travel_speed.value=500;config.initial_layer_travel_speed=ConfigOptionFloatOrPercent(100,false);
+    config.travel_speed_z.value=12;config.z_hop.values={1.};config.enable_arc_fitting.value=false;
+    config.retract_lift_above.values={0.};config.retract_lift_below.values={0.};
+    const auto initialize=[&](GCodeWriter& writer) {
+        writer.apply_print_config(config);writer.set_extruders({0});writer.toolchange(0);
+        writer.set_position(Vec3d(10,10,1));writer.set_current_position_clear(true);
+    };
+    SECTION("actual XYZ F is shared by check and formatter") {
+        GCodeWriter writer;initialize(writer);
+        const GCodeWriter::ScopedXYZPrecision precision(writer,6);
+        double requested=0;
+        const GCodeWriter::ScopedFiberMotionCheck check(writer,[&](const Vec3d&,const Vec3d&,EMovePathType,
+            const Vec2d&,double,double& speed){requested=speed;speed=50;});
+        const auto text=writer.travel_to_xyz(Vec3d(20,20,2),"checked XYZ",true);
+        CHECK(requested==500);CHECK(text.find("F3000")!=std::string::npos);
+    }
+    SECTION("spiral final segment has its own modal F") {
+        GCodeWriter writer;initialize(writer);
+        const GCodeWriter::ScopedXYZPrecision precision(writer,6);
+        std::vector<double> speeds;
+        const GCodeWriter::ScopedFiberMotionCheck check(writer,[&](const Vec3d&,const Vec3d& to,EMovePathType,
+            const Vec2d&,double,double& speed){speed=to.z()>1.9999?1.5:10.;speeds.push_back(speed);});
+        const auto text=writer.eager_lift(LiftType::SpiralLift);
+        REQUIRE(speeds.size()>=4);
+        std::istringstream input(text);std::string line;double modal_f=0;size_t motion=0;
+        const std::regex feed("(?:^| )F([-0-9.]+)");std::smatch match;
+        while(std::getline(input,line)) {
+            if(std::regex_search(line,match,feed))modal_f=std::stod(match[1]);
+            if(line.rfind("G1 ",0)==0 && line.find(" X")!=std::string::npos) {
+                REQUIRE(motion<speeds.size());CHECK(modal_f==Catch::Approx(speeds[motion++]*60).margin(.001));
+            }
+        }
+        CHECK(motion==speeds.size());CHECK(modal_f==90);
+    }
+    SECTION("ordinary spiral retains its single modal feed command") {
+        GCodeWriter writer;initialize(writer);
+        const auto text=writer.eager_lift(LiftType::SpiralLift);
+        std::istringstream input(text);std::string line;size_t feeds=0;
+        while(std::getline(input,line))if(line.rfind("G1 F",0)==0)++feeds;
+        CHECK(feeds==1);
+    }
+}
+
+TEST_CASE("fiber execution tables preserve automatic and manual resin mappings across cached runs", "[ContinuousFiber][R4][OrcaIsolation]")
+{
+    auto config=masked_print_config();
+    // The generic full defaults have zero per-tool printable height. Manual
+    // ownership bypasses that geometric filter; automatic mapping requires a
+    // real printable workspace for both the resin and fiber candidates.
+    config.set_deserialize_strict("filament_printable","3,3");
+    config.set_deserialize_strict("extruder_printable_height","100,100");
+    auto* printable_areas=new ConfigOptionPointsGroups;
+    const Vec2ds bed{{0,0},{200,0},{200,200},{0,200}};
+    printable_areas->values={bed,bed};config.set_key_value("extruder_printable_area",printable_areas);
+    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("top_shell_thickness","0");
+    config.set_deserialize_strict("bottom_shell_thickness","0");
+    const auto sequence=GENERATE(PrintSequence::ByLayer,PrintSequence::ByObject);
+    config.set_key_value("print_sequence",new ConfigOptionEnum<PrintSequence>(sequence));
+    const auto mapping_mode=GENERATE(fmmManual,fmmAutoForFlush);
+    config.set_key_value("filament_map_mode",new ConfigOptionEnum<FilamentMapMode>(mapping_mode));
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,2));
+    object->add_instance()->set_offset(Vec3d(60,60,0));
+    Print print;print.is_BBL_printer()=false;print.apply(model,config);print.process();
+    const auto first=print.fiber_execution_plans();REQUIRE(first);REQUIRE_FALSE(first->paths.empty());
+    CHECK(first->filament_map==std::vector<int>{1,2});
+    CHECK(print.config().filament_map.values==std::vector<int>{1,2});
+    const auto geometry=first->paths.begin()->second.geometry;
+    print.process(nullptr,true);
+    const auto next=print.fiber_execution_plans();REQUIRE(next);REQUIRE_FALSE(next->paths.empty());
+    CHECK(next->paths.begin()->second.geometry==geometry);
+    CHECK(next->filament_map.front()==first->filament_map.front());
+    CHECK(print.config().filament_map.values.front()==1);
+    CHECK_FALSE(print.fiber_execution_plans_current(first));
+    CHECK(next->execution_generation>first->execution_generation);
+    bool delivered=false;
+    CHECK_THROWS_AS(print.with_current_fiber_execution_plans(first,[&]{delivered=true;}),FiberExecutionError);
+    CHECK_FALSE(delivered);
+    CHECK_NOTHROW(print.with_current_fiber_execution_plans(next,[&]{delivered=true;}));
+    CHECK(delivered);
+}
+
+TEST_CASE("BBL fiber candidates preserve original solver used material decisions",
+    "[ContinuousFiber][OrcaIsolation][BBLFiberMapping]")
+{
+    // Isolate unused capacity, unused TPU, used TPU, multiple used TPU,
+    // incompatible TPU ownership, and ordinary material aliases respectively.
+    const int scenario = GENERATE(0,1,2,3,4,5);
+    CAPTURE(scenario);
+    const bool used_tpu=scenario>=2 && scenario<=4;
+    const bool extra_used_material=scenario==3 || scenario==5;
+    const bool conflicting_master=scenario==4;
+    const std::string types=scenario==1?"PLA;CF;TPU;TPU":
+        (used_tpu?(scenario==3?"TPU;CF;TPU;ABS":"TPU;CF;PETG;ABS"):
+        (scenario==5?"PLA;CF;PLA;ABS":"PLA;CF;PETG;ABS"));
+    auto config=masked_print_config();
+    const std::vector<std::pair<std::string,std::string>> options {
+        {"filament_map","1,2,1,1"},
+        {"filament_colour",scenario==5?"#FFFFFF;#000000;#FFFFFF;#0000FF":"#FFFFFF;#000000;#FF0000;#0000FF"},
+        {"filament_ids",scenario==5?"used-resin;used-fiber;used-resin;unused-b":"used-resin;used-fiber;unused-a;unused-b"},
+        {"filament_type",types},
+        {"filament_process_type","thermoplastic;continuous_fiber;thermoplastic;thermoplastic"},
+        {"filament_diameter","1.75,1.75,1.75,1.75"}, {"filament_fiber_feed_correction","1,1,1,1"},
+        {"filament_is_support","0,0,0,0"}, {"filament_printable","3,3,3,3"},
+        {"filament_slots_bound_to_physical_tools","0"},
+        {"extruder_ams_count",scenario==0 || scenario==5?"1#1;1#1":"4#1;4#1"},
+        {"master_extruder_id",conflicting_master?"2":"1"},
+        {"printable_area","0x0,200x0,200x200,0x200"}, {"extruder_printable_height","100,100"},
+        {"fiber_layer_height_ratio","1"}, {"top_shell_thickness","0"}, {"bottom_shell_thickness","0"}
+    };
+    for(const auto& [key,value]:options)config.set_deserialize_strict(key,value);
+    config.set_key_value("filament_map_mode",new ConfigOptionEnum<FilamentMapMode>(fmmAutoForFlush));
+    config.set_key_value("toolhead_filament_capacity",new ConfigOptionInts);
+    auto* matrix=new ConfigOptionFloats;matrix->values.assign(2*4*4,0.);
+    config.set_key_value("flush_volumes_matrix",matrix);
+    auto* areas=new ConfigOptionPointsGroups;
+    const Vec2ds bed{{0,0},{200,0},{200,200},{0,200}};
+    areas->values={bed,bed};config.set_key_value("extruder_printable_area",areas);
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,2));
+    object->config.set("extruder",1);object->add_instance()->set_offset(Vec3d(60,60,0));
+    if(extra_used_material) {
+        auto* other=model.add_object();other->add_volume(make_cube(20,20,2));
+        other->config.set("extruder",3);other->add_instance()->set_offset(Vec3d(100,60,0));
+    }
+    Print print;print.is_BBL_printer()=true;print.apply(model,config);
+    REQUIRE_FALSE(print.certified_fiber_filament_map().size());
+    const std::vector<unsigned> used=extra_used_material?std::vector<unsigned>{0,1,2}:std::vector<unsigned>{0,1};
+    const auto physical=print.get_physical_unprintable_filaments(used);
+    const std::vector<std::set<int>> geometric(2);
+    // No task table exists: this calls the real original mode solver. The
+    // declared used set is checked against the actual sliced entities below.
+    const auto original=ToolOrdering::get_recommended_filament_maps({used},&print,
+        fmmAutoForFlush,physical,geometric);
+    REQUIRE(original.size()==4);
+    REQUIRE(original[0]==(conflicting_master?1:0));
+    REQUIRE(original[1]==(conflicting_master?0:1));
+    if(extra_used_material)REQUIRE(original[2]==0);
+    std::string process_error;
+    try { print.process(); }
+    catch(const std::exception& error) { process_error=error.what(); }
+    INFO("Print.process result: " << process_error);
+    size_t accepted_fibers=0;
+    const auto inspect=[&](const auto& self,const ExtrusionEntity& entity)->void {
+        if(const auto* fiber=dynamic_cast<const ExtrusionFiberPath*>(&entity)) {
+            REQUIRE(fiber->prepared_path());++accepted_fibers;
+        } else if(const auto* collection=dynamic_cast<const ExtrusionEntityCollection*>(&entity))
+            for(const auto* child:collection->entities)self(self,*child);
+    };
+    for(const auto* sliced:print.objects())for(const auto* layer:sliced->layers())
+        for(const auto* region:layer->regions())inspect(inspect,region->fills);
+    REQUIRE(accepted_fibers>0);
+    const ToolOrdering actual_usage(print,-1,false);
+    REQUIRE(actual_usage.all_extruders()==used);
+    if(conflicting_master) {
+        CHECK(process_error.find("No permitted tool mapping")!=std::string::npos);
+        CHECK_FALSE(print.fiber_execution_plans());
+        return;
+    }
+    REQUIRE(process_error.empty());
+    const auto table=print.fiber_execution_plans();REQUIRE(table);REQUIRE_FALSE(table->paths.empty());
+    for(unsigned material:used)CHECK(table->filament_map.at(material)==original.at(material)+1);
+    CHECK(print.config().filament_map.values==table->filament_map);
+}
+
+TEST_CASE("a revoked process run cannot recapture a newer execution generation", "[ContinuousFiber][R4][OrcaIsolation]")
+{
+    auto config=masked_print_config();config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("top_shell_thickness","0");config.set_deserialize_strict("bottom_shell_thickness","0");
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,2));
+    object->add_instance()->set_offset(Vec3d(60,60,0));Print print;print.apply(model,config);
+    bool revoked=false;
+    print.set_status_callback([&](const PrintBase::SlicingStatus& status) {
+        if(status.percent==35 && !revoked){revoked=true;print.invalidate_fiber_execution_plans(false);}
+    });
+    CHECK_THROWS_AS(print.process(),FiberExecutionError);CHECK(revoked);
+    CHECK_FALSE(print.fiber_execution_plans());
+    print.set_status_silent();print.process(nullptr,true);
+    REQUIRE(print.fiber_execution_plans());CHECK_FALSE(print.fiber_execution_plans()->paths.empty());
+    const auto published=print.fiber_execution_plans();
+    print.set_belt_coordinate_system(BeltCoordinateSystem::create(45,250));
+    CHECK_FALSE(print.fiber_execution_plans_current(published));
+}
+
+TEST_CASE("material bitmap expansion is restricted to enabled fiber tasks", "[ContinuousFiber][R4][OrcaIsolation]")
+{
+    const bool reinforced=GENERATE(false,true);
+    auto config=DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict("nozzle_diameter","0.4,0.4,0.4");
+    config.set_deserialize_strict("physical_extruder_map","0,1,2");
+    config.set_deserialize_strict("filament_printable","1");
+    if(reinforced) {
+        config.set_deserialize_strict("generate_reinforced_infills","1");
+        config.set_deserialize_strict("filament_process_type","continuous_fiber");
+        config.set_deserialize_strict("toolhead_process_capabilities","continuous_fiber;continuous_fiber;continuous_fiber");
+    }
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,1));object->add_instance();
+    Print print;print.apply(model,config);
+    const auto masks=print.get_physical_unprintable_filaments({0});REQUIRE(masks.size()==3);
+    CHECK(masks[0].count(0)==0);CHECK(masks[1].count(0)==1);
+    // HEAD records only the first forbidden tool. Preserve that ordinary
+    // behavior here; the stricter complete bitmap belongs to fiber planning.
+    CHECK(masks[2].count(0)==size_t(reinforced));
+}
+
+TEST_CASE("component coverage preserves short butt caps and rejects tiny distorted edges", "[ContinuousFiber][R4]")
+{
+    FiberPathDraft draft;draft.width_mm=2;draft.execution_deviation_mm=.000211314;
+    draft.reference_deposition=std::make_shared<const Polyline>(
+        Polyline(Points{Point::new_scale(0,0),Point::new_scale(.1,0),Point::new_scale(.1,10)}));
+    const auto bounds=fiber_geometry_coverage_bounds(draft);
+    const Point behind_butt=Point::new_scale(-.5,-.5);
+    CHECK(std::none_of(bounds.second.begin(),bounds.second.end(),[&](const ExPolygon& p){return p.contains(behind_butt);}));
+    CHECK_FALSE(bounds.first.empty());CHECK(diff_ex(bounds.first,bounds.second).empty());
+
+    auto config=ContinuousFiberConfig{};config.cut_to_contact_length_mm=0;config.z_hop_height_mm=0;
+    const auto result=finalize_independent(straight_path(0,5,100,5),{rectangle(-5,0,110,15)},config,test_id());
+    REQUIRE(result.prepared);auto context=fiber_fixture_context();
+    auto execution=compile_fiber_execution(result.prepared->draft(),*context,context->placements.front(),0);
+    REQUIRE(certify_fiber_coverage(*result.prepared,execution,*context));
+    auto commands=std::make_shared<FrozenFiberCommands>(*execution.commands);
+    auto& first=commands->spans.front();REQUIRE_FALSE(first.commands.empty());
+    auto micro=first.commands.front();micro.target=first.from+Vec2d(.000001,.000001);
+    first.commands.insert(first.commands.begin(),micro);execution.commands=commands;
+    // One grid of centerline displacement is much less than delta, but its
+    // short first edge rotates the butt cross-section. Hausdorff is insufficient.
+    CHECK_THROWS_AS(certify_fiber_coverage(*result.prepared,execution,*context),FiberExecutionError);
+}
+
+TEST_CASE("native coverage rejects an off-circle rounded endpoint", "[ContinuousFiber][R4]")
+{
+    auto config=ContinuousFiberConfig{};config.cut_to_contact_length_mm=0;config.z_hop_height_mm=0;
+    const auto result=finalize_independent(straight_path(0,5,100,5),{rectangle(-5,0,110,15)},config,test_id());
+    REQUIRE(result.prepared);auto context=fiber_fixture_context();
+    auto execution=compile_fiber_execution(result.prepared->draft(),*context,context->placements.front(),0);
+    auto commands=std::make_shared<FrozenFiberCommands>(*execution.commands);
+    REQUIRE_FALSE(commands->spans.front().commands.empty());
+    auto& first=commands->spans.front();auto& command=first.commands.front();
+    command.target=first.from+Vec2d(.0001,.0001);command.arc_index=0;
+    commands->arcs.push_back({Vec2d(0,10),true});execution.commands=commands;
+    try {certify_fiber_coverage(*result.prepared,execution,*context);FAIL("Off-circle arc was certified");}
+    catch(const FiberExecutionError& error){CHECK(error.failure==FiberExecutionFailure::Quantization);}
+}
+
+TEST_CASE("component guarantees leave the uncertain seam between touching strands", "[ContinuousFiber][R4]")
+{
+    FiberPathDraft draft;draft.width_mm=2;draft.execution_deviation_mm=.000211314;
+    draft.reference_deposition=std::make_shared<const Polyline>(Polyline(Points{
+        Point::new_scale(0,0),Point::new_scale(10,0),Point::new_scale(10,2),Point::new_scale(0,2)}));
+    const auto bounds=fiber_geometry_coverage_bounds(draft);const auto seam=Point::new_scale(5,1);
+    CHECK(std::none_of(bounds.first.begin(),bounds.first.end(),[&](const ExPolygon& p){return p.contains(seam);}));
+    CHECK(std::any_of(bounds.second.begin(),bounds.second.end(),[&](const ExPolygon& p){return p.contains(seam);}));
+}
+
+TEST_CASE("arc normal bands retain negative signed radii", "[ContinuousFiber][R4]")
+{
+    FiberPathDraft draft;draft.width_mm=2;draft.execution_deviation_mm=.000211314;
+    auto context=std::make_shared<FiberGeometryContext>();context->export_arcs=true;draft.geometry_context=context;
+    FiberMotionSpan span;span.geometry.points={Point3::new_scale(.3,0,0),Point3::new_scale(0,.3,0)};
+    span.geometry.fitting_result={{0,1,EMovePathType::Arc_move_ccw,ArcSegment(Point(0,0),scale_(.3),
+        span.geometry.points.front().to_point(),span.geometry.points.back().to_point(),ArcDirection::Arc_Dir_CCW)}};
+    draft.spans.push_back(span);const auto bounds=fiber_geometry_coverage_bounds(draft);
+    const auto negative=Point::new_scale(-.1,-.1);
+    CHECK(std::any_of(bounds.first.begin(),bounds.first.end(),[&](const ExPolygon& p){return p.contains(negative);}));
+    CHECK(std::any_of(bounds.second.begin(),bounds.second.end(),[&](const ExPolygon& p){return p.contains(negative);}));
+    CHECK(diff_ex(bounds.first,bounds.second).empty());
+}
+
+TEST_CASE("fiber belt normalization protects shared layers without changing ordinary normalization", "[ContinuousFiber][R4][belt][OrcaIsolation][FiberEarlyExecution]")
+{
+    const bool reinforced=GENERATE(false,true);
+    auto config=reinforced?masked_print_config():DynamicPrintConfig::full_print_config();
+    if(reinforced) {
+        config.set_deserialize_strict("fiber_layer_height_ratio","1");
+        config.set_deserialize_strict("top_shell_thickness","0");config.set_deserialize_strict("bottom_shell_thickness","0");
+    }
+    config.set_key_value("printer_structure",new ConfigOptionEnum<PrinterStructure>(PrinterStructure::psBelt));
+    config.set_deserialize_strict("enable_support","0");config.set_deserialize_strict("enable_prime_tower","0");
+    config.set_deserialize_strict("brim_type","no_brim");
+    // A thin tilted box can have no internal fiber region after skin removal.
+    // Give the reinforced branch a genuine internal band; require real plans.
+    Model model;auto* first=model.add_object();first->add_volume(make_cube(12,12,reinforced?10.:.4));
+    first->add_instance()->set_offset(Vec3d(60,60,0));
+    first->config.set_key_value("extruder",new ConfigOptionInt(1));
+    auto* alias=model.add_object(*first);auto mesh=first->volumes.front()->mesh_ptr();alias->volumes.front()->set_mesh(mesh);
+    alias->instances.front()->set_offset(Vec3d(60,60,0));
+    Print print;print.set_belt_coordinate_system(BeltCoordinateSystem::create(45,250));print.apply(model,config);
+    bool raised=false;
+    print.set_status_callback([&](const PrintBase::SlicingStatus& status) {
+        if(status.percent==71 && !raised) {
+            raised=true;
+            for(auto* layer:print.get_object(0)->layers()){layer->slice_z+=5;layer->print_z+=5;}
+        }
+    });
+    print.process();REQUIRE(raised);REQUIRE(print.objects().size()==2);
+    REQUIRE(print.objects()[1]->get_shared_object()==print.objects()[0]);
+    REQUIRE(print.objects()[0]->layers().front()==print.objects()[1]->layers().front());
+    CHECK(print.belt_coordinate_system()->print_origin_s()>4.9);
+    const auto& layers=print.objects()[0]->layers();
+    const auto first_printed=std::find_if(layers.begin(),layers.end(),[](const Layer* layer){return layer->has_extrusions();});
+    REQUIRE(first_printed!=layers.end());const auto* printed=*first_printed;
+    const double z=printed->print_z;
+    const double expected_z=config.opt_float("initial_layer_print_height")-
+        (reinforced?0.:print.belt_coordinate_system()->print_origin_s());
+    CHECK(z==Catch::Approx(expected_z).margin(1e-6));
+    const auto table=print.fiber_execution_plans();
+    const auto reuse=print.fiber_execution_reuse_statistics();
+    CHECK(reuse.early_compile_calls==0);CHECK(reuse.reused_variants==0);
+    if(reinforced)CHECK(reuse.late_compile_calls>0);
+    if(reinforced) {
+        REQUIRE(table);
+        std::ostringstream diagnostics;
+        for(const auto* layer:print.objects()[0]->layers())for(const auto& d:layer->fiber_fill_diagnostics)
+            if(!d.reason.empty())diagnostics<<layer->id()<<":"<<d.reason<<"; ";
+        INFO(diagnostics.str());
+        REQUIRE_FALSE(table->paths.empty());CHECK(table->statistics.swept_coverage>0);
+        for(const auto& item:table->paths) {
+            CHECK(item.second.variants.size()==2);
+            REQUIRE(item.second.context->transform.belt);
+            CHECK(item.second.context->transform.belt->print_origin_s()==print.belt_coordinate_system()->print_origin_s());
+        }
+    } else CHECK_FALSE(table);
+    print.set_status_silent();print.process(nullptr,true);
+    CHECK(printed->print_z==z);
+    CHECK_FALSE(print.fiber_execution_plans_current(table));
+    if(reinforced)CHECK(print.fiber_execution_plans()->paths.begin()->second.geometry==table->paths.begin()->second.geometry);
+    else CHECK_FALSE(print.fiber_execution_plans());
+}
+
+TEST_CASE("native circular fiber retains exact targets IJ and quantized feed", "[ContinuousFiber][R4][NativeArc]")
+{
+    auto config=ContinuousFiberConfig{};config.cut_to_contact_length_mm=0;config.z_hop_height_mm=0;
+    config.start_stabilization_length_mm=0;config.speed_sampling_length_mm=10000;
+    config.prefeed_extra_length_mm=.1234567;
+    config.infill_min_speed_mm_s=config.infill_max_speed_mm_s=10;
+    auto geometry=std::make_shared<FiberGeometryContext>();geometry->export_arcs=true;config.geometry_context=geometry;
+    auto source=path_from_points({{40,0},{0,40}});
+    source.polyline.fitting_result={{0,1,EMovePathType::Arc_move_ccw,ArcSegment(Point(0,0),scale_(40),
+        source.polyline.points[0].to_point(),source.polyline.points[1].to_point(),ArcDirection::Arc_Dir_CCW)}};
+    const auto result=finalize_independent(source,{rectangle(-60,-10,50,50)},config,test_id(),
+        continuous_fiber_detail::arc_metadata(source.polyline));
+    INFO(result.detail);REQUIRE(result.prepared);
+    auto context=fiber_fixture_context();context->export_arcs=true;
+    const auto execution=compile_fiber_execution(result.prepared->draft(),*context,context->placements.front(),0);
+    REQUIRE_FALSE(execution.arcs().empty());
+    CHECK_NOTHROW(certify_fiber_coverage(*result.prepared,execution,*context));
+    double ideal=result.prepared->start_procedure.prefeed_length_mm,emitted=execution.prefeed_dE;
+    for(size_t i=0;i<execution.spans().size();++i) {
+        const auto& span=execution.spans()[i];Vec2d from=span.from;
+        for(const auto& command:span.commands) {
+            const auto& source_span=result.prepared->spans[i];const auto owner=command.source_primitive;
+            const Vec2d expected=source_span.geometry.points[owner+1].head<2>().cast<double>()*SCALING_FACTOR;
+            CHECK(command.target==Vec2d(GCodeFormatter::quantize(expected.x(),6),GCodeFormatter::quantize(expected.y(),6)));
+            double length=(command.target-from).norm();
+            if(command.arc_index>=0) {
+                const auto& arc=execution.arcs()[command.arc_index];
+                const auto& fit=source_span.geometry.fitting_result[owner];
+                const Vec2d center=fit.arc_data.center.cast<double>()*SCALING_FACTOR;
+                const Vec2d expected_ij=center-from;
+                CHECK(arc.ij==Vec2d(GCodeFormatter::quantize(expected_ij.x(),6),GCodeFormatter::quantize(expected_ij.y(),6)));
+                CHECK(arc.ccw==(fit.path_type==EMovePathType::Arc_move_ccw));
+                const Vec2d a=-arc.ij,b=command.target-from-arc.ij;
+                double angle=std::atan2(a.x()*b.y()-a.y()*b.x(),a.dot(b));
+                if(arc.ccw && angle<=0)angle+=2*PI;if(!arc.ccw && angle>=0)angle-=2*PI;
+                length=std::abs(angle)*arc.ij.norm();
+            }
+            if(source_span.actively_feeds_fiber())ideal+=length*source_span.edges[owner].feed_mm_per_xy_mm;
+            else CHECK(command.dE==0);
+            emitted+=command.dE;CHECK(emitted==Catch::Approx(GCodeFormatter::quantize_e(ideal)).margin(1e-10));from=command.target;
+        }
+    }
+}
+
+TEST_CASE("fiber compiler propagates cancellation from inside a long command stream", "[ContinuousFiber][R4]")
+{
+    auto config=ContinuousFiberConfig{};config.cut_to_contact_length_mm=0;config.z_hop_height_mm=0;
+    config.speed_sampling_length_mm=.01;
+    const auto result=finalize_independent(straight_path(0,5,100,5),{rectangle(-5,0,110,15)},config,test_id());
+    REQUIRE(result.prepared);auto context=fiber_fixture_context();size_t checks=0;
+    CHECK_THROWS_AS(compile_fiber_execution(result.prepared->draft(),*context,context->placements.front(),0,[&] {
+        if(++checks==3)throw CanceledException();
+    }),CanceledException);
+    CHECK(checks==3);CHECK_NOTHROW(result.prepared->validate());
+}
+
+TEST_CASE("coverage keeps an outer bound when a thin rectangle snaps to a line", "[ContinuousFiber][R4]")
+{
+    FiberPathDraft draft;draft.width_mm=SCALING_FACTOR;draft.execution_deviation_mm=.000211314;
+    draft.reference_deposition=std::make_shared<const Polyline>(Polyline(Points{Point::new_scale(0,0),Point::new_scale(10,0)}));
+    const auto bounds=fiber_geometry_coverage_bounds(draft);
+    REQUIRE_FALSE(bounds.second.empty());
+    CHECK(std::any_of(bounds.second.begin(),bounds.second.end(),[](const ExPolygon& p){return p.contains(Point::new_scale(5,0));}));
+}
+
+TEST_CASE("reference coverage cache preserves exact geometry and remains bounded", "[ContinuousFiber][R4][cache]")
+{
+    FiberPathDraft draft;draft.width_mm=1;draft.execution_deviation_mm=.000211314;
+    draft.reference_deposition=std::make_shared<const Polyline>(Polyline(Points{
+        Point::new_scale(0,0),Point::new_scale(5,0),Point::new_scale(10,0)}));
+    const auto uncached=fiber_geometry_coverage_bounds(draft);
+    auto context=std::make_shared<FiberGeometryContext>();context->coverage_cache=make_fiber_geometry_coverage_cache();
+    draft.geometry_context=context;
+    const auto first=fiber_geometry_coverage_bounds(draft),second=fiber_geometry_coverage_bounds(draft);
+    for(const auto* item:{&first,&second}) {
+        CHECK(diff_ex(uncached.first,item->first).empty());CHECK(diff_ex(item->first,uncached.first).empty());
+        CHECK(diff_ex(uncached.second,item->second).empty());CHECK(diff_ex(item->second,uncached.second).empty());
+    }
+    auto stats=fiber_geometry_coverage_cache_statistics(context->coverage_cache);
+    CHECK(stats.hits==1);CHECK(stats.misses==1);
+    draft.reference_groups={{1,1},{2,2}};const auto split=fiber_geometry_coverage_bounds(draft);
+    CHECK_FALSE(diff_ex(first.first,split.first).empty()); // The semantic join must not be merged.
+    draft.width_mm=2;const auto wider=fiber_geometry_coverage_bounds(draft);
+    CHECK_FALSE(diff_ex(wider.second,split.second).empty());
+    draft.reference_deposition=std::make_shared<const Polyline>(Polyline(Points{
+        Point::new_scale(0,0),Point::new_scale(5,1),Point::new_scale(10,0)}));
+    const auto moved=fiber_geometry_coverage_bounds(draft);
+    CHECK_FALSE(diff_ex(moved.second,wider.second).empty());
+    stats=fiber_geometry_coverage_cache_statistics(context->coverage_cache);CHECK(stats.misses==4);
+    for(unsigned i=0;i<40;++i){draft.width_mm=1+i*.01;fiber_geometry_coverage_bounds(draft);}
+    stats=fiber_geometry_coverage_cache_statistics(context->coverage_cache);
+    CHECK(stats.entries==32);CHECK(stats.retained_bytes<=32*1024*1024);
+    draft.width_mm=std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(fiber_geometry_coverage_bounds(draft),FiberExecutionError);
+}
+
+TEST_CASE("parallel reference cache misses return independent equivalent bounds", "[ContinuousFiber][R4][cache]")
+{
+    FiberPathDraft draft;draft.width_mm=1;draft.execution_deviation_mm=.000211314;
+    draft.reference_deposition=std::make_shared<const Polyline>(Polyline(Points{
+        Point::new_scale(0,0),Point::new_scale(10,0),Point::new_scale(10,10)}));
+    const auto expected=fiber_geometry_coverage_bounds(draft);
+    auto context=std::make_shared<FiberGeometryContext>();context->coverage_cache=make_fiber_geometry_coverage_cache();
+    draft.geometry_context=context;
+    std::vector<std::future<std::pair<ExPolygons,ExPolygons>>> jobs;
+    for(int i=0;i<4;++i)jobs.push_back(std::async(std::launch::async,[&]{return fiber_geometry_coverage_bounds(draft);}));
+    for(auto& job:jobs) {
+        auto result=job.get();CHECK(diff_ex(expected.first,result.first).empty());CHECK(diff_ex(result.first,expected.first).empty());
+        CHECK(diff_ex(expected.second,result.second).empty());CHECK(diff_ex(result.second,expected.second).empty());
+        result.second.clear(); // A consumer cannot mutate the cached result.
+    }
+    const auto after=fiber_geometry_coverage_bounds(draft);CHECK(diff_ex(expected.second,after.second).empty());
+    const auto stats=fiber_geometry_coverage_cache_statistics(context->coverage_cache);
+    CHECK(stats.entries==1);CHECK(stats.hits+stats.misses==5);CHECK(stats.hits>=1);
+}
+
+TEST_CASE("late machine rejection revokes the whole task without changing a manual mapping", "[ContinuousFiber][R4]")
+{
+    auto config=masked_print_config();config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("top_shell_thickness","0");config.set_deserialize_strict("bottom_shell_thickness","0");
+    config.set_deserialize_strict("fiber_z_hop_height","0");
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,2));
+    object->add_instance()->set_offset(Vec3d(60,60,0));object->add_instance()->set_offset(Vec3d(160,60,0));
+    Print print;print.set_plate_origin(Vec3d::Zero());print.apply(model,config);print.process();
+    const auto previous=print.fiber_execution_plans();REQUIRE(previous);REQUIRE_FALSE(previous->paths.empty());
+    SECTION("one placement outside the fiber workspace rejects all placements") {
+        auto* areas=new ConfigOptionPointsGroups;
+        areas->values={Vec2ds{{0,0},{250,0},{250,250},{0,250}},Vec2ds{{0,0},{120,0},{120,120},{0,120}}};
+        config.set_key_value("extruder_printable_area",areas);
+    }
+    SECTION("fiber tool height is checked after final layer Z") {
+        config.set_deserialize_strict("extruder_printable_height","250,0.3");
+    }
+    SECTION("a late CFSYS pressure advance violation is rejected before export") {
+        config.set_deserialize_strict("gcode_flavor","klipper");
+        config.set_deserialize_strict("toolhead_fiber_protocol_id",";cfsys-v1");
+        config.set_deserialize_strict("fiber_cut_gcode","M400\nS0\nM400\n");
+        config.set_deserialize_strict("enable_pressure_advance","1,1");config.set_deserialize_strict("pressure_advance","0,0.1");
+    }
+    print.apply(model,config);CHECK_FALSE(print.fiber_execution_plans_current(previous));
+    CHECK_THROWS_AS(print.process(),FiberExecutionError);CHECK_FALSE(print.fiber_execution_plans());
+    CHECK(print.config().filament_map.values==std::vector<int>{1,2});
+}
+
+TEST_CASE("derived envelopes retain the old explicit material partition", "[ContinuousFiber][R5][ledger][CoverageStatistics]")
+{
+    auto config=ContinuousFiberConfig{};config.z_hop_height_mm=0;
+    const auto shape=GENERATE(0,1,2);
+    const ExPolygons domain{rectangle(-20,-20,80,80)};
+    auto route=shape==0?path_from_points({{0,0},{20,0},{20,20},{0,20}},2):
+        shape==1?path_from_points({{0,0},{20,0},{20,2},{0,2}},2):path_from_points({{40,0},{0,40}},2);
+    if(shape==2)route.polyline.fitting_result={{0,1,EMovePathType::Arc_move_ccw,
+        ArcSegment(Point(0,0),scale_(40),route.polyline.points[0].to_point(),route.polyline.points[1].to_point(),ArcDirection::Arc_Dir_CCW)}};
+    const auto first=finalize_independent(route,domain,config,test_id(),
+        shape==2?continuous_fiber_detail::arc_metadata(route.polyline):std::vector<ContourArc>{});
+    auto other_id=test_id();other_id.fragment_ordinal=1;
+    const auto second=finalize_independent(straight_path(10,-5,10,25,1),domain,config,other_id);
+    REQUIRE(first.prepared);REQUIRE(second.prepared);
+    FiberCoverageRecord record;record.source=test_id().parent.domain;record.source_domain=domain;
+    record.accepted_contour_exclusion=first.prepared->resin_exclusion;
+    record.accepted_infill_exclusion=second.prepared->resin_exclusion;
+    record.execution_envelope=FiberCoverageEnvelope::from_paths({first.prepared,second.prepared});
+    const auto fiber=union_ex(record.accepted_contour_exclusion,record.accepted_infill_exclusion);
+    record.resin_domain=diff_ex(domain,fiber);
+    // Independent regression oracle: the full R4 materialized partition, with
+    // its extra clips/unions, must agree with the new derived measurements.
+    auto components=first.prepared->guaranteed_components;
+    append(components,second.prepared->guaranteed_components);
+    const auto legacy_area_mm2=[](const ExPolygons& p){return std::abs(area(p))*SCALING_FACTOR*SCALING_FACTOR;};
+    const auto guaranteed=intersection_ex(components,fiber);
+    const auto uncertain=diff_ex(fiber,guaranteed);
+    const auto old_guaranteed=intersection_ex(guaranteed,fiber);
+    const auto old_uncertain=intersection_ex(uncertain,fiber);
+    const auto old_classified=union_ex(old_guaranteed,old_uncertain);
+    const double old_invalid=legacy_area_mm2(diff_ex(fiber,old_classified))+
+        legacy_area_mm2(intersection_ex(old_guaranteed,old_uncertain));
+    FiberCoverageLedger ledger;ledger.add(record);const auto audit=ledger.audit(FiberCoverageAuditMode::Detailed);
+    REQUIRE(audit.partition_statistics);
+    CHECK(audit.partition_statistics->guaranteed_fiber_area_mm2==Catch::Approx(legacy_area_mm2(old_guaranteed)).margin(1e-7));
+    CHECK(audit.partition_statistics->uncertain_fiber_area_mm2==Catch::Approx(legacy_area_mm2(old_uncertain)).margin(1e-7));
+    CHECK(audit.invalid_execution_envelope_area_mm2==Catch::Approx(old_invalid).margin(1e-7));
+    CHECK(audit.partition_statistics->guaranteed_fiber_area_mm2+audit.partition_statistics->uncertain_fiber_area_mm2==Catch::Approx(audit.fiber_exclusion_area_mm2).margin(1e-10));
+    CHECK(audit.invalid_execution_envelope_area_mm2<.000001);
+    CHECK(audit.unassigned_area_mm2<.01);CHECK(audit.unexpected_overlap_area_mm2<.01);
+    const auto normal=ledger.audit();
+    CHECK_FALSE(normal.partition_statistics);
+    CHECK(normal.original_area_mm2==audit.original_area_mm2);
+    CHECK(normal.fiber_exclusion_area_mm2==audit.fiber_exclusion_area_mm2);
+    CHECK(normal.resin_area_mm2==audit.resin_area_mm2);
+    CHECK(normal.intentional_void_area_mm2==audit.intentional_void_area_mm2);
+    CHECK(normal.unassigned_area_mm2==audit.unassigned_area_mm2);
+    CHECK(normal.unexpected_overlap_area_mm2==audit.unexpected_overlap_area_mm2);
+    CHECK(normal.outside_area_mm2==audit.outside_area_mm2);
+    CHECK(normal.invalid_execution_envelope_area_mm2==audit.invalid_execution_envelope_area_mm2);
+    if(shape==1) {
+        const auto seam=Point::new_scale(5,1);
+        CHECK(std::none_of(guaranteed.begin(),guaranteed.end(),[&](const ExPolygon& p){return p.contains(seam);}));
+        CHECK(std::any_of(uncertain.begin(),uncertain.end(),[&](const ExPolygon& p){return p.contains(seam);}));
+    }
+}
+
+TEST_CASE("derived envelopes reject missing or mismatched accepted sources", "[ContinuousFiber][R5][ledger][CoverageStatistics]")
+{
+    const auto mode=GENERATE(FiberCoverageAuditMode::MaterialIntegrity,FiberCoverageAuditMode::Detailed);
+    auto config=ContinuousFiberConfig{};config.z_hop_height_mm=0;
+    const ExPolygons domain{rectangle(-5,-5,30,30)};
+    const auto first=finalize_independent(straight_path(0,0,20,0,1),domain,config,test_id());
+    auto other_id=test_id();other_id.fragment_ordinal=1;
+    const auto second=finalize_independent(straight_path(0,10,20,10,1),domain,config,other_id);
+    REQUIRE(first.prepared);REQUIRE(second.prepared);
+    FiberCoverageRecord record;record.source=test_id().parent.domain;record.source_domain=domain;
+    record.accepted_contour_exclusion=first.prepared->resin_exclusion;
+    record.accepted_infill_exclusion=second.prepared->resin_exclusion;
+    const auto fiber=union_ex(record.accepted_contour_exclusion,record.accepted_infill_exclusion);
+    record.resin_domain=diff_ex(domain,fiber);
+    SECTION("missing optional cannot turn the whole allocation into uncertainty") {
+        CHECK_THROWS(([&]{FiberCoverageLedger ledger;ledger.add(record);return ledger.audit(mode);})());
+    }
+    SECTION("omitting a real accepted source is an invalid envelope") {
+        record.execution_envelope=FiberCoverageEnvelope::from_paths({first.prepared});
+        FiberCoverageLedger ledger;ledger.add(record);CHECK(ledger.audit(mode).invalid_execution_envelope_area_mm2>1);
+    }
+    SECTION("an empty source list cannot conceal real allocated fiber") {
+        record.execution_envelope=FiberCoverageEnvelope::from_paths({});
+        CHECK_THROWS(([&]{FiberCoverageLedger ledger;ledger.add(record);return ledger.audit(mode);})());
+    }
+    SECTION("changing F after sealing sources is independently detected") {
+        record.execution_envelope=FiberCoverageEnvelope::from_paths({first.prepared,second.prepared});
+        record.accepted_infill_exclusion.clear();
+        FiberCoverageLedger ledger;ledger.add(record);CHECK(ledger.audit(mode).invalid_execution_envelope_area_mm2>1);
+    }
+    SECTION("a tiny change to F is still measured independently") {
+        record.execution_envelope=FiberCoverageEnvelope::from_paths({first.prepared,second.prepared});
+        record.accepted_infill_exclusion.push_back(rectangle(25,25,25.001,25.001));
+        FiberCoverageLedger ledger;ledger.add(record);const auto audit=ledger.audit(mode);
+        CHECK(audit.invalid_execution_envelope_area_mm2>0);
+        CHECK(audit.invalid_execution_envelope_area_mm2<.01);
+    }
+    SECTION("a sealed source cannot be attributed to another domain") {
+        record.execution_envelope=FiberCoverageEnvelope::from_paths({first.prepared,second.prepared});
+        ++record.source.policy_group_id;
+        CHECK_THROWS(([&]{FiberCoverageLedger ledger;ledger.add(record);return ledger.audit(mode);})());
+    }
+    SECTION("conflicting sealed identities are invalid") {
+        const auto conflict=finalize_independent(straight_path(0,20,20,20,1),domain,config,test_id());
+        REQUIRE(conflict.prepared);CHECK_THROWS(FiberCoverageEnvelope::from_paths({first.prepared,conflict.prepared}));
+    }
+    SECTION("null sources are invalid rather than an empty guarantee") {
+        CHECK_THROWS(FiberCoverageEnvelope::from_paths({nullptr}));
+    }
+}
+
+TEST_CASE("derived envelope optimization retains real material audit failures", "[ContinuousFiber][R5][ledger][CoverageStatistics]")
+{
+    const auto mode=GENERATE(FiberCoverageAuditMode::MaterialIntegrity,FiberCoverageAuditMode::Detailed);
+    auto config=ContinuousFiberConfig{};config.z_hop_height_mm=0;
+    const ExPolygons domain{rectangle(-5,-5,30,30)};
+    const auto source=finalize_independent(straight_path(0,0,20,0,1),domain,config,test_id());REQUIRE(source.prepared);
+    FiberCoverageRecord record;record.source=test_id().parent.domain;record.source_domain=domain;record.accepted_infill_exclusion=source.prepared->resin_exclusion;
+    record.execution_envelope=FiberCoverageEnvelope::from_paths({source.prepared});
+    SECTION("a real resin overlap remains visible") {
+        record.resin_domain=domain;FiberCoverageLedger ledger;ledger.add(record);
+        CHECK(ledger.audit(mode).unexpected_overlap_area_mm2>1);
+    }
+    SECTION("a real unassigned model region remains visible") {
+        FiberCoverageLedger ledger;ledger.add(record);CHECK(ledger.audit(mode).unassigned_area_mm2>1);
+    }
+    SECTION("an intentional void remains valid") {
+        record.intentional_void=diff_ex(domain,record.accepted_infill_exclusion);
+        FiberCoverageLedger ledger;ledger.add(record);const auto audit=ledger.audit(mode);
+        CHECK(audit.unassigned_area_mm2<.01);CHECK(audit.unexpected_overlap_area_mm2<.01);
+    }
+}
+
+TEST_CASE("derived envelope subtracts grid areas before converting large coordinates", "[ContinuousFiber][R5][ledger][CoverageStatistics]")
+{
+    auto config=ContinuousFiberConfig{};config.z_hop_height_mm=0;
+    const ExPolygons domain{rectangle(99995,99995,100025,100005)};
+    const auto source=finalize_independent(straight_path(100000,100000,100020,100000,2),domain,config,test_id());
+    REQUIRE(source.prepared);REQUIRE(source.prepared->guaranteed_components.size()==1);
+    FiberCoverageRecord record;record.source=test_id().parent.domain;record.source_domain=domain;record.accepted_infill_exclusion=source.prepared->resin_exclusion;
+    record.execution_envelope=FiberCoverageEnvelope::from_paths({source.prepared});
+    FiberCoverageLedger ledger;ledger.add(record);const auto audit=ledger.audit(FiberCoverageAuditMode::Detailed);
+    REQUIRE(audit.partition_statistics);
+    // Both bounds are axis-aligned: margin=ceil(.1*delta/q)+64=86 grids.
+    const double margin=(std::ceil(source.prepared->execution_deviation_mm*.1/SCALING_FACTOR)+64)*SCALING_FACTOR;
+    CHECK(audit.partition_statistics->guaranteed_fiber_area_mm2==Catch::Approx((20-2*margin)*(2-2*margin)).margin(1e-11));
+    CHECK(audit.partition_statistics->uncertain_fiber_area_mm2==Catch::Approx(4*margin*(20+2)).margin(1e-11));
+}
+
+namespace {
+FiberFinalizationResult native_fallback_fixture(bool exact_circle=false,double tail_mm=0,bool native_geometry=true,double rotation=0)
+{
+    auto config=ContinuousFiberConfig{};config.cut_to_contact_length_mm=tail_mm;config.z_hop_height_mm=0;
+    config.start_stabilization_length_mm=0;config.speed_sampling_length_mm=10000;
+    config.infill_min_speed_mm_s=config.infill_max_speed_mm_s=10;
+    auto geometry=std::make_shared<FiberGeometryContext>();geometry->export_arcs=native_geometry;config.geometry_context=geometry;
+    const double end_x=exact_circle?0:std::sqrt(50.),end_y=exact_circle?10:std::sqrt(50.);
+    const double c=std::cos(rotation),s=std::sin(rotation);
+    auto source=path_from_points({{10*c,10*s},{end_x*c-end_y*s,end_x*s+end_y*c}},1);
+    source.polyline.fitting_result={{0,1,EMovePathType::Arc_move_ccw,ArcSegment(Point(0,0),scale_(10),
+        source.polyline.points[0].to_point(),source.polyline.points[1].to_point(),ArcDirection::Arc_Dir_CCW)}};
+    return finalize_independent(source,{rectangle(-15,-15,15,15)},config,test_id(),
+        continuous_fiber_detail::arc_metadata(source.polyline));
+}
+}
+
+TEST_CASE("rounded native arc uses certified linear commands without reallocating material", "[ContinuousFiber][NativeFallback]")
+{
+    const auto result=native_fallback_fixture();INFO(result.detail);REQUIRE(result.prepared);
+    const auto& prepared=*result.prepared;
+    const auto possible=prepared.possible_coverage,guaranteed=prepared.guaranteed_components;
+    const auto reference=prepared.reference_deposition;const auto source_points=prepared.spans.front().geometry.points;
+    auto context=fiber_fixture_context();context->export_arcs=true;
+    const auto raw=compile_fiber_execution(prepared.draft(),*context,context->placements.front(),0);
+    REQUIRE_FALSE(raw.arcs().empty());
+    try {certify_fiber_coverage(prepared,raw,*context);FAIL("Rounded 45 degree endpoint was certified as a native circle");}
+    catch(const FiberExecutionError& error){REQUIRE(error.failure==FiberExecutionFailure::Quantization);}
+    FiberExecutionStatistics statistics;
+    const auto execution=compile_certified_fiber_execution(prepared,*context,context->placements.front(),0,statistics);
+    CHECK(statistics.compiled_candidates>=2);CHECK(statistics.compiled_candidates<=9);
+    CHECK(statistics.translated_coverage+statistics.swept_coverage==1);
+    REQUIRE(execution.arcs().empty());CHECK(context->export_arcs);
+    CHECK(prepared.geometry_context->export_arcs);CHECK(prepared.possible_coverage==possible);
+    CHECK(prepared.guaranteed_components==guaranteed);CHECK(prepared.reference_deposition==reference);
+    CHECK(prepared.spans.front().geometry.points==source_points);
+    CHECK(execution.source_deviation_mm<=prepared.execution_deviation_mm);
+    CHECK_NOTHROW(certify_fiber_coverage(prepared,execution,*context));
+    PrintConfig config;config.use_relative_e_distances.value=false;
+    GCodeWriter writer;writer.apply_print_config(config);writer.set_extruders({0});writer.toolchange(0);
+    const GCodeWriter::ScopedXYZPrecision precision(writer,6);
+    writer.set_position(execution.machine_target(execution.spans().front().from));
+    std::string text;double ideal_e=0,emitted_e=0;size_t commands=0;
+    for(size_t si=0;si<execution.spans().size();++si) {
+        const auto& span=execution.spans()[si];Vec3d from=execution.machine_target(span.from);
+        for(const auto& command:span.commands) {
+            REQUIRE(command.source_primitive<prepared.spans[si].edges.size());
+            CHECK(command.arc_index==-1);
+            CHECK(command.speed_mm_s==prepared.spans[si].edges[command.source_primitive].speed_mm_s);
+            const Vec3d target=execution.machine_target(command.target);
+            // The finalizer source remains analytic, and every emitted endpoint
+            // must stay within its frozen geometric deviation budget.
+            CHECK(std::abs(target.head<2>().norm()-10)<=prepared.execution_deviation_mm);
+            ideal_e+=(target-from).norm()*prepared.spans[si].edges[command.source_primitive].feed_mm_per_xy_mm;
+            emitted_e+=command.dE;CHECK(emitted_e==Catch::Approx(GCodeFormatter::quantize_e(ideal_e)).margin(1e-10));
+            const auto row=writer.emit_frozen_fiber_motion(target,command.dE,command.speed_mm_s);
+            const auto coordinate=[&](char axis) {
+                const std::regex expression(std::string("(?:^| )")+axis+"([-0-9.]+)");std::smatch match;
+                REQUIRE(std::regex_search(row,match,expression));return std::stod(match[1].str());
+            };
+            CHECK(coordinate('X')==Catch::Approx(target.x()).margin(1e-12));
+            CHECK(coordinate('Y')==Catch::Approx(target.y()).margin(1e-12));
+            CHECK(coordinate('E')==Catch::Approx(GCodeFormatter::quantize_e(emitted_e)).margin(1e-10));
+            text+=row;from=target;++commands;
+        }
+    }
+    CHECK(commands>1);CHECK(text.find("G2 ")==std::string::npos);CHECK(text.find("G3 ")==std::string::npos);
+    CHECK(writer.quantized_machine_position(writer.get_position())==execution.machine_target(execution.spans().back().commands.back().target));
+}
+
+TEST_CASE("certified compiler preserves exact native arcs and ordinary linear schedules", "[ContinuousFiber][NativeFallback]")
+{
+    const bool native=GENERATE(false,true);
+    const auto result=native_fallback_fixture(true,0,native);INFO(result.detail);REQUIRE(result.prepared);
+    auto context=fiber_fixture_context();context->export_arcs=native;
+    const auto raw=compile_fiber_execution(result.prepared->draft(),*context,context->placements.front(),0);
+    REQUIRE_NOTHROW(certify_fiber_coverage(*result.prepared,raw,*context));
+    FiberExecutionStatistics statistics;
+    const auto execution=compile_certified_fiber_execution(*result.prepared,*context,context->placements.front(),0,statistics);
+    CHECK(statistics.compiled_candidates==1);CHECK(statistics.translated_coverage+statistics.swept_coverage==1);
+    CHECK(equal_fiber_commands(*raw.commands,*execution.commands));
+    CHECK(raw.command_origin==execution.command_origin);CHECK(raw.layer_z==execution.layer_z);
+    CHECK(raw.prefeed_dE==execution.prefeed_dE);CHECK(raw.prefeed_F==execution.prefeed_F);
+    CHECK(raw.entry_targets==execution.entry_targets);CHECK(raw.entry_stations_mm==execution.entry_stations_mm);
+    CHECK(raw.source_deviation_mm==execution.source_deviation_mm);CHECK(raw.nozzle_offset==execution.nozzle_offset);
+    CHECK(execution.arcs().empty()!=native);
+}
+
+TEST_CASE("certified native fallback propagates cancellation and machine failures", "[ContinuousFiber][NativeFallback]")
+{
+    const auto result=native_fallback_fixture();INFO(result.detail);REQUIRE(result.prepared);
+    auto context=fiber_fixture_context();context->export_arcs=true;FiberExecutionStatistics statistics;
+    SECTION("cancellation inside the fallback never publishes a partial execution") {
+        CHECK_THROWS_AS(compile_certified_fiber_execution(*result.prepared,*context,context->placements.front(),0,statistics,[&] {
+            if(statistics.compiled_candidates==2)throw CanceledException();
+        }),CanceledException);
+        CHECK(statistics.compiled_candidates==2);CHECK(statistics.translated_coverage+statistics.swept_coverage==0);
+    }
+    SECTION("machine workspace rejection is not a representation failure") {
+        context->check_machine=true;
+        auto limits=std::make_shared<FiberMachineMotionLimits>();limits->tip_xy={rectangle(-2,-2,2,2)};
+        limits->maximum_z_mm=100;limits->prepare();
+        context->machine_limits.push_back(limits);
+        try {
+            compile_certified_fiber_execution(*result.prepared,*context,context->placements.front(),0,statistics);
+            FAIL("An unreachable native path was accepted");
+        } catch(const FiberExecutionError& error){CHECK(error.failure==FiberExecutionFailure::Motion);}
+        CHECK(statistics.compiled_candidates==1);CHECK(statistics.translated_coverage+statistics.swept_coverage==0);
+    }
+}
+
+TEST_CASE("native linear fallback retains rotated placed cut tails and cumulative feed", "[ContinuousFiber][NativeFallback]")
+{
+    const double rotation=GENERATE(0.,PI/2);
+    const auto result=native_fallback_fixture(false,2,true,rotation);INFO(result.detail);REQUIRE(result.prepared);
+    const auto& prepared=*result.prepared;const auto possible=prepared.possible_coverage,guaranteed=prepared.guaranteed_components;
+    auto context=fiber_fixture_context();context->export_arcs=true;
+    context->placements={{42,7,Vec2d(100.1234567,80.7654321)}};
+    context->config.extruder_offset.values[0]=Vec2d(7.1234567,-2.7654321);
+    context->transform.xy_offset=Vec2d(20.1234567,10.7654321);
+    FiberExecutionStatistics statistics;
+    const auto execution=compile_certified_fiber_execution(prepared,*context,context->placements.front(),.54,statistics);
+    CHECK(execution.arcs().empty());CHECK(statistics.compiled_candidates>=2);CHECK(statistics.compiled_candidates<=9);
+    CHECK_NOTHROW(certify_fiber_coverage(prepared,execution,*context));
+    CHECK(prepared.possible_coverage==possible);CHECK(prepared.guaranteed_components==guaranteed);CHECK(context->export_arcs);
+    double ideal=prepared.start_procedure.prefeed_length_mm,emitted=execution.prefeed_dE,passive_length=0;
+    for(size_t si=0;si<execution.spans().size();++si) {
+        const auto& span=execution.spans()[si];Vec3d from=execution.machine_target(span.from);
+        for(const auto& command:span.commands) {
+            const auto to=execution.machine_target(command.target);const double length=(to-from).norm();
+            REQUIRE(command.source_primitive<prepared.spans[si].edges.size());
+            if(prepared.spans[si].actively_feeds_fiber())
+                ideal+=length*prepared.spans[si].edges[command.source_primitive].feed_mm_per_xy_mm;
+            else CHECK(command.dE==0);
+            if(span.kind==FiberMotionKind::PassiveDepositingAfterCut) {CHECK(command.dE==0);passive_length+=length;}
+            emitted+=command.dE;CHECK(emitted==Catch::Approx(GCodeFormatter::quantize_e(ideal)).margin(1e-9));from=to;
+        }
+    }
+    CHECK(std::abs(passive_length-prepared.requested_passive_length_mm)<=prepared.passive_length_error_mm);
+    CHECK(execution.source_deviation_mm<=prepared.execution_deviation_mm);
+    // The shared low-level compiler must reject a tail target incompatible
+    // with this fixed geometry, rather than accepting its approximate length.
+    auto incompatible=prepared.draft();incompatible.requested_passive_length_mm+=.01;
+    auto linear_context=*context;linear_context.export_arcs=false;
+    try {
+        compile_fiber_execution(incompatible,linear_context,linear_context.placements.front(),.54);
+        FAIL("A mismatched passive length budget was bypassed");
+    } catch(const FiberExecutionError& error){CHECK(error.failure==FiberExecutionFailure::TailBudget);}
+}
+
+TEST_CASE("shared contour envelopes retain the original independent clipping policies", "[ContinuousFiber][FillPerformance]")
+{
+    const double clearance=GENERATE(0.,.3);
+    const bool short_edge=GENERATE(false,true);
+    auto candidate=short_edge?path_from_points({{0,0},{.00005,0},{20,0},{20,20},{0,20},{0,0}},1):
+        path_from_points({{0,0},{20,0},{20,20},{0,20},{0,0}},1);
+    auto id=test_id();id.parent.purpose=FiberPathPurpose::Contour;
+    ContinuousFiberConfig config;config.z_hop_height_mm=0;config.cut_to_contact_length_mm=2;
+    config.finish_overlap_length_mm=0;config.contour_infill_clearance_mm=clearance;
+    // A hole and a remote island exercise both final domain clips while the
+    // strand touches the outer model edge along its first horizontal run.
+    const ExPolygons domain{rectangle_with_hole(-1,-.5,21,21,5,5,15,15),rectangle(30,30,35,35)};
+    const auto result=finalize_independent(candidate,domain,config,id);INFO(result.detail);REQUIRE(result.prepared);
+    const auto& prepared=*result.prepared;
+    ExPolygons original_occupancy,original_keepout;
+    for(const auto& run:fiber_geometry_contour_runs(prepared.draft())) {
+        append(original_occupancy,fiber_contour_coverage(run,.5*prepared.width_mm));
+        append(original_keepout,fiber_contour_coverage(run,.5*prepared.width_mm+clearance));
+    }
+    const auto original_resin=intersection_ex(fiber_material_offset(union_ex(original_occupancy),
+        prepared.execution_deviation_mm),prepared.resin_exclusion);
+    const auto original_infill=intersection_ex(fiber_material_offset(union_ex(original_keepout),
+        prepared.execution_deviation_mm),domain,ApplySafetyOffset::Yes);
+    CHECK(prepared.contour_resin_exclusion==original_resin);
+    CHECK(prepared.contour_to_infill_keepout==original_infill);
+}
+
+TEST_CASE("rounded intermediate masks cannot replace the actual fiber allocation", "[ContinuousFiber][FillPerformance]")
+{
+    // This exact-grid counterexample prevents substituting G intersect A for
+    // G intersect F: clipping P first rounds the slanted boundary of F.
+    const auto rectangle_grid=[](coord_t x0,coord_t y0,coord_t x1,coord_t y1) {
+        return ExPolygon(Polygon(Points{{x0,y0},{x1,y0},{x1,y1},{x0,y1}}));
+    };
+    const ExPolygons possible{rectangle_grid(0,0,1000,1000)};
+    const ExPolygons guaranteed{rectangle_grid(100,100,900,900)};
+    const ExPolygons allowed{ExPolygon(Polygon(Points{{-1000,-333},{2000,667},{2000,3000},{-1000,3000}}))};
+    const auto allocated=intersection_ex(possible,allowed);
+    const auto original=intersection_ex(guaranteed,allocated);
+    const auto substituted=intersection_ex(guaranteed,allowed);
+    CHECK_FALSE(xor_ex(original,substituted).empty());
+}
+
+TEST_CASE("coverage audits canonicalize public resin inputs before an empty void fast path", "[ContinuousFiber][FillPerformance][CoverageStatistics]")
+{
+    const bool has_void=GENERATE(false,true);
+    const auto mode=GENERATE(FiberCoverageAuditMode::MaterialIntegrity,FiberCoverageAuditMode::Detailed);
+    FiberCoverageRecord record;record.source=test_id().parent.domain;
+    record.source_domain={rectangle(0,0,20,10)};
+    record.resin_domain=has_void?ExPolygons{rectangle(0,0,6,10),rectangle(4,0,10,10)}:
+        ExPolygons{rectangle(0,0,12,10),rectangle(8,0,20,10)};
+    if(has_void)record.intentional_void={rectangle(10,0,20,10)};
+    FiberCoverageLedger ledger;ledger.add(record);const auto audit=ledger.audit(mode);
+    CHECK(bool(audit.partition_statistics)==(mode==FiberCoverageAuditMode::Detailed));
+    CHECK(audit.unassigned_area_mm2==0);
+    CHECK(audit.unexpected_overlap_area_mm2==0);
+    CHECK(audit.fiber_exclusion_area_mm2==0);
+    CHECK(audit.intentional_void_area_mm2==Catch::Approx(has_void?100.:0.));
+}
+
+TEST_CASE("empty coverage statistics distinguish unmeasured from measured zero", "[ContinuousFiber][ledger][CoverageStatistics]")
+{
+    FiberCoverageLedger ledger;
+    CHECK_FALSE(ledger.audit().partition_statistics);
+    const auto detailed=ledger.audit(FiberCoverageAuditMode::Detailed);
+    REQUIRE(detailed.partition_statistics);
+    CHECK(detailed.partition_statistics->guaranteed_fiber_area_mm2==0);
+    CHECK(detailed.partition_statistics->uncertain_fiber_area_mm2==0);
 }

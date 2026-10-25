@@ -29,6 +29,9 @@
 #include <tbb/global_control.h>
 #include <tbb/task_arena.h>
 #include <stdexcept>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 namespace {
 using Json = nlohmann::json;
@@ -1817,6 +1820,144 @@ int ring_positive_acceptance(const fixture_fs::path& output)
     report["passed"]=true;write_json(output/"report.json",report);return 0;
 }
 
+int snapshot_benchmark(const fixture_fs::path& model,const fixture_fs::path& snapshot_file,const fixture_fs::path& output,
+    bool plan_statistics=false,bool no_fiber_contract=false)
+{
+    std::string loaded_library;
+#ifdef __APPLE__
+    for(uint32_t i=0;i<_dyld_image_count();++i) {
+        const std::string image=_dyld_get_image_name(i);
+        if(image.find("liblibslicer.dylib")!=std::string::npos)loaded_library=image;
+    }
+#endif
+    std::cout<<"LOADED_LIBRARY="<<loaded_library<<std::endl;
+    fixture_fs::create_directories(output);
+    const Json pinned=read_json(snapshot_file);
+    if(no_fiber_contract) {
+        require(pinned.at("settings").at("generate_reinforced_infills")=="0" &&
+            pinned.at("settings").at("generate_reinforced_perimeters")=="0",
+            "The no-fiber differential probe requires an explicitly disabled frozen snapshot");
+        require(!plan_statistics,"No-fiber SDK comparison must not request a fiber planning table");
+    }
+    libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);
+    const auto& s=pinned.at("selection");libslicer::ConfigSelection selection;
+    selection.machine_model_id=s.at("machine_model_id");selection.machine_variant_id=s.at("machine_variant_id");
+    selection.process_preset_id=s.at("process_preset_id");
+    selection.filament_preset_ids=s.at("filament_preset_ids").get<std::vector<std::string>>();
+    selection.filament_physical_tools=s.at("filament_physical_tools").get<std::vector<unsigned>>();
+    require(library->activate_config(selection).success,"Cannot activate snapshot selection");
+    const auto before=*library->active_config_snapshot();const auto items=library->active_config()->settings;
+    std::vector<std::pair<std::string,std::string>> patch;
+    for(auto it=pinned.at("settings").begin();it!=pinned.at("settings").end();++it) {
+        const auto old=before.value(it.key());require(bool(old),"Missing pinned option "+it.key());
+        if(*old!=it.value().get<std::string>() && std::any_of(items.begin(),items.end(),[&](const auto& item){return item.key==it.key();}))
+            patch.emplace_back(it.key(),it.value().get<std::string>());
+    }
+    const auto applied=library->apply_active_config_patch(patch);
+    for(const auto& d:applied.diagnostics)std::cerr<<d.key<<": "<<d.message<<"\n";
+    require(applied.success,"Cannot apply snapshot");
+    libslicer::SliceRequest request;request.config=*library->active_config_snapshot();
+    Json effective=Json::object();for(const auto& [key,value]:request.config.values())effective[key]=value;
+    std::ofstream(output/"effective_config.json")<<effective.dump(2);
+    require(effective==pinned.at("settings"),"Effective snapshot differs from pinned full snapshot");
+    request.objects.push_back(read_model(model));request.output_gcode_path=(output/"model.gcode").string();
+    if(plan_statistics) {
+        // Separate native planning probe: public-SDK timing above remains a
+        // different measurement. No diagnostic/counter is added to the SDK.
+        Slic3r::DynamicPrintConfig config;config.apply(Slic3r::FullPrintConfig::defaults());
+        for(const auto& [key,value]:request.config.values())
+            if(Slic3r::print_config_def.get(key))config.set_deserialize_strict(key,value);
+        require(config.opt_enum<Slic3r::PrinterStructure>("printer_structure")!=Slic3r::PrinterStructure::psBelt,
+            "Native statistics probe currently supports Cartesian fixtures");
+        const auto& input=request.objects.front();Slic3r::Model plate;auto* object=plate.add_object();object->name=input.name;
+        for(const auto& volume:input.volumes) {
+            std::vector<Slic3r::Vec3f> vertices;std::vector<Slic3r::Vec3i32> faces;
+            for(const auto& p:volume.vertices)vertices.emplace_back(p.x,p.y,p.z);
+            for(const auto& f:volume.triangles)faces.emplace_back(f.vertex_a,f.vertex_b,f.vertex_c);
+            object->add_volume(Slic3r::TriangleMesh(std::move(vertices),std::move(faces)),Slic3r::ModelVolumeType::MODEL_PART,false)
+                ->config.set("extruder",volume.default_filament_slot);
+        }
+        Slic3r::Transform3d transform=Slic3r::Transform3d::Identity();
+        for(int r=0;r<4;++r)for(int c=0;c<4;++c)transform(r,c)=input.transform[size_t(r*4+c)];
+        object->add_instance()->set_transformation(Slic3r::Geometry::Transformation(transform));
+        const auto& area=config.option<Slic3r::ConfigOptionPoints>("printable_area")->values;
+        plate.center_instances_around_point(Slic3r::BoundingBoxf(area).center());
+        Slic3r::Print print;print.set_plate_origin(Slic3r::Vec3d::Zero());
+        print.is_BBL_printer()=config.opt_string("printer_model").rfind("Bambu Lab",0)==0;
+        print.apply(plate,config);Slic3r::StringObjectException warning;const auto error=print.validate(&warning);
+        require(error.string.empty(),error.string);print.process();const auto table=print.fiber_execution_plans();
+        require(bool(table),"Missing execution statistics table");
+        const auto& stats=table->statistics;
+        Json report={{"scope","native planning counters only; not a public-SDK timing"},{"paths",table->paths.size()},
+            {"selected_compilations",stats.compiled_candidates},{"translated_coverage",stats.translated_coverage},{"swept_coverage",stats.swept_coverage}};
+        if(!table->paths.empty()) {
+            const auto& geometry=*table->paths.begin()->second.geometry;
+            const auto cache=Slic3r::fiber_geometry_coverage_cache_statistics(geometry.geometry_context->coverage_cache);
+            report["reference_cache"]={{"hits",cache.hits},{"misses",cache.misses},{"entries",cache.entries},{"retained_bytes",cache.retained_bytes}};
+        }
+        write_json(output/"plan_statistics.json",report);std::cout<<report.dump(2)<<std::endl;return 0;
+    }
+    request.generate_preview=true;request.generate_gcode_3mf=true;request.output_gcode_3mf_path=(output/"model.gcode.3mf").string();
+    const auto start=std::chrono::steady_clock::now();Json stages=Json::array();
+    libslicer::SliceCallbacks callbacks;
+    callbacks.progress=[&](float progress,std::string_view stage) {
+        const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+        stages.push_back({{"seconds",seconds},{"progress",progress},{"stage",stage}});
+        if(stages.size()==1 || stages.back()["stage"]!=stages[stages.size()-2]["stage"])
+            std::cout<<seconds<<" "<<progress<<" "<<stage<<std::endl;
+    };
+    const auto result=library->slice(request,callbacks);
+    const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    for(const auto& d:result.diagnostics)std::cerr<<d.code<<": "<<d.message<<"\n";
+    Json report={{"library_image",loaded_library},{"success",result.success},{"slice_seconds",seconds},
+        {"layer_count",result.summary.layer_count},{"logical_motions",result.summary.logical_motion_count},
+        {"render_segments",result.summary.render_segment_count},{"stages",stages}};
+    if(result.success)report["gcode_bytes"]=fixture_fs::file_size(result.output.path);
+    if(no_fiber_contract) {
+        require(result.success && result.preview,"No-fiber SDK regression did not produce a preview");
+        // Compare actual ordinary output across loaded libraries. Exclude IDs
+        // and duration estimates; retain geometry, E, feed, role and tool use.
+        // Hash after the timed SDK call so verification cannot inflate it.
+        std::uint64_t signature=UINT64_C(14695981039346656037);
+        const auto word=[&](std::uint32_t value) {
+            for(unsigned byte=0;byte<4;++byte)
+                signature=(signature^((value>>(8*byte))&0xffu))*UINT64_C(1099511628211);
+        };
+        const auto scalar=[&](float value) {
+            if(value==0.f)value=0.f; // Canonicalize negative zero only.
+            std::uint32_t bits=0;std::memcpy(&bits,&value,sizeof(bits));word(bits);
+        };
+        size_t thermoplastic=0;
+        for(const auto& segment:result.preview->segments) {
+            require(segment.deposition!=libslicer::ToolpathDepositionKind::ContinuousFiberPowered &&
+                segment.deposition!=libslicer::ToolpathDepositionKind::ContinuousFiberPassive &&
+                segment.fiber_phase==libslicer::ToolpathFiberPhase::None &&
+                segment.extrusion_role!=libslicer::ToolpathExtrusionRole::ContinuousFiberContour &&
+                segment.extrusion_role!=libslicer::ToolpathExtrusionRole::ContinuousFiberInfill,
+                "Disabled fiber leaked into the public preview");
+            thermoplastic+=segment.deposition==libslicer::ToolpathDepositionKind::Thermoplastic;
+            word(segment.layer_index);word(segment.tool_id);word(segment.filament_id);
+            word(std::uint32_t(segment.motion));word(std::uint32_t(segment.deposition));
+            word(std::uint32_t(segment.extrusion_role));
+            for(float value:{segment.start_mm.x,segment.start_mm.y,segment.start_mm.z,
+                segment.end_mm.x,segment.end_mm.y,segment.end_mm.z,segment.extrusion_delta_mm,
+                segment.nominal_speed_mm_s,segment.width_mm,segment.height_mm,segment.mm3_per_mm})scalar(value);
+        }
+        require(thermoplastic>0,"No-fiber fixture contains no ordinary deposition");
+        std::ifstream gcode(result.output.path);require(bool(gcode),"No-fiber G-code was not delivered");
+        std::string line;
+        while(std::getline(gcode,line))
+            require(line.find(";FIBER_BEGIN ")==std::string::npos,"Disabled fiber leaked into G-code");
+        std::ostringstream encoded;encoded<<std::hex<<std::setfill('0')<<std::setw(16)<<signature;
+        report["no_fiber_contract"]=true;report["thermoplastic_segments"]=thermoplastic;
+        report["ordinary_toolpath_fnv1a64"]=encoded.str();
+        report["ordinary_toolpath_fingerprint_scope"]="ordered preview geometry, E, nominal feed, role, layer, tool, filament, width and height; IDs and time estimates excluded";
+    }
+    std::ofstream(output/"report.json")<<report.dump(2);std::cout<<report.dump(2)<<std::endl;
+    return result.success?0:2;
+}
+
 int run_acceptance(int argc,char** argv)
 {
     const fixture_fs::path assets=fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao";
@@ -1828,6 +1969,9 @@ int run_acceptance(int argc,char** argv)
         fixture_fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR);
     const bool checking=argc==2 && std::string(argv[1])=="--self-test";
     try {
+        if(argc==5 && std::string(argv[1])=="--snapshot-benchmark")return snapshot_benchmark(argv[2],argv[3],argv[4]);
+        if(argc==5 && std::string(argv[1])=="--snapshot-benchmark-no-fiber")return snapshot_benchmark(argv[2],argv[3],argv[4],false,true);
+        if(argc==5 && std::string(argv[1])=="--snapshot-plan-statistics")return snapshot_benchmark(argv[2],argv[3],argv[4],true);
         if((argc==7 || argc==8) && std::string(argv[1])=="--connection-model") {
             const auto pinned=read_json(fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao/config.json");const auto& selected=pinned.at("selection");
             libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};auto library=libslicer::Library::open(options);

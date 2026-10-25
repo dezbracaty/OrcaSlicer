@@ -70,6 +70,18 @@ bool is_fiber_mask_parameter(std::string_view key)
 }
 
 
+bool is_fiber_execution_parameter(std::string_view key)
+{
+    static const std::set<std::string_view> keys={"filament_map","filament_map_mode","physical_extruder_map",
+        "filament_process_type","filament_slots_bound_to_physical_tools","toolhead_process_capabilities","toolhead_filament_capacity","filament_printable",
+        "extruder_offset","z_offset","nozzle_diameter","printable_area","bed_exclude_area","printable_height",
+        "extruder_printable_area","extruder_printable_height","gcode_flavor","single_extruder_multi_material",
+        "use_relative_e_distances","use_volumetric_e","enable_arc_fitting","spiral_mode",
+        "enable_pressure_advance","pressure_advance","fiber_cut_gcode"};
+    return keys.count(key) || key.substr(0,15)=="toolhead_fiber_" || key.substr(0,18)=="machine_max_speed_" ||
+        key.substr(0,25)=="machine_max_acceleration_";
+}
+
 FiberMachineProtocol fiber_machine_protocol(const GCodeConfig& config)
 {
     return std::find(config.toolhead_fiber_protocol_id.values.begin(),
@@ -594,8 +606,10 @@ void validate_continuous_fiber_region_config(const PrintConfig& print_config,
 
 ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region)
 {
-    return resolve_region_fiber_config(layer.object()->print()->config(), region.region().config(),
+    auto result=resolve_region_fiber_config(layer.object()->print()->config(), region.region().config(),
         layer.height, layer.id());
+    result.geometry_context=layer.object()->fiber_geometry_context();
+    return result;
 }
 
 } // namespace Slic3r

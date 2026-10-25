@@ -172,6 +172,7 @@ PrintBase::ApplyStatus PrintObject::set_instances(PrintInstances &&instances)
     	[](const PrintInstance& lhs, const PrintInstance& rhs) { return lhs.model_instance == rhs.model_instance && lhs.shift == rhs.shift; });
     if (! equal) {
         status = PrintBase::APPLY_STATUS_CHANGED;
+        m_print->invalidate_fiber_execution_plans(false);
         if (m_print->invalidate_steps({ psSkirtBrim, psGCodeExport }) ||
             (! equal_length && m_print->invalidate_step(psWipeTower)))
             status = PrintBase::APPLY_STATUS_INVALIDATED;
@@ -733,12 +734,13 @@ void PrintObject::prepare_infill()
     this->set_done(posPrepareInfill);
 }
 
-void PrintObject::infill()
+void PrintObject::infill(std::shared_ptr<FiberEarlyExecutionBatch> early)
 {
     // prerequisites
     this->prepare_infill();
 
     if (this->set_started(posInfill)) {
+        if (early && !m_print->prepare_fiber_early_slots(*early,m_layers.size())) early.reset();
         m_print->set_status(35, L("Generating infill toolpath"));
         const auto& adaptive_fill_octree = this->m_adaptive_fill_octrees.first;
         const auto& support_fill_octree = this->m_adaptive_fill_octrees.second;
@@ -746,14 +748,16 @@ void PrintObject::infill()
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - start";
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
+            [this, early, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
                 for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                     m_print->throw_if_canceled();
                     m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get());
+                    if (early) m_print->compile_fiber_early_layer(*early,*m_layers[layer_idx],layer_idx);
                 }
             }
         );
         m_print->throw_if_canceled();
+        if (early) m_print->finish_fiber_early_batch(*early);
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - end";
         /*  we could free memory now, but this would make this step not idempotent
         ### $_->fill_surfaces->clear for map @{$_->regions}, @{$object->layers};
@@ -1494,7 +1498,7 @@ bool PrintObject::invalidate_state_by_config_options(
                opt_key == "flush_into_infill"
             || opt_key == "flush_into_objects"
             || opt_key == "flush_into_support") {
-            invalidated |= m_print->invalidate_step(psWipeTower);
+            invalidated |= m_print->invalidate_step(psWipeTower,false);
             invalidated |= m_print->invalidate_step(psGCodeExport);
         } else {
             // for legacy, if we can't handle this option let's invalidate all steps
@@ -1509,8 +1513,9 @@ bool PrintObject::invalidate_state_by_config_options(
     return invalidated;
 }
 
-bool PrintObject::invalidate_step(PrintObjectStep step)
+bool PrintObject::invalidate_step(PrintObjectStep step, bool invalidate_fiber)
 {
+    if(invalidate_fiber)m_print->invalidate_fiber_execution_plans(true);
 	bool invalidated = Inherited::invalidate_step(step);
 
     // propagate to dependent steps
@@ -1535,16 +1540,23 @@ bool PrintObject::invalidate_step(PrintObjectStep step)
     // Wipe tower depends on the ordering of extruders, which in turn depends on everything.
     // It also decides about what the flush_into_infill / wipe_into_object / flush_into_support features will do,
     // and that too depends on many of the settings.
-    invalidated |= m_print->invalidate_step(psWipeTower);
+    invalidated |= m_print->invalidate_step(psWipeTower,false);
     // Invalidate G-code export in any case.
     invalidated |= m_print->invalidate_step(psGCodeExport);
+    // Publish after all cancellation callbacks have joined the old worker;
+    // otherwise its successful teardown could erase this rebuild request.
+    if (step == posInfill && m_fiber_geometry_context)
+        m_fiber_fill_rebuild_required.store(true);
     return invalidated;
 }
 
 bool PrintObject::invalidate_all_steps()
 {
+    m_print->invalidate_fiber_execution_plans(true);
 	// First call the "invalidate" functions, which may cancel background processing.
     bool result = Inherited::invalidate_all_steps() | m_print->invalidate_all_steps();
+    if (m_fiber_geometry_context)
+        m_fiber_fill_rebuild_required.store(true);
 	// Then reset some of the depending values.
 	m_slicing_params.valid = false;
 	return result;

@@ -10,10 +10,19 @@
 #include "PrintConfig.hpp"
 #include "GCode/CoolingBuffer.hpp"
 #include "Belt/BeltCoordinateSystem.hpp"
+#include <functional>
 
 #include <optional>
 
 namespace Slic3r {
+
+struct GCodeCoordinateTransform {
+    Vec2d xy_offset {Vec2d::Zero()};
+    std::optional<BeltCoordinateSystem> belt;
+    Vec3d machine(const Vec3d& oriented) const;
+    Vec3d oriented(const Vec3d& machine) const;
+    Vec3d quantized(const Vec3d& oriented, size_t digits) const;
+};
 
 class GCodeWriter {
 public:
@@ -120,11 +129,26 @@ public:
         GCodeWriter& m_writer;
         size_t m_previous_digits;
     };
+    using FiberMotionCheck=std::function<void(const Vec3d&,const Vec3d&,EMovePathType,const Vec2d&,double,double&)>;
+    class ScopedFiberMotionCheck {
+    public:
+        ScopedFiberMotionCheck(GCodeWriter& writer,FiberMotionCheck check);
+        ~ScopedFiberMotionCheck() noexcept;
+        ScopedFiberMotionCheck(const ScopedFiberMotionCheck&)=delete;
+    private:
+        GCodeWriter& m_writer;
+        FiberMotionCheck m_previous;
+        Vec3d m_previous_position;
+    };
+    std::string emit_frozen_fiber_motion(const Vec3d& machine,double dE,double speed_mm_s,
+        EMovePathType type=EMovePathType::Linear_move,const Vec2d& ij=Vec2d::Zero(),bool emit_z=false,
+        const std::string& comment={});
     size_t      xyz_export_digits() const { return m_xyz_export_digits; }
     double      quantize_xyz(double value) const;
     Vec3d       get_emitted_position() const;
     Vec3d       quantized_machine_position(const Vec3d& oriented) const;
     Vec3d       oriented_position(const Vec3d& machine) const;
+    GCodeCoordinateTransform coordinate_transform() const { return {{m_x_offset,m_y_offset},m_belt_coordinates}; }
     std::string travel_to_bound_xyz(const Vec3d& oriented, const Vec3d& machine);
     double      get_zhop() const { return m_lifted; }
 
@@ -231,6 +255,10 @@ public:
     std::string _retract(double length, double restart_extra, const std::string &comment);
     std::string set_acceleration_internal(Acceleration type, unsigned int acceleration);
     Vec3d       machine_position(const Vec3d &oriented_position) const;
+    FiberMotionCheck m_fiber_motion_check;
+    Vec3d m_fiber_emitted_position {Vec3d::Zero()};
+    double check_fiber_emitted_motion(const Vec3d& target,unsigned axes,double dE=0,double speed_mm_s=0,
+        EMovePathType type=EMovePathType::Linear_move,const Vec2d& ij=Vec2d::Zero());
 
 };
 

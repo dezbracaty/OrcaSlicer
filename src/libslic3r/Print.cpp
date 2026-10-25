@@ -17,6 +17,7 @@
 #include "Utils.hpp"
 #include "PrintConfig.hpp"
 #include "ContinuousFiber/ContinuousFiberConfig.hpp"
+#include "ContinuousFiber/FiberPathValidator.hpp"
 #include "MaterialType.hpp"
 #include "Model.hpp"
 #include "format.hpp"
@@ -72,9 +73,12 @@ void Print::clear()
 	std::scoped_lock<std::mutex> lock(this->state_mutex());
     // The following call should stop background processing if it is running.
     this->invalidate_all_steps();
+    invalidate_fiber_execution_plans(true);
 	for (PrintObject *object : m_objects)
 		delete object;
 	m_objects.clear();
+    m_fiber_geometry_coverage_cache.reset();
+    m_fiber_lifecycle_active.store(false);
     m_print_regions.clear();
     m_model.clear_objects();
     m_statistics_by_extruder_count.clear();
@@ -98,6 +102,16 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
     if (opt_keys.empty())
         return false;
 
+    bool invalidated = false;
+    if(fiber_execution_required())for(const auto& key:opt_keys)if(is_fiber_execution_parameter(key)) {
+        invalidate_fiber_execution_plans(key=="nozzle_diameter" || key=="filament_process_type" ||
+            key=="enable_arc_fitting" || key=="spiral_mode");
+        if(key=="nozzle_diameter" || key=="filament_process_type" || key=="enable_arc_fitting" || key=="spiral_mode")
+            for(auto* object:m_objects)if(object->m_fiber_geometry_context) {
+                invalidated |= object->invalidate_step(posInfill);object->m_fiber_geometry_context.reset();
+            }
+        invalidated |= invalidate_step(psWipeTower);
+    }
     // Cache the plenty of parameters, which influence the G-code generator only,
     // or they are only notes not influencing the generated G-code.
     static std::unordered_set<std::string> steps_gcode = {
@@ -250,7 +264,6 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
 
     std::vector<PrintStep> steps;
     std::vector<PrintObjectStep> osteps;
-    bool invalidated = false;
 
     for (const t_config_option_key &opt_key : opt_keys) {
         if (opt_key == "fiber_toolchange_approach_speed") {
@@ -438,8 +451,9 @@ void Print::set_calib_params(const Calib_Params& params) {
     m_calib_params.mode = params.mode;
 }
 
-bool Print::invalidate_step(PrintStep step)
+bool Print::invalidate_step(PrintStep step, bool invalidate_fiber)
 {
+    if(invalidate_fiber && step!=psGCodeExport)invalidate_fiber_execution_plans(false);
 	bool invalidated = Inherited::invalidate_step(step);
     // Propagate to dependent steps.
     if (step != psGCodeExport)
@@ -2290,12 +2304,16 @@ void Print::normalize_belt_print_origin()
     if (print_origin_s <= EPSILON)
         return;
 
+    const bool protect_fiber_geometry=fiber_printing_enabled();
+    std::set<Layer*> normalized_layers;
     for (PrintObject* object : m_objects) {
         for (Layer* layer : object->layers()) {
+            if(protect_fiber_geometry && !normalized_layers.insert(layer).second)continue;
             layer->slice_z -= print_origin_s;
             layer->print_z -= print_origin_s;
         }
         for (SupportLayer* layer : object->support_layers()) {
+            if(protect_fiber_geometry && !normalized_layers.insert(layer).second)continue;
             layer->slice_z -= print_origin_s;
             layer->print_z -= print_origin_s;
         }
@@ -2306,6 +2324,8 @@ void Print::normalize_belt_print_origin()
 // Slicing process, running at a background thread.
 void Print::process(long long *time_cost_with_cache, bool use_cache)
 {
+    std::optional<FiberRunToken> fiber_run;
+    if(fiber_execution_required())fiber_run=begin_fiber_run();
     long long start_time = 0, end_time = 0;
     if (time_cost_with_cache)
         *time_cost_with_cache = 0;
@@ -2369,6 +2389,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
     int object_count = m_objects.size();
     std::set<PrintObject*> need_slicing_objects;
     std::set<PrintObject*> re_slicing_objects;
+    std::set<PrintObject*> fiber_rebuilt_objects;
     if (!use_cache) {
         for (int index = 0; index < object_count; index++)
         {
@@ -2416,6 +2437,15 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         }
     }
 
+    if(fiber_run) {
+        prepare_fiber_geometry_contexts();
+        prepare_fiber_early_batches(*fiber_run);
+    }
+    const auto early_batch=[&](const PrintObject* object)->std::shared_ptr<FiberEarlyExecutionBatch> {
+        if(!fiber_run)return {};
+        const auto found=fiber_run->early_batches.find(object);
+        return found==fiber_run->early_batches.end()?nullptr:found->second;
+    };
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": total object counts %1% in current print, need to slice %2%")%m_objects.size()%need_slicing_objects.size();
     BOOST_LOG_TRIVIAL(info) << "Starting the slicing process." << log_memory_info();
     if (!use_cache) {
@@ -2441,7 +2471,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         }
         for (PrintObject *obj : m_objects) {
             if (need_slicing_objects.count(obj) != 0) {
-                obj->infill();
+                obj->infill(early_batch(obj));
             }
             else {
                 if (obj->set_started(posPrepareInfill))
@@ -2505,12 +2535,32 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                     obj->set_done(posPerimeters);
                 if (obj->set_started(posPrepareInfill))
                     obj->set_done(posPrepareInfill);
-                if (obj->set_started(posInfill))
-                    obj->set_done(posInfill);
-                if (obj->set_started(posIroning))
-                    obj->set_done(posIroning);
-                if (obj->set_started(posContouring))
-                    obj->set_done(posContouring);
+                const bool fiber_fill_dirty=obj->m_fiber_fill_rebuild_required.load();
+                const bool rebuild_fiber=(obj->fiber_geometry_context() || fiber_fill_dirty) &&
+                    (fiber_fill_dirty || !obj->is_step_done(posInfill) ||
+                     !obj->is_step_done(posIroning) || !obj->is_step_done(posContouring) ||
+                     !obj->is_step_done(posSimplifyInfill)) && need_slicing_objects.count(obj);
+                if(rebuild_fiber) {
+                    // A failed successor may have appended partial paths. Rebuild
+                    // Fill as well before retrying ironing/contouring/simplification.
+                    {
+                        std::lock_guard<std::mutex> state_lock(state_mutex());
+                        throw_if_canceled();
+                        // This is the current worker recovering its own stages,
+                        // not a frontend invalidation that must stop the worker.
+                        obj->invalidate_steps_without_cancel({posInfill,posIroning,posContouring,posSimplifyInfill});
+                        invalidate_steps_without_cancel({psSkirtBrim,psWipeTower,psGCodeExport});
+                        obj->m_fiber_fill_rebuild_required.store(true);
+                    }
+                    obj->infill(early_batch(obj));obj->ironing();
+                    if(obj->need_z_contouring())obj->contour_z();
+                    else if(obj->set_started(posContouring))obj->set_done(posContouring);
+                    fiber_rebuilt_objects.insert(obj);
+                } else {
+                    if(obj->set_started(posInfill))obj->set_done(posInfill);
+                    if(obj->set_started(posIroning))obj->set_done(posIroning);
+                    if(obj->set_started(posContouring))obj->set_done(posContouring);
+                }
                 if (obj->set_started(posSupportMaterial))
                     obj->set_done(posSupportMaterial);
                 if (obj->set_started(posDetectOverhangsForLift))
@@ -2518,7 +2568,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
             }
             else {
                 obj->make_perimeters();
-                obj->infill();
+                obj->infill(early_batch(obj));
                 obj->ironing();
                 obj->generate_support_material();
                 obj->detect_overhangs_for_lift();
@@ -2539,20 +2589,25 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
 
 
 
-    if (this->set_started(psWipeTower)) {
-        {
-            std::vector<std::set<int>> geometric_unprintables(m_config.nozzle_diameter.size());
-            for (PrintObject* obj : m_objects) {
-                std::vector<std::set<int>> obj_geometric_unprintables = obj->detect_extruder_geometric_unprintables();
-                for (size_t idx = 0; idx < obj_geometric_unprintables.size(); ++idx) {
-                    if (idx < geometric_unprintables.size()) {
-                        geometric_unprintables[idx].insert(obj_geometric_unprintables[idx].begin(), obj_geometric_unprintables[idx].end());
-                    }
+    const auto refresh_geometric_unprintables=[this] {
+        std::vector<std::set<int>> geometric_unprintables(m_config.nozzle_diameter.size());
+        for (PrintObject* obj : m_objects) {
+            std::vector<std::set<int>> obj_geometric_unprintables = obj->detect_extruder_geometric_unprintables();
+            for (size_t idx = 0; idx < obj_geometric_unprintables.size(); ++idx) {
+                if (idx < geometric_unprintables.size()) {
+                    geometric_unprintables[idx].insert(obj_geometric_unprintables[idx].begin(), obj_geometric_unprintables[idx].end());
                 }
             }
-            this->set_geometric_unprintable_filaments(geometric_unprintables);
         }
-
+        this->set_geometric_unprintable_filaments(geometric_unprintables);
+    };
+    if(fiber_run) {
+        refresh_geometric_unprintables();
+        prepare_fiber_tool_candidates(*fiber_run);
+    }
+    if (this->set_started(psWipeTower)) {
+        // Ordinary slicing keeps the original state/cancellation boundary.
+        if(!fiber_run)refresh_geometric_unprintables();
         m_wipe_tower_data.clear();
         m_tool_ordering.clear();
         if (this->has_wipe_tower()) {
@@ -2701,7 +2756,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
     //BBS
     for (PrintObject *obj : m_objects) {
         if (((!use_cache)&&(need_slicing_objects.count(obj) != 0))
-            || (use_cache &&(re_slicing_objects.count(obj) != 0))){
+            || (use_cache &&(re_slicing_objects.count(obj) != 0)) || fiber_rebuilt_objects.count(obj)){
             obj->simplify_extrusion_path();
         }
         else {
@@ -2742,6 +2797,19 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         }
     }
 
+    if(fiber_run) {
+        // Manual/no-op and cached fiber runs also require a certified task table.
+        finalize_fiber_executions(*fiber_run);
+        for(auto* object:m_objects)object->m_fiber_fill_rebuild_required.store(false);
+        if(!fiber_printing_enabled()) {
+            // The on-to-off rebuild is complete. Ordinary printing no longer
+            // needs fiber snapshots, table scans, or execution locks.
+            std::lock_guard<std::mutex> fiber_lock(m_fiber_execution_mutex);
+            m_fiber_execution_plans.reset();m_fiber_selected_plans.reset();
+            m_fiber_locked_filament_map.clear();
+            m_fiber_lifecycle_active.store(false);
+        }
+    }
     BOOST_LOG_TRIVIAL(info) << "Slicing process finished." << log_memory_info();
 }
 
@@ -3297,43 +3365,648 @@ void Print::finalize_first_layer_convex_hull()
     m_first_layer_convex_hull = Geometry::convex_hull(m_first_layer_convex_hull.points);
 }
 
-void Print::update_filament_maps_to_config(std::vector<int> f_maps)
+bool Print::fiber_printing_enabled() const
 {
-    if (m_config.filament_map.values != f_maps)
-    {
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": filament maps changed after pre-slicing.");
-        m_ori_full_print_config.option<ConfigOptionInts>("filament_map", true)->values = f_maps;
-        m_config.filament_map.values = f_maps;
+    for(const auto* object:m_objects) {
+        if(!object->shared_regions())continue;
+        for(size_t region=0;region<object->num_printing_regions();++region)
+            if(continuous_fiber_enabled(object->printing_region(region).config()))return true;
+    }
+    return false;
+}
 
-        m_full_print_config = m_ori_full_print_config;
-        m_full_print_config.update_values_to_printer_extruders_for_multiple_filaments(m_full_print_config, filament_options_with_variant,  "filament_self_index", "filament_extruder_variant");
+bool Print::fiber_execution_required() const
+{
+    if(m_fiber_lifecycle_active.load())return true;
+    for(const auto* object:m_objects) {
+        if(object->m_fiber_geometry_context || object->m_fiber_fill_rebuild_required.load())return true;
+        if(!object->shared_regions())continue;
+        for(size_t region=0;region<object->num_printing_regions();++region)
+            if(continuous_fiber_enabled(object->printing_region(region).config()))return true;
+    }
+    return false;
+}
 
-        const std::vector<std::string> &extruder_retract_keys = print_config_def.extruder_retract_keys();
-        const std::string               filament_prefix       = "filament_";
-        t_config_option_keys            print_diff;
-        DynamicPrintConfig              filament_overrides;
-        for (auto& opt_key: extruder_retract_keys)
-        {
-            const ConfigOption *opt_new_filament = m_full_print_config.option(filament_prefix + opt_key);
-            const ConfigOption *opt_new_machine = m_full_print_config.option(opt_key);
-            const ConfigOption *opt_old_machine = m_config.option(opt_key);
+void Print::set_belt_coordinate_system(BeltCoordinateSystem coordinates)
+{
+    if(!fiber_execution_required()) {
+        m_belt_coordinate_system=std::move(coordinates);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(state_mutex());
+    invalidate_fiber_execution_plans(false);
+    invalidate_step(psWipeTower);
+    m_belt_coordinate_system=std::move(coordinates);
+}
 
-            if (opt_new_filament)
-                compute_filament_override_value(opt_key, opt_old_machine, opt_new_machine, opt_new_filament, m_full_print_config, print_diff, filament_overrides, f_maps);
+bool Print::invalidate_all_steps()
+{
+    invalidate_fiber_execution_plans(true);
+    return Inherited::invalidate_all_steps();
+}
+
+void Print::set_plate_origin(Vec3d origin)
+{
+    if(!fiber_execution_required()) {
+        m_origin=origin;
+        return;
+    }
+    std::lock_guard<std::mutex> lock(state_mutex());
+    if(origin==m_origin)return;
+    invalidate_fiber_execution_plans(false);
+    invalidate_step(psWipeTower);
+    invalidate_step(psGCodeExport);
+    m_origin=origin;
+}
+
+std::vector<int> Print::fiber_locked_filament_map() const
+{
+    if(!m_fiber_lifecycle_active.load())return {};
+    std::lock_guard<std::mutex> lock(m_fiber_execution_mutex);
+    return m_fiber_locked_filament_map;
+}
+
+void Print::invalidate_fiber_execution_plans(bool geometry)
+{
+    if(!m_fiber_lifecycle_active.load())return;
+    std::lock_guard<std::mutex> lock(m_fiber_execution_mutex);
+    if(geometry)++m_fiber_geometry_generation;
+    ++m_fiber_execution_generation;
+    m_fiber_execution_plans.reset();m_fiber_selected_plans.reset();
+    m_fiber_locked_filament_map.clear();
+    m_fiber_execution_reuse_statistics={};
+}
+
+std::shared_ptr<const FiberExecutionPlanTable> Print::fiber_execution_plans() const
+{
+    if(!m_fiber_lifecycle_active.load())return {};
+    std::lock_guard<std::mutex> lock(m_fiber_execution_mutex);
+    if(!m_fiber_execution_plans || m_fiber_execution_plans->geometry_generation!=m_fiber_geometry_generation ||
+        m_fiber_execution_plans->execution_generation!=m_fiber_execution_generation)return {};
+    return m_fiber_execution_plans;
+}
+
+bool Print::fiber_execution_plans_current(const std::shared_ptr<const FiberExecutionPlanTable>& table) const
+{
+    return table && fiber_execution_plans()==table;
+}
+
+FiberExecutionReuseStatistics Print::fiber_execution_reuse_statistics() const
+{
+    std::lock_guard<std::mutex> lock(m_fiber_execution_mutex);
+    if(!m_fiber_execution_plans || m_fiber_execution_plans->geometry_generation!=m_fiber_geometry_generation ||
+        m_fiber_execution_plans->execution_generation!=m_fiber_execution_generation)return {};
+    return m_fiber_execution_reuse_statistics;
+}
+
+void Print::with_current_fiber_execution_plans(const std::shared_ptr<const FiberExecutionPlanTable>& table,
+    const std::function<void()>& action) const
+{
+    std::lock_guard<std::mutex> lock(m_fiber_execution_mutex);
+    if(!table || table!=m_fiber_execution_plans || table->geometry_generation!=m_fiber_geometry_generation ||
+        table->execution_generation!=m_fiber_execution_generation)
+        throw FiberExecutionError("Fiber inputs changed before G-code delivery",FiberExecutionFailure::Context);
+    action(); // File handoff only. Never call state/cancel methods here.
+}
+
+std::vector<int> Print::certified_fiber_filament_map() const
+{
+    if(!m_fiber_lifecycle_active.load())return {};
+    std::lock_guard<std::mutex> lock(m_fiber_execution_mutex);
+    const auto* table=m_fiber_selected_plans?m_fiber_selected_plans.get():m_fiber_execution_plans.get();
+    return table && !table->paths.empty()?table->filament_map:std::vector<int>{};
+}
+
+Print::FiberRunToken Print::begin_fiber_run()
+{
+    std::lock_guard<std::mutex> state_lock(state_mutex());
+    m_fiber_lifecycle_active.store(true);
+    std::lock_guard<std::mutex> fiber_lock(m_fiber_execution_mutex);
+    throw_if_canceled();
+    ++m_fiber_execution_generation;
+    m_fiber_execution_plans.reset();m_fiber_selected_plans.reset();m_fiber_locked_filament_map.clear();
+    m_fiber_execution_reuse_statistics={};
+    return {m_fiber_geometry_generation,m_fiber_execution_generation,m_ori_full_print_config,m_config};
+}
+
+Print::ResolvedFilamentMapping Print::resolve_filament_mapping(const DynamicPrintConfig& original,
+    const PrintConfig& current,const std::vector<int>& mapping)
+{
+    ResolvedFilamentMapping result;result.original=original;result.config=current;
+    result.original.option<ConfigOptionInts>("filament_map",true)->values=mapping;
+    result.full=result.original;
+    result.full.update_values_to_printer_extruders_for_multiple_filaments(result.full,
+        filament_options_with_variant,"filament_self_index","filament_extruder_variant");
+    result.config.filament_map.values=mapping;
+    t_config_option_keys changes;
+    auto override_mapping=mapping;
+    for(const auto& key:print_config_def.extruder_retract_keys()) {
+        const auto* material=result.full.option("filament_"+key);
+        if(material)compute_filament_override_value(key,current.option(key),result.full.option(key),material,
+            result.full,changes,result.overrides,override_mapping);
+    }
+    const t_config_option_keys keys(filament_options_with_variant.begin(),filament_options_with_variant.end());
+    result.config.apply_only(result.full,keys,true);
+    if(!changes.empty())result.config.apply(result.overrides);
+    return result;
+}
+
+namespace {
+struct FiberEarlyPathResult {
+    double source_z {0};
+    CompiledFiberPath compiled;
+    FiberExecutionStatistics statistics;
+};
+
+std::map<FiberFragmentId,std::shared_ptr<const PreparedFiberPath>> collect_layer_fiber_geometry(const Layer& layer)
+{
+    std::map<FiberFragmentId,std::shared_ptr<const PreparedFiberPath>> result;
+    const auto visit=[&](const auto& self,const ExtrusionEntity& entity)->void {
+        if(const auto* collection=dynamic_cast<const ExtrusionEntityCollection*>(&entity)) {
+            for(const auto* child:collection->entities)self(self,*child);
+        } else if(const auto* fiber=dynamic_cast<const ExtrusionFiberPath*>(&entity)) {
+            fiber->validate_derived_view();const auto& geometry=fiber->prepared_path();
+            const auto inserted=result.emplace(geometry->id,geometry);
+            if(!inserted.second && inserted.first->second!=geometry)
+                throw FiberExecutionError("Conflicting fiber geometry identities");
         }
+    };
+    for(const auto* region:layer.regions())visit(visit,region->fills);
+    return result;
+}
 
-        t_config_option_keys keys(filament_options_with_variant.begin(), filament_options_with_variant.end());
-        m_config.apply_only(m_full_print_config, keys, true);
-        if (!print_diff.empty()) {
-            m_placeholder_parser.apply_config(filament_overrides);
-            m_config.apply(filament_overrides);
+std::shared_ptr<const FiberExecutionContext> make_fiber_execution_context(const PrintConfig& config,
+    const GCodeCoordinateTransform& transform)
+{
+    auto context=std::make_shared<FiberExecutionContext>();context->config=config;
+    context->transform=transform;context->export_arcs=config.enable_arc_fitting && !config.spiral_mode;
+    for(size_t tool=0;tool<config.nozzle_diameter.size();++tool)
+        context->machine_limits.push_back(fiber_machine_limits(config,unsigned(tool)));
+    return context;
+}
+
+void validate_fiber_path_context(const PreparedFiberPath& geometry,const FiberExecutionContext& context)
+{
+    const auto& config=context.config;
+    const auto binding=resolve_fiber_tool(config,geometry.logical_filament_id);
+    if(config.toolhead_fiber_protocol_id.values[binding.physical_tool_id]=="cfsys-v1" &&
+        config.enable_pressure_advance.get_at(binding.logical_filament_id) &&
+        config.pressure_advance.get_at(binding.logical_filament_id)!=0)
+        throw FiberExecutionError("CFSYS fiber requires zero pressure advance",FiberExecutionFailure::Context);
+    if(geometry.geometry_context) {
+        const auto& before=geometry.geometry_context->config;
+        const unsigned f=geometry.logical_filament_id;
+        const int previous=before.filament_map.get_at(f)-1;
+        const auto tool=resolve_fiber_tool(config,f);
+        if(previous<0 || before.nozzle_diameter.get_at(previous)!=config.nozzle_diameter.get_at(tool.logical_extruder_id) ||
+            before.filament_fiber_feed_correction.get_at(f)!=config.filament_fiber_feed_correction.get_at(f) ||
+            geometry.geometry_context->export_arcs!=context.export_arcs)
+            throw FiberExecutionError("Tool variant changes the prepared fiber geometry; upstream replanning required",FiberExecutionFailure::Context);
+    }
+}
+
+void append_fiber_variant(CompiledFiberPath& compiled,FrozenFiberExecution execution)
+{
+    for(const auto& prior:compiled.variants)if(equal_fiber_commands(*prior->commands,*execution.commands)) {
+        execution.commands=prior->commands;break;
+    }
+    compiled.variants.push_back(std::make_shared<const FrozenFiberExecution>(std::move(execution)));
+}
+
+void add_fiber_statistics(FiberExecutionStatistics& total,const FiberExecutionStatistics& part)
+{
+    total.compiled_candidates+=part.compiled_candidates;
+    total.translated_coverage+=part.translated_coverage;
+    total.swept_coverage+=part.swept_coverage;
+}
+} // namespace
+
+// Owned only by the process run and its workers. Invalidation revokes the run's
+// epoch, never the slot storage that parallel Fill may still be writing.
+struct FiberEarlyExecutionBatch {
+    uint64_t geometry_generation {0}, execution_generation {0};
+    std::shared_ptr<const FiberExecutionContext> context;
+    std::vector<FiberPlacement> placements;
+    struct LayerSlot {
+        std::map<FiberFragmentId,FiberEarlyPathResult> paths;
+        size_t compile_calls {0}, successful_variants {0}, failed_compile_calls {0};
+    };
+    std::vector<LayerSlot> slots;
+    std::map<FiberFragmentId,FiberEarlyPathResult> paths;
+    size_t compile_calls {0}, successful_variants {0}, failed_compile_calls {0};
+};
+
+void Print::prepare_fiber_early_batches(FiberRunToken& token)
+{
+    const auto& config=token.config;
+    const bool fixed=config.filament_map_mode.value>=fmmManual ||
+        !config.toolhead_filament_capacity.values.empty() || config.filament_slots_bound_to_physical_tools.value;
+    if(!fixed)return;
+    try {
+        GCodeCoordinateTransform transform;
+        std::map<const PrintObject*,std::shared_ptr<FiberEarlyExecutionBatch>> batches;
+        {
+            std::lock_guard<std::mutex> state_lock(state_mutex());
+            std::lock_guard<std::mutex> fiber_lock(m_fiber_execution_mutex);
+            throw_if_canceled();
+            if(token.geometry!=m_fiber_geometry_generation || token.execution!=m_fiber_execution_generation)
+                return;
+            if(is_belt_printer() || belt_coordinate_system())return;
+            transform.xy_offset=m_origin.head<2>();
+            for(const auto* object:m_objects) {
+                const auto* canonical=object->get_shared_object()?object->get_shared_object():object;
+                if(!canonical->fiber_geometry_context())continue;
+                auto& batch=batches[canonical];
+                if(!batch)batch=std::make_shared<FiberEarlyExecutionBatch>();
+                for(const auto& instance:object->instances()) {
+                    const size_t id=instance.model_instance->id().id;
+                    if(std::none_of(batch->placements.begin(),batch->placements.end(),[&](const auto& p){return p.instance_id==id;}))
+                        batch->placements.push_back({id,object->id().id,instance.shift.cast<double>()*SCALING_FACTOR});
+                }
+            }
+        }
+        if(batches.empty())return;
+        const auto resolved=resolve_filament_mapping(token.original,token.config,config.filament_map.values);
+        validate_material_tool_bindings(resolved.config);
+        validate_fiber_cut_event(resolved.config.fiber_cut_gcode.value,fiber_machine_protocol(resolved.config));
+        const auto context=make_fiber_execution_context(resolved.config,transform);
+        for(auto& item:batches) {
+            item.second->context=context;
+            item.second->geometry_generation=token.geometry;item.second->execution_generation=token.execution;
+        }
+        token.early_context=context;token.early_batches=std::move(batches);
+    } catch(const CanceledException&) {throw;}
+    catch(const std::exception&) {
+        // Early work is optional. Empty tasks and final permissions are decided
+        // at the original late boundary, including snapshot construction errors.
+    }
+}
+
+bool Print::prepare_fiber_early_slots(FiberEarlyExecutionBatch& batch,size_t count)
+{
+    try {
+        batch.slots.resize(count); // Called once by the parent before parallel_for.
+        return true;
+    } catch(const std::exception&) {return false;}
+}
+
+void Print::compile_fiber_early_layer(FiberEarlyExecutionBatch& batch,const Layer& layer,size_t index)
+{
+    auto& slot=batch.slots.at(index);
+    try {
+        for(const auto& item:collect_layer_fiber_geometry(layer)) {
+            auto& result=slot.paths[item.first];result.source_z=layer.print_z;
+            result.compiled.geometry=item.second;result.compiled.context=batch.context;
+            try {
+                validate_fiber_path_context(*item.second,*batch.context);
+                for(const auto& placement:batch.placements) {
+                    throw_if_canceled();++slot.compile_calls;
+                    try {
+                        auto execution=compile_certified_fiber_execution(*item.second,*batch.context,placement,
+                            layer.print_z+batch.context->config.z_offset.value,result.statistics,[this]{throw_if_canceled();});
+                        append_fiber_variant(result.compiled,std::move(execution));++slot.successful_variants;
+                    } catch(const CanceledException&) {throw;}
+                    catch(const std::exception&) {++slot.failed_compile_calls;}
+                }
+            } catch(const CanceledException&) {throw;}
+            catch(const std::exception&) {} // The original late path decides errors.
+        }
+    } catch(const CanceledException&) {throw;}
+    catch(const std::exception&) {} // A partial optional result is never permission.
+}
+
+void Print::finish_fiber_early_batch(FiberEarlyExecutionBatch& batch)
+{
+    for(auto& slot:batch.slots) {
+        batch.compile_calls+=slot.compile_calls;batch.successful_variants+=slot.successful_variants;
+        batch.failed_compile_calls+=slot.failed_compile_calls;
+    }
+    try {
+        for(auto& slot:batch.slots)for(auto& item:slot.paths) {
+            const auto inserted=batch.paths.emplace(item.first,std::move(item.second));
+            if(!inserted.second)batch.paths.erase(inserted.first); // Ambiguous results are late misses.
+        }
+    } catch(const std::exception&) {batch.paths.clear();}
+    batch.slots.clear(); // All workers joined; no invalidation touches this storage.
+}
+
+void Print::prepare_fiber_tool_candidates(FiberRunToken& token)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_fiber_execution_mutex);
+        if(token.geometry!=m_fiber_geometry_generation || token.execution!=m_fiber_execution_generation)
+            throw FiberExecutionError("Fiber planning inputs were invalidated",FiberExecutionFailure::Context);
+        if(m_fiber_selected_plans)return;
+    }
+    struct Work {std::shared_ptr<const PreparedFiberPath> geometry;double z;std::vector<FiberPlacement> placements;};
+    std::map<FiberFragmentId,Work> work;
+    for(const auto* object:m_objects)for(const auto* layer:object->layers()) {
+        for(const auto& item:collect_layer_fiber_geometry(*layer)) {
+                const auto& geometry=item.second;
+                auto found=work.find(item.first);
+                if(found==work.end())found=work.emplace(item.first,Work{geometry,layer->print_z,{}}).first;
+                if(found->second.geometry!=geometry || found->second.z!=layer->print_z)
+                    throw FiberExecutionError("Conflicting fiber geometry identities");
+                for(const auto& instance:object->instances()) {
+                    const auto id=instance.model_instance->id().id;
+                    auto& placements=found->second.placements;
+                    if(std::none_of(placements.begin(),placements.end(),[&](const auto& p){return p.instance_id==id;}))
+                        placements.push_back({id,object->id().id,instance.shift.cast<double>()*SCALING_FACTOR});
+                }
         }
     }
-    m_has_auto_filament_map_result = true;
+    std::map<FiberFragmentId,const FiberEarlyPathResult*> early_paths;
+    for(const auto& item:token.early_batches) {
+        const auto& batch=*item.second;
+        token.reuse_statistics.early_compile_calls+=batch.compile_calls;
+        token.reuse_statistics.early_successful_variants+=batch.successful_variants;
+        token.reuse_statistics.early_failed_compile_calls+=batch.failed_compile_calls;
+        if(batch.geometry_generation!=token.geometry || batch.execution_generation!=token.execution)continue;
+        for(const auto& path:batch.paths)early_paths.emplace(path.first,&path.second);
+    }
+    auto selected=std::make_shared<FiberExecutionPlanTable>();
+    auto mapping=m_config.filament_map.values;
+    if(!work.empty()) {
+        ToolOrdering usage(*this,-1,false);
+        std::vector<std::vector<unsigned>> layers;
+        for(const auto& tools:usage)layers.push_back(tools.extruders);
+        const auto used=usage.all_extruders();
+        const auto physical=get_physical_unprintable_filaments(used);
+        const auto geometric=get_geometric_unprintable_filaments();
+        const bool fixed=m_config.filament_map_mode.value>=fmmManual ||
+            !m_config.toolhead_filament_capacity.values.empty() || m_config.filament_slots_bound_to_physical_tools.value;
+        auto recommended=mapping;
+        if(!fixed) {
+            const auto proposal=ToolOrdering::get_recommended_filament_maps(layers,this,m_config.filament_map_mode.value,
+                physical,geometric);
+            if(proposal.size()==mapping.size())for(size_t i=0;i<mapping.size();++i)recommended[i]=proposal[i]+1;
+        }
+        std::set<unsigned> used_fibers;
+        for(const auto& item:work)used_fibers.insert(item.second.geometry->logical_filament_id);
+        std::string last_failure;
+        const auto certify=[&](const std::vector<int>& trial_mapping)->std::shared_ptr<FiberExecutionPlanTable> {
+            throw_if_canceled();
+            const auto resolved=resolve_filament_mapping(token.original,token.config,trial_mapping);
+            validate_material_tool_bindings(resolved.config);
+            validate_fiber_cut_event(resolved.config.fiber_cut_gcode.value,fiber_machine_protocol(resolved.config));
+            auto table=std::make_shared<FiberExecutionPlanTable>();table->filament_map=trial_mapping;
+            GCodeCoordinateTransform transform;transform.xy_offset=m_origin.head<2>();
+            if(belt_coordinate_system())transform.belt=*belt_coordinate_system();
+            // One complete comparison for the batch, never config.diff per path.
+            // A hit uses the same immutable factory-built limits and check mode.
+            const auto& early=token.early_context;
+            const bool reuse_context=early && early->check_machine && !early->transform.belt && !transform.belt &&
+                early->transform.xy_offset==transform.xy_offset && early->config.diff(resolved.config).empty() &&
+                early->export_arcs==(resolved.config.enable_arc_fitting && !resolved.config.spiral_mode);
+            const auto context=reuse_context?early:make_fiber_execution_context(resolved.config,transform);
+            for(const auto& item:work) {
+                throw_if_canceled();const auto& geometry=*item.second.geometry;
+                validate_fiber_path_context(geometry,*context);
+                CompiledFiberPath compiled;compiled.geometry=item.second.geometry;compiled.context=context;
+                const FiberEarlyPathResult* cached=nullptr;
+                if(reuse_context) {
+                    const auto found=early_paths.find(item.first);
+                    if(found!=early_paths.end() && found->second->compiled.geometry==item.second.geometry &&
+                        found->second->source_z==item.second.z && found->second->compiled.context==context)
+                        cached=found->second;
+                }
+                if(cached)add_fiber_statistics(table->statistics,cached->statistics);
+                for(const auto& placement:item.second.placements) {
+                    std::shared_ptr<const FrozenFiberExecution> reusable;
+                    if(cached) {
+                        const auto prior=std::find_if(cached->compiled.variants.begin(),cached->compiled.variants.end(),
+                        [&](const auto& execution) {
+                            return execution->placement.instance_id==placement.instance_id &&
+                                execution->placement.object_id==placement.object_id && execution->placement.origin==placement.origin &&
+                                execution->layer_z==context->transform.quantized(Vec3d(0,0,item.second.z+resolved.config.z_offset.value),6).z();
+                        });
+                        if(prior!=cached->compiled.variants.end())reusable=*prior;
+                    }
+                    if(reusable) {
+                        compiled.variants.push_back(std::move(reusable));++token.reuse_statistics.reused_variants;
+                        continue;
+                    }
+                    ++token.reuse_statistics.late_compile_calls;
+                    try {
+                        auto execution=compile_certified_fiber_execution(geometry,*context,placement,
+                            item.second.z+resolved.config.z_offset.value,table->statistics,[this]{throw_if_canceled();});
+                        append_fiber_variant(compiled,std::move(execution));++token.reuse_statistics.late_successful_variants;
+                    } catch(...) {++token.reuse_statistics.late_failed_compile_calls;throw;}
+                }
+                table->paths.emplace(item.first,std::move(compiled));
+            }
+            audit_fiber_execution_connections(table->paths);
+            return table;
+        };
+        const auto acceptable=[&](unsigned f,int logical) {
+            if(logical<0 || size_t(logical)>=m_config.nozzle_diameter.size() ||
+               size_t(logical)>=m_config.physical_extruder_map.size())return false;
+            const int owner=m_config.physical_extruder_map.values[logical];
+            if(owner<0 || !tool_accepts_process(m_config,unsigned(owner),is_fiber_filament(m_config,f)?"continuous_fiber":"thermoplastic"))return false;
+            if(size_t(logical)<physical.size() && physical[logical].count(int(f)))return false;
+            // Explicit slot ownership preserves the pre-existing manual policy.
+            if(!fixed && size_t(logical)<geometric.size() && geometric[logical].count(int(f)))return false;
+            return true;
+        };
+        const auto attempt=[&](const std::vector<int>& trial)->bool {
+            for(unsigned f:used)if(f>=trial.size() || !acceptable(f,trial[f]-1)) {
+                last_failure="Material "+std::to_string(f)+" cannot use candidate tool "+
+                    (f<trial.size()?std::to_string(trial[f]):std::string("missing"))+" under configured process/printable limits";
+                return false;
+            }
+            if(!fixed) {
+                // Ask the original mode solver to validate a pinned draft. This
+                // preserves FG/AMS/TPU/global group rules during fallback too.
+                auto pinned=physical;
+                pinned.resize(m_config.nozzle_diameter.size());
+                for(unsigned f:used)for(size_t t=0;t<pinned.size();++t)
+                    if(int(t+1)!=trial[f])pinned[t].insert(int(f));
+                const auto permitted=ToolOrdering::get_recommended_filament_maps(layers,this,
+                    m_config.filament_map_mode.value,pinned,geometric);
+                if(permitted.size()!=trial.size())return false;
+                for(unsigned f:used)if(permitted[f]!=trial[f]-1)return false;
+            }
+            try {selected=certify(trial);return true;}
+            catch(const CanceledException&){throw;}
+            catch(const FiberExecutionError& error) {
+                if(error.failure==FiberExecutionFailure::InvalidPlan)throw;
+                last_failure=error.what();return false;
+            }
+            catch(const std::invalid_argument& error){last_failure=error.what();return false;}
+        };
+        bool found=attempt(fixed?mapping:recommended);
+        if(found)mapping=selected->filament_map;
+        else if(!fixed) {
+            mapping=recommended;
+            // Preserve every ordinary material from the original recommendation.
+            // Fallback may search only materials present in actual fiber work.
+            const std::vector<unsigned> variable(used_fibers.begin(),used_fibers.end());
+            const auto search=[&](const auto& self,size_t index)->bool {
+                throw_if_canceled();
+                if(index==variable.size())return attempt(mapping);
+                const unsigned f=variable[index];const int initial=mapping.at(f);
+                std::vector<int> choices{initial};
+                for(size_t tool=0;tool<m_config.nozzle_diameter.size();++tool)
+                    if(int(tool+1)!=initial)choices.push_back(int(tool+1));
+                for(int choice:choices)if(acceptable(f,choice-1)) {
+                    mapping[f]=choice;if(self(self,index+1))return true;
+                }
+                mapping[f]=initial;return false;
+            };
+            found=search(search,0);
+        }
+        if(!found)throw FiberExecutionError("No permitted tool mapping can execute the prepared fiber plans: "+last_failure,
+            FiberExecutionFailure::Context);
+    }
+    selected->filament_map=mapping;
+    const auto resolved=work.empty()?ResolvedFilamentMapping{}:
+        resolve_filament_mapping(token.original,token.config,mapping);
+    std::lock_guard<std::mutex> state_lock(state_mutex());
+    std::lock_guard<std::mutex> fiber_lock(m_fiber_execution_mutex);
+    throw_if_canceled();
+    if(token.geometry!=m_fiber_geometry_generation || token.execution!=m_fiber_execution_generation)
+        throw FiberExecutionError("Stale fiber run cannot commit a mapping",FiberExecutionFailure::Context);
+    if(!work.empty()) {
+        m_ori_full_print_config=resolved.original;m_full_print_config=resolved.full;m_config=resolved.config;
+        m_placeholder_parser.apply_config(resolved.overrides);m_has_auto_filament_map_result=true;
+    }
+    ++m_fiber_execution_generation;token.execution=m_fiber_execution_generation;
+    selected->geometry_generation=token.geometry;selected->execution_generation=token.execution;
+    m_fiber_locked_filament_map.assign(mapping.size(),0);
+    for(const auto& item:work) {
+        const auto f=item.second.geometry->logical_filament_id;m_fiber_locked_filament_map[f]=mapping[f];
+    }
+    m_fiber_selected_plans=std::move(selected);
+}
+
+void Print::finalize_fiber_executions(const FiberRunToken& token)
+{
+    std::lock_guard<std::mutex> state_lock(state_mutex());
+    std::lock_guard<std::mutex> fiber_lock(m_fiber_execution_mutex);
+    throw_if_canceled();
+    if(token.geometry!=m_fiber_geometry_generation || token.execution!=m_fiber_execution_generation ||
+        !m_fiber_selected_plans || (!m_fiber_selected_plans->paths.empty() &&
+        m_fiber_selected_plans->filament_map!=m_config.filament_map.values))
+        throw FiberExecutionError("Invalidated fiber run cannot publish its execution table",FiberExecutionFailure::Context);
+    std::set<FiberFragmentId> found;
+    for(const auto* object:m_objects)for(const auto* layer:object->layers()) {
+        const auto visit=[&](const auto& self,const ExtrusionEntity& entity)->void {
+            if(const auto* collection=dynamic_cast<const ExtrusionEntityCollection*>(&entity)) {
+                for(const auto* child:collection->entities)self(self,*child);
+            } else if(const auto* fiber=dynamic_cast<const ExtrusionFiberPath*>(&entity)) {
+                fiber->validate_derived_view();const auto& geometry=fiber->prepared_path();
+                const auto item=m_fiber_selected_plans->paths.find(geometry->id);
+                if(item==m_fiber_selected_plans->paths.end() || item->second.geometry!=geometry)
+                    throw FiberExecutionError("Fiber geometry changed before publication",FiberExecutionFailure::Context);
+                found.insert(geometry->id);const auto& context=*item->second.context;
+                if(!context.config.diff(m_config).empty() || context.transform.xy_offset!=m_origin.head<2>() ||
+                    bool(context.transform.belt)!=bool(m_belt_coordinate_system))
+                    throw FiberExecutionError("Fiber effective configuration/frame changed before publication",FiberExecutionFailure::Context);
+                if(context.transform.belt && (context.transform.belt->angle_degrees()!=m_belt_coordinate_system->angle_degrees() ||
+                    context.transform.belt->plate_max_world_y()!=m_belt_coordinate_system->plate_max_world_y() ||
+                    context.transform.belt->print_origin_s()!=m_belt_coordinate_system->print_origin_s()))
+                    throw FiberExecutionError("Fiber belt frame changed before publication",FiberExecutionFailure::Context);
+                for(const auto& instance:object->instances()) {
+                    const auto& execution=item->second.execution(instance.model_instance->id().id);
+                    if(execution.placement.origin!=instance.shift.cast<double>()*SCALING_FACTOR ||
+                        execution.layer_z!=context.transform.quantized(Vec3d(0,0,layer->print_z+m_config.z_offset.value),6).z())
+                        throw FiberExecutionError("Fiber placement/layer changed before publication",FiberExecutionFailure::Context);
+                }
+            }
+        };
+        for(const auto* region:layer->regions())visit(visit,region->fills);
+    }
+    if(found.size()!=m_fiber_selected_plans->paths.size())
+        throw FiberExecutionError("Fiber execution table contains obsolete geometry",FiberExecutionFailure::Context);
+    m_fiber_execution_plans=m_fiber_selected_plans;
+    m_fiber_execution_reuse_statistics=token.reuse_statistics;
+    BOOST_LOG_TRIVIAL(info)<<"[FiberExecution] paths="<<m_fiber_execution_plans->paths.size()
+        <<" translated="<<m_fiber_execution_plans->statistics.translated_coverage
+        <<" swept="<<m_fiber_execution_plans->statistics.swept_coverage
+        <<" early_calls="<<token.reuse_statistics.early_compile_calls
+        <<" early_success="<<token.reuse_statistics.early_successful_variants
+        <<" early_fail="<<token.reuse_statistics.early_failed_compile_calls
+        <<" reused="<<token.reuse_statistics.reused_variants
+        <<" late_calls="<<token.reuse_statistics.late_compile_calls;
+}
+
+void Print::prepare_fiber_geometry_contexts()
+{
+    for(auto* object:m_objects) {
+        auto* canonical=object->get_shared_object()?object->get_shared_object():object;
+        if(object!=canonical)continue;
+        bool enabled=false;
+        for(const auto& region:canonical->all_regions())enabled=enabled || continuous_fiber_enabled(region.get().config());
+        if(!enabled)canonical->m_fiber_geometry_context.reset();
+        else {
+            const auto& old=canonical->m_fiber_geometry_context;
+            bool same=bool(old);
+            if(old)for(const auto& key:old->config.diff(m_config))
+                if(!is_fiber_execution_parameter(key) || key=="nozzle_diameter" || key=="filament_process_type" ||
+                   key=="enable_arc_fitting" || key=="spiral_mode") {same=false;break;}
+            if(!same) {
+                if(!m_fiber_geometry_coverage_cache)m_fiber_geometry_coverage_cache=make_fiber_geometry_coverage_cache();
+                auto context=std::make_shared<FiberGeometryContext>();context->config=m_config;
+                context->export_arcs=m_config.enable_arc_fitting && !m_config.spiral_mode;
+                context->coverage_cache=m_fiber_geometry_coverage_cache;
+                canonical->m_fiber_geometry_context=std::move(context);
+            }
+        }
+        for(auto* alias:m_objects)if(alias->get_shared_object()==canonical)
+            alias->m_fiber_geometry_context=canonical->m_fiber_geometry_context;
+    }
+}
+
+void Print::update_filament_maps_to_config(std::vector<int> mapping)
+{
+    if(!m_fiber_lifecycle_active.load() || !fiber_printing_enabled()) {
+        if (m_config.filament_map.values != mapping)
+        {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": filament maps changed after pre-slicing.");
+            m_ori_full_print_config.option<ConfigOptionInts>("filament_map", true)->values = mapping;
+            m_config.filament_map.values = mapping;
+
+            m_full_print_config = m_ori_full_print_config;
+            m_full_print_config.update_values_to_printer_extruders_for_multiple_filaments(m_full_print_config, filament_options_with_variant,  "filament_self_index", "filament_extruder_variant");
+
+            const std::vector<std::string> &extruder_retract_keys = print_config_def.extruder_retract_keys();
+            const std::string               filament_prefix       = "filament_";
+            t_config_option_keys            print_diff;
+            DynamicPrintConfig              filament_overrides;
+            for (auto& opt_key: extruder_retract_keys)
+            {
+                const ConfigOption *opt_new_filament = m_full_print_config.option(filament_prefix + opt_key);
+                const ConfigOption *opt_new_machine = m_full_print_config.option(opt_key);
+                const ConfigOption *opt_old_machine = m_config.option(opt_key);
+
+                if (opt_new_filament)
+                    compute_filament_override_value(opt_key, opt_old_machine, opt_new_machine, opt_new_filament, m_full_print_config, print_diff, filament_overrides, mapping);
+            }
+
+            t_config_option_keys keys(filament_options_with_variant.begin(), filament_options_with_variant.end());
+            m_config.apply_only(m_full_print_config, keys, true);
+            if (!print_diff.empty()) {
+                m_placeholder_parser.apply_config(filament_overrides);
+                m_config.apply(filament_overrides);
+            }
+        }
+        m_has_auto_filament_map_result = true;
+        return;
+    }
+    const auto certified=certified_fiber_filament_map();
+    if(!certified.empty() && mapping!=certified)
+        throw FiberExecutionError("Tool ordering changed a certified task mapping",FiberExecutionFailure::Context);
+    if(m_config.filament_map.values!=mapping) {
+        const auto resolved=resolve_filament_mapping(m_ori_full_print_config,m_config,mapping);
+        m_ori_full_print_config=resolved.original;m_full_print_config=resolved.full;m_config=resolved.config;
+        m_placeholder_parser.apply_config(resolved.overrides);
+    }
+    m_has_auto_filament_map_result=true;
 }
 
 void Print::apply_config_for_render(const DynamicConfig &config)
 {
+    if(m_fiber_lifecycle_active.load() && !m_config.diff(config).empty())invalidate_fiber_execution_plans(true);
     m_config.apply(config);
 }
 
@@ -3349,6 +4022,8 @@ FilamentMapMode Print::get_filament_map_mode() const
 
 std::vector<std::set<int>> Print::get_physical_unprintable_filaments(const std::vector<unsigned int>& used_filaments) const
 {
+    const bool fiber_enabled=fiber_printing_enabled();
+    const auto fiber_locks=fiber_enabled?fiber_locked_filament_map():std::vector<int>{};
     int extruder_num = m_config.nozzle_diameter.size();
     std::vector<std::set<int>>physical_unprintables(extruder_num);
     // Material/capability constraints participate in the search itself. These
@@ -3370,6 +4045,8 @@ std::vector<std::set<int>> Print::get_physical_unprintable_filaments(const std::
                     compatible = compatible && original >= 0 && original < extruder_num &&
                         m_config.nozzle_diameter.values[original] == m_config.nozzle_diameter.values[logical];
                 }
+                if(filament<fiber_locks.size() && fiber_locks[filament]>0)
+                    compatible=compatible && logical==fiber_locks[filament]-1;
                 if (!compatible) physical_unprintables[logical].insert(int(filament));
             }
         }
@@ -3377,28 +4054,25 @@ std::vector<std::set<int>> Print::get_physical_unprintable_filaments(const std::
     if (extruder_num < 2)
         return physical_unprintables;
 
-    auto get_unprintable_extruder_id = [&](unsigned int filament_idx) -> int {
-        int status = m_config.filament_printable.values[filament_idx];
-        for (int i = 0; i < extruder_num; ++i) {
-            if (!(status >> i & 1)) {
-                return i;
+    if(fiber_enabled) {
+        for(unsigned filament:used_filaments) {
+            if(filament<fiber_locks.size() && fiber_locks[filament]>0)continue;
+            const auto mask=uint32_t(m_config.filament_printable.get_at(filament));
+            for(int tool=0;tool<extruder_num;++tool)
+                if(tool>=32 || (mask&(uint32_t(1)<<tool))==0)
+                    physical_unprintables[tool].insert(int(filament));
+        }
+    } else {
+        // Preserve the upstream ordinary-material bitmap interpretation.
+        for(unsigned filament:used_filaments) {
+            const int status=m_config.filament_printable.values[filament];
+            for(int tool=0;tool<extruder_num;++tool) {
+                if(!(status>>tool&1)) {
+                    physical_unprintables[tool].insert(int(filament));
+                    break;
+                }
             }
         }
-        return -1;
-    };
-
-
-    std::set<int> tpu_filaments;
-    for (auto f : used_filaments) {
-        if (m_config.filament_type.get_at(f) == "TPU")
-            tpu_filaments.insert(f);
-    }
-
-    for (auto f : used_filaments) {
-        int extruder_id = get_unprintable_extruder_id(f);
-        if (extruder_id == -1)
-            continue;
-        physical_unprintables[extruder_id].insert(f);
     }
 
     return physical_unprintables;

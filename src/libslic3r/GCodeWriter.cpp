@@ -20,6 +20,29 @@
 namespace Slic3r {
 
 namespace {
+Vec3d to_machine_coordinates(const Vec3d& oriented, double x_offset, double y_offset,
+    const std::optional<BeltCoordinateSystem>& belt)
+{
+    const Vec3d point_on_plate(oriented.x() - x_offset, oriented.y() - y_offset, oriented.z());
+    return belt ? belt->oriented_to_machine(point_on_plate) : point_on_plate;
+}
+
+Vec3d to_oriented_coordinates(const Vec3d& machine, double x_offset, double y_offset,
+    const std::optional<BeltCoordinateSystem>& belt)
+{
+    Vec3d oriented = belt ? belt->world_to_oriented(belt->machine_to_world(machine)) : machine;
+    oriented.x() += x_offset;
+    oriented.y() += y_offset;
+    return oriented;
+}
+
+Vec3d quantized_coordinates(Vec3d machine, size_t digits)
+{
+    for (int axis = 0; axis < 3; ++axis)
+        machine[axis] = GCodeFormatter::quantize(machine[axis], digits);
+    return machine;
+}
+
 double limited_travel_speed(double speed, std::optional<double> limit, bool has_xy_motion = true)
 {
     if (limit && (!std::isfinite(*limit) || *limit < 0))
@@ -35,13 +58,24 @@ bool GCodeWriter::supports_separate_travel_acceleration(GCodeFlavor flavor)
     return (flavor == gcfRepetier || flavor == gcfMarlinFirmware ||  flavor == gcfRepRapFirmware);
 }
 
-Vec3d GCodeWriter::machine_position(const Vec3d &oriented_position) const
+Vec3d GCodeCoordinateTransform::machine(const Vec3d &oriented_position) const
 {
-    const Vec3d point_on_plate(oriented_position.x() - m_x_offset,
-                               oriented_position.y() - m_y_offset,
-                               oriented_position.z());
-    return m_belt_coordinates ? m_belt_coordinates->oriented_to_machine(point_on_plate)
-                              : point_on_plate;
+    return to_machine_coordinates(oriented_position, xy_offset.x(), xy_offset.y(), belt);
+}
+
+Vec3d GCodeCoordinateTransform::oriented(const Vec3d& position) const
+{
+    return to_oriented_coordinates(position, xy_offset.x(), xy_offset.y(), belt);
+}
+
+Vec3d GCodeCoordinateTransform::quantized(const Vec3d& position,size_t digits) const
+{
+    return quantized_coordinates(machine(position), digits);
+}
+
+Vec3d GCodeWriter::machine_position(const Vec3d& position) const
+{
+    return to_machine_coordinates(position, m_x_offset, m_y_offset, m_belt_coordinates);
 }
 
 GCodeWriter::ScopedXYZPrecision::ScopedXYZPrecision(GCodeWriter& writer, size_t digits)
@@ -65,17 +99,12 @@ double GCodeWriter::quantize_xyz(double value) const
 
 Vec3d GCodeWriter::quantized_machine_position(const Vec3d& oriented) const
 {
-    Vec3d machine=machine_position(oriented);
-    for(int axis=0;axis<3;++axis) machine[axis]=quantize_xyz(machine[axis]);
-    return machine;
+    return quantized_coordinates(machine_position(oriented), m_xyz_export_digits);
 }
 
 Vec3d GCodeWriter::oriented_position(const Vec3d& machine) const
 {
-    Vec3d oriented=m_belt_coordinates ?
-        m_belt_coordinates->world_to_oriented(m_belt_coordinates->machine_to_world(machine)) : machine;
-    oriented.x()+=m_x_offset;oriented.y()+=m_y_offset;
-    return oriented;
+    return to_oriented_coordinates(machine, m_x_offset, m_y_offset, m_belt_coordinates);
 }
 
 Vec3d GCodeWriter::get_emitted_position() const
@@ -95,6 +124,54 @@ std::string GCodeWriter::travel_to_bound_xyz(const Vec3d& oriented,const Vec3d& 
     command.emit_xyz(machine);
     command.emit_f(m_current_speed);
     return command.string();
+}
+
+GCodeWriter::ScopedFiberMotionCheck::ScopedFiberMotionCheck(GCodeWriter& writer,FiberMotionCheck check)
+    :m_writer(writer),m_previous(std::move(writer.m_fiber_motion_check)),m_previous_position(writer.m_fiber_emitted_position)
+{
+    writer.m_fiber_emitted_position=writer.machine_position(writer.get_emitted_position());
+    for(int axis=0;axis<3;++axis)writer.m_fiber_emitted_position[axis]=writer.quantize_xyz(writer.m_fiber_emitted_position[axis]);
+    writer.m_fiber_motion_check=std::move(check);
+}
+GCodeWriter::ScopedFiberMotionCheck::~ScopedFiberMotionCheck() noexcept
+{
+    m_writer.m_fiber_motion_check=std::move(m_previous);
+    m_writer.m_fiber_emitted_position=m_previous_position;
+}
+double GCodeWriter::check_fiber_emitted_motion(const Vec3d& target,unsigned axes,double dE,double speed,
+    EMovePathType type,const Vec2d& ij)
+{
+    if(!m_fiber_motion_check)return speed;
+    Vec3d actual=m_fiber_emitted_position;
+    for(unsigned axis=0;axis<3;++axis)if(axes&(1u<<axis))actual[axis]=quantize_xyz(target[axis]);
+    const Vec2d actual_ij(quantize_xyz(ij.x()),quantize_xyz(ij.y()));
+    m_fiber_motion_check(m_fiber_emitted_position,actual,type,actual_ij,dE,speed);
+    m_fiber_emitted_position=actual;
+    return speed;
+}
+std::string GCodeWriter::emit_frozen_fiber_motion(const Vec3d& machine,double dE,double speed,
+    EMovePathType type,const Vec2d& ij,bool emit_z,const std::string& comment)
+{
+    if(!machine.allFinite() || !ij.allFinite() || !std::isfinite(dE) || dE<0 || !std::isfinite(speed) || speed<=0)
+        throw std::invalid_argument("Invalid frozen fiber command");
+    for(int axis=0;axis<3;++axis)if(quantize_xyz(machine[axis])!=machine[axis])
+        throw std::invalid_argument("Frozen fiber target is not quantized");
+    speed=check_fiber_emitted_motion(machine,emit_z?7u:3u,dE,speed,type,ij);
+    m_pos=oriented_position(machine);m_lifted=0;
+    m_position_export_digits[0]=m_position_export_digits[1]=m_xyz_export_digits;
+    if(emit_z)m_position_export_digits[2]=m_xyz_export_digits;
+    if(dE>0)filament()->extrude(dE);
+    std::string result=set_speed(speed*60);
+    if(type==EMovePathType::Arc_move_cw || type==EMovePathType::Arc_move_ccw) {
+        GCodeG2G3Formatter command(type==EMovePathType::Arc_move_ccw,m_xyz_export_digits);
+        command.emit_xy(machine.head<2>());command.emit_ij(ij);
+        if(dE>0)command.emit_e(filament()->E());
+        command.emit_comment(full_gcode_comment,comment);return result+command.string();
+    }
+    GCodeG1Formatter command(m_xyz_export_digits);
+    if(emit_z)command.emit_xyz(machine);else command.emit_xy(machine.head<2>());
+    if(dE>0)command.emit_e(filament()->E());
+    command.emit_comment(full_gcode_comment,comment);return result+command.string();
 }
 
 void GCodeWriter::apply_print_config(const PrintConfig &print_config)
@@ -711,6 +788,8 @@ std::string GCodeWriter::travel_to_xy(const Vec2d &point, const std::string &com
     speed = limited_travel_speed(speed, speed_limit_mm_s,
         position_unknown || ((speed_limit_mm_s?quantized_machine_position(m_pos):machine).head<2>() -
             previous_machine.head<2>()).squaredNorm() > 0);
+    if (m_fiber_motion_check)
+        speed = check_fiber_emitted_motion(Vec3d(machine.x(), machine.y(), 0), 3u, 0, speed);
     w.emit_f(speed * 60.0);
     //BBS
     w.emit_comment(GCodeWriter::full_gcode_comment, comment);
@@ -837,9 +916,12 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
     if (m_belt_coordinates) {
         const Vec3d machine = machine_position(dest_point);
         GCodeG1Formatter w(m_xyz_export_digits);
+        double checked_speed = travel_speed;
+        if (m_fiber_motion_check)
+            checked_speed = check_fiber_emitted_motion(machine, 7u, 0, travel_speed);
         w.emit_xyz(machine);
         m_position_export_digits.fill(m_xyz_export_digits);
-        w.emit_f(travel_speed * 60.0);
+        w.emit_f(checked_speed * 60.0);
         w.emit_comment(GCodeWriter::full_gcode_comment, comment);
         m_pos = dest_point;
         m_lifted = 0.0;
@@ -887,8 +969,11 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
                 Vec2d temp = delta_no_z.normalized() * delta(2) / tan(this->filament()->travel_slope());
                 Vec3d slope_top_point = Vec3d(temp(0), temp(1), delta(2)) + source;
                 GCodeG1Formatter w0(m_xyz_export_digits);
+                double checked_speed = travel_speed;
+                if (m_fiber_motion_check)
+                    checked_speed = check_fiber_emitted_motion(slope_top_point, 7u, 0, travel_speed);
                 w0.emit_xyz(slope_top_point);
-                w0.emit_f(travel_speed * 60.0);
+                w0.emit_f(checked_speed * 60.0);
                 //BBS
                 w0.emit_comment(GCodeWriter::full_gcode_comment, comment);
                 slop_move = w0.string();
@@ -902,14 +987,20 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
         {
             GCodeG1Formatter w0(m_xyz_export_digits);
             if (this->is_current_position_clear()) {
+                double checked_speed = travel_speed;
+                if (m_fiber_motion_check)
+                    checked_speed = check_fiber_emitted_motion(target, 7u, 0, travel_speed);
                 w0.emit_xyz(target);
-                w0.emit_f(travel_speed * 60.0);
+                w0.emit_f(checked_speed * 60.0);
                 w0.emit_comment(GCodeWriter::full_gcode_comment, comment);
                 xy_z_move = w0.string();
             }
             else {
+                double checked_speed = travel_speed;
+                if (m_fiber_motion_check)
+                    checked_speed = check_fiber_emitted_motion(Vec3d(target.x(), target.y(), 0), 3u, 0, travel_speed);
                 w0.emit_xy(Vec2d(target.x(), target.y()));
-                w0.emit_f(travel_speed * 60.0);
+                w0.emit_f(checked_speed * 60.0);
                 w0.emit_comment(GCodeWriter::full_gcode_comment, comment);
                 xy_z_move = w0.string() + _travel_to_z(target.z(), comment);
             }
@@ -939,17 +1030,24 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
     Vec3d point_on_plate = { dest_point(0) - m_x_offset, dest_point(1) - m_y_offset, dest_point(2) };
     std::string out_string;
     GCodeG1Formatter w(m_xyz_export_digits);
+    const double command_speed=limited_travel_speed(this->config.travel_speed.value,speed_limit_mm_s,has_xy_motion);
     if (!this->is_current_position_clear())
     {
         //force to move xy first then z after filament change
+        double checked_speed = command_speed;
+        if (m_fiber_motion_check)
+            checked_speed = check_fiber_emitted_motion(Vec3d(point_on_plate.x(), point_on_plate.y(), 0), 3u, 0, command_speed);
         w.emit_xy(Vec2d(point_on_plate.x(), point_on_plate.y()));
-        w.emit_f(limited_travel_speed(this->config.travel_speed.value, speed_limit_mm_s, has_xy_motion) * 60.0);
+        w.emit_f(checked_speed * 60.0);
         w.emit_comment(GCodeWriter::full_gcode_comment, comment);
         out_string = w.string() + _travel_to_z(point_on_plate.z(), comment);
     } else {
         GCodeG1Formatter w(m_xyz_export_digits);
+        double checked_speed = command_speed;
+        if (m_fiber_motion_check)
+            checked_speed = check_fiber_emitted_motion(point_on_plate, 7u, 0, command_speed);
         w.emit_xyz(point_on_plate);
-        w.emit_f(limited_travel_speed(this->config.travel_speed.value, speed_limit_mm_s, has_xy_motion) * 60.0);
+        w.emit_f(checked_speed * 60.0);
         w.emit_comment(GCodeWriter::full_gcode_comment, comment);
         out_string = w.string();
     }
@@ -993,9 +1091,13 @@ std::string GCodeWriter::_travel_to_z(double z, const std::string &comment)
     if (m_belt_coordinates) {
         const Vec3d machine = machine_position(m_pos);
         w.emit_y(machine.y());
+        if (m_fiber_motion_check)
+            speed = check_fiber_emitted_motion(machine, 6u, 0, speed);
         w.emit_z(machine.z());
         m_position_export_digits[1] = m_xyz_export_digits;
     } else {
+        if (m_fiber_motion_check)
+            speed = check_fiber_emitted_motion(Vec3d(0, 0, z), 4u, 0, speed);
         w.emit_z(z);
     }
     m_position_export_digits[2] = m_xyz_export_digits;
@@ -1043,12 +1145,12 @@ std::string GCodeWriter::_spiral_travel_to_z(double z, const Vec2d &ij_offset, c
         if (full_gcode_comment)
             oss << ";" << comment << "\n";
 
-        if (m_xyz_export_digits == GCodeFormatter::XYZF_EXPORT_DIGITS)
-            oss << "G1 F" << (speed * 60.0) << "\n";  // preserve ordinary export
-        else {
-            GCodeG1Formatter feed(m_xyz_export_digits);
-            feed.emit_f(speed * 60.0);
-            oss << feed.string();
+        if(!m_fiber_motion_check) {
+            if (m_xyz_export_digits == GCodeFormatter::XYZF_EXPORT_DIGITS)
+                oss << "G1 F" << (speed * 60.0) << "\n";
+            else {
+                GCodeG1Formatter feed(m_xyz_export_digits);feed.emit_f(speed*60.0);oss<<feed.string();
+            }
         }
 
         // approximate the arc with small linear segments (without the last point which is added later to ensure exactness)
@@ -1059,19 +1161,33 @@ std::string GCodeWriter::_spiral_travel_to_z(double z, const Vec2d &ij_offset, c
             double y = cy + radius * std::sin(a);       // point on circle
             double zz = z_start + (z - z_start) * t;    // interpolated Z height
 
+            if (m_fiber_motion_check) {
+                const double checked_speed = check_fiber_emitted_motion(Vec3d(x, y, zz), 7u, 0, speed);
+                GCodeG1Formatter feed(m_xyz_export_digits);
+                feed.emit_f(checked_speed * 60.0);
+                oss << feed.string();
+            }
             if (m_xyz_export_digits == GCodeFormatter::XYZF_EXPORT_DIGITS)
                 oss << "G1 X" << x << " Y" << y << " Z" << zz << "\n";
             else {
                 GCodeG1Formatter move(m_xyz_export_digits);
+
                 move.emit_xyz(Vec3d(x, y, zz));
                 oss << move.string();
             }
         }
 
+        if (m_fiber_motion_check) {
+            const double checked_speed = check_fiber_emitted_motion(Vec3d(px, py, z), 7u, 0, speed);
+            GCodeG1Formatter feed(m_xyz_export_digits);
+            feed.emit_f(checked_speed * 60.0);
+            oss << feed.string();
+        }
         if (m_xyz_export_digits == GCodeFormatter::XYZF_EXPORT_DIGITS)
             oss << "G1 X" << px << " Y" << py << " Z" << z << "\n";
         else {
             GCodeG1Formatter move(m_xyz_export_digits);
+
             move.emit_xyz(Vec3d(px, py, z));
             oss << move.string();
         }
@@ -1081,6 +1197,8 @@ std::string GCodeWriter::_spiral_travel_to_z(double z, const Vec2d &ij_offset, c
         output = std::string("G17") + (full_gcode_comment ? " ; XY plane for arc\n" : "\n");
 
         GCodeG2G3Formatter w(true, m_xyz_export_digits);
+        if (m_fiber_motion_check)
+            speed = check_fiber_emitted_motion(Vec3d(0, 0, z), 4u, 0, speed, EMovePathType::Arc_move_ccw, ij_offset);
         w.emit_z(z);
         w.emit_ij(ij_offset);
         w.emit_string(" P1 ");
@@ -1129,6 +1247,14 @@ std::string GCodeWriter::extrude_to_xy(const Vec2d &point, double dE, const std:
     const Vec3d machine = machine_position(m_pos);
 
     GCodeG1Formatter w(m_xyz_export_digits);
+    if (m_fiber_motion_check) {
+        const double checked_speed = check_fiber_emitted_motion(Vec3d(machine.x(), machine.y(), 0), 3u,
+            force_no_extrusion ? 0 : dE, m_current_speed / 60.0);
+        if (checked_speed * 60.0 != m_current_speed) {
+            w.emit_f(checked_speed * 60.0);
+            m_current_speed = checked_speed * 60.0;
+        }
+    }
     w.emit_xy(machine.head<2>());
     m_position_export_digits[0] = m_position_export_digits[1] = m_xyz_export_digits;
     if (!force_no_extrusion)
@@ -1151,6 +1277,15 @@ std::string GCodeWriter::extrude_arc_to_xy(const Vec2d& point, const Vec2d& cent
     const Vec3d machine = machine_position(m_pos);
 
     GCodeG2G3Formatter w(is_ccw, m_xyz_export_digits);
+    if (m_fiber_motion_check) {
+        const double checked_speed = check_fiber_emitted_motion(Vec3d(machine.x(), machine.y(), 0), 3u,
+            force_no_extrusion ? 0 : dE, m_current_speed / 60.0,
+            is_ccw ? EMovePathType::Arc_move_ccw : EMovePathType::Arc_move_cw, center_offset);
+        if (checked_speed * 60.0 != m_current_speed) {
+            w.emit_f(checked_speed * 60.0);
+            m_current_speed = checked_speed * 60.0;
+        }
+    }
     w.emit_xy(machine.head<2>());
     m_position_export_digits[0] = m_position_export_digits[1] = m_xyz_export_digits;
     w.emit_ij(center_offset);
@@ -1179,10 +1314,27 @@ std::string GCodeWriter::extrude_to_xyz(const Vec3d &point, double dE, const std
 
     GCodeG1Formatter w(m_xyz_export_digits);
     if (z_changed || m_belt_coordinates) {
+        if (m_fiber_motion_check) {
+            const double checked_speed = check_fiber_emitted_motion(machine, 7u,
+                force_no_extrusion ? 0 : dE, m_current_speed / 60.0);
+            if (checked_speed * 60.0 != m_current_speed) {
+                w.emit_f(checked_speed * 60.0);
+                m_current_speed = checked_speed * 60.0;
+            }
+        }
         w.emit_xyz(machine);
         m_position_export_digits[2] = m_xyz_export_digits;
-    } else
+    } else {
+        if (m_fiber_motion_check) {
+            const double checked_speed = check_fiber_emitted_motion(Vec3d(machine.x(), machine.y(), 0), 3u,
+                force_no_extrusion ? 0 : dE, m_current_speed / 60.0);
+            if (checked_speed * 60.0 != m_current_speed) {
+                w.emit_f(checked_speed * 60.0);
+                m_current_speed = checked_speed * 60.0;
+            }
+        }
         w.emit_xy(machine.head<2>());
+    }
     m_position_export_digits[0] = m_position_export_digits[1] = m_xyz_export_digits;
     if (!force_no_extrusion)
         w.emit_e(filament()->E());

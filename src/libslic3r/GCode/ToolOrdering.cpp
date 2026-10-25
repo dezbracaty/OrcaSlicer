@@ -1223,6 +1223,12 @@ std::vector<int> ToolOrdering::get_recommended_filament_maps(const std::vector<s
     if (!print || layer_filaments.empty())
         return std::vector<int>();
 
+    if(print->fiber_execution_required()) {
+        const auto certified=print->certified_fiber_filament_map();
+        if(!certified.empty()) {
+            auto mapping=certified;for(int& value:mapping)--value;return mapping;
+        }
+    }
     const auto& print_config = print->config();
     if (!print_config.toolhead_filament_capacity.values.empty()) {
         // Slots added under a physical tool already have an explicit owner.

@@ -5,9 +5,25 @@
 #include "FiberSource.hpp"
 
 #include <cstddef>
+#include <memory>
+#include <optional>
 #include <vector>
 
 namespace Slic3r {
+
+class PreparedFiberPath;
+
+// The partition is derived, never supplied as independently mutable G/U masks:
+// G = union(sealed source components) intersect allocated F; U = F minus G.
+class FiberCoverageEnvelope {
+public:
+    static FiberCoverageEnvelope from_paths(std::vector<std::shared_ptr<const PreparedFiberPath>> paths);
+
+private:
+    explicit FiberCoverageEnvelope(std::vector<std::shared_ptr<const PreparedFiberPath>> paths);
+    std::vector<std::shared_ptr<const PreparedFiberPath>> m_paths;
+    friend class FiberCoverageLedger;
+};
 
 struct FiberCoverageRecord {
     FiberDomainId source;
@@ -17,9 +33,14 @@ struct FiberCoverageRecord {
     ExPolygons resin_domain;
     ExPolygons intentional_void;
     ExPolygons outside_domain;
-    bool has_execution_envelope {false};
-    ExPolygons guaranteed_fiber;
-    ExPolygons uncertain_fiber;
+    std::optional<FiberCoverageEnvelope> execution_envelope;
+};
+
+enum class FiberCoverageAuditMode { MaterialIntegrity, Detailed };
+
+struct FiberCoveragePartitionStatistics {
+    double guaranteed_fiber_area_mm2 {0.0};
+    double uncertain_fiber_area_mm2 {0.0};
 };
 
 struct FiberCoverageAudit {
@@ -30,15 +51,16 @@ struct FiberCoverageAudit {
     double unassigned_area_mm2 { 0.0 };
     double unexpected_overlap_area_mm2 { 0.0 };
     double outside_area_mm2 { 0.0 };
-    double guaranteed_fiber_area_mm2 {0.0};
-    double uncertain_fiber_area_mm2 {0.0};
     double invalid_execution_envelope_area_mm2 {0.0};
+    // Domain-wide G/U areas are diagnostic measurements, separate from the
+    // material-integrity checks. Absence means they were not calculated.
+    std::optional<FiberCoveragePartitionStatistics> partition_statistics;
 };
 
 class FiberCoverageLedger {
 public:
     void add(FiberCoverageRecord record);
-    FiberCoverageAudit audit() const;
+    FiberCoverageAudit audit(FiberCoverageAuditMode mode = FiberCoverageAuditMode::MaterialIntegrity) const;
     const std::vector<FiberCoverageRecord>& records() const { return m_records; }
 
 private:

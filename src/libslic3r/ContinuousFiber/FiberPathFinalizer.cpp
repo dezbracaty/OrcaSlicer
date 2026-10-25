@@ -336,7 +336,7 @@ struct FiberSpeedPlanner {
     }
 };
 
-void plan_edges(PreparedFiberPath& prepared, const Polyline3& depositing, const ContinuousFiberConfig& config,
+void plan_edges(FiberPathDraft& prepared, const Polyline3& depositing, const ContinuousFiberConfig& config,
                 const std::vector<ContourArc>& arcs,
                 const std::vector<FiberExecutionPiece>& pieces,
                 const Polyline3& finish, const std::vector<FiberExecutionPiece>& finish_pieces)
@@ -483,7 +483,7 @@ bool split_process_span(const Polyline3& source,double distance,Polyline3& befor
 // Finish is a tool motion after the depositing tail, not another material path.
 // Its machine-space limits are checked at execution binding, never against the
 // deposition domain (or its contour keepouts) and never using fiber line width.
-void append_finish(PreparedFiberPath& prepared, const FiberFinishRoute& finish)
+void append_finish(FiberPathDraft& prepared, const FiberFinishRoute& finish)
 {
     if (finish.geometry.empty()) return;
     prepared.finish_strategy = finish.strategy;
@@ -637,10 +637,10 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         return result;
     }
 
-    auto prepared = std::make_shared<PreparedFiberPath>();
+    auto prepared = std::make_unique<FiberPathDraft>();
     prepared->id = id;
     prepared->execution_deviation_mm=4*ContourRoundingOptions{}.chord_tolerance_mm+8*std::sqrt(2.)*SCALING_FACTOR;
-    prepared->policy_boundary = config.policy_boundary;
+    prepared->policy_boundary = config.policy_boundary ? std::make_shared<const FiberPolicyBoundary>(*config.policy_boundary) : nullptr;
     prepared->allowed_domain = allowed_domain;
     prepared->outside_tolerance_mm2 = config.outside_tolerance_mm2;
     prepared->geometric_mm3_per_mm = candidate.mm3_per_mm;
@@ -829,39 +829,29 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         passive_primitives+=span.edges.size();
     prepared->passive_length_error_mm=std::min(ContourRoundingOptions{}.geometry_tolerance_mm,
         4*std::sqrt(2.)*SCALING_FACTOR*std::max(size_t(1),passive_primitives));
-    Polygons physical;
-    Polygons keepout;
-    {
-        // All fiber uses the circular material envelope used to construct its
-        // centerline domain, including infill without explicit return arcs.
-        // Process boundaries do not introduce physical end caps in a continuous
-        // strand. Sweep connected deposition once, including the cyclic seam.
-        Polyline depositing;
-        if (prepared->entry.lowers() && prepared->entry.end_station_mm>0)
-            depositing=Geometry::sample_with_arcs(prepared->entry.geometry,ContourRoundingOptions{}.chord_tolerance_mm).to_polyline();
-        const auto flush = [&] {
-            const double physical_radius = 0.5 * candidate.width;
-            const double keepout_radius = physical_radius + config.contour_infill_clearance_mm;
-            auto footprint = to_polygons(fiber_contour_coverage(depositing, physical_radius));
-            if (contour) append(keepout, keepout_radius == physical_radius ? footprint :
-                to_polygons(fiber_contour_coverage(depositing, keepout_radius)));
-            append(physical, std::move(footprint));
-            depositing.points.clear();
-        };
-        for (const auto& span : prepared->spans) if (span.deposits_fiber()) {
-            const auto points = Geometry::sample_with_arcs(span.geometry,ContourRoundingOptions{}.chord_tolerance_mm).to_polyline().points;
-            if (points.empty()) continue;
-            if (!depositing.points.empty() && depositing.points.back() != points.front()) flush();
-            depositing.points.insert(depositing.points.end(),
-                points.begin() + (depositing.points.empty() ? 0 : 1), points.end());
-        }
-        flush();
-    }
-
-    prepared->physical_coverage = union_ex(physical);
-    prepared->possible_coverage=fiber_material_offset(prepared->physical_coverage,prepared->execution_deviation_mm);
-    prepared->guaranteed_coverage=fiber_material_offset(prepared->physical_coverage,-prepared->execution_deviation_mm);
-    prepared->uncertain_coverage=diff_ex(prepared->possible_coverage,prepared->guaranteed_coverage);
+    prepared->geometry_context=config.geometry_context;
+    Polyline reference;
+    const auto append_reference=[&](const Polyline3& route,double tolerance,size_t group) {
+        const auto points=Geometry::sample_with_arcs(route,tolerance).to_polyline().points;
+        for(const auto& point:points)
+            if(reference.points.empty() || reference.points.back()!=point)reference.points.push_back(point);
+        if(!reference.points.empty())prepared->reference_groups.emplace_back(reference.points.size()-1,group);
+    };
+    if(prepared->entry.lowers())append_reference(prepared->entry.geometry,ContourRoundingOptions{}.chord_tolerance_mm,0);
+    for(size_t i=0;i<prepared->spans.size();++i)if(prepared->spans[i].deposits_fiber())
+        append_reference(prepared->spans[i].geometry,fiber_reference_chord_tolerance(*prepared,prepared->spans[i]),i+1);
+    prepared->reference_deposition=std::make_shared<const Polyline>(std::move(reference));
+    // Display/source occupancy uses the original chord schedule. The material
+    // contract below uses the frozen execution reference and its own bounds;
+    // do not send the denser passive representation through a second offset.
+    Polyline3 display;
+    if(prepared->entry.lowers())display=prepared->entry.geometry;
+    for(const auto& span:prepared->spans)if(span.deposits_fiber())Geometry::append_with_arcs(display,span.geometry);
+    const auto display_line=Geometry::sample_with_arcs(display,ContourRoundingOptions{}.chord_tolerance_mm).to_polyline();
+    prepared->physical_coverage=fiber_contour_coverage(display_line,0.5*candidate.width);
+    auto bounds=fiber_geometry_coverage_bounds(*prepared);
+    prepared->guaranteed_components=std::move(bounds.first);
+    prepared->possible_coverage=std::move(bounds.second);
     // Material uncertainty stays inside the existing geometry-normalization
     // contract; it is recorded explicitly in the coverage ledger below.
     if(prepared->execution_deviation_mm>normalization_error_mm)
@@ -890,9 +880,28 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     // Keep the existing field as the material-allocation result, not a second
     // (overlap-reduced) representation of strand width.
     prepared->resin_exclusion = intersection_ex(prepared->possible_coverage, allowed_domain);
-    if (contour)
-        prepared->contour_to_infill_keepout = intersection_ex(fiber_material_offset(union_ex(keepout),prepared->execution_deviation_mm), allowed_domain, ApplySafetyOffset::Yes);
-    result.prepared = std::move(prepared);
+    ExPolygons contour_occupancy,contour_keepout;
+    const bool same_contour_envelope=config.contour_infill_clearance_mm==0;
+    for(const auto& run:fiber_geometry_contour_runs(*prepared)) {
+        append(contour_occupancy,fiber_contour_coverage(run,0.5*candidate.width));
+        if(!same_contour_envelope)
+            append(contour_keepout,fiber_contour_coverage(run,0.5*candidate.width+config.contour_infill_clearance_mm));
+    }
+    const ExPolygons contour_envelope=fiber_material_offset(union_ex(contour_occupancy),prepared->execution_deviation_mm);
+    prepared->contour_resin_exclusion=intersection_ex(contour_envelope,prepared->resin_exclusion);
+    // The two final clips have different domains/safety policies. Only their
+    // identical pre-clip envelope can be shared when no clearance was requested.
+    if(same_contour_envelope)
+        prepared->contour_to_infill_keepout=intersection_ex(contour_envelope,allowed_domain,ApplySafetyOffset::Yes);
+    else
+        prepared->contour_to_infill_keepout=intersection_ex(
+            fiber_material_offset(union_ex(contour_keepout),prepared->execution_deviation_mm),
+            allowed_domain,ApplySafetyOffset::Yes);
+    Polyline3 legacy;
+    if(prepared->entry.lowers())legacy=prepared->entry.geometry;
+    for(const auto& span:prepared->spans)Geometry::append_with_arcs(legacy,span.geometry);
+    prepared->expected_legacy_view=std::make_shared<const Polyline3>(Geometry::sample_with_arcs(legacy,0.00005));
+    result.prepared = std::shared_ptr<const PreparedFiberPath>(new PreparedFiberPath(std::move(*prepared)));
     return result;
 }
 
