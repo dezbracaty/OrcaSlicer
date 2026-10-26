@@ -3959,7 +3959,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         const bool xy = delta_pos[X] != 0 || delta_pos[Y] != 0;
         if (delta_pos[E] != 0 && phase != FiberProcessPhase::Powered && phase != FiberProcessPhase::Prefeed)
             throw std::runtime_error("E motion outside owned Fiber feed phase");
-        if (delta_pos[E] < 0 || (phase == FiberProcessPhase::Powered && xy && delta_pos[E] <= 0))
+        if (delta_pos[E] < 0)
             throw std::runtime_error("Invalid active Fiber E motion");
         if (phase == FiberProcessPhase::Prefeed && (xy || delta_pos[Z] != 0))
             throw std::runtime_error("Fiber prefeed must be extrusion-only");
