@@ -1,0 +1,11 @@
+{
+  "revision": "71c30dd1feb73efa40d824ee1e4be05fce7b0827",
+  "path": "src/slic3r/GUI/Plater.cpp",
+  "start": "void Plater::calib_pa(",
+  "end_exclusive": "BuildVolume_Type Plater::get_build_volume_type()",
+  "sha256_normalized_body": "556511661b977cc81de24d76c92e24f3b8fd874e8354fa5b94d5cbe3a24edc44",
+  "algorithms": {
+    "src/libslic3r/calib.cpp": "5641af041e7a0fcb850ced44a5bc83b717acccfd0ba2573f675d4574bd1aebf8",
+    "src/libslic3r/calib.hpp": "aeabf47f9cb3331d605151691341ab3bdc3b78c3e97cfd7834a55abe7d33794e"
+  }
+}

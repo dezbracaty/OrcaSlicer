@@ -20,9 +20,18 @@ set_property(TARGET libslicer_api_tests PROPERTY FOLDER "tests")
 orcaslicer_copy_test_dlls(libslicer_api_tests)
 orcaslicer_discover_tests(libslicer_api_tests)
 
+add_executable(orca_plater_tests test_orca_plater.cpp test_orca_scene.cpp ../../src/libslicer_api/Plater.cpp)
+target_link_libraries(orca_plater_tests PRIVATE libslicer::libslicer libslic3r Catch2::Catch2WithMain)
+target_include_directories(orca_plater_tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
+target_compile_definitions(orca_plater_tests PRIVATE LIBSLICER_TEST_RESOURCE_DIR="${CMAKE_SOURCE_DIR}/resources")
+orcaslicer_copy_test_dlls(orca_plater_tests)
+orcaslicer_discover_tests(orca_plater_tests)
+
 # Standard-library-only regressions for the independent entry comparison tool.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME OrcaPlaterSource COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/check_plater_source.py")
     add_test(NAME FiberEntryComparisonChecker COMMAND "${Python3_EXECUTABLE}" -m unittest discover
         -s "${CMAKE_CURRENT_SOURCE_DIR}" -p test_compare_legacy_landing.py)
     set_tests_properties(FiberEntryComparisonChecker PROPERTIES LABELS "fiber_entry_comparison" TIMEOUT 20)

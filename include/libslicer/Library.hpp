@@ -16,6 +16,12 @@
 
 namespace libslicer {
 
+class CalibrationTask;
+enum class CalibMode;
+struct CalibrationRequest;
+struct CalibrationPrepareResult;
+struct CalibrationOutputOptions;
+
 LIBSLICER_API const char* version() noexcept;
 
 struct PrintableAreaPoint
@@ -515,6 +521,13 @@ public:
     SettingsResult set_active_filament_color(std::size_t slot_index, Rgba8 color);
     std::vector<ConfigDiagnostic> validate_active_config() const;
     SliceResult slice(const SliceRequest& request, const SliceCallbacks& callbacks = {}) const;
+    // Manual calibration mirrors the original calib_dlg -> Plater entries.
+    // Include Calibration.hpp for request, task and output definitions.
+    std::vector<CalibMode> calibration_modes() const;
+    CalibrationPrepareResult prepare_calibration(const CalibrationRequest& request,
+        const SliceCallbacks& callbacks = {}) const;
+    SliceResult slice_calibration(const CalibrationTask& task, std::size_t plate_index,
+        const CalibrationOutputOptions& output, const SliceCallbacks& callbacks = {}) const;
     GCodePreviewResult load_gcode_preview(const GCodePreviewRequest& request,
                                           const SliceCallbacks& callbacks = {}) const;
     ProjectImportResult import_project(const ProjectImportRequest& request,
@@ -522,6 +535,8 @@ public:
 
 private:
     Library();
+    SliceResult slice_impl(const SliceRequest& request, const SliceCallbacks& callbacks,
+        const CalibrationTask* calibration, std::size_t plate_index) const;
 
     class Impl;
     std::unique_ptr<Impl> impl_;

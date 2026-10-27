@@ -1,6 +1,7 @@
 #include <nanosvg/nanosvg.h>
 
 #include <libslicer/Library.hpp>
+#include "OrcaCalibrationInternal.hpp"
 
 #include <libslic3r/PresetBundle.hpp>
 #include <libslic3r/Model.hpp>
@@ -3118,6 +3119,119 @@ std::vector<ConfigDiagnostic> Library::validate_active_config() const
 
 SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& callbacks) const
 {
+    return slice_impl(request, callbacks, nullptr, 0);
+}
+
+std::vector<CalibMode> Library::calibration_modes() const
+{
+    return {libslicer::CalibMode::Calib_PA_Line,
+            libslicer::CalibMode::Calib_PA_Pattern,
+            libslicer::CalibMode::Calib_PA_Tower,
+            libslicer::CalibMode::Calib_Flow_Rate,
+            libslicer::CalibMode::Calib_Temp_Tower,
+            libslicer::CalibMode::Calib_Vol_speed_Tower,
+            libslicer::CalibMode::Calib_VFA_Tower,
+            libslicer::CalibMode::Calib_Retraction_tower,
+            libslicer::CalibMode::Calib_Input_shaping_freq,
+            libslicer::CalibMode::Calib_Input_shaping_damp,
+            libslicer::CalibMode::Calib_Cornering,
+            libslicer::CalibMode::Calib_Tolerance_Model};
+}
+
+CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& request, const SliceCallbacks& callbacks) const
+{
+    CalibrationPrepareResult result;
+    try {
+        if (!request.config.valid())
+            throw std::invalid_argument("Calibration has no configuration");
+        if (cancellation_requested(callbacks)) {
+            result.cancelled = true;
+            return result;
+        }
+        auto config = dynamic_config(request.config);
+        Slic3r::set_resources_dir(impl_->resource_directory);
+        const auto params                = orca::dialog_parameters(request, config);
+        const Slic3r::PresetBundle* seed = nullptr;
+        const auto model                 = config.opt_string("printer_model");
+        for (const auto& candidate : impl_->vendor_presets)
+            for (const auto& vendor : candidate->vendors)
+                if (std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
+                                [&](const auto& item) { return item.id == model; }))
+                    seed = candidate.get();
+        auto task      = std::unique_ptr<CalibrationTask>(new CalibrationTask());
+        auto& native   = *task->impl_;
+        native.request = request;
+        native.host    = std::make_unique<orca::Plater>(config, seed);
+        report_progress(callbacks, 0.1f, "Running original Plater calibration");
+        if (request.mode == libslicer::CalibMode::Calib_Flow_Rate)
+            native.host->prepare_flow(request.flow_linear, request.flow_pass,
+                                      request.flow_pattern == CalibrationRequest::FlowPattern::ArchimedeanChords ?
+                                          Slic3r::ipArchimedeanChords :
+                                          Slic3r::ipMonotonic);
+        else if (request.mode == libslicer::CalibMode::Calib_Tolerance_Model)
+            native.host->prepare_tolerance();
+        else
+            native.host->prepare(params);
+        for (const auto& message : native.host->notifications())
+            result.diagnostics.push_back({"calibration_info", message, true});
+        if (request.mode == libslicer::CalibMode::Calib_Cornering) {
+            const auto* jd    = config.option<Slic3r::ConfigOptionFloats>("machine_max_junction_deviation");
+            const bool use_jd = config.option<Slic3r::ConfigOptionEnum<Slic3r::GCodeFlavor>>("gcode_flavor")->value ==
+                                    Slic3r::gcfMarlinFirmware &&
+                                jd && !jd->values.empty() && jd->values.front() > 0;
+            if (request.end > (use_jd ? .25 : 20.))
+                result.diagnostics.push_back({"calibration_warning", "High cornering values may cause layer shifts", true});
+        }
+        native.params   = native.host->print_params();
+        const auto full = native.host->full_config();
+        std::vector<std::pair<std::string, std::string>> values;
+        for (const auto& key : full.keys())
+            values.emplace_back(key, full.option(key)->serialize());
+        const auto snapshot = Config(std::move(values)).snapshot();
+        for (std::size_t i = 0; i < native.host->plate_count(); ++i) {
+            if (cancellation_requested(callbacks)) {
+                result.cancelled = true;
+                return result;
+            }
+            native.models.push_back(native.host->plate_model(i));
+            auto plate   = orca::describe_plate(native.models.back(), i);
+            plate.config = snapshot;
+            native.plates.push_back(std::move(plate));
+        }
+        report_progress(callbacks, 1.f, "Original Plater preparation complete");
+        result.task    = std::move(task);
+        result.success = true;
+    } catch (const std::exception& error) {
+        result.diagnostics.push_back({"calibration", error.what(), false});
+    }
+    return result;
+}
+
+SliceResult Library::slice_calibration(const CalibrationTask& task,
+                                       std::size_t plate_index,
+                                       const CalibrationOutputOptions& output,
+                                       const SliceCallbacks& callbacks) const
+{
+    if (plate_index >= task.impl_->plates.size()) {
+        SliceResult result;
+        result.diagnostics.push_back({"plate", "Calibration plate index is outside the task", false});
+        return result;
+    }
+    SliceRequest request;
+    request.config                = task.impl_->plates[plate_index].config;
+    request.center_on_build_plate = false;
+    request.output_gcode_path     = output.output_gcode_path;
+    request.generate_preview      = output.generate_preview;
+    request.generate_gcode_3mf    = output.generate_gcode_3mf;
+    request.output_gcode_3mf_path = output.output_gcode_3mf_path;
+    return slice_impl(request, callbacks, &task, plate_index);
+}
+
+SliceResult Library::slice_impl(const SliceRequest& request,
+                                const SliceCallbacks& callbacks,
+                                const CalibrationTask* calibration,
+                                std::size_t plate_index) const
+{
     SliceResult result;
     std::vector<std::string> generated_temporary_paths;
     const auto discard_generated_temporary = [&generated_temporary_paths]() {
@@ -3128,7 +3242,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         generated_temporary_paths.clear();
     };
     try {
-        if (request.objects.empty()) {
+        if (request.objects.empty() && calibration == nullptr) {
             result.diagnostics.push_back({"input", "Slice request contains no models", false});
             return result;
         }
@@ -3136,8 +3250,12 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             result.diagnostics.push_back({"config", "Slice request has no initialized configuration", false});
             return result;
         }
-        Slic3r::DynamicPrintConfig config = dynamic_config(request.config);
-        normalize_filament_identity(config);
+        // Keep the original native values: serializing a float-derived layer
+        // height and parsing it back can move a layer across a calibration
+        // boundary (for example floor(z - 0.4) in the retraction tower).
+        Slic3r::DynamicPrintConfig config = calibration
+            ? calibration->impl_->host->full_config() : dynamic_config(request.config);
+        if (!calibration) normalize_filament_identity(config);
         Slic3r::validate_material_tool_bindings(tool_config(config));
         const auto filament_diagnostics = slice_filament_diagnostics(config);
         if (!filament_diagnostics.empty()) {
@@ -3156,6 +3274,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
 
         report_progress(callbacks, 0.02f, "Loading models");
         Slic3r::Model plate_model;
+        if (calibration) plate_model=calibration->impl_->models[plate_index];
         std::set<size_t> mask_volume_ids;
         for (const SliceObjectInput& input : request.objects) {
             const bool has_file_input = !input.model_path.empty();
@@ -3381,6 +3500,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
         const auto* printer_model = config.option<Slic3r::ConfigOptionString>("printer_model");
         print.is_BBL_printer() = printer_model != nullptr &&
             printer_model->value.rfind("Bambu Lab", 0) == 0;
+        if (calibration) print.is_BBL_printer()=calibration->impl_->host->presets().is_bbl_vendor();
         print.set_status_callback([&](const Slic3r::PrintBase::SlicingStatus& status) {
             if (cancellation_requested(callbacks)) {
                 print.cancel();
@@ -3389,6 +3509,7 @@ SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& ca
             report_progress(callbacks, 0.08f + engine_progress * 0.78f, status.text);
         });
         print.apply(plate_model, config);
+        if (calibration) print.set_calib_params(calibration->impl_->params);
         validate_effective_mask_regions(print, mask_volume_ids);
 
         Slic3r::StringObjectException warning;
