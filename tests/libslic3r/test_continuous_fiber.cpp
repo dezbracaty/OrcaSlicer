@@ -16,6 +16,7 @@
 #include "libslic3r/GCode/FanMover.hpp"
 
 #include <set>
+#include <cstdlib>
 #include <map>
 #include <limits>
 #include <random>
@@ -7687,4 +7688,186 @@ TEST_CASE("empty coverage statistics distinguish unmeasured from measured zero",
     REQUIRE(detailed.partition_statistics);
     CHECK(detailed.partition_statistics->guaranteed_fiber_area_mm2==0);
     CHECK(detailed.partition_statistics->uncertain_fiber_area_mm2==0);
+}
+
+namespace {
+// Compiler-only fixture: no sealed source or material/connection proof is edited.
+FiberPathDraft zero_e_draft(const std::vector<std::vector<Point3>>& routes,double prefeed=23.5)
+{
+    FiberPathDraft draft;draft.id=test_id();draft.logical_filament_id=0;
+    draft.allowed_domain={rectangle(-2,-2,20,20)};draft.width_mm=.8f;draft.height_mm=.2f;
+    draft.geometric_mm3_per_mm=.1;draft.execution_deviation_mm=.0002;
+    draft.start_procedure.prefeed_length_mm=prefeed;
+    draft.start_procedure.prefeed_speed_mm_s=prefeed>0?10:0;
+    draft.start_procedure.start_speed_mm_s=10;
+    draft.entry.mode=FiberEntryMode::PoweredFirstEdge;
+    draft.entry.start=draft.entry.contact=routes.front().front();
+    draft.entry.geometry.points={draft.entry.start};
+    for(size_t si=0;si<routes.size();++si) {
+        FiberMotionSpan span;span.kind=routes.size()>1 && si==0?FiberMotionKind::PoweredStart:FiberMotionKind::PoweredDepositing;
+        span.geometry.points.assign(routes[si].begin(),routes[si].end());
+        for(size_t i=1;i<span.geometry.points.size();++i) {
+            span.geometry.fitting_result.push_back({i-1,i,EMovePathType::Linear_move,{}});
+            span.edges.push_back({10,1});
+        }
+        draft.spans.push_back(std::move(span));
+    }
+    draft.finalize_actions();return draft;
+}
+std::string zero_e_begin(double units=1)
+{
+    std::ostringstream text;text<<std::setprecision(17)
+        <<";FIBER_BEGIN v=3 occurrence=1 purpose=infill width=0.8 height=0.2 e_units_per_mm="<<units
+        <<"\n;FIBER_START\n";return text.str();
+}
+std::string zero_e_end()
+{
+    return ";FIBER_CUT\n;FIBER_TAIL_BEGIN\nG1 X3 Y0 F600\n;FIBER_DEPLETED\n"
+           ";FIBER_FINISH_BEGIN\n;FIBER_FINISH\n;FIBER_END\n";
+}
+}
+
+TEST_CASE("fiber cumulative feed preserves an internal nanometre motion", "[ContinuousFiber][ZeroE]")
+{
+    auto draft=zero_e_draft({{Point3(0,0,0),Point3(1000000,0,0),Point3(1000003,1,0),Point3(2000003,1,0)}});
+    REQUIRE_NOTHROW(draft.validate());const auto original=draft.spans.front().geometry.points;
+    auto context=fiber_fixture_context();const auto execution=compile_fiber_execution(draft,*context,context->placements.front(),0);
+    REQUIRE(execution.spans().size()==1);const auto& commands=execution.spans().front().commands;
+    REQUIRE(commands.size()==3);CHECK(commands[0].dE>0);CHECK(commands[1].dE==0);CHECK(commands[2].dE>0);
+    CHECK(commands[1].source_primitive==1);CHECK(commands[1].speed_mm_s==10);
+    const Vec3d expected(1.000003,.000001,0);
+    CHECK((execution.machine_target(commands[1].target)-expected).norm()<1e-12);
+    CHECK(commands[1].station_mm>commands[0].station_mm);
+    CHECK(draft.spans.front().geometry.points==original);
+    CHECK(execution.spans().front().kind==FiberMotionKind::PoweredDepositing);
+    CHECK((expected-execution.machine_target(commands[0].target)).norm()==Catch::Approx(std::sqrt(10.)*1e-6).margin(1e-12));
+}
+
+TEST_CASE("fiber cumulative feed retains consecutive zeros and a zero before CUT", "[ContinuousFiber][ZeroE]")
+{
+    const int scenario=GENERATE(0,1,2);CAPTURE(scenario);
+    const Point3 origin(0,0,0),one(1000000,0,0);
+    std::vector<std::vector<Point3>> routes;
+    if(scenario==0)routes={{origin,one,Point3(1000002,0,0),Point3(1000004,0,0),Point3(1000006,0,0),Point3(2000006,0,0)}};
+    else if(scenario==1)routes={{origin,one,Point3(1000002,0,0)}};
+    else routes={{origin,Point3(2,0,0)},{Point3(2,0,0),one,Point3(1000002,0,0)}};
+    auto draft=zero_e_draft(routes);REQUIRE_NOTHROW(draft.validate());auto context=fiber_fixture_context();
+    const auto execution=compile_fiber_execution(draft,*context,context->placements.front(),0);
+    double ideal=draft.start_procedure.prefeed_length_mm,emitted=execution.prefeed_dE;size_t zeros=0,positive=0;
+    for(size_t si=0;si<routes.size();++si) {
+        const auto& span=execution.spans()[si];REQUIRE(span.commands.size()+1==routes[si].size());
+        Vec3d from=execution.machine_target(span.from);
+        for(size_t i=0;i<span.commands.size();++i) {
+            const auto& command=span.commands[i];const auto to=execution.machine_target(command.target);
+            const Vec3d expected=routes[si][i+1].cast<double>()*SCALING_FACTOR;
+            CHECK((to-expected).norm()<1e-12);CHECK(command.source_primitive==i);CHECK(command.dE>=0);
+            ideal+=(to-from).norm();emitted+=command.dE;
+            CHECK(std::abs(emitted-ideal)<=.000005+1e-10);
+            if(command.dE==0)++zeros;else ++positive;
+            from=to;
+        }
+    }
+    CHECK(positive>0);CHECK(zeros>=size_t(scenario==1?1:2));
+    CHECK(std::abs((emitted-execution.prefeed_dE)-(ideal-draft.start_procedure.prefeed_length_mm))<=.00001+1e-10);
+    if(scenario==0) {
+        const auto& c=execution.spans().front().commands;CHECK(c[1].dE==0);CHECK(c[2].dE==0);CHECK(c[3].dE>0);
+    } else {
+        CHECK(execution.spans().back().commands.back().dE==0);
+        if(scenario==2)CHECK(execution.spans().front().commands.front().dE==0);
+    }
+    const auto next_path=compile_fiber_execution(draft,*context,context->placements.front(),0);
+    for(size_t si=0;si<execution.spans().size();++si)
+        for(size_t i=0;i<execution.spans()[si].commands.size();++i)
+            CHECK(next_path.spans()[si].commands[i].dE==execution.spans()[si].commands[i].dE);
+}
+
+TEST_CASE("fiber compilation rejects an entirely unrepresentable powered feed", "[ContinuousFiber][ZeroE]")
+{
+    const double prefeed=GENERATE(0.,23.5);CAPTURE(prefeed);
+    auto draft=zero_e_draft({{Point3(0,0,0),Point3(2,0,0)}},prefeed);REQUIRE_NOTHROW(draft.validate());
+    auto context=fiber_fixture_context();
+    try {compile_fiber_execution(draft,*context,context->placements.front(),0);FAIL("Entire Powered feed quantized to zero was accepted");}
+    catch(const FiberExecutionError& error){CHECK(error.failure==FiberExecutionFailure::Feed);}
+    // The existing tiny-units geometry-finalization negative case remains intact.
+    draft=zero_e_draft({{Point3(0,0,0),Point3(1000000,0,0)}},0);
+    context->config.toolhead_fiber_e_units_per_mm.values.assign(8,1e-9);
+    try {compile_fiber_execution(draft,*context,context->placements.front(),0);FAIL("Tiny machine E units were accepted");}
+    catch(const FiberExecutionError& error){CHECK(error.failure==FiberExecutionFailure::Feed);}
+}
+
+TEST_CASE("fiber compiler rejects nonfinite quantized E", "[ContinuousFiber][ZeroE]")
+{
+    auto draft=zero_e_draft({{Point3(0,0,0),Point3(10000,0,0)}},0);REQUIRE_NOTHROW(draft.validate());
+    auto context=fiber_fixture_context();context->config.toolhead_fiber_e_units_per_mm.values.assign(8,1e308);
+    // ideal E is finite, but the formatter's multiplication by 1e5 overflows.
+    try {compile_fiber_execution(draft,*context,context->placements.front(),0);FAIL("Nonfinite formatter output was accepted");}
+    catch(const FiberExecutionError& error){CHECK(error.failure==FiberExecutionFailure::Feed);}
+}
+
+TEST_CASE("fiber zero-feed text retains motion in absolute and relative E modes", "[ContinuousFiber][ZeroE][preview]")
+{
+    const bool relative=GENERATE(false,true);const bool streaming=GENERATE(false,true);
+    const double base=GENERATE(0.,75000.,75000.000001);CAPTURE(relative,streaming,base);
+    auto draft=zero_e_draft({{Point3(0,0,0),Point3(1000000,0,0),Point3(1010000,0,0),Point3(2010000,0,0)}},0);
+    REQUIRE_NOTHROW(draft.validate());auto context=fiber_fixture_context();const double units=.0001;
+    context->config.toolhead_fiber_e_units_per_mm.values.assign(8,units);
+    const auto execution=compile_fiber_execution(draft,*context,context->placements.front(),.2);
+    const auto& commands=execution.spans().front().commands;REQUIRE(commands.size()==3);REQUIRE(commands[1].dE==0);
+    PrintConfig config;config.gcode_flavor.value=gcfKlipper;config.use_relative_e_distances.value=relative;
+    GCodeWriter writer;writer.apply_print_config(config);writer.set_extruders({0});writer.toolchange(0);
+    const GCodeWriter::ScopedXYZPrecision precision(writer,6);writer.set_position(Vec3d(0,0,.2));writer.filament()->extrude(base);
+    std::ostringstream prefix;prefix<<std::setprecision(17)<<"G90\n"<<(relative?"M83\n":"M82\n")<<"G92 E"<<base<<"\nG1 X0 Y0 Z0.2 F600\n";
+    std::string text=prefix.str()+zero_e_begin(units);double frozen_total=0;
+    for(size_t i=0;i<commands.size();++i) {
+        const auto& command=commands[i];const auto target=execution.machine_target(command.target);
+        const auto row=writer.emit_frozen_fiber_motion(target,command.dE,command.speed_mm_s);
+        const std::regex eword(R"((?:^| )E[-+0-9.]+)");CHECK(std::regex_search(row,eword)==(command.dE>0));
+        if(i==1) {const std::regex xword(R"(X([-+0-9.]+))");std::smatch match;REQUIRE(std::regex_search(row,match,xword));CHECK(std::stod(match[1].str())==Catch::Approx(1.01).margin(1e-12));}
+        text+=row;frozen_total+=command.dE;
+    }
+    text+=zero_e_end();
+    if(!streaming)if(const auto* directory=std::getenv("GPLATFORM_ZERO_E_TEST_OUTPUT")) {
+        std::filesystem::create_directories(directory);std::ofstream file(std::filesystem::path(directory)/
+            (std::string(relative?"M83-":"M82-")+std::to_string(base)+".gcode"));file<<text;
+    }
+    GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+    if(streaming) {std::istringstream input(text);std::string row;while(std::getline(input,row))processor.process_buffer(row+"\n");}
+    else processor.process_buffer(text);
+    CHECK_NOTHROW(processor.finalize(false));size_t zero_powered=0,positive_powered=0;double readback_feed=0;
+    for(const auto& move:processor.get_result().moves)if(move.deposition==ToolpathDeposition::ContinuousFiberPowered) {
+        readback_feed+=move.fiber_feed_delta_mm;
+        if(move.fiber_feed_delta_mm==0) {++zero_powered;CHECK(move.type==EMoveType::Travel);CHECK(move.position.x()==Catch::Approx(1.01).margin(1e-6));}
+        else ++positive_powered;
+    }
+    CHECK(zero_powered==1);CHECK(positive_powered==2);
+    // This includes the existing M82 non-grid-origin text rounding, not a new local-half-q claim.
+    const double expected_text_e=relative?frozen_total:std::round((base+frozen_total)*1e5)*1e-5-base;
+    CHECK(readback_feed*units==Catch::Approx(expected_text_e).margin(1e-9));
+    if(relative || base==0)CHECK(readback_feed*units==Catch::Approx(frozen_total).margin(1e-10));
+}
+
+TEST_CASE("fiber zero-feed parsing retains phase ownership and ordinary separation", "[ContinuousFiber][ZeroE][preview]")
+{
+    const int invalid=GENERATE(0,1,2);const bool streaming=GENERATE(false,true);CAPTURE(invalid,streaming);
+    const std::string prefix="G90\nM83\nG1 X0 Y0 Z0.2 F600\n";
+    std::string text;
+    if(invalid==0)text=prefix+zero_e_begin()+"G1 X1 E-0.1 F600\n"+zero_e_end();
+    else if(invalid==1)text=prefix+
+        ";FIBER_BEGIN v=3 occurrence=1 purpose=infill width=0.8 height=0.2 e_units_per_mm=1\n"
+        ";FIBER_PREFEED_BEGIN\nG1 X1 E1 F600\n";
+    else text=prefix+zero_e_begin()+"G1 X1 E1 F600\n;FIBER_CUT\nG1 X2 E0.1 F600\n";
+    PrintConfig config;config.gcode_flavor.value=gcfKlipper;GCodeProcessor processor;processor.apply_config(config);processor.initialize_result_moves();
+    const auto process=[&](const std::string& input) {
+        if(streaming){std::istringstream rows(input);std::string row;while(std::getline(rows,row))processor.process_buffer(row+"\n");}
+        else processor.process_buffer(input);
+    };
+    CHECK_THROWS_AS(process(text),std::runtime_error);
+    // Import interprets owned phases; it does not certify an unknown source's feed ratio or total.
+    GCodeProcessor imported;imported.apply_config(config);imported.initialize_result_moves();
+    CHECK_NOTHROW(imported.process_buffer(prefix+zero_e_begin()+"G1 X1 F600\n"+zero_e_end()));
+    CHECK_NOTHROW(imported.finalize(false));
+    REQUIRE(std::any_of(imported.get_result().moves.begin(),imported.get_result().moves.end(),[](const auto& move){return move.deposition==ToolpathDeposition::ContinuousFiberPowered && move.fiber_feed_delta_mm==0;}));
+    GCodeProcessor ordinary;ordinary.apply_config(config);ordinary.initialize_result_moves();
+    CHECK_NOTHROW(ordinary.process_buffer(prefix+"G1 X1 F600\n"));
+    CHECK(std::none_of(ordinary.get_result().moves.begin(),ordinary.get_result().moves.end(),[](const auto& move){return move.deposition==ToolpathDeposition::ContinuousFiberPowered;}));
 }

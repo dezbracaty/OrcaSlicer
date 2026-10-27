@@ -486,6 +486,7 @@ static FrozenFiberExecution compile_fiber_execution_impl(const FiberPathDraft& p
         (ideal_e>0 && ideal_e<0.00001))throw FiberExecutionError("Fiber prefeed conversion overflow",FiberExecutionFailure::Feed);
     result.prefeed_dE=GCodeFormatter::quantize_e(ideal_e);
     double emitted_e=result.prefeed_dE,station=0;
+    bool has_powered_e=false;
     const auto check_limit=[](double value,const ConfigOptionFloats& option,const char* name) {
         if(!option.values.empty() && option.values.front()>0 && value>option.values.front()+EPSILON)
             throw FiberExecutionError(std::string("Prepared fiber exceeds ")+name,FiberExecutionFailure::Motion);
@@ -619,7 +620,9 @@ static FrozenFiberExecution compile_fiber_execution_impl(const FiberPathDraft& p
                         ideal_e+=length*source.edges[edge].feed_mm_per_xy_mm*tool.e_units_per_mm;
                         if(!std::isfinite(ideal_e))throw FiberExecutionError("Fiber E conversion overflow",FiberExecutionFailure::Feed);
                         const double next=GCodeFormatter::quantize_e(ideal_e);command.dE=next-emitted_e;
-                        if(command.dE<=0)throw FiberExecutionError("Quantized fiber E command is not representable",FiberExecutionFailure::Feed);
+                        if(!std::isfinite(next) || !std::isfinite(command.dE) || command.dE<0)
+                            throw FiberExecutionError("Quantized fiber E command is not representable",FiberExecutionFailure::Feed);
+                        has_powered_e |= command.dE>0;
                         emitted_e=next;
                     }
                     command.station_mm=station+length_sum;
@@ -639,6 +642,8 @@ static FrozenFiberExecution compile_fiber_execution_impl(const FiberPathDraft& p
             station+=length_sum;commands.spans.push_back(std::move(span));break;
         }
     }
+    if(!has_powered_e)
+        throw FiberExecutionError("Fiber powered feed is not representable",FiberExecutionFailure::Feed);
     result.entry_start=context.transform.quantized(input(prepared.entry.start,layer_z+prepared.start_procedure.z_hop_height_mm),6);
     if(prepared.entry.lowers()) {
         std::vector<double> stations;
