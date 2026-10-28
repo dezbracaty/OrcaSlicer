@@ -109,6 +109,39 @@ target_link_libraries(calibration_demo PRIVATE libslicer::libslicer)
 
 ### 方法
 
+参数表单规则也由库提供，调用方无需复制 `calib_dlg.cpp` 的数值或固件判断。以下三个函数不依赖 Qt、wxWidgets 或已打开的 `Library`，只使用调用方传入的配置快照；不会修改活动配置或准备模型。
+
+```cpp
+CalibrationParameters calibration_parameters(
+    CalibMode mode, const ConfigSnapshot& config,
+    const std::vector<std::pair<std::string, std::string>>& values = {});
+CalibrationParameters update_calibration_parameters(
+    CalibrationParameters parameters, std::string_view key,
+    std::string_view value, bool focus_out = false);
+CalibrationValidationResult validate_calibration_parameters(
+    const CalibrationParameters& parameters);
+```
+
+`CalibrationParameters.fields` 复用 `SettingItem`：`key/value/default_value` 为字段及文本值，`enum_items` 为可选值，`unit` 为单位，`visible/enabled/read_only` 表达当前模式与固件的字段状态。`label` 和选项标签为源语言文本，翻译与控件布局留给 App。字段包括 `extruder_type`（DDE/Bowden，与材料槽 `extruder_id` 无关）、`pa_method`、`flow_type`、`flow_pattern`、`filament_type`、`test_model`、`shaper_type`、起止值、步长、X/Y 频率、批量速度/加速度及 `print_numbers`。布尔值使用 `"0"/"1"`，枚举值使用 `enum_items.value`，其余数值在编辑阶段也保留文本，允许暂存空值或未完成输入。
+
+`calibration_parameters` 先建立原版默认值，再恢复可选的已保存字段；恢复过程不模拟单选框切换，不意外重置用户范围。`update_calibration_parameters` 执行一次明确的字段事件：PA 方法或 DDE/Bowden **发生变化**时按原版重置范围，材料温度快捷项发生变化时更新温度，RRF 的 Y 轴随 X。`can_refine` 表示当前流量首轮可继续对应精调，通过 `key="next_pass"` 进入下一轮。不支持的模式、无效配置和未知字段名抛出 `std::invalid_argument`；无效字段文本保留到预检时返回诊断。
+
+温度输入框失焦时传 `focus_out=true`：库按原版限制到 155–500 ℃，向下取到 5 ℃，超范围提示返回在 `CalibrationParameters.diagnostics` 中。普通编辑与原生 `prepare_calibration` **不会隐式执行失焦取整**，因此原 API 接受合法、非 5 整除的整数端点这一行为保持不变。
+
+预检返回 `CalibrationValidationResult`，成功时 `request` 可直接传给 `prepare_calibration`；失败或警告见 `diagnostics`。预检与任务准备共用同一 `dialog_parameters` 校验实现及转角警告条件，App 不重复维护校验。例：
+
+```cpp
+auto form = libslicer::calibration_parameters(
+    libslicer::CalibMode::Calib_PA_Tower, config.snapshot());
+form = libslicer::update_calibration_parameters(std::move(form), "pa_method", "1");
+form = libslicer::update_calibration_parameters(std::move(form), "end", "0.07");
+auto checked = libslicer::validate_calibration_parameters(form);
+if (checked) {
+    auto prepared = library->prepare_calibration(checked.request);
+    // 后续按已有逐盘切片接口处理。
+}
+```
+
 ```cpp
 std::vector<CalibMode> Library::calibration_modes() const;
 

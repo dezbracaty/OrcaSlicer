@@ -15,6 +15,7 @@ public:
 };
 namespace orca {
 Slic3r::Calib_Params dialog_parameters(const CalibrationRequest& request, const Slic3r::DynamicPrintConfig& config);
+std::vector<SliceDiagnostic> calibration_warnings(const CalibrationRequest& request, const Slic3r::DynamicPrintConfig& config);
 CalibrationPlate describe_plate(const Slic3r::Model& model, std::size_t index);
 } // namespace orca
 } // namespace libslicer

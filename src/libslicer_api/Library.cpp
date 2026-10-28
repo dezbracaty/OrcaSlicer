@@ -1443,6 +1443,11 @@ bool store_gcode_3mf(const std::string& output_path,
                      bool support_used,
                      Slic3r::ThumbnailData plate_thumbnail)
 {
+    // Plater's preset loader may retain one self-index for several material
+    // variants. Repair only the exported project metadata: the native task,
+    // Print configuration and generated calibration G-code must stay intact.
+    auto package_config = config;
+    normalize_filament_identity(package_config);
     Slic3r::PlateData plate;
     plate.plate_index = 0;
     for (std::size_t object_index = 0; object_index < model.objects.size(); ++object_index) {
@@ -1452,7 +1457,7 @@ bool store_gcode_3mf(const std::string& output_path,
                                                      static_cast<int>(instance_index));
         }
     }
-    plate.config.apply(config);
+    plate.config.apply(package_config);
     plate.printer_model_id = config.opt_serialize("printer_model");
     plate.nozzle_diameters = config.opt_serialize("nozzle_diameter");
     plate.gcode_file = gcode_path;
@@ -1479,7 +1484,7 @@ bool store_gcode_3mf(const std::string& output_path,
     params.model = &model;
     params.plate_data_list = {&plate};
     params.export_plate_idx = 0;
-    params.config = &config;
+    params.config = &package_config;
     params.thumbnail_data = {&plate.plate_thumbnail};
     params.strategy = Slic3r::SaveStrategy::Silence |
                       Slic3r::SaveStrategy::SplitModel |
@@ -3174,14 +3179,8 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
             native.host->prepare(params);
         for (const auto& message : native.host->notifications())
             result.diagnostics.push_back({"calibration_info", message, true});
-        if (request.mode == libslicer::CalibMode::Calib_Cornering) {
-            const auto* jd    = config.option<Slic3r::ConfigOptionFloats>("machine_max_junction_deviation");
-            const bool use_jd = config.option<Slic3r::ConfigOptionEnum<Slic3r::GCodeFlavor>>("gcode_flavor")->value ==
-                                    Slic3r::gcfMarlinFirmware &&
-                                jd && !jd->values.empty() && jd->values.front() > 0;
-            if (request.end > (use_jd ? .25 : 20.))
-                result.diagnostics.push_back({"calibration_warning", "High cornering values may cause layer shifts", true});
-        }
+        const auto warnings = orca::calibration_warnings(request, config);
+        result.diagnostics.insert(result.diagnostics.end(), warnings.begin(), warnings.end());
         native.params   = native.host->print_params();
         const auto full = native.host->full_config();
         std::vector<std::pair<std::string, std::string>> values;

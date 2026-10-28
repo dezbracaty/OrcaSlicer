@@ -45,6 +45,43 @@ struct CalibrationRequest
     FlowPattern flow_pattern{FlowPattern::ArchimedeanChords};
 };
 
+// GUI-independent state of the original calib_dlg.cpp parameter forms. Values
+// remain text while editing (including incomplete input). Existing SettingItem
+// describes choices, units, visibility and enabled state; labels are source
+// strings for the host's translation system. config is an immutable snapshot.
+struct CalibrationParameters
+{
+    ConfigSnapshot config;
+    CalibMode mode{CalibMode::Calib_None};
+    std::vector<SettingItem> fields;
+    std::vector<SliceDiagnostic> diagnostics;
+    bool can_refine{false};
+};
+struct CalibrationValidationResult
+{
+    bool success{false};
+    CalibrationRequest request;
+    std::vector<SliceDiagnostic> diagnostics;
+    explicit operator bool() const noexcept { return success; }
+};
+
+// Defaults and optional saved text values, without simulating edit events.
+// Throws invalid_argument for unsupported modes, unknown fields or config.
+LIBSLICER_API CalibrationParameters calibration_parameters(
+    CalibMode mode, const ConfigSnapshot& config,
+    const std::vector<std::pair<std::string, std::string>>& values = {});
+// Change one field, performing Orca's PA reset, material shortcut or RRF
+// linkage. focus_out applies only the original temperature kill-focus rule;
+// prepare_calibration never applies that rule implicitly. "next_pass" advances
+// an eligible flow form to its corresponding refinement pass.
+LIBSLICER_API CalibrationParameters update_calibration_parameters(
+    CalibrationParameters parameters, std::string_view key,
+    std::string_view value, bool focus_out = false);
+// Parses text and uses the same dialog_parameters validation as native task
+// preparation. Invalid user input is returned as diagnostics, not an exception.
+LIBSLICER_API CalibrationValidationResult validate_calibration_parameters(
+    const CalibrationParameters& parameters);
+
 struct CalibrationObject
 {
     SliceObjectInput geometry;
