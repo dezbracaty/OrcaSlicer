@@ -77,6 +77,149 @@ else()
 endif()
 
 message(STATUS "")
+
+# GMP 6.2.1's AArch64 assembly uses x18, which is reserved by the Apple ABI.
+# Keep other platforms unchanged. The C implementation is exact and ABI-safe.
+set(_GMP_APPLE_ARM64_NOASM FALSE)
+if(APPLE AND NOT _GMP_FROM_VENDORED)
+    if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
+       (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$"))
+        set(_GMP_APPLE_ARM64_NOASM TRUE)
+    endif()
+endif()
+set(_gmp_configure_extra)
+if(_GMP_APPLE_ARM64_NOASM)
+    set(_gmp_configure_extra --disable-assembly)
+    # A verified archive initializes a new immutable source attempt. Never trust
+    # the legacy shared src solely because configure happens to exist there.
+    if(NOT _GMP_SAFE_SOURCE_READY)
+        set(_gmp_source_root "${GMP_CACHE_DIR}/sources/gmp-${_GMP_SRC_VERSION}-${_GMP_SRC_SHA256}")
+        file(MAKE_DIRECTORY "${_gmp_source_root}")
+        file(LOCK "${_gmp_source_root}/initialize.lock" TIMEOUT 900)
+        set(_gmp_source_attempt 0)
+        while(TRUE)
+            set(_gmp_source_attempt_root "${_gmp_source_root}/attempt-${_gmp_source_attempt}")
+            if(NOT EXISTS "${_gmp_source_attempt_root}")
+                file(MAKE_DIRECTORY "${_gmp_source_attempt_root}")
+                set(_gmp_archive "${_gmp_source_root}/gmp-${_GMP_SRC_VERSION}.tar.bz2")
+                set(_gmp_archive_hash "")
+                if(EXISTS "${_gmp_archive}")
+                    file(SHA256 "${_gmp_archive}" _gmp_archive_hash)
+                endif()
+                if(NOT _gmp_archive_hash STREQUAL _GMP_SRC_SHA256)
+                    # The existing common archive is reusable only after hash
+                    # verification; its files are never removed by this mode.
+                    set(_gmp_legacy_archive_hash "")
+                    if(EXISTS "${GMP_ZIP_FILE}")
+                        file(SHA256 "${GMP_ZIP_FILE}" _gmp_legacy_archive_hash)
+                    endif()
+                    if(_gmp_legacy_archive_hash STREQUAL _GMP_SRC_SHA256)
+                        configure_file("${GMP_ZIP_FILE}" "${_gmp_archive}.tmp" COPYONLY)
+                    else()
+                        file(DOWNLOAD "${_GMP_SRC_URL}" "${_gmp_archive}.tmp"
+                            EXPECTED_HASH "SHA256=${_GMP_SRC_SHA256}" STATUS _gmp_download_status)
+                        list(GET _gmp_download_status 0 _gmp_download_result)
+                        if(NOT _gmp_download_result EQUAL 0)
+                            message(FATAL_ERROR "Cannot download verified GMP source: ${_gmp_download_status}")
+                        endif()
+                    endif()
+                    file(RENAME "${_gmp_archive}.tmp" "${_gmp_archive}")
+                endif()
+                execute_process(COMMAND "${CMAKE_COMMAND}" -E tar xjf "${_gmp_archive}"
+                    WORKING_DIRECTORY "${_gmp_source_attempt_root}" RESULT_VARIABLE _gmp_extract_result)
+                if(NOT _gmp_extract_result EQUAL 0 OR
+                   NOT EXISTS "${_gmp_source_attempt_root}/gmp-${_GMP_SRC_VERSION}/configure")
+                    message(FATAL_ERROR "Cannot initialize verified GMP source")
+                endif()
+                file(RENAME "${_gmp_source_attempt_root}/gmp-${_GMP_SRC_VERSION}"
+                            "${_gmp_source_attempt_root}/src")
+                file(WRITE "${_gmp_source_attempt_root}/src/.orcaslicer-source" "${_GMP_SRC_SHA256}\n")
+                break()
+            endif()
+            set(_gmp_source_stamp "${_gmp_source_attempt_root}/src/.orcaslicer-source")
+            set(_gmp_saved_source "")
+            if(EXISTS "${_gmp_source_stamp}")
+                file(READ "${_gmp_source_stamp}" _gmp_saved_source)
+                string(STRIP "${_gmp_saved_source}" _gmp_saved_source)
+            endif()
+            if(_gmp_saved_source STREQUAL _GMP_SRC_SHA256 AND
+               EXISTS "${_gmp_source_attempt_root}/src/configure")
+                break()
+            endif()
+            math(EXPR _gmp_source_attempt "${_gmp_source_attempt} + 1")
+        endwhile()
+        set(_GMP_SAFE_SOURCE_DIR "${_gmp_source_attempt_root}/src")
+        set(_GMP_SAFE_SOURCE_READY TRUE)
+        file(LOCK "${_gmp_source_root}/initialize.lock" RELEASE)
+    endif()
+    set(GMP_SOURCE_DIR "${_GMP_SAFE_SOURCE_DIR}")
+    if(NOT _GMP_SAFE_RECIPE_SELECTED)
+        if(CMAKE_OSX_SYSROOT AND IS_DIRECTORY "${CMAKE_OSX_SYSROOT}")
+            set(_GMP_SAFE_SYSROOT "${CMAKE_OSX_SYSROOT}")
+        else()
+            set(_gmp_sdk macosx)
+            if(CMAKE_OSX_SYSROOT)
+                set(_gmp_sdk "${CMAKE_OSX_SYSROOT}")
+            endif()
+            execute_process(COMMAND xcrun --sdk "${_gmp_sdk}" --show-sdk-path
+                OUTPUT_VARIABLE _GMP_SAFE_SYSROOT OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE _gmp_sdk_result)
+            if(NOT _gmp_sdk_result EQUAL 0 OR NOT IS_DIRECTORY "${_GMP_SAFE_SYSROOT}")
+                message(FATAL_ERROR "Cannot resolve macOS SDK for GMP")
+            endif()
+        endif()
+        get_filename_component(_GMP_SAFE_SYSROOT "${_GMP_SAFE_SYSROOT}" REALPATH)
+        set(_gmp_sdk_identity "${_GMP_SAFE_SYSROOT}")
+        if(EXISTS "${_GMP_SAFE_SYSROOT}/SDKSettings.json")
+            file(SHA256 "${_GMP_SAFE_SYSROOT}/SDKSettings.json" _gmp_sdk_settings_hash)
+            string(APPEND _gmp_sdk_identity ":${_gmp_sdk_settings_hash}")
+        endif()
+        set(_gmp_recipe_flags "-O2 -DNDEBUG -fPIC -DPIC -fomit-frame-pointer -fno-common")
+        if(CMAKE_OSX_DEPLOYMENT_TARGET)
+            string(APPEND _gmp_recipe_flags " -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+        endif()
+        string(APPEND _gmp_recipe_flags " -arch arm64")
+        set(_gmp_recipe_text
+            "apple-arm64-noasm-v1\nsource=${_GMP_SRC_VERSION}:${_GMP_SRC_SHA256}\narch=${FETCH_CACHE_ARCH}:arm64\nconfig=${GMP_ACTUAL_BUILD_TYPE}\ncc=${CMAKE_C_COMPILER}:${CMAKE_C_COMPILER_ID}:${CMAKE_C_COMPILER_VERSION}\ncxx=${CMAKE_CXX_COMPILER}:${CMAKE_CXX_COMPILER_ID}:${CMAKE_CXX_COMPILER_VERSION}\nsdkroot=${_gmp_sdk_identity}\nflags=${_gmp_recipe_flags}\nconfigure=static,cxx,no-shared,no-assembly\n")
+        string(SHA256 GMP_RECIPE_ID "${_gmp_recipe_text}")
+        set(_gmp_recipe_root "${GMP_CACHE_DIR}/${FETCH_CACHE_ARCH}/apple-arm64-noasm-v1/${GMP_RECIPE_ID}")
+        file(MAKE_DIRECTORY "${_gmp_recipe_root}")
+        # The outer include owns this lock. Recursive ZIP/SOURCE includes keep
+        # the selected slot and never reacquire it or append another identity.
+        file(LOCK "${_gmp_recipe_root}/configure.lock" GUARD FILE TIMEOUT 900)
+        set(_gmp_attempt 0)
+        while(TRUE)
+            set(_gmp_attempt_root "${_gmp_recipe_root}/attempt-${_gmp_attempt}")
+            if(NOT EXISTS "${_gmp_attempt_root}")
+                file(MAKE_DIRECTORY "${_gmp_attempt_root}")
+                break()
+            endif()
+            set(_gmp_stamp "${_gmp_attempt_root}/install/.orcaslicer-recipe")
+            set(_gmp_saved_recipe "")
+            if(EXISTS "${_gmp_stamp}")
+                file(READ "${_gmp_stamp}" _gmp_saved_recipe)
+                string(STRIP "${_gmp_saved_recipe}" _gmp_saved_recipe)
+            endif()
+            if(_gmp_saved_recipe STREQUAL GMP_RECIPE_ID AND
+               EXISTS "${_gmp_attempt_root}/install/include/gmp.h" AND
+               EXISTS "${_gmp_attempt_root}/install/include/gmpxx.h" AND
+               EXISTS "${_gmp_attempt_root}/install/lib/libgmp.a" AND
+               EXISTS "${_gmp_attempt_root}/install/lib/libgmpxx.a")
+                break()
+            endif()
+            # Preserve missing/bad stamps and incomplete installs for recovery.
+            math(EXPR _gmp_attempt "${_gmp_attempt} + 1")
+        endwhile()
+        set(_GMP_SAFE_BUILD_DIR "${_gmp_attempt_root}/build")
+        set(_GMP_SAFE_INSTALL_DIR "${_gmp_attempt_root}/install")
+        set(_GMP_SAFE_RECIPE_SELECTED TRUE)
+    endif()
+    set(GMP_BUILD_DIR "${_GMP_SAFE_BUILD_DIR}")
+    set(GMP_INSTALL_DIR "${_GMP_SAFE_INSTALL_DIR}")
+    set(_GMP_INSTALLED_LIB "${GMP_INSTALL_DIR}/lib/libgmp.a")
+    set(_gmp_safe_env "CC=${CMAKE_C_COMPILER}" "CXX=${CMAKE_CXX_COMPILER}" "SDKROOT=${_GMP_SAFE_SYSROOT}")
+endif()
+
 message(STATUS "🔧 GMP 库缓存管理系统")
 message(STATUS "   GMP版本: ${GMP_VERSION}")
 message(STATUS "   GMP构建类型: ${GMP_ACTUAL_BUILD_TYPE}")
@@ -104,6 +247,10 @@ set(HAS_ZIP FALSE)
 if(EXISTS "${GMP_INSTALL_DIR}/include/gmp.h"
    AND EXISTS "${_GMP_INSTALLED_LIB}")
     set(HAS_INSTALL TRUE)
+    if(_GMP_APPLE_ARM64_NOASM AND (NOT EXISTS "${GMP_INSTALL_DIR}/include/gmpxx.h" OR
+                                NOT EXISTS "${GMP_INSTALL_DIR}/lib/libgmpxx.a"))
+        set(HAS_INSTALL FALSE)
+    endif()
     message(STATUS "✅ 发现安装目录: ${GMP_INSTALL_DIR}")
 endif()
 
@@ -300,17 +447,22 @@ elseif(GMP_STATUS STREQUAL "SOURCE_ONLY")
             file(MAKE_DIRECTORY "${GMP_BUILD_DIR}")
         endif()
 
+        if(_GMP_APPLE_ARM64_NOASM)
+            set(_gmp_ccflags "${_gmp_recipe_flags}")
+        endif()
+
         message(STATUS "   configure: ${GMP_SOURCE_DIR}/configure ${_gmp_build_tgt} --enable-static=yes --enable-cxx=yes --enable-shared=no")
         message(STATUS "   prefix: ${GMP_INSTALL_DIR}")
         message(STATUS "   CFLAGS: ${_gmp_ccflags}")
 
         execute_process(
-            COMMAND env "CFLAGS=${_gmp_ccflags}" "CXXFLAGS=${_gmp_ccflags}"
+            COMMAND env ${_gmp_safe_env} "CFLAGS=${_gmp_ccflags}" "CXXFLAGS=${_gmp_ccflags}"
                 "${GMP_SOURCE_DIR}/configure"
                 ${_gmp_build_tgt}
                 --enable-shared=no
                 --enable-static=yes
                 --enable-cxx=yes
+                ${_gmp_configure_extra}
                 "--prefix=${GMP_INSTALL_DIR}"
             WORKING_DIRECTORY "${GMP_BUILD_DIR}"
             RESULT_VARIABLE _gmp_cfg_result
@@ -424,6 +576,20 @@ else()
     message(STATUS "✅ GMP 下载成功")
     set(GMP_STATUS "ZIP_ONLY")
     include(${CMAKE_CURRENT_LIST_FILE})
+endif()
+
+# Publish provenance only after the complete matching C/C++ install succeeds.
+if(GMP_FOUND AND _GMP_APPLE_ARM64_NOASM)
+    foreach(_file include/gmp.h include/gmpxx.h lib/libgmp.a lib/libgmpxx.a)
+        if(NOT EXISTS "${GMP_INSTALL_DIR}/${_file}")
+            message(FATAL_ERROR "Incomplete Apple arm64 GMP install: ${_file}")
+        endif()
+    endforeach()
+    file(WRITE "${GMP_INSTALL_DIR}/.orcaslicer-recipe.tmp" "${GMP_RECIPE_ID}\n")
+    file(RENAME "${GMP_INSTALL_DIR}/.orcaslicer-recipe.tmp" "${GMP_INSTALL_DIR}/.orcaslicer-recipe")
+    file(WRITE "${GMP_INSTALL_DIR}/orcaslicer-build-recipe.txt" "${_gmp_recipe_text}")
+    set(GMPXX_INCLUDE_DIR "${GMP_INSTALL_DIR}/include" CACHE PATH "GMP C++ include" FORCE)
+    set(GMPXX_LIBRARIES "${GMP_INSTALL_DIR}/lib/libgmpxx.a" CACHE FILEPATH "GMP C++ library" FORCE)
 endif()
 
 # 注册到主项目的 find_package(GMP)
