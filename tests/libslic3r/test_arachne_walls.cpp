@@ -27,10 +27,76 @@
 #include "libslic3r/Point.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstring>
 #include <cmath>
+#include <new>
 
 using namespace Slic3r;
 using namespace Slic3r::Arachne;
+
+TEST_CASE("Concentric Arachne short paths ignore previous stack contents", "[Arachne][initialization]") {
+    // Small triangular region from a 20 mm cube's second solid layer. Its
+    // short open path must be filtered by configured values, not stack bytes.
+    const Polygons outline{Polygon(Points{
+        Point(-9347498, -8529396), Point(-9347498, -9347498),
+        Point(-8529395, -9347498)})};
+    const coord_t spacing = scaled<coord_t>(0.42 - 0.16 * (1.0 - M_PI / 4.0));
+    const auto paths = [&](const WallToolPathsParams& params) {
+        WallToolPaths walls(outline, spacing, spacing, 3, 0, 0.16, params);
+        std::vector<std::array<coord_t, 3>> signature;
+        for (const auto& inset : walls.getToolPaths())
+            for (const auto& line : inset)
+                for (const auto& junction : line)
+                    signature.push_back({junction.p.x(), junction.p.y(), junction.w});
+        return signature;
+    };
+    const auto configure = [](WallToolPathsParams& params) {
+        // Match the two concentric fill callers, which set these parameters
+        // and intentionally rely on defaults for the short-path policy.
+        params.min_bead_width = 0.34f;
+        params.min_feature_size = 0.10f;
+        params.wall_transition_length = 0.4f;
+        params.wall_transition_angle = 10.f;
+        params.wall_transition_filter_deviation = 0.10f;
+        params.wall_distribution_count = 1;
+    };
+
+    float previous_factor = 100.f;
+    bool previous_surface = false;
+    float wanted_factor = 0.5f;
+    SECTION("default short-path length factor") {
+        // An old stack frame asked to discard short paths.
+    }
+    SECTION("internal surfaces honor an explicit length factor") {
+        previous_factor = 0.5f;
+        previous_surface = true;
+        wanted_factor = 100.f;
+    }
+
+    alignas(WallToolPathsParams) std::array<unsigned char, sizeof(WallToolPathsParams)> storage{};
+    std::memcpy(storage.data() + offsetof(WallToolPathsParams, min_length_factor),
+                &previous_factor, sizeof(previous_factor));
+    std::memcpy(storage.data() + offsetof(WallToolPathsParams, is_top_or_bottom_layer),
+                &previous_surface, sizeof(previous_surface));
+    auto* actual = ::new (storage.data()) WallToolPathsParams;
+    configure(*actual);
+    if (wanted_factor != 0.5f)
+        actual->min_length_factor = wanted_factor;
+
+    WallToolPathsParams reference;
+    configure(reference);
+    reference.min_length_factor = wanted_factor;
+    reference.is_top_or_bottom_layer = false;
+    const auto expected = paths(reference);
+    if (wanted_factor == 0.5f)
+        REQUIRE_FALSE(expected.empty());
+    else
+        REQUIRE(expected.empty());
+    CHECK(paths(*actual) == expected);
+    actual->~WallToolPathsParams();
+}
 
 namespace {
 

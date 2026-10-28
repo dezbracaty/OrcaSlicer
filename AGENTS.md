@@ -1,6 +1,7 @@
 # libslicer
 
-Minimal C++17 static-library build extracted from OrcaSlicer's `src/libslic3r`.
+Standalone slicing library extracted from OrcaSlicer's `src/libslic3r`, with a
+public C++17 shared-library API and an internal static core.
 This branch intentionally removes the wxWidgets GUI, app entry points, packaging
 targets, legacy shell build scripts, and unused third-party subprojects.
 
@@ -26,30 +27,37 @@ cmake --preset windows-x64-release
 cmake --build --preset windows-x64-release
 ```
 
-The macOS arm64 release artifact is:
+The macOS arm64 release public artifact is:
 
 ```bash
-build-libslicer/release/arm64/src/libslic3r/liblibslicer.a
+build-libslicer/release/arm64/src/libslicer_api/liblibslicer.dylib
 ```
 
 ## Tests
 
-Only the `tests/libslic3r` Catch2 suite is connected to the top-level CMake
-project.
+The top-level project registers core and public API Catch2 suites, continuous-
+fiber model acceptance, and a CMake consumer smoke test. Build all test
+executables before running unfiltered CTest:
 
 ```bash
-cmake --build --preset macos-arm64-release --target libslic3r_tests
+cmake --preset macos-arm64-release -DLIBSLICER_BUILD_TESTS=ON
+cmake --build --preset macos-arm64-release --target libslic3r_tests libslicer_api_tests fiber_4xiao_acceptance
 ctest --test-dir build-libslicer/release/arm64 --output-on-failure
 ```
 
 ## Scope
 
-- Primary target: `libslicer`
+- Build target: `libslicer` (depends on `libslicer_api`)
+- Public API: `include/libslicer/`, implemented in `src/libslicer_api/`
+- Application link target: `libslicer::libslicer` (shared; installed CMake package)
+- Internal link target: `libslicer::core` (static; source builds only)
 - Core source: `src/libslic3r/`
 - Bundled source dependencies: `deps_src/`
 - Fetched dependencies: managed by `deps/fetch_deps.cmake`
-- Tests: `tests/libslic3r`, `tests/catch2`, `tests/data`, and shared helpers
-- No GUI/app/package targets are expected in this branch.
+- Tests: `tests/libslic3r`, `tests/libslicer_api`, `tests/cmake`, `tests/catch2`,
+  `tests/data`, `models/continuous_fiber`, and shared helpers
+- No GUI, application-bundle, or installer targets are expected in this branch.
+- See `README.md` for SDK installation, runtime resources, and public API usage.
 
 ## Code Style
 
