@@ -4,6 +4,7 @@
 #include "PreparedFiberPath.hpp"
 
 #include <boost/multiprecision/cpp_int.hpp>
+#include <algorithm>
 #include <cmath>
 #include <map>
 #include <utility>
@@ -11,6 +12,129 @@
 namespace Slic3r {
 
 namespace {
+
+int compare_coverage_points(const Point& lhs, const Point& rhs)
+{
+    if (lhs.x() != rhs.x())
+        return lhs.x() < rhs.x() ? -1 : 1;
+    if (lhs.y() != rhs.y())
+        return lhs.y() < rhs.y() ? -1 : 1;
+    return 0;
+}
+
+// start and offset are both below size. Avoid overflowing their sum.
+size_t coverage_cyclic_index(size_t start, size_t offset, size_t size)
+{
+    const size_t remaining = size - start;
+    return offset < remaining ? start + offset : offset - remaining;
+}
+
+size_t coverage_least_rotation(const Points& points)
+{
+    const size_t size = points.size();
+    if (size < 2)
+        return 0;
+    // Booth's two candidates discard a whole mismatching prefix at once.
+    // Repeated minima and periodic rings retain the full directed sequence.
+    size_t lhs = 0, rhs = 1, offset = 0;
+    while (lhs < size && rhs < size && offset < size) {
+        const int order = compare_coverage_points(
+            points[coverage_cyclic_index(lhs, offset, size)],
+            points[coverage_cyclic_index(rhs, offset, size)]);
+        if (order == 0) {
+            ++offset;
+            continue;
+        }
+        if (order > 0) {
+            lhs = offset < size - lhs ? lhs + offset + 1 : size;
+            if (lhs <= rhs)
+                lhs = rhs + 1;
+        } else {
+            rhs = offset < size - rhs ? rhs + offset + 1 : size;
+            if (rhs <= lhs)
+                rhs = lhs + 1;
+        }
+        offset = 0;
+    }
+    return std::min(lhs, rhs);
+}
+
+struct CoverageRingView {
+    const Points* points;
+    size_t start;
+
+    explicit CoverageRingView(const Polygon& ring)
+        : points(&ring.points), start(coverage_least_rotation(ring.points)) {}
+};
+
+int compare_coverage_rings(const CoverageRingView& lhs, const CoverageRingView& rhs)
+{
+    const size_t size = lhs.points->size();
+    if (size != rhs.points->size())
+        return size < rhs.points->size() ? -1 : 1;
+    for (size_t offset = 0; offset < size; ++offset) {
+        const int order = compare_coverage_points(
+            (*lhs.points)[coverage_cyclic_index(lhs.start, offset, size)],
+            (*rhs.points)[coverage_cyclic_index(rhs.start, offset, size)]);
+        if (order != 0)
+            return order;
+    }
+    return 0;
+}
+
+struct CoverageComponentView {
+    CoverageRingView contour;
+    std::vector<CoverageRingView> holes;
+
+    explicit CoverageComponentView(const ExPolygon& polygon) : contour(polygon.contour)
+    {
+        holes.reserve(polygon.holes.size());
+        for (const Polygon& hole : polygon.holes)
+            holes.emplace_back(hole);
+        std::sort(holes.begin(), holes.end(), [](const auto& lhs, const auto& rhs) {
+            return compare_coverage_rings(lhs, rhs) < 0;
+        });
+    }
+};
+
+int compare_coverage_components(const CoverageComponentView& lhs, const CoverageComponentView& rhs)
+{
+    const int contour_order = compare_coverage_rings(lhs.contour, rhs.contour);
+    if (contour_order != 0)
+        return contour_order;
+    if (lhs.holes.size() != rhs.holes.size())
+        return lhs.holes.size() < rhs.holes.size() ? -1 : 1;
+    for (size_t index = 0; index < lhs.holes.size(); ++index) {
+        const int order = compare_coverage_rings(lhs.holes[index], rhs.holes[index]);
+        if (order != 0)
+            return order;
+    }
+    return 0;
+}
+
+bool same_exact_mask_representation(const ExPolygons& lhs, const ExPolygons& rhs)
+{
+    if (lhs.size() != rhs.size())
+        return false;
+    // Views borrow the two immutable union results for this synchronous call.
+    // Sort only metadata, preserving contour/hole ownership and multiplicity.
+    const auto make_views = [](const ExPolygons& polygons) {
+        std::vector<CoverageComponentView> views;
+        views.reserve(polygons.size());
+        for (const ExPolygon& polygon : polygons)
+            views.emplace_back(polygon);
+        std::sort(views.begin(), views.end(), [](const auto& a, const auto& b) {
+            return compare_coverage_components(a, b) < 0;
+        });
+        return views;
+    };
+    const auto left = make_views(lhs);
+    const auto right = make_views(rhs);
+    for (size_t index = 0; index < left.size(); ++index)
+        if (compare_coverage_components(left[index], right[index]) != 0)
+            return false;
+    return true;
+}
 
 double area_mm2(const ExPolygons& polygons)
 {
@@ -130,7 +254,7 @@ FiberCoverageAudit FiberCoverageLedger::audit(FiberCoverageAuditMode mode) const
             // must not silently become uncertainty. Identity completeness is
             // supplied by Fill's traversal and the later execution-table audit.
             source_exclusion = union_ex(source_exclusion);
-            if (source_exclusion != fiber)
+            if (source_exclusion != fiber && !same_exact_mask_representation(source_exclusion, fiber))
                 result.invalid_execution_envelope_area_mm2 += exact_area_mm2(twice_area(xor_ex(source_exclusion, fiber)));
 
             if (result.partition_statistics) {

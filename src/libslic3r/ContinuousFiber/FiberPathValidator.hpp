@@ -12,6 +12,7 @@
 #include <vector>
 
 namespace Slic3r {
+namespace continuous_fiber_detail { struct FiberInfillValidationContext; }
 void audit_fiber_execution_connections(const std::map<FiberFragmentId,CompiledFiberPath>& paths);
 
 
@@ -153,6 +154,8 @@ struct FiberContourPlanResult {
     void set_display_cutoff(size_t contour_depths);
 };
 
+namespace continuous_fiber_detail { class FiberDomainIndex; struct FiberFinalizationDomains; }
+
 class FiberPathValidator {
 public:
     static void plan_open_ring_chains(FiberContourPlanResult& plan,
@@ -186,7 +189,10 @@ private:
         const ExPolygons* physical_centerline_domain, bool collect_debug,
         bool requires_closed_loop = false, const std::vector<ContourArc>* source_arcs = nullptr,
         double bend_stabilization_length_mm = 0.0,
-        std::vector<FiberFragmentId>* policy_rejected = nullptr);
+        std::vector<FiberFragmentId>* policy_rejected = nullptr,
+        const continuous_fiber_detail::FiberDomainIndex* containment = nullptr,
+        const continuous_fiber_detail::FiberFinalizationDomains* finalization_domains = nullptr,
+        const continuous_fiber_detail::FiberInfillValidationContext* material_context = nullptr);
 };
 
 } // namespace Slic3r

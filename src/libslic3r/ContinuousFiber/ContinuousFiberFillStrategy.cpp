@@ -3,9 +3,12 @@
 #include "../ClipperUtils.hpp"
 #include "../AABBTreeLines.hpp"
 #include "../Geometry.hpp"
+#include "../Int128.hpp"
 #include "../Geometry/ArcWelder.hpp"
 #include <algorithm>
+#include <set>
 #include <cmath>
+#include <cfenv>
 #include <map>
 #include <tuple>
 #include <limits>
@@ -116,7 +119,7 @@ bool inside(const Polyline& path, const ExPolygons& domain)
     return diff_pl(Polylines{path}, domain).empty();
 }
 
-bool simple(const Points& p)
+bool simple(const Points& p, bool proper_only=false)
 {
     std::vector<size_t> edges;
     for (size_t i=1;i<p.size();++i) edges.push_back(i);
@@ -131,10 +134,100 @@ bool simple(const Points& p)
             if (i+1==j || j+1==i || (p.front()==p.back() && std::min(i,j)==1 && std::max(i,j)==p.size()-1)) continue;
             if (std::max(p[i-1].y(),p[i].y())<std::min(p[j-1].y(),p[j].y()) ||
                 std::max(p[j-1].y(),p[j].y())<std::min(p[i-1].y(),p[i].y())) continue;
-            if (Geometry::segments_intersect(p[i-1],p[i],p[j-1],p[j])) return false;
+            if (proper_only) {
+                const auto orient=[](const Point& a,const Point& b,const Point& c) {
+                    return Int128::sign_determinant_2x2(b.x()-a.x(),b.y()-a.y(),c.x()-a.x(),c.y()-a.y());
+                };
+                if(orient(p[i-1],p[i],p[j-1])*orient(p[i-1],p[i],p[j])<0 &&
+                    orient(p[j-1],p[j],p[i-1])*orient(p[j-1],p[j],p[i])<0) return false;
+            } else if (Geometry::segments_intersect(p[i-1],p[i],p[j-1],p[j])) return false;
         }
     }
     return true;
+}
+
+// A quantized offset can attach a tiny closed walk at a repeated vertex.
+// Remove only a walk wholly inside the existing normalization disk, retaining
+// original integer points. Ordinary self crossings never use this allowance.
+std::optional<Polyline3> normalized_outer_micro_walks(const Polyline3& source)
+{
+#if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__ > 0)
+    return std::nullopt;
+#endif
+    if(!source.fitting_result.empty() || source.points.size()<4 ||
+        !std::numeric_limits<double>::is_iec559 || std::fegetround()!=FE_TONEAREST ||
+        !std::isfinite(SCALING_FACTOR) || SCALING_FACTOR<=0) return std::nullopt;
+    const Points raw=source.to_polyline().points;
+    if(raw.front()!=raw.back())return std::nullopt;
+    for(const auto& p:raw) if(std::abs(double(p.x()))>ClipperLib::loRange ||
+        std::abs(double(p.y()))>ClipperLib::loRange)return std::nullopt;
+    const double ratio=straight_tolerance_mm/SCALING_FACTOR;
+    if(!std::isfinite(ratio) || ratio<1 || ratio>ClipperLib::loRange)return std::nullopt;
+    coord_t limit=coord_t(std::floor(ratio));
+    // Product residual plus twoSum preserves the exact sign of limit*scale-tol.
+    // The subtraction is exact by Sterbenz here (the floor product is > tol/2).
+    const auto exceeds_budget=[&] {
+        const double product=double(limit)*SCALING_FACTOR;
+        if(product<=straight_tolerance_mm/2)return false;
+        const double delta=product-straight_tolerance_mm;
+        const double residual=std::fma(double(limit),SCALING_FACTOR,-product);
+        const double sum=delta+residual,z=sum-delta;
+        const double error=(delta-(sum-z))+(residual-z);
+        return sum>0 || (sum==0 && error>0);
+    };
+    while(limit>0 && exceeds_budget())--limit;
+    if(!limit)return std::nullopt;
+    const Int128 squared_limit=Int128::multiply(limit,limit);
+    Points retained(raw.begin(),raw.end()-1);
+    std::vector<size_t> provenance;
+    for(size_t i=0;i<retained.size();++i)provenance.push_back(i);
+    bool changed=false;
+    for(;;) {
+        std::map<Point,size_t> seen;
+        bool removed=false;
+        for(size_t j=0;j<retained.size();++j) {
+            const auto found=seen.emplace(retained[j],j);
+            if(found.second)continue;
+            const size_t i=found.first->second;
+            const auto near=[&](const Point& p) {
+                const coord_t x=p.x()-retained[i].x(),y=p.y()-retained[i].y();
+                return Int128::multiply(x,x)+Int128::multiply(y,y)<=squared_limit;
+            };
+            // Include points removed by earlier nested walks. The retained
+            // indices are an ordered cyclic subsequence of the original ring.
+            const auto span_near=[&](size_t first,size_t last) {
+                size_t k=(provenance[first]+1)%(raw.size()-1);
+                if(k==provenance[last])return false;
+                for(;k!=provenance[last];k=(k+1)%(raw.size()-1))
+                    if(!near(raw[k]))return false;
+                return true;
+            };
+            if(span_near(i,j)) {
+                retained.erase(retained.begin()+i+1,retained.begin()+j+1);
+                provenance.erase(provenance.begin()+i+1,provenance.begin()+j+1);
+            }
+            else {
+                if(!span_near(j,i))continue;
+                retained=Points(retained.begin()+i,retained.begin()+j);
+                provenance=std::vector<size_t>(provenance.begin()+i,provenance.begin()+j);
+            }
+            removed=changed=true;break;
+        }
+        if(!removed)break;
+        if(retained.size()<3)return std::nullopt;
+    }
+    if(!changed || std::set<Point>(retained.begin(),retained.end()).size()<3)return std::nullopt;
+    retained.push_back(retained.front());
+    if(!simple(raw,true) || !simple(retained))return std::nullopt;
+    const auto area_sign=[](const Points& p) {
+        Int128 area;
+        for(size_t i=1;i<p.size();++i)area+=Int128::multiply(p[i-1].x(),p[i].y())-
+            Int128::multiply(p[i].x(),p[i-1].y());
+        return area.sign();
+    };
+    const int sign=area_sign(raw);
+    if(!sign || sign!=area_sign(retained))return std::nullopt;
+    return Polyline3(Polyline(std::move(retained)));
 }
 
 struct TangentSupports {
@@ -1418,17 +1511,20 @@ ContourRoundingResult assemble_outer(const std::vector<Vec2d>& p,
 } // namespace
 
 ContourRoundingResult ContinuousFiberFillStrategy::round_outer_contour(
-    const Polyline3& source,const ExPolygons& centerline_domain,const ContourRoundingOptions& options)
+    const Polyline3& input,const ExPolygons& centerline_domain,const ContourRoundingOptions& options)
 {
-    if (options.radius_mm==0) {ContourRoundingResult result;result.path=source;return result;}
-    const Polyline line=source.to_polyline();
+    if (options.radius_mm==0) {ContourRoundingResult result;result.path=input;return result;}
+    const Polyline raw_line=input.to_polyline();
     ContourRoundingResult invalid;
-    invalid.issues.push_back({ContourRoundingFailure::InvalidInput,line});
+    invalid.issues.push_back({ContourRoundingFailure::InvalidInput,raw_line});
     if (!std::isfinite(options.radius_mm) || options.radius_mm<0 ||
         !std::isfinite(options.chord_tolerance_mm) || options.chord_tolerance_mm<=0 ||
         !std::isfinite(options.geometry_tolerance_mm) || options.geometry_tolerance_mm<=options.chord_tolerance_mm ||
-        line.points.size()<4 || line.points.front()!=line.points.back() || centerline_domain.empty() ||
-        std::any_of(source.points.begin(),source.points.end(),[](const Point3& p){return p.z()!=0;})) return invalid;
+        raw_line.points.size()<4 || raw_line.points.front()!=raw_line.points.back() || centerline_domain.empty() ||
+        std::any_of(input.points.begin(),input.points.end(),[](const Point3& p){return p.z()!=0;})) return invalid;
+    const auto normalized=normalized_outer_micro_walks(input);
+    const Polyline3& source=normalized?*normalized:input;
+    const Polyline line=source.to_polyline();
     try {
         const auto p=canonical_ring(line);
         if (p.size()<3 || !simple(line.points)) return invalid;
@@ -1775,8 +1871,95 @@ ExPolygons ContinuousFiberFillStrategy::build_resin_area(
 
 
 namespace Slic3r::continuous_fiber_detail {
-void bind_contour_arcs(Polyline3& path,std::vector<ContourArc>& arcs,std::vector<ContourBend>* bends)
+namespace {
+coord_t checked_material_coordinate(double value)
 {
+    const double scaled = scale_(value);
+    const double limit = double(ClipperLib::loRange);
+    // Truncation maps the open preimage (-L-1,L+1) onto the supported
+    // integers [-L,L]. Checking only the closed floating interval [-L,L]
+    // would reject legitimate General coordinates such as L+.25.
+    if (!std::isfinite(value) || !std::isfinite(scaled) || scaled <= -limit-1. || scaled >= limit+1.)
+        throw std::runtime_error("Unsupported material-query world coordinate");
+    const coord_t result = coord_t(scaled);
+    if (result < -ClipperLib::loRange || result > ClipperLib::loRange)
+        throw std::runtime_error("Unsupported material-query truncated coordinate");
+    return result;
+}
+coord_t checked_material_integer(int64_t value)
+{
+    if (value < -int64_t(ClipperLib::loRange) || value > int64_t(ClipperLib::loRange))
+        throw std::runtime_error("Unsupported material-query integer coordinate");
+    return coord_t(value);
+}
+}
+
+MaterialQueryCoordinates::MaterialQueryCoordinates(double rotation_radians)
+{
+    if ((SCALING_FACTOR != SCALING_FACTOR_INTERNAL && SCALING_FACTOR != SCALING_FACTOR_INTERNAL_LARGE_PRINTER) ||
+        std::fegetround() != FE_TONEAREST || !std::isfinite(rotation_radians))
+        throw std::runtime_error("Invalid material-query coordinate context");
+    // Do not normalize or infer a quarter turn from nearby trigonometric values.
+    // In particular, float-promoted SDK angles retain the General path.
+    if (rotation_radians == 0.) canonical_quarter = 0;
+    else if (rotation_radians == PI / 2) canonical_quarter = 1;
+    else if (rotation_radians == PI) canonical_quarter = 2;
+    else if (rotation_radians == -PI / 2) canonical_quarter = 3;
+    switch (canonical_quarter) {
+    case 0: frame << 0., 1., 1., 0.; break;
+    case 1: frame << -1., 0., 0., 1.; break;
+    case 2: frame << 0., -1., -1., 0.; break;
+    case 3: frame << 1., 0., 0., -1.; break;
+    default:
+        frame << -std::sin(rotation_radians), std::cos(rotation_radians),
+                  std::cos(rotation_radians), std::sin(rotation_radians);
+    }
+}
+
+Point MaterialQueryCoordinates::input_point(const Point& p) const
+{
+    if (!canonical())
+        throw std::logic_error("Integer input transport requires a canonical frame");
+    const int64_t x = checked_material_integer(p.x()), y = checked_material_integer(p.y());
+    switch (canonical_quarter) {
+    case 0: return Point(checked_material_integer(y), checked_material_integer(x));
+    case 1: return Point(checked_material_integer(-x), checked_material_integer(y));
+    case 2: return Point(checked_material_integer(-y), checked_material_integer(-x));
+    case 3: return Point(checked_material_integer(x), checked_material_integer(-y));
+    default: throw std::logic_error("Invalid material-query frame identity");
+    }
+}
+
+coord_t MaterialQueryCoordinates::row_offset(coord_t row, coord_t offset, int step) const
+{
+    if (step != -1 && step != 1)
+        throw std::logic_error("Invalid material-query row direction");
+    // Inputs are loRange bounded before addition; the sum cannot overflow int64.
+    const int64_t base = checked_material_integer(row), delta = checked_material_integer(offset);
+    return checked_material_integer(base + int64_t(step) * delta);
+}
+
+Point MaterialQueryCoordinates::point(const Vec2d& world_mm, std::optional<coord_t> transverse) const
+{
+    if (!std::isfinite(world_mm.x()) || !std::isfinite(world_mm.y()))
+        throw std::runtime_error("Non-finite material-query world coordinate");
+    Point out;
+    for (int axis=0; axis<2; ++axis) {
+        if (canonical() && transverse && axis == canonical_quarter%2) {
+            const int64_t value = checked_material_integer(*transverse);
+            out[axis] = checked_material_integer(canonical_quarter < 2 ? value : -value);
+        } else {
+            out[axis] = checked_material_coordinate(world_mm[axis]);
+        }
+    }
+    return out;
+}
+
+void bind_contour_arcs(Polyline3& path,std::vector<ContourArc>& arcs,std::vector<ContourBend>* bends,
+                       const std::vector<Point>* explicit_centers)
+{
+    if (explicit_centers && explicit_centers->size() != arcs.size())
+        throw std::invalid_argument("Explicit arc center count differs from the source arcs");
     if (arcs.empty()) return;
     std::vector<double> old(path.points.size(),0);
     for (size_t i=1;i<old.size();++i) old[i]=old[i-1]+unscale<double>((path.points[i]-path.points[i-1]).cast<double>().norm());
@@ -1791,10 +1974,14 @@ void bind_contour_arcs(Polyline3& path,std::vector<ContourArc>& arcs,std::vector
         if(best>std::pow(scale_(0.0001),2)) throw std::invalid_argument("Solver arc endpoint is absent from its path");
         return result;
     };
+    size_t center_index = 0;
     for (const auto& arc:arcs) {
         const size_t begin=nearest(arc.start_mm,previous),end=nearest(arc.end_mm,begin+1);
         if(begin>previous) path.fitting_result.push_back({previous,begin,EMovePathType::Linear_move,{}});
-        ArcSegment a(Point::new_scale(arc.center_mm.x(),arc.center_mm.y()),scale_(arc.radius_mm),
+        const Point center = explicit_centers ? explicit_centers->at(center_index) :
+            Point::new_scale(arc.center_mm.x(),arc.center_mm.y());
+        ++center_index;
+        ArcSegment a(center,scale_(arc.radius_mm),
             path.points[begin].to_point(),path.points[end].to_point(),
             arc.sweep_radians>0?ArcDirection::Arc_Dir_CCW:ArcDirection::Arc_Dir_CW);
         path.fitting_result.push_back({begin,end,arc.sweep_radians>0?EMovePathType::Arc_move_ccw:EMovePathType::Arc_move_cw,a});

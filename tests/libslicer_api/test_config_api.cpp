@@ -4310,3 +4310,63 @@ TEST_CASE("open ring connection settings persist their explicit software trim mu
     CHECK_FALSE(config.apply_patch(libslicer::ConfigScope::FiberMask,{{"fiber_connection_head_trim_widths","-1"}}).success);
     CHECK(config.snapshot().values()==before);
 }
+
+
+TEST_CASE("certified material infill reaches the public SDK while disabled fiber stays ordinary",
+          "[libslicer_api][fiber-material-query][fiber-disabled][slice]")
+{
+    const bool fiber = GENERATE(true,false);
+    CAPTURE(fiber);
+    libslicer::LibraryOptions options;
+    options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors={"CFSYS"};
+    auto library=libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id="CFSYS Alpha500 Printer";
+    selection.machine_variant_id="0.4";
+    selection.process_preset_id="CCF&CIRON @CFSYS";
+    selection.filament_preset_ids={"CFSYS CIRON","CFSYS CCF"};
+    selection.filament_physical_tools={0,1};
+    const auto activation=library->activate_config(selection,{
+        {"generate_reinforced_perimeters","0"},
+        {"generate_reinforced_infills",fiber?"1":"0"},
+        {"reinforced_infill_pattern","rectilinear"}, {"reinforced_infill_density","100%"},
+        {"fiber_width","1"}, {"fiber_infill_bend_radius","0.5"},
+        {"fiber_corner_stabilization_length","5"}, {"fiber_infill_angle_sequence","0"},
+        {"sparse_infill_rotate_template","0"}, {"top_shell_layers","0"}, {"bottom_shell_layers","0"},
+        {"sparse_infill_density","40%"}});
+    for (const auto& d:activation.diagnostics) INFO(d.message);
+    REQUIRE(activation.success);
+    auto object=fiber_infill_block();
+    for (auto& vertex:object.volumes.front().vertices)
+        if (vertex.z>0) vertex.z=1.04;
+    libslicer::SliceRequest request;
+    request.config=*library->active_config_snapshot();
+    request.objects.push_back(std::move(object));
+    const auto sliced=library->slice(request);
+    for (const auto& d:sliced.diagnostics) INFO(d.message);
+    REQUIRE(sliced.success);
+    REQUIRE(sliced.preview);
+    size_t infill=0,contour=0;
+    for (const auto& segment:sliced.preview->segments) {
+        infill+=segment.extrusion_role==libslicer::ToolpathExtrusionRole::ContinuousFiberInfill;
+        contour+=segment.extrusion_role==libslicer::ToolpathExtrusionRole::ContinuousFiberContour;
+    }
+    CHECK(contour==0);
+    std::ifstream input(sliced.output.path);
+    const std::string gcode((std::istreambuf_iterator<char>(input)),std::istreambuf_iterator<char>());
+    if (fiber) {
+        CHECK(infill>0);
+        CHECK(sliced.preview->statistics.total_fiber_feed_mm>0);
+        CHECK(gcode.find(";FIBER_BEGIN")!=std::string::npos);
+        CHECK(gcode.find(";FIBER_TAIL_BEGIN")!=std::string::npos);
+        CHECK(gcode.find(";FIBER_END")!=std::string::npos);
+    } else {
+        CHECK(infill==0);
+        CHECK(sliced.preview->statistics.total_fiber_feed_mm==0);
+        CHECK(gcode.find(";FIBER_BEGIN")==std::string::npos);
+    }
+    std::error_code error;
+    std::filesystem::remove(sliced.output.path,error);
+}

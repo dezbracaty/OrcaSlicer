@@ -1,4 +1,6 @@
+#include "FiberInfillValidationDomains.hpp"
 #include "FiberPathFinalizer.hpp"
+#include "FiberDomainIndex.hpp"
 #include "ContinuousFiberFillStrategy.hpp"
 
 #include "../ClipperUtils.hpp"
@@ -583,6 +585,49 @@ Polyline3 normalize_fiber_chain_geometry(const Polyline3& input,
     return normalized;
 }
 
+bool continuous_fiber_detail::FiberFinalizationDomains::band_matches(
+    const ExPolygons* current,const FiberCandidateId& source,double width) const
+{
+    return is_lazy_band_context() && band_source && *band_source==source &&
+        planned_source==current && width==band_width_mm && SCALING_FACTOR==band_sigma &&
+        source.purpose==FiberPathPurpose::Contour && std::isfinite(proof_radius_grid) &&
+        proof_radius_grid>=0 && proof_radius_grid<=ClipperLib::loRange &&
+        std::floor(proof_radius_grid)==proof_radius_grid &&
+        native_query_delta_grid==double(float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm))) &&
+        proof_radius_grid==native_query_delta_grid/2;
+}
+const ExPolygons& continuous_fiber_detail::FiberFinalizationDomains::comparison_domain() const
+{
+    if(!comparison_source){if(!comparison_resolver)throw std::logic_error("Missing real fiber comparison domain");comparison_source=&comparison_resolver();}
+    return *comparison_source;
+}
+const continuous_fiber_detail::FiberDomainIndex& continuous_fiber_detail::FiberFinalizationDomains::planned_index() const
+{
+    if(!planned_index_storage)planned_index_storage=std::make_shared<const FiberDomainIndex>(*planned_source);
+    return *planned_index_storage;
+}
+bool continuous_fiber_detail::FiberFinalizationDomains::proves_planned_band(const Polyline& path) const
+{
+    return band_source && band_matches(planned_source,*band_source,band_width_mm) &&
+        planned_index().proves_sample_band(path,proof_radius_grid);
+}
+const ExPolygons& continuous_fiber_detail::FiberFinalizationDomains::arc_query_domain() const
+{
+    if(!arc_query_storage)arc_query_storage=offset_ex(comparison_domain(),
+        float(scale_(ContourRoundingOptions{}.chord_tolerance_mm)));
+    return *arc_query_storage;
+}
+const continuous_fiber_detail::FiberDomainIndex& continuous_fiber_detail::FiberFinalizationDomains::comparison_index() const
+{
+    if(!comparison_index_storage)comparison_index_storage=std::make_shared<const FiberDomainIndex>(comparison_domain());
+    return *comparison_index_storage;
+}
+const continuous_fiber_detail::FiberDomainIndex& continuous_fiber_detail::FiberFinalizationDomains::arc_query_index() const
+{
+    if(!arc_query_index_storage)arc_query_index_storage=std::make_shared<const FiberDomainIndex>(arc_query_domain());
+    return *arc_query_index_storage;
+}
+
 FiberFinalizationResult FiberPathFinalizer::finalize(
     const ExtrusionPath& input,
     const ExPolygons& allowed_domain,
@@ -590,7 +635,9 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     const FiberFragmentId& id, const FiberFinishRoute& finish,
     const std::vector<ContourArc>& arcs, const ExPolygons* planned_centerline_domain,
     const std::vector<FiberExecutionPiece>& pieces,
-    const std::vector<FiberExecutionPiece>& finish_pieces)
+    const std::vector<FiberExecutionPiece>& finish_pieces,
+    const continuous_fiber_detail::FiberFinalizationDomains* domains,
+    const continuous_fiber_detail::FiberInfillFinalizationContext* material_context)
 {
     FiberFinalizationResult result;
     // The validator owns source normalization, before geometry checks and
@@ -635,6 +682,15 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         result.failure=FiberFinalizationFailure::TooShort;
         result.detail="Entry and active process budget must finish before CUT";
         return result;
+    }
+
+    // New material-certified infill has already proved its unchanged source
+    // against post-contour M. Only an eligible process needs the real legacy
+    // C -> comparison+100nm -> arc-query+50nm certification domains.
+    if (material_context) {
+        const auto& resolved=material_context->resolve();
+        planned_centerline_domain=resolved.planned_source;
+        domains=&resolved;
     }
 
     auto prepared = std::make_unique<FiberPathDraft>();
@@ -762,10 +818,21 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     append_finish(*prepared, finish);
     if (!pieces.empty()) prepared->finish_strategy=finish.strategy;
     const bool check_centerline = planned_centerline_domain || !arcs.empty();
-    const ExPolygons centerline_domain = planned_centerline_domain ?
+    // A mismatched lazy context is unusable for ALL cached/resolved domains,
+    // not merely for its band proof. Current owned/native domains take over.
+    const bool lazy_context_valid=!domains || !domains->is_lazy_band_context() ||
+        (id.parent.purpose==FiberPathPurpose::Contour && config.contour_bend_radius_mm>0 &&
+         domains->band_matches(planned_centerline_domain,id.parent,candidate.width));
+    const bool reuse_domains=domains && lazy_context_valid && domains->planned_source==planned_centerline_domain &&
+        (is_rectilinear_fiber_infill(config,id.parent.purpose) ||
+         (id.parent.purpose==FiberPathPurpose::Contour && config.contour_bend_radius_mm>0));
+    const ExPolygons owned_centerline_domain = reuse_domains ? ExPolygons{} : planned_centerline_domain ?
         offset_ex(*planned_centerline_domain, float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm))) :
         check_centerline ? offset_ex(allowed_domain, -float(scale_(0.5*candidate.width +
             (contour ? config.contour_boundary_clearance_mm : 0.0) - ContourRoundingOptions{}.geometry_tolerance_mm))) : ExPolygons{};
+    const auto comparison_domain=[&]() -> const ExPolygons& {
+        return reuse_domains?domains->comparison_domain():owned_centerline_domain;
+    };
     try {
         plan_edges(*prepared, candidate.polyline, config, arcs,
                    pieces,finish.geometry,finish_pieces);
@@ -795,16 +862,40 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
         return result;
     }
 
-    // A derived check chord can fall outside a valid concave arc. Give only
-    // that query its known sagitta budget; material/policy domains stay fixed.
-    const auto arc_query_domain=check_centerline?offset_ex(centerline_domain,
-        float(scale_(ContourRoundingOptions{}.chord_tolerance_mm))):ExPolygons{};
+    // A strict certificate in the actual comparison domain is sufficient on
+    // its own. Only an unproved curved route needs the original extra chord
+    // query budget; material, policy and physical domains remain unchanged.
+    std::optional<ExPolygons> owned_arc_query_storage;
+    std::unique_ptr<continuous_fiber_detail::FiberDomainIndex> owned_comparison_index,owned_arc_query_index;
     const auto centerline_inside=[&](const Polyline3& route) {
         const bool curved=std::any_of(route.fitting_result.begin(),route.fitting_result.end(),[](const auto& p) {
             return p.path_type!=EMovePathType::Linear_move;
         });
-        return diff_pl(Polylines{Geometry::sample_with_arcs(route,ContourRoundingOptions{}.chord_tolerance_mm).to_polyline()},
-            curved?arc_query_domain:centerline_domain).empty();
+        const Polyline sampled=Geometry::sample_with_arcs(route,ContourRoundingOptions{}.chord_tolerance_mm).to_polyline();
+        if(reuse_domains && domains->is_lazy_band_context() && domains->proves_planned_band(sampled))return true;
+        const ExPolygons& centerline_domain=comparison_domain();
+        const continuous_fiber_detail::FiberDomainIndex* base_index;
+        if(reuse_domains) base_index=&domains->comparison_index();
+        else {
+            if(!owned_comparison_index) owned_comparison_index=
+                std::make_unique<continuous_fiber_detail::FiberDomainIndex>(centerline_domain);
+            base_index=owned_comparison_index.get();
+        }
+        if(base_index->proves_strict_containment(sampled)) return true;
+        if(!curved) return diff_pl(Polylines{sampled},centerline_domain).empty();
+
+        if(!reuse_domains && !owned_arc_query_storage) owned_arc_query_storage=offset_ex(centerline_domain,
+            float(scale_(ContourRoundingOptions{}.chord_tolerance_mm)));
+        const ExPolygons& arc_query_domain=reuse_domains?domains->arc_query_domain():*owned_arc_query_storage;
+        const continuous_fiber_detail::FiberDomainIndex* arc_index;
+        if(reuse_domains) arc_index=&domains->arc_query_index();
+        else {
+            if(!owned_arc_query_index) owned_arc_query_index=
+                std::make_unique<continuous_fiber_detail::FiberDomainIndex>(arc_query_domain);
+            arc_index=owned_arc_query_index.get();
+        }
+        if(arc_index->proves_strict_containment(sampled)) return true;
+        return diff_pl(Polylines{sampled},arc_query_domain).empty();
     };
     if (check_centerline && prepared->entry.lowers() && prepared->entry.end_station_mm>0 &&
         !centerline_inside(prepared->entry.geometry)) {
