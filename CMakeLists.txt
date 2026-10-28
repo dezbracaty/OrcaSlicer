@@ -287,6 +287,9 @@ install(TARGETS libslicer_api
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/libslicer"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/resources/calib"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/handy_models"
+    DESTINATION "${LIBSLICER_INSTALL_RESOURCEDIR}")
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/OrcaFilamentLibrary.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/profiles/Flashforge.json"

@@ -1,6 +1,8 @@
 add_library(libslicer_api SHARED
     Config.cpp
     Library.cpp
+    Plater.cpp
+    OrcaCalibrationApi.cpp
 )
 
 set_target_properties(libslicer_api PROPERTIES
