@@ -1,7 +1,4 @@
-#include <boost/multiprecision/cpp_int.hpp>
-#include "FiberInfillValidationDomains.hpp"
 #include "FiberPathValidator.hpp"
-#include "FiberDomainIndex.hpp"
 #include "../PrintBase.hpp"
 
 #include "../ClipperUtils.hpp"
@@ -20,109 +17,6 @@
 #include <tuple>
 
 namespace Slic3r {
-
-namespace continuous_fiber_detail {
-namespace query_band_detail {
-// Supported coordinates/radius bound affine coefficients to128 bits.
-using Coefficient=boost::multiprecision::int128_t;
-using Product=boost::multiprecision::int256_t;
-struct Fraction { Coefficient n,d; };
-struct InnerInterval { Fraction lo,hi; };
-inline Fraction fraction(Coefficient n,Coefficient d) {
-    if(d==0)throw std::logic_error("zero fraction denominator");
-    if(d<0){n=-n;d=-d;}
-    return {n,d};
-}
-inline bool less(const Fraction&a,const Fraction&b){return Product(a.n)*Product(b.d)<Product(b.n)*Product(a.d);}
-inline bool equal(const Fraction&a,const Fraction&b){return !less(a,b)&&!less(b,a);}
-inline Fraction maximum(Fraction a,const Fraction&b){return less(a,b)?b:a;}
-inline Fraction minimum(Fraction a,const Fraction&b){return less(a,b)?a:b;}
-inline uint64_t floor_sqrt(uint64_t n) {
-    // Exact restoring integer square root; no floating estimate or correction.
-    uint64_t remainder=n,result=0,bit=uint64_t(1)<<62;
-    while(bit>remainder)bit>>=2;
-    while(bit){
-        if(remainder>=result+bit){remainder-=result+bit;result=(result>>1)+bit;}
-        else result>>=1;
-        bit>>=2;
-    }
-    if(Product(result)*result>Product(n)||Product(result+1)*(result+1)<=Product(n))
-        throw std::logic_error("incorrect integer square root");
-    return result;
-}
-inline bool affine(InnerInterval&i,const Coefficient&origin,const Coefficient&slope,const Coefficient&lower,const Coefficient&upper){
-    if(slope==0)return origin>=lower&&origin<=upper;
-    // Promotion precedes subtraction/negation. Bound-origin can exceed int64.
-    Fraction lo=fraction(lower-origin,slope),hi=fraction(upper-origin,slope);
-    if(slope<0)std::swap(lo,hi);
-    i.lo=maximum(i.lo,lo);i.hi=minimum(i.hi,hi);
-    return !less(i.hi,i.lo);
-}
-inline void diamond(std::vector<InnerInterval>&out,const Point&a,const Point&b,const Point&p,int64_t eps){
-    const Coefficient wx=Coefficient(a.x())-Coefficient(p.x()),wy=Coefficient(a.y())-Coefficient(p.y()),dx=Coefficient(b.x())-Coefficient(a.x()),dy=Coefficient(b.y())-Coefficient(a.y()),r=Coefficient(eps);
-    InnerInterval i{{Coefficient(0),Coefficient(1)},{Coefficient(1),Coefficient(1)}};
-    if(affine(i,wx+wy,dx+dy,-r,r)&&affine(i,wx-wy,dx-dy,-r,r))out.push_back(i);
-}
-inline void intervals(std::vector<InnerInterval>&out,const Point&a,const Point&b,const Line&e,int64_t eps){
-    const Coefficient vx=Coefficient(e.b.x())-Coefficient(e.a.x()),vy=Coefficient(e.b.y())-Coefficient(e.a.y()),K=vx*vx+vy*vy;
-    diamond(out,a,b,e.a,eps);
-    if(K==0)return;
-    diamond(out,a,b,e.b,eps);
-    if(K<0||K>=(Coefficient(1)<<63))throw std::logic_error("unsupported positive K");
-    const Coefficient wx=Coefficient(a.x())-Coefficient(e.a.x()),wy=Coefficient(a.y())-Coefficient(e.a.y()),dx=Coefficient(b.x())-Coefficient(a.x()),dy=Coefficient(b.y())-Coefficient(a.y());
-    const Coefficient band=Coefficient(eps)*Coefficient(floor_sqrt(K.convert_to<uint64_t>()));
-    InnerInterval strip{{Coefficient(0),Coefficient(1)},{Coefficient(1),Coefficient(1)}};
-    if(affine(strip,wx*vx+wy*vy,dx*vx+dy*vy,Coefficient(0),K)&&
-       affine(strip,vx*wy-vy*wx,vx*dy-vy*dx,-band,band))out.push_back(strip);
-}
-inline bool covers(std::vector<InnerInterval> intervals,Fraction&reach){
-    std::sort(intervals.begin(),intervals.end(),[](const InnerInterval&a,const InnerInterval&b){return equal(a.lo,b.lo)?less(a.hi,b.hi):less(a.lo,b.lo);});
-    reach={Coefficient(0),Coefficient(1)};bool started=false;
-    for(const auto&i:intervals){
-        if(!started){if(less({Coefficient(0),Coefficient(1)},i.lo))break;reach=i.hi;started=true;}
-        else{if(less(reach,i.lo))break;reach=maximum(reach,i.hi);}
-        if(!less(reach,{Coefficient(1),Coefficient(1)}))return true;
-    }
-    return false;
-}
-
-bool in_capsule(const Point& p, const Line& e, int64_t eps)
-{
-    // The caller checked |coordinate|, eps <= loRange. K/h/cross fit int64;
-    // cross^2 and eps^2*K require the full Int128 product, never int64 squares.
-    const int64_t vx = e.b.x()-e.a.x(), vy = e.b.y()-e.a.y(),
-                  wx = p.x()-e.a.x(), wy = p.y()-e.a.y(),
-                  K = vx*vx+vy*vy, h = wx*vx+wy*vy, eps2 = eps*eps;
-    if (K == 0 || h <= 0) return wx*wx+wy*wy <= eps2;
-    if (h >= K) {
-        const int64_t x = p.x()-e.b.x(), y = p.y()-e.b.y();
-        return x*x+y*y <= eps2;
-    }
-    const int64_t c = vx*wy-vy*wx;
-    return Int128::multiply(c, c) <= Int128::multiply(eps2, K);
-}
-}
-// Only native regularized planned-C masks are eligible at the controlled
-// rounded-contour call sites. False is unproved, never a rejection.
-bool FiberDomainIndex::proves_sample_band(const Polyline&path,double radius_grid) const
-{
-    if(empty_domain||boundaries.empty()||!supports(path)||path.points.size()<2||
-       !std::isfinite(radius_grid)||radius_grid<0||radius_grid>ClipperLib::loRange||std::floor(radius_grid)!=radius_grid)return false;
-    const int64_t eps=int64_t(radius_grid);bool nonzero=false;
-    for(size_t i=1;i<path.points.size();++i){const Point&a=path.points[i-1],&b=path.points[i];if(a==b)continue;nonzero=true;
-        if(permits(Polyline(Points{a,b}),false))continue;
-        bool witnessed=false;
-        query(double(a.x()-eps),double(a.y()-eps),double(a.x()+eps),double(a.y()+eps),[&](const Line&e){if(query_band_detail::in_capsule(a,e,eps)&&query_band_detail::in_capsule(b,e,eps)){witnessed=true;return false;}return true;});
-        if(witnessed)continue;
-        std::vector<query_band_detail::InnerInterval> intervals;
-        query(double(std::min(a.x(),b.x())-eps),double(std::min(a.y(),b.y())-eps),double(std::max(a.x(),b.x())+eps),double(std::max(a.y(),b.y())+eps),[&](const Line&e){query_band_detail::intervals(intervals,a,b,e,eps);return true;});
-        query_band_detail::Fraction reach{query_band_detail::Coefficient(0),query_band_detail::Coefficient(1)};
-        if(!query_band_detail::covers(std::move(intervals),reach))return false;
-    }
-    return nonzero;
-}
-}
-
 
 namespace {
 
@@ -622,10 +516,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
     size_t job_ordinal, const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
     const ExPolygons* physical_centerline_domain, bool collect_debug, bool requires_closed_loop,
     const std::vector<ContourArc>* source_arcs, double bend_stabilization_length_mm,
-    std::vector<FiberFragmentId>* policy_rejected,
-    const continuous_fiber_detail::FiberDomainIndex* containment,
-    const continuous_fiber_detail::FiberFinalizationDomains* finalization_domains,
-    const continuous_fiber_detail::FiberInfillValidationContext* material_context)
+    std::vector<FiberFragmentId>* policy_rejected)
 {
     FiberValidationResult result;
     result.output_role = output_role;
@@ -633,7 +524,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
     // Analytic geometry belongs to this one candidate, never to a separate
     // array indexed by a traversal order through extrusion collections.
     if (source_arcs && (candidate_roots.size() != 1 || !dynamic_cast<const ExtrusionPath*>(candidate_roots.front()) ||
-        (!material_context && (!planned_centerline_domain || !physical_centerline_domain))))
+        !planned_centerline_domain || !physical_centerline_domain))
         throw std::invalid_argument("Analytic fiber geometry requires one path and its centerline domains");
     const bool allocates_contour = purpose == FiberPathPurpose::Contour && planned_centerline_domain;
     const bool rounds_contours = purpose == FiberPathPurpose::Contour && config.contour_bend_radius_mm > 0;
@@ -675,10 +566,6 @@ FiberValidationResult FiberPathValidator::validate_impl(
 
     const auto process_path = [&](const ExtrusionPath& input) {
         ExtrusionPath path(input);
-        if (material_context && (!source_arcs || purpose!=FiberPathPurpose::Infill ||
-            !material_context->certificate.matches_source(material_context->source_index,path.polyline,*source_arcs)))
-            throw std::runtime_error("Material-certified infill source identity mismatch");
-        std::optional<continuous_fiber_detail::FiberFinalizationDomains> contour_domains;
         bool planar = true;
         // Source shaping may ignore other boundaries, but simplification must
         // not create a shortcut outside the physical domain and then clip it
@@ -691,22 +578,14 @@ FiberValidationResult FiberPathValidator::validate_impl(
             // Clean these before freezing source stations, with the existing
             // domain-preserving normalizer. Never simplify analytic arcs.
             if (!rounds_contours) {
-                if (purpose == FiberPathPurpose::Infill && source_arcs) {
-                    // validate_infill already computed this exact expanded planned domain.
-                    path.polyline = normalize_fiber_geometry(path.polyline, physical_centerline_domain);
-                } else {
-                    const auto cleanup_domain=offset_ex(centerline_domain_for_width(path.width),
-                        float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
-                    path.polyline = normalize_fiber_geometry(path.polyline, &cleanup_domain);
-                }
+                const auto cleanup_domain=offset_ex(centerline_domain_for_width(path.width),
+                    float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
+                path.polyline = normalize_fiber_geometry(path.polyline, &cleanup_domain);
             }
         }
         catch (const FiberExecutionError&) { throw; }
     catch (const CanceledException&) { throw; }
     catch (const std::invalid_argument&) { planar = false; }
-        if (material_context && !material_context->certificate.matches_source(
-                material_context->source_index,path.polyline,*source_arcs))
-            throw std::runtime_error("Material-certified infill normalization changed source identity");
         const FiberCandidateId candidate_id {domain_id, purpose, job_ordinal, path_ordinal++};
         FiberRejectionReason whole_path_reason = !planar ? FiberRejectionReason::InvalidGeometry :
             validate_path_geometry(path, !rounds_contours);
@@ -770,41 +649,13 @@ FiberValidationResult FiberPathValidator::validate_impl(
         if (collect_debug && whole_path_reason==FiberRejectionReason::None) result.reference_paths.push_back(path);
         bool mapping_valid=true;
         std::vector<SourceInterval> intervals;
-        bool band_source_proved=false;
-        if(whole_path_reason==FiberRejectionReason::None && allocates_contour && rounds_contours &&
-            !source_arcs && (!requires_closed_loop || path.is_closed())) {
-            const double native_delta=double(float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
-            const double proof_radius=native_delta/2;
-            if(std::isfinite(proof_radius) && proof_radius>=0 && proof_radius<=ClipperLib::loRange &&
-                std::floor(proof_radius)==proof_radius) {
-                continuous_fiber_detail::FiberFinalizationDomains tentative(*planned_centerline_domain,
-                    candidate_id,path.width,native_delta,[&partition_domain_for_width,width=path.width]() -> const ExPolygons& {
-                        return partition_domain_for_width(width);
-                    });
-                if(tentative.proves_planned_band(check_view(path.polyline))) {
-                    band_source_proved=true;
-                    contour_domains.emplace(std::move(tentative));
-                }
-            }
-        }
         if (whole_path_reason==FiberRejectionReason::None) {
             if (source_arcs) {
                 // The generator already produces contained paths. Clipping an
                 // arc here would hide a generation error and break its routing.
-                if (!material_context) {
-                    const auto checked=check_view(path.polyline);
-                    const bool contained=containment && containment->supports(checked)?
-                        containment->permits(checked,false):diff_pl(Polylines{checked},*physical_centerline_domain).empty();
-                    if (!contained)
-                        throw std::runtime_error("Generated fiber infill leaves its centerline domain");
-                }
-                // Material context carries a full-width source proof. The
-                // original whole-source C check is deferred until AFTER the
-                // unchanged Finalizer process guard, never replaced by a fragment.
+                if (!diff_pl(Polylines{check_view(path.polyline)}, *physical_centerline_domain).empty())
+                    throw std::runtime_error("Generated fiber infill leaves its centerline domain");
                 intervals={{0.0,scale_(Geometry::length_with_arcs_mm(path.polyline)),FiberAssignmentKind::AcceptedFiber,FiberRejectionReason::None}};
-            } else if (band_source_proved) {
-                intervals={{0.0,scale_(Geometry::length_with_arcs_mm(path.polyline)),FiberAssignmentKind::AcceptedFiber,FiberRejectionReason::None}};
-                if(allocates_contour && !requires_closed_loop)rotate_reference(path,reference_arcs,intervals);
             } else if (requires_closed_loop) {
                 // Do not partition an exterior into printable strands. Geometry,
                 // occupancy and process validation belong to the entire loop;
@@ -952,30 +803,8 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 FiberFinalizationResult finalized;
                 try {
                     const auto finish=make_independent_fiber_finish_route(*assignment.centerline,config,assignment.id);
-                    const auto* effective_domains=finalization_domains;
-                    if (rounds_contours && planned_centerline_domain && !source_arcs &&
-                        final_domain==planned_centerline_domain) {
-                        // This path's partition already owns the identical +100nm domain.
-                        // A committed fragment may replace final_domain; recheck every time.
-                        if (!contour_domains)
-                            contour_domains.emplace(*planned_centerline_domain,
-                                partition_domain_for_width(path.width));
-                        effective_domains=&*contour_domains;
-                    }
-                    std::optional<continuous_fiber_detail::FiberInfillFinalizationContext> lazy_context;
-                    if (material_context) {
-                        lazy_context.emplace(continuous_fiber_detail::FiberInfillFinalizationContext{
-                            *material_context,path.polyline,*source_arcs,[&](const continuous_fiber_detail::FiberDomainIndex& index,const ExPolygons& physical) {
-                                if (!material_context->certificate.matches_source(material_context->source_index,path.polyline,*source_arcs))
-                                    throw std::runtime_error("Material-certified infill lost whole-source identity");
-                                const auto checked=check_view(path.polyline);
-                                const bool contained=index.supports(checked)?index.permits(checked,false):diff_pl(Polylines{checked},physical).empty();
-                                if (!contained)throw std::runtime_error("Generated fiber infill leaves its centerline domain");
-                            }});
-                    }
                     finalized=FiberPathFinalizer::finalize(
-                        *assignment.centerline,allowed_domain,config,assignment.id,finish,arcs,final_domain,{}, {},effective_domains,
-                        lazy_context?&*lazy_context:nullptr);
+                        *assignment.centerline,allowed_domain,config,assignment.id,finish,arcs,final_domain);
                 } catch (const FiberExecutionError&) { throw; }
     catch (const CanceledException&) { throw; }
     catch (const std::invalid_argument& error) {
@@ -1091,36 +920,17 @@ FiberValidationResult FiberPathValidator::validate_infill(
 {
     FiberValidationResult result;
     result.output_role = erContinuousFiberInfill;
-    const bool material_mode=candidates.domain_mode==FiberInfillDomainMode::MaterialCertified2R;
-    std::optional<continuous_fiber_detail::FiberLazyInfillDomains> lazy_domains;
-    std::optional<ExPolygons> comparison_domain;
-    std::unique_ptr<continuous_fiber_detail::FiberDomainIndex> containment;
-    std::optional<continuous_fiber_detail::FiberFinalizationDomains> finalization_domains;
-    if (material_mode) {
-        if (!candidates.material_certificate ||
-            !candidates.material_certificate->matches_material(allowed_domain,config.infill_flow.width()) ||
-            !candidates.material_certificate->matches_batch(candidates))
-            throw std::runtime_error("Material-certified infill batch identity mismatch");
-        lazy_domains.emplace(*candidates.material_certificate,config.infill_flow.width());
-    } else {
-        comparison_domain=offset_ex(candidates.centerline_domain,float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
-        containment=std::make_unique<continuous_fiber_detail::FiberDomainIndex>(*comparison_domain);
-        finalization_domains.emplace(candidates.centerline_domain,*comparison_domain);
-    }
+    const auto comparison_domain = offset_ex(candidates.centerline_domain,
+        float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
     for (size_t i = 0; i < candidates.paths.size(); ++i) {
         const auto& candidate = candidates.paths[i];
         ExtrusionPath path(erContinuousFiberInfill, config.infill_flow.mm3_per_mm(),
             config.infill_flow.width(), config.infill_flow.height());
         path.polyline = candidate.geometry;
         std::vector<FiberFragmentId> policy_rejected;
-        std::optional<continuous_fiber_detail::FiberInfillValidationContext> material_context;
-        if (material_mode) material_context.emplace(continuous_fiber_detail::FiberInfillValidationContext{
-            *lazy_domains,*candidates.material_certificate,i});
         auto validated = validate_impl({&path}, allowed_domain, config, FiberPathPurpose::Infill,
-            erContinuousFiberInfill, domain_id, i, material_mode?nullptr:&candidates.centerline_domain, nullptr,
-            material_mode?nullptr:&*comparison_domain, false, false, &candidate.arcs, 0.0, &policy_rejected,
-            containment.get(),finalization_domains?&*finalization_domains:nullptr,
-            material_context?&*material_context:nullptr);
+            erContinuousFiberInfill, domain_id, i, &candidates.centerline_domain, nullptr, &comparison_domain,
+            false, false, &candidate.arcs, 0.0, &policy_rejected);
         for (const auto& assignment : validated.assignments)
             if (assignment.kind == FiberAssignmentKind::Rejected &&
                 assignment.reason != FiberRejectionReason::TooShort &&
@@ -1137,10 +947,6 @@ FiberValidationResult FiberPathValidator::validate_infill(
             }
         merge_validation(result, std::move(validated));
     }
-    if (material_mode)
-        BOOST_LOG_TRIVIAL(warning) << "FIBER_MATERIAL_QUERY_BATCH mode=MaterialCertified2R candidates=" << candidates.paths.size()
-            << " accepted=" << result.accepted_count() << " rejected=" << result.rejected_count()
-            << " true_C_resolutions=" << lazy_domains->resolution_count;
     result.physical_footprint = union_ex(result.physical_footprint);
     result.resin_exclusion = union_ex(result.resin_exclusion);
     result.outside_domain = union_ex(result.outside_domain);

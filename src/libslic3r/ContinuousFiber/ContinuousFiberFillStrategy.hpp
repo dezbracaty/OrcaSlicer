@@ -105,19 +105,7 @@ ContourRoundingResult search_contour_partitions(std::vector<CornerGroup> initial
 } // namespace continuous_fiber_detail
 
 namespace continuous_fiber_detail {
-// Integer provenance belongs only to the explicitly enumerated G1 frames.
-// General rotations keep the native truncating conversion and frame exactly.
-struct MaterialQueryCoordinates {
-    Eigen::Matrix2d frame;
-    int canonical_quarter = -1;
-    explicit MaterialQueryCoordinates(double rotation_radians);
-    bool canonical() const { return canonical_quarter >= 0; }
-    Point input_point(const Point& point) const;
-    Point point(const Vec2d& world_mm, std::optional<coord_t> transverse = {}) const;
-    coord_t row_offset(coord_t row, coord_t offset, int step) const;
-};
-void bind_contour_arcs(Polyline3& path, std::vector<ContourArc>& arcs, std::vector<ContourBend>* bends = nullptr,
-                       const std::vector<Point>* explicit_centers = nullptr);
+void bind_contour_arcs(Polyline3& path, std::vector<ContourArc>& arcs, std::vector<ContourBend>* bends = nullptr);
 std::vector<ContourArc> arc_metadata(const Polyline3& path);
 }
 
@@ -147,14 +135,9 @@ struct FiberInfillPath {
     std::vector<ContourArc> arcs;
 };
 
-namespace continuous_fiber_detail { class FiberInfillMaterialCertificate; }
-enum class FiberInfillDomainMode { NativeCenterline, MaterialCertified2R };
-
 struct FiberInfillCandidates {
     ExPolygons centerline_domain;
     std::vector<FiberInfillPath> paths;
-    FiberInfillDomainMode domain_mode {FiberInfillDomainMode::NativeCenterline};
-    std::shared_ptr<const continuous_fiber_detail::FiberInfillMaterialCertificate> material_certificate;
 };
 
 class ContinuousFiberFillStrategy {

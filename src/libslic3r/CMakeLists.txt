@@ -122,10 +122,6 @@ set(lisbslic3r_sources
     ContinuousFiber/FiberPathFinalizer.hpp
     ContinuousFiber/FiberPathValidator.cpp
     ContinuousFiber/FiberPathValidator.hpp
-    ContinuousFiber/ContinuousFiberClearanceQuery.hpp
-    ContinuousFiber/FiberDomainIndex.hpp
-    ContinuousFiber/FiberInfillMaterialCertificate.hpp
-    ContinuousFiber/FiberInfillValidationDomains.hpp
     CustomGCode.cpp
     CustomGCode.hpp
     CutUtils.cpp
@@ -684,6 +680,3 @@ if (SLIC3R_PCH AND NOT SLIC3R_SYNTAXONLY)
     set_source_files_properties(NSVGUtils.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
     add_precompiled_header(libslic3r pchheader.hpp FORCEINCLUDE)
 endif ()
-
-# Exact fiber material queries consume these headers in the core itself.
-target_include_directories(libslic3r PRIVATE ${GMP_INCLUDE_DIR} ${MPFR_INCLUDE_DIR})
