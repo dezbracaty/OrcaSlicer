@@ -27,6 +27,9 @@ void FillConcentricInternal::fill_surface_extrusion(const Surface* surface, cons
 
         double min_nozzle_diameter = *std::min_element(print_config->nozzle_diameter.values.begin(), print_config->nozzle_diameter.values.end());
         Arachne::WallToolPathsParams input_params;
+        // Preserve short residual paths in solid infill. The perimeter default
+        // (0.5) removes valid deposition here and changes ordinary Orca output.
+        input_params.min_length_factor = 0.0f;
         input_params.min_bead_width = 0.85 * min_nozzle_diameter;
         input_params.min_feature_size = 0.25 * min_nozzle_diameter;
         input_params.wall_transition_length = 0.4;
