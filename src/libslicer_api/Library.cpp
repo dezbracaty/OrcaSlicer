@@ -3917,8 +3917,9 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
 
     try {
         std::error_code file_error;
+        // API paths are UTF-8; implicit narrow paths use the Windows ANSI code page.
         if (request.path.empty() ||
-            !fs::is_regular_file(request.path, file_error) || file_error) {
+            !fs::is_regular_file(fs::u8path(request.path), file_error) || file_error) {
             result.diagnostics.push_back(
                 {"input", "3MF project does not exist: " + request.path, false});
             release_import_resources();
