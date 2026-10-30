@@ -8,5 +8,5 @@
     "bed_model": "",
     "bed_texture": "",
     "hotend_model": "",
-    "default_materials": "Generic PLA @P3"
+    "default_materials": "Generic PLA @P3;CFSYS PLA;CFSYS PETG;CFSYS ABS;CFSYS ABS-CF;CFSYS ABS-GF;CFSYS ASA;CFSYS ASA-CF;CFSYS ASA-GF;CFSYS PA;CFSYS PA-CF;CFSYS TPU 95A;CFSYS PET-CF;CFSYS PET-GF;CFSYS PPS-CF;CFSYS S-Multi;CFSYS CIRON;CFSYS CCF"
 }

@@ -185,6 +185,12 @@ resource root explicitly, as in the example. `find_package` also exposes
   validation, and independent configuration snapshots. Pass a snapshot to each
   slice. Material slots and physical tool IDs are distinct; use explicit tool
   mappings rather than inferring tools from material types.
+  A tool may declare `thermoplastic+continuous_fiber` to accept either process;
+  `filament_process_type` identifies the process of each selected material.
+  P3 supports this selection on T0 through T5. Selection does not certify its
+  firmware: fiber export still requires a configured protocol and cut command.
+  The shared CFSYS materials allow all six P3 tool bits (`filament_printable=63`);
+  machine capabilities still enforce Alpha500's dedicated tool roles.
 - [`Toolpath.hpp`](include/libslicer/Toolpath.hpp): preview data for rendering.
   Logical motions and render segments have separate counts; retain the preview
   handle while using its data.

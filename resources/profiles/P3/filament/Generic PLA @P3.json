@@ -5,6 +5,7 @@
     "setting_id": "P3FPLA",
     "filament_id": "P3PLA",
     "instantiation": "true",
+    "filament_printable": ["63"],
     "compatible_printers": ["P3 0.4 nozzle"],
     "filament_type": ["PLA"],
     "filament_vendor": ["Generic"],

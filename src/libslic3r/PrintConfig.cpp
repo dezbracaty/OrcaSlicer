@@ -5696,7 +5696,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("toolhead_process_capabilities", coStrings);
     def->label = "Toolhead process capabilities";
-    def->tooltip = "Process accepted by each physical tool: thermoplastic or continuous_fiber.";
+    def->tooltip = "Processes accepted by each physical tool: thermoplastic, continuous_fiber, or thermoplastic+continuous_fiber.";
     def->mode = comDevelop;
     def->set_default_value(new ConfigOptionStrings{"thermoplastic"});
 

@@ -1324,6 +1324,42 @@ TEST_CASE("fiber tool resolution keeps material logical extruder and physical to
     CHECK_THROWS(resolve_fiber_tool(config, 1));
 }
 
+TEST_CASE("mixed-capability tools resolve fiber from the selected material", "[ContinuousFiber][mapping][p3]")
+{
+    const unsigned fiber_tool = GENERATE(0u, 1u, 2u, 3u, 4u, 5u);
+    const bool reverse_logical_order = GENERATE(false, true);
+    CAPTURE(fiber_tool, reverse_logical_order);
+    GCodeConfig config;
+    config.filament_diameter.values.assign(6, 1.75);
+    config.filament_process_type.values.assign(6, "thermoplastic");
+    config.filament_process_type.values[fiber_tool] = "continuous_fiber";
+    config.physical_extruder_map.values = reverse_logical_order
+        ? std::vector<int>{5,4,3,2,1,0} : std::vector<int>{0,1,2,3,4,5};
+    config.filament_map.values = reverse_logical_order
+        ? std::vector<int>{6,5,4,3,2,1} : std::vector<int>{1,2,3,4,5,6};
+    config.filament_slots_bound_to_physical_tools.value = true;
+    config.toolhead_process_capabilities.values.assign(6, "thermoplastic+continuous_fiber");
+    config.toolhead_filament_capacity.values.assign(6, 1);
+    config.toolhead_fiber_protocol_id.values.assign(6, "");
+    config.toolhead_fiber_e_units_per_mm.values.assign(6, 2.0);
+    CHECK(has_fiber_tool(config));
+    CHECK(tool_accepts_process(config, fiber_tool, "thermoplastic"));
+    CHECK(tool_accepts_process(config, fiber_tool, "continuous_fiber"));
+    CHECK_FALSE(tool_accepts_process(config, fiber_tool, "unknown"));
+    CHECK_FALSE(tool_accepts_process(config, 6, "continuous_fiber"));
+    CHECK_NOTHROW(validate_material_tool_bindings(config));
+    CHECK_THROWS(resolve_fiber_tool(config, fiber_tool));
+    config.toolhead_fiber_protocol_id.values.assign(6, "linear-e-v1");
+    const auto resolved = resolve_fiber_tool(config, fiber_tool);
+    CHECK(resolved.logical_filament_id == fiber_tool);
+    CHECK(resolved.logical_extruder_id == (reverse_logical_order ? 5-fiber_tool : fiber_tool));
+    CHECK(resolved.physical_tool_id == fiber_tool);
+    CHECK(resolved.e_units_per_mm == 2.0);
+    config.toolhead_process_capabilities.values[fiber_tool] = "thermoplastic";
+    CHECK_THROWS(validate_material_tool_bindings(config));
+    CHECK_THROWS(resolve_fiber_tool(config, fiber_tool));
+}
+
 TEST_CASE("CFSYS physical tool ownership is independent of material order", "[ContinuousFiber][mapping][tool-materials]")
 {
     GCodeConfig config;

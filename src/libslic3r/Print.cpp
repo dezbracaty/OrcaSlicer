@@ -4033,11 +4033,10 @@ std::vector<std::set<int>> Print::get_physical_unprintable_filaments(const std::
         for (int logical = 0; logical < extruder_num; ++logical) {
             const int physical = size_t(logical) < m_config.physical_extruder_map.values.size() ?
                 m_config.physical_extruder_map.values[logical] : -1;
-            const std::string capability = physical >= 0 && size_t(physical) < m_config.toolhead_process_capabilities.values.size() ?
-                m_config.toolhead_process_capabilities.values[physical] : "";
             for (unsigned filament : used_filaments) {
                 const bool fiber = is_fiber_filament(m_config, filament);
-                bool compatible = capability == (fiber ? "continuous_fiber" : "thermoplastic");
+                bool compatible = physical >= 0 && tool_accepts_process(m_config, unsigned(physical),
+                    fiber ? "continuous_fiber" : "thermoplastic");
                 if (fiber && filament < m_config.filament_map.values.size()) {
                     const int original = m_config.filament_map.values[filament]-1;
                     // No upstream geometric replan in a mapping pass: nozzle
