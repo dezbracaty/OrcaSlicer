@@ -538,7 +538,7 @@ else()
     message(STATUS "📥 正在下载 OpenVDB...")
     message(STATUS "   URL: ${OPENVDB_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${OPENVDB_DOWNLOAD_URL}
         ${OPENVDB_ZIP_FILE}
         EXPECTED_HASH SHA256=f353e7b99bd0cbfc27ac9082de51acf32a8bc0b3e21ff9661ecca6f205ec1d81

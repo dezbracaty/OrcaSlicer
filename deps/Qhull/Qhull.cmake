@@ -243,7 +243,7 @@ else() # NONE
     message(STATUS "⬇️  开始下载 Qhull ${QHULL_VERSION}...")
     message(STATUS "   URL: ${QHULL_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${QHULL_URL}
         ${QHULL_ZIP_FILE}
         EXPECTED_HASH ${QHULL_URL_HASH}
@@ -255,7 +255,7 @@ else() # NONE
     list(GET download_status 0 status_code)
     list(GET download_status 1 status_msg)
     if(NOT status_code EQUAL 0)
-        file(REMOVE "${QHULL_ZIP_FILE}")
+
         message(FATAL_ERROR "❌ Qhull 下载失败: ${status_msg}\n   ${download_log}")
     endif()
     message(STATUS "✅ Qhull 下载成功")

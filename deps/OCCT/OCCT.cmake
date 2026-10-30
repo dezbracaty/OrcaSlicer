@@ -519,7 +519,7 @@ else()
     message(STATUS "📥 正在下载 OCCT...")
     message(STATUS "   URL: ${OCCT_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${OCCT_DOWNLOAD_URL}
         ${OCCT_ZIP_FILE}
         EXPECTED_HASH SHA256=28334f0e98f1b1629799783e9b4d21e05349d89e695809d7e6dfa45ea43e1dbc

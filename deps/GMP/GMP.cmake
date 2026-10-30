@@ -116,7 +116,7 @@ if(_GMP_APPLE_ARM64_NOASM)
                     if(_gmp_legacy_archive_hash STREQUAL _GMP_SRC_SHA256)
                         configure_file("${GMP_ZIP_FILE}" "${_gmp_archive}.tmp" COPYONLY)
                     else()
-                        file(DOWNLOAD "${_GMP_SRC_URL}" "${_gmp_archive}.tmp"
+                        gplatform_download( "${_GMP_SRC_URL}" "${_gmp_archive}.tmp"
                             EXPECTED_HASH "SHA256=${_GMP_SRC_SHA256}" STATUS _gmp_download_status)
                         list(GET _gmp_download_status 0 _gmp_download_result)
                         if(NOT _gmp_download_result EQUAL 0)
@@ -557,7 +557,7 @@ else()
     message(STATUS "⬇️  下载 GMP ${_GMP_SRC_VERSION} 源码...")
     message(STATUS "   URL: ${_GMP_SRC_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         "${_GMP_SRC_URL}"
         "${GMP_ZIP_FILE}"
         EXPECTED_HASH SHA256=${_GMP_SRC_SHA256}

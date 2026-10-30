@@ -443,7 +443,7 @@ else()
     message(STATUS "📥 正在下载 libnoise...")
     message(STATUS "   URL: ${LIBNOISE_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${LIBNOISE_DOWNLOAD_URL}
         ${LIBNOISE_ZIP_FILE}
         EXPECTED_HASH SHA256=96ffd6cc47898dd8147aab53d7d1b1911b507d9dbaecd5613ca2649468afd8b6

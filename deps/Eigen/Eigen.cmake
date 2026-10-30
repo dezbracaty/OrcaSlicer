@@ -228,7 +228,7 @@ else()
     message(STATUS "⬇️  开始下载 Eigen ${EIGEN_VERSION}...")
     message(STATUS "   URL: ${EIGEN_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${EIGEN_URL}
         ${EIGEN_ZIP_FILE}
         EXPECTED_HASH ${EIGEN_URL_HASH}
@@ -240,7 +240,7 @@ else()
     list(GET download_status 0 status_code)
     list(GET download_status 1 status_msg)
     if(NOT status_code EQUAL 0)
-        file(REMOVE "${EIGEN_ZIP_FILE}")
+
         message(FATAL_ERROR "❌ Eigen 下载失败: ${status_msg}\n   ${download_log}")
     endif()
     message(STATUS "✅ Eigen 下载成功")

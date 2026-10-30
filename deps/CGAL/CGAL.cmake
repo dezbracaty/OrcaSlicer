@@ -445,7 +445,7 @@ else()
     message(STATUS "📥 正在下载 CGAL...")
     message(STATUS "   URL: ${CGAL_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${CGAL_DOWNLOAD_URL}
         ${CGAL_ZIP_FILE}
         EXPECTED_HASH SHA256=5d577acb4a9918ccb960491482da7a3838f8d363aff47e14d703f19fd84733d4

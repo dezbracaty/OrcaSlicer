@@ -105,7 +105,7 @@ if(_GMP_APPLE_ARM64_NOASM)
                     if(_mpfr_legacy_archive_hash STREQUAL _MPFR_SRC_SHA256)
                         configure_file("${MPFR_ZIP_FILE}" "${_mpfr_archive}.tmp" COPYONLY)
                     else()
-                        file(DOWNLOAD "${_MPFR_SRC_URL}" "${_mpfr_archive}.tmp"
+                        gplatform_download( "${_MPFR_SRC_URL}" "${_mpfr_archive}.tmp"
                             EXPECTED_HASH "SHA256=${_MPFR_SRC_SHA256}" STATUS _mpfr_download_status)
                         list(GET _mpfr_download_status 0 _mpfr_download_result)
                         if(NOT _mpfr_download_result EQUAL 0)
@@ -515,7 +515,7 @@ else()
     message(STATUS "⬇️  下载 MPFR ${_MPFR_SRC_VERSION} 源码...")
     message(STATUS "   URL: ${_MPFR_SRC_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         "${_MPFR_SRC_URL}"
         "${MPFR_ZIP_FILE}"
         EXPECTED_HASH SHA256=${_MPFR_SRC_SHA256}

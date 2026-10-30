@@ -274,7 +274,7 @@ else() # NONE
     message(STATUS "⬇️  开始下载 TBB ${TBB_VERSION}...")
     message(STATUS "   URL: ${TBB_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${TBB_URL}
         ${TBB_ZIP_FILE}
         EXPECTED_HASH ${TBB_URL_HASH}
@@ -286,7 +286,7 @@ else() # NONE
     list(GET download_status 0 status_code)
     list(GET download_status 1 status_msg)
     if(NOT status_code EQUAL 0)
-        file(REMOVE "${TBB_TAR_FILE}")
+
         message(FATAL_ERROR "❌ TBB 下载失败: ${status_msg}\n   ${download_log}")
     endif()
     message(STATUS "✅ TBB 下载成功")

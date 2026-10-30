@@ -463,7 +463,7 @@ else()
     message(STATUS "📥 正在下载 OpenEXR...")
     message(STATUS "   URL: ${OPENEXR_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${OPENEXR_DOWNLOAD_URL}
         ${OPENEXR_ZIP_FILE}
         EXPECTED_HASH SHA256=0307a3d7e1fa1e77e9d84d7e9a8694583fbbbfd50bdc6884e2c96b8ef6b902de

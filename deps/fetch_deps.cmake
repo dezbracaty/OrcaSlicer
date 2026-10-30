@@ -1,4 +1,5 @@
 # deps/fetch_deps.cmake
+include("${CMAKE_CURRENT_LIST_DIR}/DependencyDownload.cmake")
 #
 # Aggregator for the fetch-based dependency system.
 #

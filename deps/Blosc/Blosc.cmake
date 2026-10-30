@@ -469,7 +469,7 @@ else()
     message(STATUS "📥 正在下载 Blosc...")
     message(STATUS "   URL: ${BLOSC_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${BLOSC_DOWNLOAD_URL}
         ${BLOSC_ZIP_FILE}
         EXPECTED_HASH SHA256=dcb48bf43a672fa3de6a4b1de2c4c238709dad5893d1e097b8374ad84b1fc3b3

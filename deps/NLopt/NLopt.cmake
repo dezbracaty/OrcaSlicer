@@ -476,7 +476,7 @@ else()
     message(STATUS "📥 正在下载 NLopt...")
     message(STATUS "   URL: ${NLOPT_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${NLOPT_DOWNLOAD_URL}
         ${NLOPT_ZIP_FILE}
         EXPECTED_HASH SHA256=c6dd7a5701fff8ad5ebb45a3dc8e757e61d52658de3918e38bab233e7fd3b4ae

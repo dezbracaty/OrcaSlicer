@@ -582,7 +582,7 @@ else()
     message(STATUS "📥 正在下载 OpenCV...")
     message(STATUS "   URL: ${OPENCV_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${OPENCV_DOWNLOAD_URL}
         ${OPENCV_ZIP_FILE}
         EXPECTED_HASH SHA256=1ec1cba65f9f20fe5a41fda1586e01c70ea0c9a6d7b67c9e13edf0cfe2239277

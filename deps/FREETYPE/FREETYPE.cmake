@@ -465,7 +465,7 @@ else()
     message(STATUS "📥 正在下载 FREETYPE...")
     message(STATUS "   URL: ${FREETYPE_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${FREETYPE_DOWNLOAD_URL}
         ${FREETYPE_ZIP_FILE}
         EXPECTED_HASH SHA256=efe71fd4b8246f1b0b1b9bfca13cfff1c9ad85930340c27df469733bbb620938

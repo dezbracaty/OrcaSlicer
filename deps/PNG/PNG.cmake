@@ -324,7 +324,7 @@ else() # NONE
     message(STATUS "⬇️  开始下载 PNG ${PNG_VERSION}...")
     message(STATUS "   URL: ${PNG_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${PNG_URL}
         ${PNG_ZIP_FILE}
         EXPECTED_HASH ${PNG_URL_HASH}
@@ -336,7 +336,7 @@ else() # NONE
     list(GET download_status 0 status_code)
     list(GET download_status 1 status_msg)
     if(NOT status_code EQUAL 0)
-        file(REMOVE "${PNG_ZIP_FILE}")
+
         message(FATAL_ERROR "❌ PNG 下载失败: ${status_msg}\n   ${download_log}")
     endif()
     message(STATUS "✅ PNG 下载成功")

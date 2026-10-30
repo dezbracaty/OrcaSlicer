@@ -263,7 +263,7 @@ else() # NONE
     message(STATUS "⬇️  开始下载 Cereal ${CEREAL_VERSION}...")
     message(STATUS "   URL: ${CEREAL_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${CEREAL_URL}
         ${CEREAL_ZIP_FILE}
         EXPECTED_HASH ${CEREAL_URL_HASH}
@@ -275,7 +275,7 @@ else() # NONE
     list(GET download_status 0 status_code)
     list(GET download_status 1 status_msg)
     if(NOT status_code EQUAL 0)
-        file(REMOVE "${CEREAL_ZIP_FILE}")
+
         message(FATAL_ERROR "❌ Cereal 下载失败: ${status_msg}\n   ${download_log}")
     endif()
     message(STATUS "✅ Cereal 下载成功")

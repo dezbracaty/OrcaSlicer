@@ -459,7 +459,7 @@ else()
     message(STATUS "📥 正在下载 JPEG (libjpeg-turbo)...")
     message(STATUS "   URL: ${JPEG_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${JPEG_DOWNLOAD_URL}
         ${JPEG_ZIP_FILE}
         EXPECTED_HASH SHA256=d6d99e693366bc03897677650e8b2dfa76b5d6c54e2c9e70c03f0af821b0a52f

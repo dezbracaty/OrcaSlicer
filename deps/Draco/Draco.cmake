@@ -444,7 +444,7 @@ else()
     message(STATUS "📥 正在下载 Draco...")
     message(STATUS "   URL: ${DRACO_DOWNLOAD_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${DRACO_DOWNLOAD_URL}
         ${DRACO_ZIP_FILE}
         EXPECTED_HASH SHA256=27b72ba2d5ff3d0a9814ad40d4cb88f8dc89a35491c0866d952473f8f9416b77

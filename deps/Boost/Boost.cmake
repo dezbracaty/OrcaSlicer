@@ -293,7 +293,7 @@ else() # NONE
     message(STATUS "⬇️  开始下载 Boost ${BOOST_VERSION} (约 150MB)...")
     message(STATUS "   URL: ${BOOST_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${BOOST_URL}
         ${BOOST_TAR_FILE}
         EXPECTED_HASH ${BOOST_URL_HASH}
@@ -305,7 +305,7 @@ else() # NONE
     list(GET download_status 0 status_code)
     list(GET download_status 1 status_msg)
     if(NOT status_code EQUAL 0)
-        file(REMOVE "${BOOST_TAR_FILE}")
+
         message(FATAL_ERROR "❌ Boost 下载失败: ${status_msg}\n   ${download_log}")
     endif()
     message(STATUS "✅ Boost 下载成功")

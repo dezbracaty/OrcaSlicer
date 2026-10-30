@@ -316,7 +316,7 @@ else() # NONE
     message(STATUS "⬇️  开始下载 ZLIB ${ZLIB_VERSION}...")
     message(STATUS "   URL: ${ZLIB_URL}")
 
-    file(DOWNLOAD
+    gplatform_download(
         ${ZLIB_URL}
         ${ZLIB_ZIP_FILE}
         EXPECTED_HASH ${ZLIB_URL_HASH}
@@ -328,7 +328,7 @@ else() # NONE
     list(GET download_status 0 status_code)
     list(GET download_status 1 status_msg)
     if(NOT status_code EQUAL 0)
-        file(REMOVE "${ZLIB_ZIP_FILE}")
+
         message(FATAL_ERROR "❌ ZLIB 下载失败: ${status_msg}\n   ${download_log}")
     endif()
     message(STATUS "✅ ZLIB 下载成功")
