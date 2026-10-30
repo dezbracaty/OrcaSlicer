@@ -185,6 +185,284 @@ std::optional<DecodedPng> decode_png(const std::vector<unsigned char>& encoded)
 }
 } // namespace
 
+TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material", "[libslicer_api][p3][slice]")
+{
+    const unsigned physical_tool = GENERATE(0u, 1u, 2u, 3u, 4u, 5u);
+    INFO("physical_tool=" << physical_tool);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    // P3 must work on its own, without loading the CFSYS machine bundle first.
+    options.vendors = {"P3"};
+    auto p3 = libslicer::Library::open(options);
+    REQUIRE(p3);
+    options.vendors = {"CFSYS"};
+    auto alpha500 = libslicer::Library::open(options);
+    REQUIRE(alpha500);
+
+    const std::vector<std::string> materials = {
+        "CFSYS PLA", "CFSYS PETG", "CFSYS ABS", "CFSYS ABS-CF", "CFSYS ABS-GF",
+        "CFSYS ASA", "CFSYS ASA-CF", "CFSYS ASA-GF", "CFSYS PA", "CFSYS PA-CF",
+        "CFSYS TPU 95A", "CFSYS PET-CF", "CFSYS PET-GF", "CFSYS PPS-CF",
+        "CFSYS S-Multi", "CFSYS CIRON"
+    };
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    const auto initial = p3->activate_config(selection);
+    for (const auto& issue : initial.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(initial.success);
+    REQUIRE(initial.view.filament_slots.size() == 6);
+    for (const auto& slot : initial.view.filament_slots) {
+        for (const auto& material : materials) {
+            INFO("tool=" << slot.physical_tool_index << " material=" << material);
+            CHECK(std::any_of(slot.compatible_presets.begin(), slot.compatible_presets.end(),
+                [&](const auto& preset) { return preset.id == material; }));
+        }
+    }
+
+    libslicer::SliceObjectInput object;
+    object.name = "P3-material-coupon";
+    libslicer::SliceVolumeInput volume;
+    volume.vertices = {{100,100,0},{110,100,0},{110,110,0},{100,110,0},
+                       {100,100,0.6f},{110,100,0.6f},{110,110,0.6f},{100,110,0.6f}};
+    volume.triangles = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                       {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+    volume.default_filament_slot = int(physical_tool + 1);
+    object.volumes.push_back(std::move(volume));
+    const auto output_directory = std::filesystem::temp_directory_path() / "libslicer-p3-materials";
+    std::filesystem::create_directories(output_directory);
+
+    for (const auto& material : materials) {
+        INFO(material);
+        selection.filament_preset_ids.assign(6, "Generic PLA @P3");
+        selection.filament_preset_ids[physical_tool] = material;
+        const auto activated = p3->activate_config(selection);
+        for (const auto& issue : activated.diagnostics) UNSCOPED_INFO(issue.message);
+        REQUIRE(activated.success);
+        const auto config = p3->active_config_snapshot();
+        REQUIRE(config);
+
+        libslicer::ConfigSelection reference;
+        reference.machine_model_id = "CFSYS Alpha500 Printer";
+        reference.machine_variant_id = "0.4";
+        reference.filament_preset_ids = {material, "CFSYS CCF"};
+        const auto expected = alpha500->create_config(reference);
+        for (const auto& issue : expected.diagnostics) UNSCOPED_INFO(issue.message);
+        REQUIRE(expected.success);
+        const auto original = expected.config->snapshot();
+        const auto material_value = [&](const std::string& serialized) {
+            std::istringstream input(serialized);
+            std::string value;
+            for (unsigned index = 0; index <= physical_tool; ++index)
+                REQUIRE(std::getline(input, value, ','));
+            return value;
+        };
+        // Compare the actual loaded material, including inherited cooling and
+        // flow settings, rather than just checking the catalog's JSON entries.
+        for (const char* key : {"nozzle_temperature", "nozzle_temperature_initial_layer",
+                "nozzle_temperature_range_low", "nozzle_temperature_range_high",
+                "filament_flow_ratio", "filament_max_volumetric_speed", "filament_density",
+                "filament_diameter", "fan_min_speed", "fan_max_speed",
+                "close_fan_the_first_x_layers", "hot_plate_temp", "hot_plate_temp_initial_layer",
+                "chamber_temperature", "pressure_advance", "enable_pressure_advance"}) {
+            INFO(key);
+            const auto actual_value = config->value(key);
+            const auto original_value = original.value(key);
+            REQUIRE(actual_value);
+            REQUIRE(original_value);
+            CHECK(material_value(*actual_value) ==
+                  original_value->substr(0, original_value->find(',')));
+        }
+
+        libslicer::SliceRequest request;
+        request.config = *config;
+        request.objects = {object};
+        request.output_gcode_path = (output_directory / (material + "-T" + std::to_string(physical_tool) + ".gcode")).string();
+        const auto sliced = p3->slice(request);
+        for (const auto& issue : sliced.diagnostics) UNSCOPED_INFO(issue.message);
+        REQUIRE(sliced.success);
+        REQUIRE(sliced.preview);
+        CHECK(sliced.preview->layers.size() == 3);
+        CHECK(sliced.preview->statistics.total_fiber_feed_mm == 0);
+        CHECK(std::any_of(sliced.preview->segments.begin(), sliced.preview->segments.end(),
+            [](const auto& segment) { return segment.extrusion_delta_mm > 0; }));
+        CHECK(std::all_of(sliced.preview->segments.begin(), sliced.preview->segments.end(),
+            [&](const auto& segment) {
+                return segment.extrusion_delta_mm <= 0 ||
+                    (segment.tool_id == physical_tool && segment.filament_id == physical_tool);
+            }));
+        std::ifstream generated(request.output_gcode_path);
+        REQUIRE(generated.good());
+        const std::string gcode((std::istreambuf_iterator<char>(generated)), {});
+        const auto initial_temperature = config->value("nozzle_temperature_initial_layer");
+        REQUIRE(initial_temperature);
+        CHECK(gcode.find("M109 S" + material_value(*initial_temperature) + "\n") != std::string::npos);
+        CHECK(gcode.find("\nT" + std::to_string(physical_tool) + "\n") != std::string::npos);
+        CHECK(gcode.find("DF1004") == std::string::npos);
+        CHECK(gcode.find("CF1004") == std::string::npos);
+        CHECK(gcode.find(";FIBER_BEGIN") == std::string::npos);
+    }
+}
+
+TEST_CASE("P3 can select CCF on any tool without changing material ownership", "[libslicer_api][p3][tool-materials]")
+{
+    const unsigned fiber_tool = GENERATE(0u, 1u, 2u, 3u, 4u, 5u);
+    INFO("fiber_tool=" << fiber_tool);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    const auto initial = library->activate_config(selection);
+    for (const auto& issue : initial.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(initial.success);
+    REQUIRE(initial.view.filament_slots.size() == 6);
+    for (const auto& slot : initial.view.filament_slots) {
+        CHECK(std::any_of(slot.compatible_presets.begin(), slot.compatible_presets.end(),
+            [](const auto& preset) { return preset.id == "CFSYS CCF"; }));
+    }
+    CHECK(library->active_config_snapshot()->value("filament_process_type") ==
+        "thermoplastic;thermoplastic;thermoplastic;thermoplastic;thermoplastic;thermoplastic");
+    REQUIRE(library->set_active_config_value("layer_height", "0.15").success);
+    REQUIRE(library->set_active_filament_color(fiber_tool, {20,40,60,255}).success);
+    const auto selected = library->set_active_filament_preset(fiber_tool, "CFSYS CCF");
+    for (const auto& issue : selected.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(selected.success);
+    REQUIRE(selected.view.filament_slots.size() == 6);
+    for (unsigned slot = 0; slot < 6; ++slot) {
+        CHECK(selected.view.filament_slots[slot].physical_tool_index == slot);
+    }
+    std::string expected_processes;
+    for (unsigned slot = 0; slot < 6; ++slot) {
+        if (slot) expected_processes += ';';
+        expected_processes += slot == fiber_tool ? "continuous_fiber" : "thermoplastic";
+    }
+    CHECK(library->active_config_snapshot()->value("filament_process_type") == expected_processes);
+    CHECK(selected.view.filament_slots[fiber_tool].color.red == 20);
+    CHECK(library->active_config_snapshot()->value("layer_height") == "0.15");
+    CHECK(library->active_config_snapshot()->value("filament_map") == "1,2,3,4,5,6");
+    CHECK_FALSE(library->add_active_filament(fiber_tool, "CFSYS CCF").success);
+    CHECK(library->active_config()->filament_slots.size() == 6);
+
+    // All six may carry CCF together; returning to plastic must also remain
+    // possible, without leaving a sticky fiber role on any tool.
+    for (unsigned slot = 0; slot < 6; ++slot)
+        REQUIRE(library->set_active_filament_preset(slot, "CFSYS CCF").success);
+    CHECK(library->active_config_snapshot()->value("filament_process_type") ==
+        "continuous_fiber;continuous_fiber;continuous_fiber;continuous_fiber;continuous_fiber;continuous_fiber");
+    for (unsigned slot = 0; slot < 6; ++slot)
+        REQUIRE(library->set_active_filament_preset(slot, "CFSYS PLA").success);
+    CHECK(library->active_config_snapshot()->value("filament_process_type") ==
+        "thermoplastic;thermoplastic;thermoplastic;thermoplastic;thermoplastic;thermoplastic");
+}
+
+TEST_CASE("mixed-capability fiber exports preserve every physical tool ID", "[libslicer_api][p3][fiber][slice]")
+{
+    const unsigned fiber_tool = GENERATE(0u, 1u, 2u, 3u, 4u, 5u);
+    INFO("fiber_tool=" << fiber_tool);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    selection.filament_preset_ids.assign(6, "Generic PLA @P3");
+    selection.filament_preset_ids[fiber_tool] = "CFSYS CCF";
+    auto created = library->create_config(selection);
+    for (const auto& issue : created.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(created.success);
+    REQUIRE(created.config->apply_patch({
+        {"filament_colour", "#F28E2B;#4E79A7;#59A14F;#B07AA1;#EDC948;#E15759"},
+        {"generate_reinforced_perimeters", "1"}, {"outer_reinforced_perimeters_counts", "1"},
+        {"reinforced_perimeters_filament", std::to_string(fiber_tool+1)},
+        {"top_shell_layers", "1"}, {"bottom_shell_layers", "1"},
+        {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
+        {"fiber_layer_height_ratio", "1"}, {"fiber_minimum_path_length", "2"}
+    }).success);
+    libslicer::SliceObjectInput object;
+    object.name = "mixed-process-coupon";
+    libslicer::SliceVolumeInput volume;
+    volume.vertices = {{100,100,0},{160,100,0},{160,140,0},{100,140,0},
+                       {100,100,2},{160,100,2},{160,140,2},{100,140,2}};
+    volume.triangles = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                       {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+    volume.default_filament_slot = fiber_tool == 0 ? 2 : 1;
+    object.volumes.push_back(std::move(volume));
+    libslicer::SliceRequest request;
+    request.objects = {object};
+    request.config = created.config->snapshot();
+    const auto output = std::filesystem::temp_directory_path() /
+        ("libslicer-mixed-fiber-T" + std::to_string(fiber_tool) + ".gcode");
+    std::error_code remove_error;
+    std::filesystem::remove(output, remove_error);
+    request.output_gcode_path = output.string();
+    // The real P3 profile intentionally has no verified cut/protocol yet.
+    // Selecting material is allowed; exporting it must fail before writing.
+    const auto unconfigured = library->slice(request);
+    std::string readiness_diagnostics;
+    for (const auto& issue : unconfigured.diagnostics) readiness_diagnostics += issue.message + "\n";
+    INFO("unconfigured P3: " << readiness_diagnostics);
+    CHECK_FALSE(unconfigured.success);
+    CHECK_FALSE(std::filesystem::exists(output));
+    CHECK(std::any_of(unconfigured.diagnostics.begin(), unconfigured.diagnostics.end(), [](const auto& issue) {
+        return issue.message.find("no fiber cut command") != std::string::npos ||
+            issue.message.find("Missing continuous-fiber protocol") != std::string::npos;
+    }));
+
+    // Explicit software fixture, not P3 firmware acceptance: independent
+    // inventory, linear E, and a numeric test actuator, with no machine macros.
+    std::vector<std::pair<std::string,std::string>> patch;
+    for (const auto& [key,value] : request.config.values())
+        if (key.size() >= 6 && key.compare(key.size()-6,6,"_gcode") == 0 &&
+            key != "fiber_cut_gcode" && key != "emit_machine_limits_to_gcode")
+            patch.emplace_back(key, "");
+    patch.insert(patch.end(), {
+        {"single_extruder_multi_material", "0"},
+        {"toolhead_fiber_protocol_id", "linear-e-v1;linear-e-v1;linear-e-v1;linear-e-v1;linear-e-v1;linear-e-v1"},
+        {"fiber_cut_gcode", "M400\nM42 P4 S255\nG4 P100\n"},
+        {"fiber_cut_to_contact_length", "5"}, {"fiber_landing_length", "0"},
+        {"use_relative_e_distances", "1"}
+    });
+    const auto patched = created.config->apply_patch(patch);
+    for (const auto& issue : patched.diagnostics) UNSCOPED_INFO(issue.key << ": " << issue.message);
+    REQUIRE(patched.success);
+    request.config = created.config->snapshot();
+    const auto sliced = library->slice(request);
+    std::string execution_diagnostics;
+    for (const auto& issue : sliced.diagnostics) execution_diagnostics += issue.message + "\n";
+    INFO("software fixture: " << execution_diagnostics);
+    REQUIRE(sliced.success);
+    REQUIRE(sliced.preview);
+    size_t fiber_segments = 0;
+    for (const auto& segment : sliced.preview->segments) {
+        if (segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPowered ||
+            segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPassive) {
+            ++fiber_segments;
+            CHECK(segment.tool_id == fiber_tool);
+            CHECK(segment.filament_id == fiber_tool);
+        }
+    }
+    CHECK(fiber_segments > 0);
+    CHECK(sliced.preview->statistics.total_fiber_feed_mm > 0);
+    libslicer::GCodePreviewRequest import_request;
+    import_request.gcode_path = output.string();
+    const auto imported = library->load_gcode_preview(import_request);
+    for (const auto& issue : imported.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview);
+    CHECK(imported.preview->statistics.total_fiber_feed_mm ==
+        Catch::Approx(sliced.preview->statistics.total_fiber_feed_mm).margin(0.02));
+    for (const auto& segment : imported.preview->segments)
+        if (segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPowered ||
+            segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPassive)
+            CHECK(segment.tool_id == fiber_tool);
+}
+
 TEST_CASE("configuration exposes one grouped settings snapshot", "[libslicer_api][config]")
 {
     const auto items = libslicer::Config::defaults().settings();

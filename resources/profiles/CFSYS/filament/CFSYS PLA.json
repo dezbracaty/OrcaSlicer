@@ -46,6 +46,7 @@
         "100"
     ],
     "compatible_printers": [
+      "P3 0.4 nozzle",
       "CFSYS Alpha500 0.4 nozzle",
 	  "CFSYS Alpha500 Printer 0.2 nozzle",
 	  "CFSYS Alpha500 Printer 0.4 nozzle",

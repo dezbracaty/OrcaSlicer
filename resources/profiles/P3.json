@@ -1,6 +1,6 @@
 {
     "name": "P3",
-    "version": "02.00.00.00",
+    "version": "02.00.00.01",
     "force_update": "0",
     "description": "P3 six tool docks with one shared extruder and heater; candidate slicing profile pending machine acceptance",
     "machine_model_list": [
@@ -13,6 +13,31 @@
         {"name": "0.20mm Standard @P3", "sub_path": "process/0.20mm Standard @P3.json"}
     ],
     "filament_list": [
+        {"name": "fdm_filament_common", "sub_path": "../CFSYS/filament/fdm_filament_common.json"},
+        {"name": "fdm_filament_pla", "sub_path": "../CFSYS/filament/fdm_filament_pla.json"},
+        {"name": "fdm_filament_pet", "sub_path": "../CFSYS/filament/fdm_filament_pet.json"},
+        {"name": "fdm_filament_abs", "sub_path": "../CFSYS/filament/fdm_filament_abs.json"},
+        {"name": "fdm_filament_asa", "sub_path": "../CFSYS/filament/fdm_filament_asa.json"},
+        {"name": "fdm_filament_pa", "sub_path": "../CFSYS/filament/fdm_filament_pa.json"},
+        {"name": "fdm_filament_ccf", "sub_path": "../CFSYS/filament/fdm_filament_ccf.json"},
+        {"name": "fdm_filament_tpu", "sub_path": "../CFSYS/filament/fdm_filament_tpu.json"},
+        {"name": "CFSYS ASA", "sub_path": "../CFSYS/filament/CFSYS ASA.json"},
+        {"name": "CFSYS ASA-CF", "sub_path": "../CFSYS/filament/CFSYS ASA-CF.json"},
+        {"name": "CFSYS ASA-GF", "sub_path": "../CFSYS/filament/CFSYS ASA-GF.json"},
+        {"name": "CFSYS PLA", "sub_path": "../CFSYS/filament/CFSYS PLA.json"},
+        {"name": "CFSYS PETG", "sub_path": "../CFSYS/filament/CFSYS PETG.json"},
+        {"name": "CFSYS ABS", "sub_path": "../CFSYS/filament/CFSYS ABS.json"},
+        {"name": "CFSYS ABS-CF", "sub_path": "../CFSYS/filament/CFSYS ABS-CF.json"},
+        {"name": "CFSYS ABS-GF", "sub_path": "../CFSYS/filament/CFSYS ABS-GF.json"},
+        {"name": "CFSYS PA", "sub_path": "../CFSYS/filament/CFSYS PA.json"},
+        {"name": "CFSYS PA-CF", "sub_path": "../CFSYS/filament/CFSYS PA-CF.json"},
+        {"name": "CFSYS TPU 95A", "sub_path": "../CFSYS/filament/CFSYS TPU 95A.json"},
+        {"name": "CFSYS PET-CF", "sub_path": "../CFSYS/filament/CFSYS PET-CF.json"},
+        {"name": "CFSYS PET-GF", "sub_path": "../CFSYS/filament/CFSYS PET-GF.json"},
+        {"name": "CFSYS PPS-CF", "sub_path": "../CFSYS/filament/CFSYS PPS-CF.json"},
+        {"name": "CFSYS S-Multi", "sub_path": "../CFSYS/filament/CFSYS S-Multi.json"},
+        {"name": "CFSYS CIRON", "sub_path": "../CFSYS/filament/CFSYS CIRON.json"},
+        {"name": "CFSYS CCF", "sub_path": "../CFSYS/filament/CFSYS CCF.json"},
         {"name": "Generic PLA @P3", "sub_path": "filament/Generic PLA @P3.json"}
     ]
 }
