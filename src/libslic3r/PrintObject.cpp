@@ -891,6 +891,7 @@ void PrintObject::detect_overhangs_for_lift()
 void PrintObject::generate_support_material()
 {
     if (this->set_started(posSupportMaterial)) {
+        m_support_trim_audit = {};
         this->clear_support_layers();
 
         if(!has_support() && !m_print->get_no_check_flag()) {

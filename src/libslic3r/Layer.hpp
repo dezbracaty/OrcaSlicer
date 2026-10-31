@@ -123,9 +123,80 @@ private:
     const PrintRegion *m_region;
 };
 
+// Snapshots of actual stInternalSolid / erSolidInfill filler calls, before later
+// simplification/G-code processing. Polygons are in local scaled slice XY;
+// points retain raw Polyline3 coordinates (no instance shift or Z conversion).
+struct SolidFillAuditPath {
+    std::vector<size_t> entity_path; // Begins at the destination entity index.
+    std::string entity_type;
+    ExtrusionRole role { erNone };
+    double width { 0. };
+    double height { 0. };
+    double mm3_per_mm { 0. };
+    bool no_extrusion { false };
+    bool complete { false };
+    bool unsupported { false };
+    std::string unsupported_reason;
+    Points3 points;
+};
+
+struct SolidFillAuditJob {
+    size_t job_index { 0 }; // Actual selected filler-call order within the layer.
+    size_t region_id { 0 };
+    std::vector<size_t> region_ids;
+    SurfaceType surface_type { stInternalSolid };
+    int pattern { 0 };
+    ExtrusionRole extrusion_role { erNone };
+    // Raw source/config id: positive values are 1-based; 0 requires default-tool resolution.
+    unsigned int source_extruder_id { 0 };
+    double surface_thickness { 0. };
+    size_t surface_thickness_layers { 0 };
+    double surface_bridge_angle { 0. };
+    Flow flow;
+    double density { 0. };
+    double overlap { 0. };
+    double no_extrusion_overlap { 0. };
+    double spacing_before { 0. };
+    double spacing_after { 0. };
+    bool symmetric_y { false };
+    double symmetric_y_axis_scaled { 0. };
+    size_t destination_begin { 0 };
+    size_t destination_end { 0 };
+    size_t paths_seen { 0 }; // Recognized path leaves; see counts_complete.
+    bool counts_complete { true };
+    bool surface_complete { false };
+    bool no_overlap_complete { false };
+    bool paths_complete { true };
+    bool truncated { false };
+    bool unsupported { false };
+    ExPolygon surface;
+    ExPolygons no_overlap;
+    std::vector<SolidFillAuditPath> paths;
+};
+
+struct SolidFillAudit {
+    static constexpr size_t max_jobs = 64;
+    static constexpr size_t max_paths = 2048;
+    static constexpr size_t max_points = 32768; // Domains and paths combined.
+    static constexpr size_t max_entity_depth = 64;
+    bool enabled { false };
+    bool truncated { false };
+    bool unsupported { false };
+    bool counts_complete { true };
+    size_t jobs_seen { 0 };
+    size_t entities_seen { 0 };
+    size_t paths_seen { 0 }; // Recognized path leaves; see counts_complete.
+    size_t paths_recorded { 0 }; // Includes bounded unsupported-entity markers.
+    size_t points_seen { 0 };
+    size_t points_copied { 0 };
+    size_t unsupported_entities_seen { 0 };
+    std::vector<SolidFillAuditJob> jobs;
+};
+
 class Layer
 {
 public:
+    SolidFillAudit solid_fill_audit;
     struct FiberInfillStatistics {
         size_t candidates {0};
         size_t accepted_fragments {0};

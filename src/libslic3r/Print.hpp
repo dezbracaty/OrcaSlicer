@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <set>
 
 #include "calib.hpp"
@@ -317,6 +318,81 @@ private:
     size_t                                      m_ref_cnt{ 0 };
 };
 
+// Internal, opt-in observations of the actual support/object clipping operation.
+// XY polygons and offsets use the object's local scaled slicing coordinates
+// (the same frame as Layer::lslices); Z values are the original doubles. Instance
+// XY shifts are not applied here. This is not slicing configuration.
+struct SupportTrimAuditOptions {
+    bool enabled { false };
+    double max_support_print_z { 0.8 };
+    size_t max_calls { 16 };
+    size_t max_layers { 32 }; // Total recorded generator layers across all calls.
+    size_t max_decisions_per_layer { 128 };
+    size_t max_polygon_points_per_layer { 40000 }; // Shared by all three snapshots.
+};
+
+struct SupportTrimAuditDecision {
+    size_t object_layer_index { 0 };
+    size_t object_layer_id { 0 };
+    // Ordinary clipping records one lslices polygon; bridge clipping one region.
+    size_t object_polygon_index { std::numeric_limits<size_t>::max() };
+    size_t object_region_index { std::numeric_limits<size_t>::max() };
+    double object_print_z { 0. };
+    double object_bottom_z { 0. };
+    double object_height { 0. };
+    double bridging_height { 0. };
+    bool bridging_pass { false };
+    bool bridging_perimeter_pass { false };
+    bool is_overlap { false };
+    bool sharptail_checked { false };
+    bool is_sharptail { false };
+    // offset() distance, or only the extra gap passed to the bridging-perimeter
+    // collector (which additionally accounts for individual extrusion widths).
+    double offset_argument_scaled { 0. };
+};
+
+struct SupportTrimAuditLayer {
+    size_t support_input_index { 0 };
+    size_t nonempty_index { 0 };
+    int layer_type { 0 }; // SupporLayerType, not a final emitted SupportLayer id.
+    double print_z { 0. };
+    double bottom_z { 0. };
+    double bottom_print_z { 0. };
+    double height { 0. };
+    bool bridging { false };
+    size_t decisions_seen { 0 };
+    bool truncated { false };
+    bool before_complete { false };
+    bool trimming_complete { false };
+    bool after_complete { false };
+    size_t polygon_points_copied { 0 };
+    Polygons support_before;
+    Polygons trimming_polygons;
+    Polygons support_after;
+    std::vector<SupportTrimAuditDecision> decisions;
+};
+
+struct SupportTrimAuditCall {
+    size_t call_index { 0 };
+    size_t input_layer_count { 0 };
+    size_t nonempty_layer_count { 0 };
+    size_t selected_layer_count { 0 };
+    double gap_extra_above { 0. };
+    double gap_extra_below { 0. };
+    double gap_xy_scaled { 0. };
+    double no_overlap_offset_scaled { 0. };
+    double sharp_tail_offset_scaled { 0. };
+    bool truncated { false };
+    std::vector<SupportTrimAuditLayer> layers;
+};
+
+struct SupportTrimAudit {
+    size_t calls_seen { 0 };
+    size_t layers_recorded { 0 };
+    bool truncated { false };
+    std::vector<SupportTrimAuditCall> calls;
+};
+
 class PrintObject : public PrintObjectBaseWithState<Print, PrintObjectStep, posCount>
 {
 private: // Prevents erroneous use by other classes.
@@ -329,6 +405,17 @@ public:
     void                         configBrimWidth(double m)      {m_config.brim_width.value = m; }
     ConstLayerPtrsAdaptor        layers() const         { return ConstLayerPtrsAdaptor(&m_layers); }
     ConstSupportLayerPtrsAdaptor support_layers() const { return ConstSupportLayerPtrsAdaptor(&m_support_layers); }
+    // Set before process(), read after process()/export. Enable only the objects
+    // being investigated; all clipping decisions of each selected layer remain
+    // in scope, subject to the explicit limits and completeness flags above.
+    void set_support_trim_audit_options(const SupportTrimAuditOptions& options)
+        { m_support_trim_audit_options = options; m_support_trim_audit = {}; }
+    const SupportTrimAuditOptions& support_trim_audit_options() const { return m_support_trim_audit_options; }
+    const SupportTrimAudit& support_trim_audit() const { return m_support_trim_audit; }
+    // Internal candidate diagnostics only; set before process(). Each Layer
+    // owns its bounded records, so filling tasks never share a collector.
+    void set_solid_fill_audit_enabled(bool enabled) { m_solid_fill_audit_enabled = enabled; }
+    bool solid_fill_audit_enabled() const { return m_solid_fill_audit_enabled; }
     const Transform3d&           trafo() const          { return m_trafo; }
     // Trafo with the center_offset() applied after the transformation, to center the object in XY before slicing.
     Transform3d                  trafo_centered() const
@@ -565,6 +652,12 @@ private:
     SlicingParameters                       m_slicing_params;
     LayerPtrs                               m_layers;
     SupportLayerPtrs                        m_support_layers;
+    friend class PrintObjectSupportMaterial;
+    SupportTrimAuditOptions                  m_support_trim_audit_options;
+    bool                                    m_solid_fill_audit_enabled { false };
+    // The generator is const with respect to its object. Diagnostic collection
+    // is merged only outside its per-layer parallel loop, never by worker tasks.
+    mutable SupportTrimAudit                 m_support_trim_audit;
     // BBS
     std::shared_ptr<TreeSupportData>        m_tree_support_preview_cache;
 

@@ -34,6 +34,7 @@
 #include <set>
 #include <sstream>
 #include <tuple>
+#include <typeinfo>
 
 namespace Slic3r {
 
@@ -1565,6 +1566,246 @@ struct FillExecutionContext {
     double                    resolution;
 };
 
+static size_t solid_fill_audit_point_count(const ExPolygon& polygon)
+{
+    size_t count = polygon.contour.points.size();
+    for (const Polygon& hole : polygon.holes)
+        count += hole.points.size();
+    return count;
+}
+
+// Observe all points, including records beyond the storage limits. A snapshot
+// is copied in full or not at all; an empty partial shape must not look valid.
+static bool solid_fill_audit_copy_points(SolidFillAudit& audit, size_t count, bool store)
+{
+    audit.points_seen += count;
+    if (!store)
+        return false;
+    if (count > SolidFillAudit::max_points - audit.points_copied) {
+        audit.truncated = true;
+        return false;
+    }
+    audit.points_copied += count;
+    return true;
+}
+
+static void solid_fill_audit_entity(
+    const ExtrusionEntity& entity, std::vector<size_t>& entity_path,
+    SolidFillAudit& audit, SolidFillAuditJob* job)
+{
+    ++audit.entities_seen;
+    const ExtrusionPath* path = dynamic_cast<const ExtrusionPath*>(&entity);
+    const char* entity_type = "unsupported-entity";
+    const char* unsupported_reason = nullptr;
+    if (path != nullptr) {
+        ++audit.paths_seen;
+        if (job != nullptr)
+            ++job->paths_seen;
+        entity_type = "path";
+        if (typeid(entity) == typeid(ExtrusionPathOriented))
+            entity_type = "oriented-path";
+        else if (typeid(entity) != typeid(ExtrusionPath)) {
+            entity_type = "special-path";
+            unsupported_reason = "Path subtype has additional geometry/flow semantics";
+        }
+        if (!path->polyline.fitting_result.empty())
+            unsupported_reason = "Arc-fitting data is not represented by the raw point snapshot";
+        if (path->z_contoured)
+            unsupported_reason = "Contoured path requires additional Z interpretation";
+    } else if (entity_path.size() < SolidFillAudit::max_entity_depth && typeid(entity) == typeid(ExtrusionEntityCollection)) {
+        const auto& children = static_cast<const ExtrusionEntityCollection&>(entity).entities;
+        for (size_t idx = 0; idx < children.size(); ++idx) {
+            entity_path.push_back(idx);
+            solid_fill_audit_entity(*children[idx], entity_path, audit, job);
+            entity_path.pop_back();
+        }
+        return;
+    } else if (entity_path.size() < SolidFillAudit::max_entity_depth &&
+        (typeid(entity) == typeid(ExtrusionMultiPath) || typeid(entity) == typeid(ExtrusionLoop))) {
+        const ExtrusionPaths& paths = typeid(entity) == typeid(ExtrusionLoop) ?
+            static_cast<const ExtrusionLoop&>(entity).paths :
+            static_cast<const ExtrusionMultiPath&>(entity).paths;
+        for (size_t idx = 0; idx < paths.size(); ++idx) {
+            entity_path.push_back(idx);
+            solid_fill_audit_entity(paths[idx], entity_path, audit, job);
+            entity_path.pop_back();
+        }
+        return;
+    } else {
+        unsupported_reason = entity_path.size() >= SolidFillAudit::max_entity_depth ?
+            "Entity nesting limit reached" : "Entity subtype cannot be expanded without losing semantics";
+        if (entity_path.size() >= SolidFillAudit::max_entity_depth) {
+            audit.truncated = true;
+            if (job != nullptr)
+                job->truncated = true;
+        }
+        audit.counts_complete = false;
+        if (job != nullptr)
+            job->counts_complete = false;
+    }
+
+    if (unsupported_reason != nullptr) {
+        ++audit.unsupported_entities_seen;
+        audit.unsupported = true;
+        if (job != nullptr) {
+            job->unsupported = true;
+            job->paths_complete = false;
+        }
+    }
+    const bool store = job != nullptr && audit.paths_recorded < SolidFillAudit::max_paths;
+    if (job != nullptr && !store) {
+        audit.truncated = true;
+        job->truncated = true;
+        job->paths_complete = false;
+    }
+    const bool points_complete = path != nullptr && solid_fill_audit_copy_points(audit,
+        path->polyline.points.size(), store && unsupported_reason == nullptr);
+    if (!store)
+        return;
+    SolidFillAuditPath observed;
+    observed.entity_path = entity_path;
+    observed.entity_type = entity_type;
+    // Unknown/depth-limited containers may recursively inspect their children
+    // in role(). Do not bypass the diagnostic depth limit through that query.
+    observed.role = path != nullptr ? path->ExtrusionPath::role() : erNone;
+    observed.unsupported = unsupported_reason != nullptr;
+    if (unsupported_reason != nullptr)
+        observed.unsupported_reason = unsupported_reason;
+    if (path != nullptr) {
+        observed.width = path->width;
+        observed.height = path->height;
+        observed.mm3_per_mm = path->mm3_per_mm;
+        observed.no_extrusion = path->is_force_no_extrusion();
+        observed.complete = points_complete;
+        if (points_complete)
+            observed.points = path->polyline.points;
+        else if (unsupported_reason == nullptr) {
+            job->truncated = true;
+            job->paths_complete = false;
+        }
+    }
+    ++audit.paths_recorded;
+    job->paths.push_back(std::move(observed));
+}
+
+
+namespace MicroFillDetail {
+// Internal geometry seam; callers supply paths from the same layer/region and
+// the configured one-based tool identifiers. Unknown tools never cover a path.
+static bool ordinary_deposition(const ExtrusionPath &path, float height)
+{
+    return typeid(path) == typeid(ExtrusionPath) && !path.is_force_no_extrusion() &&
+        !path.z_contoured && path.polyline.fitting_result.empty() &&
+        std::isfinite(path.mm3_per_mm) && path.mm3_per_mm > 0. &&
+        std::isfinite(path.width) && path.width > 0.f && path.height == height && height > 0.f &&
+        std::isfinite(height) && path.polyline.points.size() >= 2 && std::all_of(path.polyline.points.begin(), path.polyline.points.end(),
+            [](const Point3 &point) { return point.z() == 0; });
+}
+static bool short_candidate(const ExtrusionPath &path, float height, double max_length_scaled)
+{
+    return path.ExtrusionPath::role() == erSolidInfill && ordinary_deposition(path, height) &&
+        path.length() > 0. && path.length() < max_length_scaled;
+}
+static bool contains_candidate(const ExtrusionEntity &entity, float height, double max_length_scaled, size_t depth = 0)
+{
+    if (depth >= 64) return false;
+    if (typeid(entity) == typeid(ExtrusionPath))
+        return short_candidate(static_cast<const ExtrusionPath &>(entity), height, max_length_scaled);
+    if (typeid(entity) == typeid(ExtrusionEntityCollection)) {
+        const auto &children = static_cast<const ExtrusionEntityCollection &>(entity).entities;
+        return std::any_of(children.begin(), children.end(), [&](const auto *child) {
+            return contains_candidate(*child, height, max_length_scaled, depth + 1);
+        });
+    }
+    return false;
+}
+size_t filter_redundant_paths(ExtrusionEntitiesPtr &entities, size_t begin,
+    const std::vector<std::pair<const ExtrusionPath *, unsigned int>> &neighbors,
+    unsigned int tool, float height, double max_length_scaled)
+{
+    if (tool == 0 || begin > entities.size() || !(max_length_scaled > 0.)) return 0;
+    if (std::none_of(entities.begin() + begin, entities.end(), [&](const auto *entity) {
+            return contains_candidate(*entity, height, max_length_scaled);
+        })) return 0;
+    Polygons width_coverage, spacing_coverage;
+    auto add_coverage = [&](const ExtrusionPath &path) {
+        if (!ordinary_deposition(path, height)) return;
+        path.polygons_covered_by_width(width_coverage, 0.f);
+        path.polygons_covered_by_spacing(spacing_coverage, 0.f);
+    };
+    for (const auto &[path, path_tool] : neighbors)
+        if (path != nullptr && path_tool == tool) add_coverage(*path);
+    size_t removed = 0;
+    auto visit = [&](auto &&self, ExtrusionEntity *&entity, size_t depth) -> void {
+        if (depth >= 64) return;
+        if (typeid(*entity) == typeid(ExtrusionEntityCollection)) {
+            auto &children = static_cast<ExtrusionEntityCollection *>(entity)->entities;
+            for (auto &child : children) self(self, child, depth + 1);
+            {
+                children.erase(std::remove(children.begin(), children.end(), nullptr), children.end());
+                if (children.empty()) { delete entity; entity = nullptr; }
+            }
+            return;
+        }
+        if (typeid(*entity) == typeid(ExtrusionLoop) || typeid(*entity) == typeid(ExtrusionMultiPath)) {
+            // Do not remove pieces of a structured loop or multipath.
+            const auto &paths = typeid(*entity) == typeid(ExtrusionLoop) ?
+                static_cast<const ExtrusionLoop *>(entity)->paths : static_cast<const ExtrusionMultiPath *>(entity)->paths;
+            for (const auto &path : paths) add_coverage(path);
+            return;
+        }
+        if (typeid(*entity) != typeid(ExtrusionPath)) return;
+        const auto &path = static_cast<const ExtrusionPath &>(*entity);
+        const bool candidate = short_candidate(path, height, max_length_scaled);
+        if (candidate) {
+            Polygons width, spacing;
+            path.polygons_covered_by_width(width, 0.f);
+            path.polygons_covered_by_spacing(spacing, 0.f);
+            const auto width_domain = union_ex(width), spacing_domain = union_ex(spacing);
+            const auto width_new = diff_ex(width, width_coverage), spacing_new = diff_ex(spacing, spacing_coverage);
+            const bool redundant = !width_domain.empty() && !spacing_domain.empty() && width_new.empty() && spacing_new.empty();
+
+            if (redundant) {
+                ++removed;
+                delete entity; entity = nullptr;
+                // Never let two discarded candidates vouch for each other.
+                return;
+            }
+        }
+        add_coverage(path);
+    };
+    for (size_t i = begin; i < entities.size(); ++i) visit(visit, entities[i], 0);
+    entities.erase(std::remove(entities.begin() + begin, entities.end(), nullptr), entities.end());
+    return removed;
+}
+} // namespace MicroFillDetail
+
+static void collect_micro_fill_neighbors(const ExtrusionEntity &entity, const PrintRegion &region,
+    std::vector<std::pair<const ExtrusionPath *, unsigned int>> &out, size_t depth = 0)
+{
+    if (depth >= 64) return;
+    if (typeid(entity) == typeid(ExtrusionEntityCollection)) {
+        for (const auto *child : static_cast<const ExtrusionEntityCollection &>(entity).entities)
+            collect_micro_fill_neighbors(*child, region, out, depth + 1);
+    } else if (typeid(entity) == typeid(ExtrusionLoop) || typeid(entity) == typeid(ExtrusionMultiPath)) {
+        const auto &paths = typeid(entity) == typeid(ExtrusionLoop) ?
+            static_cast<const ExtrusionLoop &>(entity).paths : static_cast<const ExtrusionMultiPath &>(entity).paths;
+        for (const auto &path : paths) collect_micro_fill_neighbors(path, region, out, depth + 1);
+    } else if (typeid(entity) == typeid(ExtrusionPath)) {
+        const auto &path = static_cast<const ExtrusionPath &>(entity);
+        unsigned int tool = 0;
+        switch (path.ExtrusionPath::role()) {
+        case erPerimeter: tool = region.extruder(frPerimeter); break;
+        case erExternalPerimeter: tool = region.extruder(frExternalPerimeter); break;
+        case erInternalInfill: tool = region.extruder(frInfill); break;
+        case erSolidInfill: tool = region.extruder(frSolidInfill); break;
+        case erTopSolidInfill: tool = region.extruder(frTopSolidInfill); break;
+        default: break;
+        }
+        out.emplace_back(&path, tool);
+    }
+}
+
 static void execute_surface_fill_job(
     const FillExecutionContext& context,
     SurfaceFill                 surface_fill,
@@ -1695,7 +1936,96 @@ static void execute_surface_fill_job(
             }
         }
 
+        SolidFillAudit& audit = layer.solid_fill_audit;
+        const bool audit_this_call = audit.enabled &&
+            (surface_fill.surface.surface_type == stInternalSolid || params.extrusion_role == erSolidInfill);
+        SolidFillAuditJob* audit_job = nullptr;
+        const size_t destination_begin = audit_this_call ? destination.size() : 0;
+        if (audit_this_call) {
+            const size_t job_index = audit.jobs_seen++;
+            if (audit.jobs.size() < SolidFillAudit::max_jobs) {
+                audit.jobs.emplace_back();
+                audit_job = &audit.jobs.back();
+                audit_job->job_index = job_index;
+                audit_job->region_id = surface_fill.region_id;
+                audit_job->region_ids = surface_fill.region_id_group;
+                audit_job->surface_type = surface_fill.surface.surface_type;
+                audit_job->pattern = static_cast<int>(surface_fill.params.pattern);
+                audit_job->extrusion_role = params.extrusion_role;
+                audit_job->source_extruder_id = surface_fill.params.extruder;
+                audit_job->surface_thickness = surface_fill.surface.thickness;
+                audit_job->surface_thickness_layers = surface_fill.surface.thickness_layers;
+                audit_job->surface_bridge_angle = surface_fill.surface.bridge_angle;
+                audit_job->flow = params.flow;
+                audit_job->density = params.density;
+                audit_job->overlap = f->overlap;
+                audit_job->no_extrusion_overlap = params.no_extrusion_overlap;
+                audit_job->spacing_before = f->spacing;
+                audit_job->symmetric_y = params.symmetric_infill_y_axis;
+                audit_job->symmetric_y_axis_scaled = params.symmetric_y_axis;
+                audit_job->destination_begin = destination_begin;
+            } else {
+                audit.truncated = true;
+            }
+            if (solid_fill_audit_copy_points(audit,
+                solid_fill_audit_point_count(surface_fill.surface.expolygon), audit_job != nullptr)) {
+                audit_job->surface = surface_fill.surface.expolygon;
+                audit_job->surface_complete = true;
+            } else if (audit_job != nullptr) {
+                audit_job->truncated = true;
+            }
+            size_t no_overlap_points = 0;
+            for (const ExPolygon& polygon : f->no_overlap_expolygons)
+                no_overlap_points += solid_fill_audit_point_count(polygon);
+            if (solid_fill_audit_copy_points(audit, no_overlap_points, audit_job != nullptr)) {
+                audit_job->no_overlap = f->no_overlap_expolygons;
+                audit_job->no_overlap_complete = true;
+            } else if (audit_job != nullptr) {
+                audit_job->truncated = true;
+            }
+        }
+
+        const size_t micro_fill_begin = destination.size();
         f->fill_surface_extrusion(&surface_fill.surface, params, destination);
+        // A merged fill job can contain regions with different reinforcement
+        // flags. Keep every such layer unchanged, even for its ordinary paths.
+        const bool non_reinforced_layer = std::none_of(layer.regions().begin(), layer.regions().end(),
+            [](const LayerRegion *region) {
+                const auto &config = region->region().config();
+                return config.generate_reinforced_infills.value || config.generate_reinforced_perimeters.value;
+            });
+        if (!policy.fixed_width && non_reinforced_layer &&
+            surface_fill.params.pattern == ipConcentricInternal &&
+            surface_fill.surface.surface_type == stInternalSolid && params.extrusion_role == erSolidInfill) {
+            std::vector<std::pair<const ExtrusionPath *, unsigned int>> neighbors;
+            for (const auto *entity : layerm->perimeters.entities)
+                collect_micro_fill_neighbors(*entity, layerm->region(), neighbors);
+            for (size_t i = 0; i < micro_fill_begin; ++i)
+                collect_micro_fill_neighbors(*destination[i], layerm->region(), neighbors);
+            MicroFillDetail::filter_redundant_paths(destination, micro_fill_begin, neighbors,
+                surface_fill.params.extruder, float(layer.height), 0.5 * params.flow.scaled_spacing());
+        }
+        if (audit_this_call) {
+            if (audit_job != nullptr) {
+                audit_job->spacing_after = f->spacing;
+                audit_job->destination_end = destination.size();
+            }
+            if (destination.size() < destination_begin) {
+                // A non-append filler cannot be associated by the index range.
+                audit.unsupported = true;
+                audit.counts_complete = false;
+                if (audit_job != nullptr) {
+                    audit_job->unsupported = true;
+                    audit_job->counts_complete = false;
+                    audit_job->paths_complete = false;
+                }
+            } else {
+                for (size_t idx = destination_begin; idx < destination.size(); ++idx) {
+                    std::vector<size_t> entity_path { idx };
+                    solid_fill_audit_entity(*destination[idx], entity_path, audit, audit_job);
+                }
+            }
+        }
     }
 }
 
@@ -2192,6 +2522,8 @@ FillSurfaceView build_resin_surface_view(
 // friend to Layer
 void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
 {
+    solid_fill_audit = {};
+    solid_fill_audit.enabled = this->object()->solid_fill_audit_enabled();
     fiber_infill_statistics = {};
     fiber_fill_diagnostics.clear();
     fiber_connection_plans.clear();

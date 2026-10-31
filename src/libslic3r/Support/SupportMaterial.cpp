@@ -3103,6 +3103,26 @@ void PrintObjectSupportMaterial::generate_base_layers(
     this->trim_support_layers_by_object(object, intermediate_layers, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
 }
 
+// Never emit partial polygons as though they were complete clipping inputs.
+// Each generator layer owns its budget and all of its snapshots/decisions.
+static bool copy_support_trim_audit_polygons(
+    const Polygons& source, Polygons& destination,
+    SupportTrimAuditLayer& layer, size_t max_points)
+{
+    size_t points = 0;
+    const size_t remaining = max_points - layer.polygon_points_copied;
+    for (const Polygon& polygon : source) {
+        if (polygon.points.size() > remaining - points) {
+            layer.truncated = true;
+            return false;
+        }
+        points += polygon.points.size();
+    }
+    destination = source;
+    layer.polygon_points_copied += points;
+    return true;
+}
+
 void PrintObjectSupportMaterial::trim_support_layers_by_object(
     const PrintObject   &object,
     SupportGeneratorLayersPtr         &support_layers,
@@ -3111,40 +3131,114 @@ void PrintObjectSupportMaterial::trim_support_layers_by_object(
     const coordf_t       gap_xy) const
 {
     const float gap_xy_scaled = float(scale_(gap_xy));
+    const SupportTrimAuditOptions audit_options = object.support_trim_audit_options();
+    SupportTrimAudit* object_audit = audit_options.enabled ? &object.m_support_trim_audit : nullptr;
+    SupportTrimAuditCall audit_call;
+    bool capture_call = false;
+    if (object_audit != nullptr) {
+        audit_call.call_index = object_audit->calls_seen++;
+        capture_call = object_audit->calls.size() < audit_options.max_calls;
+        if (!capture_call)
+            object_audit->truncated = true;
+        audit_call.input_layer_count = support_layers.size();
+        audit_call.gap_extra_above = gap_extra_above;
+        audit_call.gap_extra_below = gap_extra_below;
+        audit_call.gap_xy_scaled = gap_xy_scaled;
+        audit_call.no_overlap_offset_scaled = scale_(no_overlap_xy_gap);
+        audit_call.sharp_tail_offset_scaled = scale_(sharp_tail_xy_gap);
+    }
 
     // Collect non-empty layers to be processed in parallel.
     // This is a good idea as pulling a thread from a thread pool for an empty task is expensive.
     SupportGeneratorLayersPtr nonempty_layers;
+    std::vector<size_t> nonempty_input_indices;
     nonempty_layers.reserve(support_layers.size());
     for (size_t idx_layer = 0; idx_layer < support_layers.size(); ++ idx_layer) {
         SupportGeneratorLayer *support_layer = support_layers[idx_layer];
-        if (! support_layer->polygons.empty() && support_layer->print_z >= m_slicing_params.raft_contact_top_z + EPSILON)
+        if (! support_layer->polygons.empty() && support_layer->print_z >= m_slicing_params.raft_contact_top_z + EPSILON) {
             // Non-empty support layer and not a raft layer.
             nonempty_layers.push_back(support_layer);
+            if (capture_call)
+                nonempty_input_indices.push_back(idx_layer);
+        }
+    }
+
+    // Slots and vectors are finalized before the parallel loop. No worker writes
+    // another layer's slot or the PrintObject-level collection.
+    std::vector<size_t> audit_slot_by_layer;
+    if (capture_call) {
+        audit_call.nonempty_layer_count = nonempty_layers.size();
+        audit_slot_by_layer.assign(nonempty_layers.size(), std::numeric_limits<size_t>::max());
+        for (size_t idx = 0; idx < nonempty_layers.size(); ++idx) {
+            const SupportGeneratorLayer& source = *nonempty_layers[idx];
+            if (source.print_z > audit_options.max_support_print_z)
+                continue;
+            ++audit_call.selected_layer_count;
+            if (object_audit->layers_recorded + audit_call.layers.size() >= audit_options.max_layers) {
+                audit_call.truncated = true;
+                continue;
+            }
+            audit_slot_by_layer[idx] = audit_call.layers.size();
+            SupportTrimAuditLayer layer;
+            layer.support_input_index = nonempty_input_indices[idx];
+            layer.nonempty_index = idx;
+            layer.layer_type = static_cast<int>(source.layer_type);
+            layer.print_z = source.print_z;
+            layer.bottom_z = source.bottom_z;
+            layer.bottom_print_z = source.bottom_print_z();
+            layer.height = source.height;
+            layer.bridging = source.bridging;
+            audit_call.layers.push_back(std::move(layer));
+        }
     }
 
     // For all intermediate support layers:
     BOOST_LOG_TRIVIAL(debug) << "PrintObjectSupportMaterial::trim_support_layers_by_object() in parallel - start";
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, nonempty_layers.size()),
-        [this, &object, &nonempty_layers, gap_extra_above, gap_extra_below, gap_xy_scaled](const tbb::blocked_range<size_t>& range) {
+        [this, &object, &nonempty_layers, &audit_call, &audit_slot_by_layer, audit_options,
+         gap_extra_above, gap_extra_below, gap_xy_scaled](const tbb::blocked_range<size_t>& range) {
             size_t idx_object_layer_overlapping = size_t(-1);
 
-            auto is_layers_overlap = [](const SupportGeneratorLayer& support_layer, const Layer& object_layer, coordf_t bridging_height = 0.f) -> bool {
-                if (std::abs(support_layer.print_z - object_layer.print_z) < EPSILON)
-                    return true;
-
-                coordf_t object_lh = bridging_height > EPSILON ? bridging_height : object_layer.height;
-                if (support_layer.print_z < object_layer.print_z && support_layer.print_z > object_layer.print_z - object_lh)
-                    return true;
-
-                if (support_layer.print_z > object_layer.print_z && support_layer.bottom_z < object_layer.print_z - EPSILON)
-                    return true;
-
-                return false;
-            };
             for (size_t idx_layer = range.begin(); idx_layer < range.end(); ++ idx_layer) {
                 SupportGeneratorLayer &support_layer = *nonempty_layers[idx_layer];
+                SupportTrimAuditLayer* audit_layer = nullptr;
+                if (!audit_slot_by_layer.empty() &&
+                    audit_slot_by_layer[idx_layer] != std::numeric_limits<size_t>::max()) {
+                    audit_layer = &audit_call.layers[audit_slot_by_layer[idx_layer]];
+                    audit_layer->before_complete = copy_support_trim_audit_polygons(
+                        support_layer.polygons, audit_layer->support_before, *audit_layer,
+                        audit_options.max_polygon_points_per_layer);
+                }
+                const auto record_decision = [&](size_t object_index, const Layer& object_layer,
+                    size_t polygon_index, size_t region_index, coordf_t bridging_height,
+                    bool bridging_pass, bool is_overlap, bool sharptail_checked,
+                    bool is_sharptail, coordf_t trimming_offset,
+                    bool bridging_perimeter_pass = false) {
+                    if (audit_layer == nullptr)
+                        return;
+                    ++audit_layer->decisions_seen;
+                    if (audit_layer->decisions.size() >= audit_options.max_decisions_per_layer) {
+                        audit_layer->truncated = true;
+                        return;
+                    }
+                    SupportTrimAuditDecision decision;
+                    decision.object_layer_index = object_index;
+                    decision.object_layer_id = object_layer.id();
+                    decision.object_polygon_index = polygon_index;
+                    decision.object_region_index = region_index;
+                    decision.object_print_z = object_layer.print_z;
+                    decision.object_bottom_z = object_layer.bottom_z();
+                    decision.object_height = object_layer.height;
+                    decision.bridging_height = bridging_height;
+                    decision.bridging_pass = bridging_pass;
+                    decision.bridging_perimeter_pass = bridging_perimeter_pass;
+                    decision.is_overlap = is_overlap;
+                    decision.sharptail_checked = sharptail_checked;
+                    decision.is_sharptail = is_sharptail;
+                    decision.offset_argument_scaled = trimming_offset;
+                    audit_layer->decisions.push_back(std::move(decision));
+                };
                 // BOOST_LOG_TRIVIAL(trace) << "Support generator - trim_support_layers_by_object - trimmming non-empty layer " << idx_layer << " of " << nonempty_layers.size();
                 assert(! support_layer.polygons.empty() && support_layer.print_z >= m_slicing_params.raft_contact_top_z + EPSILON);
                 // Find the overlapping object layers including the extra above / below gap.
@@ -3160,7 +3254,8 @@ void PrintObjectSupportMaterial::trim_support_layers_by_object(
                     if (object_layer.bottom_z() > support_layer.print_z + gap_extra_above - EPSILON)
                         break;
 
-                    bool is_overlap = is_layers_overlap(support_layer, object_layer);
+                    bool is_overlap = SupportMaterialInternal::is_layers_overlap(
+                        support_layer.print_z, support_layer.bottom_z, object_layer.print_z, object_layer.height);
                     for (const ExPolygon& expoly : object_layer.lslices) {
                         // BBS
                         bool is_sharptail = !intersection_ex({ expoly }, object_layer.sharp_tails).empty();
@@ -3168,6 +3263,10 @@ void PrintObjectSupportMaterial::trim_support_layers_by_object(
                                                    is_overlap ? gap_xy_scaled :
                                                    scale_(no_overlap_xy_gap);
                         polygons_append(polygons_trimming, offset({ expoly }, trimming_offset, SUPPORT_SURFACES_OFFSET_PARAMETERS));
+                        if (audit_layer != nullptr)
+                            record_decision(i, object_layer, size_t(&expoly - object_layer.lslices.data()),
+                                std::numeric_limits<size_t>::max(), 0., false, is_overlap,
+                                true, is_sharptail, trimming_offset);
                     }
                 }
                 if (!m_slicing_params.zero_gap_interface_top && m_object_config->thick_bridges) {
@@ -3181,13 +3280,28 @@ void PrintObjectSupportMaterial::trim_support_layers_by_object(
                                 break;
                             some_region_overlaps = true;
 
-                            bool is_overlap = is_layers_overlap(support_layer, object_layer, bridging_height);
+                            bool is_overlap = SupportMaterialInternal::is_layers_overlap(
+                                support_layer.print_z, support_layer.bottom_z, object_layer.print_z,
+                                object_layer.height, bridging_height);
                             coordf_t trimming_offset = is_overlap ? gap_xy_scaled : scale_(no_overlap_xy_gap);
                             polygons_append(polygons_trimming, 
                                 offset(region->fill_surfaces.filter_by_type(stBottomBridge), trimming_offset, SUPPORT_SURFACES_OFFSET_PARAMETERS));
-                            if (region->region().config().detect_overhang_wall.value)
+                            if (audit_layer != nullptr) {
+                                const auto& regions = object_layer.regions();
+                                record_decision(i, object_layer, std::numeric_limits<size_t>::max(),
+                                    size_t(std::find(regions.begin(), regions.end(), region) - regions.begin()),
+                                    bridging_height, true, is_overlap, false, false, trimming_offset);
+                            }
+                            if (region->region().config().detect_overhang_wall.value) {
                                 // Add bridging perimeters.
                                 SupportMaterialInternal::collect_bridging_perimeter_areas(region->perimeters, gap_xy_scaled, polygons_trimming);
+                                if (audit_layer != nullptr) {
+                                    const auto& regions = object_layer.regions();
+                                    record_decision(i, object_layer, std::numeric_limits<size_t>::max(),
+                                        size_t(std::find(regions.begin(), regions.end(), region) - regions.begin()),
+                                        bridging_height, true, is_overlap, false, false, gap_xy_scaled, true);
+                                }
+                            }
                         }
                         if (! some_region_overlaps)
                             break;
@@ -3198,9 +3312,24 @@ void PrintObjectSupportMaterial::trim_support_layers_by_object(
                 // perimeter's width. $support contains the full shape of support
                 // material, thus including the width of its foremost extrusion.
                 // We leave a gap equal to a full extrusion width.
+                if (audit_layer != nullptr)
+                    audit_layer->trimming_complete = copy_support_trim_audit_polygons(
+                        polygons_trimming, audit_layer->trimming_polygons, *audit_layer,
+                        audit_options.max_polygon_points_per_layer);
                 support_layer.polygons = diff(support_layer.polygons, polygons_trimming);
+                if (audit_layer != nullptr)
+                    audit_layer->after_complete = copy_support_trim_audit_polygons(
+                        support_layer.polygons, audit_layer->support_after, *audit_layer,
+                        audit_options.max_polygon_points_per_layer);
             }
         });
+    if (capture_call) {
+        for (const SupportTrimAuditLayer& layer : audit_call.layers)
+            audit_call.truncated = audit_call.truncated || layer.truncated;
+        object_audit->layers_recorded += audit_call.layers.size();
+        object_audit->truncated = object_audit->truncated || audit_call.truncated;
+        object_audit->calls.push_back(std::move(audit_call));
+    }
     BOOST_LOG_TRIVIAL(debug) << "PrintObjectSupportMaterial::trim_support_layers_by_object() in parallel - end";
 }
 

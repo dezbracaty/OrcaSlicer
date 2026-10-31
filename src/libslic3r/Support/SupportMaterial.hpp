@@ -7,7 +7,10 @@
 #include "Fill/FillBase.hpp"
 #include "SupportLayer.hpp"
 #include "SupportParameters.hpp"
+#include "SupportLayerOverlap.hpp"
 namespace Slic3r {
+
+
 
 class PrintObject;
 class PrintConfig;

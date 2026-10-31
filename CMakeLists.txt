@@ -271,11 +271,16 @@ write_basic_package_version_file(
 set(_libslicer_runtime_dependencies)
 if(WIN32)
     # Private DLL dependencies are not propagated by the public API target.
+    # Service accounts may cache dependencies under Windows/ServiceProfiles.
+    # Exclude only system-library directories, not the entire Windows tree.
+    string(CONCAT _libslicer_system_dll_regex
+        ".*[/\\\\][Ww][Ii][Nn][Dd][Oo][Ww][Ss][/\\\\]"
+        "([Ss][Yy][Ss][Tt][Ee][Mm]32|[Ss][Yy][Ss][Ww][Oo][Ww]64|[Ww][Ii][Nn][Ss][Xx][Ss])[/\\\\].*")
     set(_libslicer_runtime_dependencies
         RUNTIME_DEPENDENCIES
         DIRECTORIES "$<TARGET_FILE_DIR:TKernel>" "${GMP_ROOT}/bin"
         PRE_EXCLUDE_REGEXES "api-ms-.*" "ext-ms-.*"
-        POST_EXCLUDE_REGEXES ".*[/\\\\][Ww][Ii][Nn][Dd][Oo][Ww][Ss][/\\\\].*")
+        POST_EXCLUDE_REGEXES "${_libslicer_system_dll_regex}")
 endif()
 install(TARGETS libslicer_api
     EXPORT libslicerTargets
