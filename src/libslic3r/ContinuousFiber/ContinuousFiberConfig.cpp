@@ -84,6 +84,10 @@ bool is_fiber_execution_parameter(std::string_view key)
 
 FiberMachineProtocol fiber_machine_protocol(const GCodeConfig& config)
 {
+    if (std::find(config.toolhead_fiber_protocol_id.values.begin(),
+                  config.toolhead_fiber_protocol_id.values.end(), "p3-shared-e-v1") !=
+        config.toolhead_fiber_protocol_id.values.end())
+        return FiberMachineProtocol::P3SharedE;
     return std::find(config.toolhead_fiber_protocol_id.values.begin(),
                      config.toolhead_fiber_protocol_id.values.end(), "cfsys-v1") !=
                      config.toolhead_fiber_protocol_id.values.end() ?
@@ -186,7 +190,7 @@ ResolvedFiberTool resolve_fiber_tool(const GCodeConfig& config, unsigned filamen
     const auto& protocol = config.toolhead_fiber_protocol_id.values[physical];
     if (protocol.empty())
         throw std::invalid_argument("Missing continuous-fiber protocol for physical tool " + std::to_string(physical));
-    if (protocol != "linear-e-v1" && protocol != "cfsys-v1")
+    if (protocol != "linear-e-v1" && protocol != "cfsys-v1" && protocol != "p3-shared-e-v1")
         throw std::invalid_argument("Unsupported fiber machine protocol");
     const double units = config.toolhead_fiber_e_units_per_mm.values[physical];
     if (!std::isfinite(units) || units <= 0)
@@ -195,6 +199,17 @@ ResolvedFiberTool resolve_fiber_tool(const GCodeConfig& config, unsigned filamen
     if (protocol == "cfsys-v1" && (config.gcode_flavor != gcfKlipper || units != 1.0 ||
         physical != 1))
         throw std::invalid_argument("CFSYS requires physical fiber T1 with linear millimeter E");
+    if (protocol == "p3-shared-e-v1") {
+        if (config.gcode_flavor != gcfKlipper || !config.single_extruder_multi_material.value ||
+            !config.filament_slots_bound_to_physical_tools.value ||
+            config.physical_extruder_map.values != std::vector<int>{0,1,2,3,4,5} ||
+            physical != 5 || units != 1.0 || !config.use_relative_e_distances.value)
+            throw std::invalid_argument("P3 fiber requires shared-channel Klipper, six bound docks, physical T5 and relative linear millimeter E");
+        if (std::find(config.toolhead_fiber_protocol_id.values.begin(),
+                      config.toolhead_fiber_protocol_id.values.end(), "cfsys-v1") !=
+            config.toolhead_fiber_protocol_id.values.end())
+            throw std::invalid_argument("P3 and CFSYS fiber execution protocols cannot be combined");
+    }
     tool.e_units_per_mm = units;
     return tool;
 }
@@ -230,6 +245,59 @@ void require_fiber_safe_script(const std::string& script, const char* name,
         std::string command;
         if (!(words >> command)) continue;
         bool allowed = false;
+        if (protocol == FiberMachineProtocol::P3SharedE) {
+            const bool change = scope == "change_filament_gcode";
+            const bool before = scope == "before_layer_change_gcode";
+            // The P3 adapter reuses the existing dock-change template at a
+            // process boundary. Expanded commands are checked again before
+            // they reach the writer; no arbitrary macros or Fiber metadata.
+            if (!expanded && (change || before) &&
+                (line == "{if toolchange_z > 0}" || line == "{if layer_num == 0}" ||
+                 (change && line == "{if filament_process_type[next_extruder] != \"continuous_fiber\" and new_retract_length_toolchange > 0}") ||
+                 line == "{endif}" || (change && line == "{e_retracted[next_extruder] = 0}")))
+                continue;
+            if (!expanded && ((startup && command == "T[initial_tool]") ||
+                              (change && command == "T{next_extruder}"))) {
+                std::string extra;
+                if (!(words >> extra)) continue;
+            }
+            const bool tool = command.size() == 2 && command[0] == 'T' && command[1] >= '0' && command[1] <= '5';
+            if ((startup || change) && (tool || command == "G90" || command == "M83" || command == "M400")) {
+                std::string extra;
+                allowed = !(words >> extra);
+            } else if ((startup && command == "G28") ||
+                       ((startup || change || before) && command == "M109") ||
+                       (change && command == "G1") ||
+                       ((startup || change) && command == "G92") ||
+                       (shutdown && (command == "M400" || command == "TURN_OFF_HEATERS" || command == "M107"))) {
+                if (!expanded && (command == "G1" || command == "M109")) {
+                    allowed = true;
+                } else {
+                    const std::string axes = command == "G28" ? "XYZ" : command == "M109" ? "S" :
+                        command == "G1" ? "XYZEF" : command == "G92" ? "E" : "";
+                    allowed = true;
+                    bool argument = false;
+                    char axis; double value;
+                    while (words >> axis) {
+                        argument = true;
+                        if (axes.find(axis) == std::string::npos || !(words >> value) || !std::isfinite(value) ||
+                            (command == "G92" && value != 0) ||
+                            (command == "M109" && value <= 0) || (axis == 'F' && value <= 0)) {
+                            allowed = false;
+                            break;
+                        }
+                    }
+                    if ((command == "G1" || command == "G92" || command == "M109") && !argument)
+                        allowed = false;
+                }
+            } else if (scope == "machine_pause_gcode" && (command == "PAUSE" || command == "M601")) {
+                std::string extra;
+                allowed = !(words >> extra);
+            }
+            if (!allowed)
+                throw std::invalid_argument(std::string("Unsupported P3 Fiber machine script command in ") + name + ": " + line);
+            continue;
+        }
         if (protocol == FiberMachineProtocol::Cfsys) {
             allowed = (startup && startup_macros.count(command)) ||
                 (shutdown && command == "PRINT_END") ||
@@ -265,7 +333,7 @@ void require_fiber_safe_script(const std::string& script, const char* name,
 
 void validate_fiber_cut_event(const std::string& script, FiberMachineProtocol protocol)
 {
-    if (protocol == FiberMachineProtocol::Cfsys) {
+    if (protocol == FiberMachineProtocol::Cfsys || protocol == FiberMachineProtocol::P3SharedE) {
         std::vector<std::string> commands;
         std::istringstream input(script);
         std::string line;
@@ -274,11 +342,11 @@ void validate_fiber_cut_event(const std::string& script, FiberMachineProtocol pr
             std::istringstream words(line);
             std::string command, extra;
             if (!(words >> command)) continue;
-            if (words >> extra) throw std::invalid_argument("Unexpected CFSYS cut argument");
+            if (words >> extra) throw std::invalid_argument("Unexpected fiber cut argument");
             commands.push_back(command);
         }
         if (commands != std::vector<std::string>{"M400", "S0", "M400"})
-            throw std::invalid_argument("CFSYS cut event must be M400 / S0 / M400");
+            throw std::invalid_argument("Fiber cut event must be M400 / S0 / M400");
         return;
     }
     // A deliberately small standard-command protocol, not a macro whitelist.

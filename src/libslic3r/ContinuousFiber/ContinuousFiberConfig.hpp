@@ -125,7 +125,7 @@ ResolvedFiberTool resolve_fiber_tool(const GCodeConfig& config, unsigned filamen
 
 // Device protocols select command vocabulary, never an alternative geometry or
 // speed algorithm. CFSYS uses the existing slicer's machine boundary scripts.
-enum class FiberMachineProtocol { LinearE, Cfsys };
+enum class FiberMachineProtocol { LinearE, Cfsys, P3SharedE };
 FiberMachineProtocol fiber_machine_protocol(const GCodeConfig& config);
 void require_fiber_safe_script(const std::string& script, const char* name,
     FiberMachineProtocol protocol = FiberMachineProtocol::LinearE, bool expanded = false);

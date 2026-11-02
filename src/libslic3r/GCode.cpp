@@ -2059,10 +2059,11 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
             if (const auto* fiber = dynamic_cast<const ExtrusionFiberPath*>(&entity)) {
                 fiber->validate_derived_view();
                 const auto tool = resolve_fiber_tool(print->config(), fiber->prepared_path()->logical_filament_id);
-                if (print->config().toolhead_fiber_protocol_id.values[tool.physical_tool_id] == "cfsys-v1" &&
+                if ((print->config().toolhead_fiber_protocol_id.values[tool.physical_tool_id] == "cfsys-v1" ||
+                     print->config().toolhead_fiber_protocol_id.values[tool.physical_tool_id] == "p3-shared-e-v1") &&
                     print->config().enable_pressure_advance.get_at(tool.logical_filament_id) &&
                     print->config().pressure_advance.get_at(tool.logical_filament_id) != 0.0)
-                    throw std::runtime_error("CFSYS fiber requires pressure_advance=0 for used filament " +
+                    throw std::runtime_error("Fiber protocol requires pressure_advance=0 for used filament " +
                         std::to_string(tool.logical_filament_id) + " on physical tool " +
                         std::to_string(tool.physical_tool_id));
                 const auto& prepared=*fiber->prepared_path();
@@ -2090,7 +2091,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     if (has_fiber) {
         const auto protocol = fiber_machine_protocol(print->config());
         validate_fiber_cut_event(print->config().fiber_cut_gcode.value, protocol);
-        if (print->config().single_extruder_multi_material.value)
+        if (print->config().single_extruder_multi_material.value && protocol != FiberMachineProtocol::P3SharedE)
             throw std::runtime_error("Fiber requires independent tool inventory, not shared-extruder multimaterial");
         for (const auto& key : print->config().keys()) {
             if (key.find("gcode") == std::string::npos || key == "fiber_cut_gcode") continue;
@@ -6354,10 +6355,11 @@ std::string GCode::ensure_fiber_pressure_advance_zero()
     if (m_fiber_pa_zero_established || !m_writer.filament())
         return {};
     const auto tool = resolve_fiber_tool(m_config, m_writer.filament()->id());
-    if (m_config.toolhead_fiber_protocol_id.values[tool.physical_tool_id] != "cfsys-v1")
+    if (m_config.toolhead_fiber_protocol_id.values[tool.physical_tool_id] != "cfsys-v1" &&
+        m_config.toolhead_fiber_protocol_id.values[tool.physical_tool_id] != "p3-shared-e-v1")
         return {};
-    // SET_PRESSURE_ADVANCE targets Klipper's active hotend. The CFSYS T1
-    // macro must activate the bound fiber extruder before this command.
+    // SET_PRESSURE_ADVANCE targets Klipper's active hotend. The tool-change
+    // macro must activate the bound fiber tool before this command.
     std::string gcode = m_writer.set_pressure_advance(0.0);
     if (m_pa_processor)
         m_pa_processor->resetPreviousPA(0.0);
@@ -8248,7 +8250,20 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
 
     const bool destination_fiber = is_fiber_filament(m_config, new_filament_id);
     const bool source_fiber = m_writer.filament() && is_fiber_filament(m_config, m_writer.filament()->id());
-    if (source_fiber || destination_fiber) {
+    const bool p3_fiber_change = (source_fiber || destination_fiber) &&
+        fiber_machine_protocol(m_config) == FiberMachineProtocol::P3SharedE;
+    if (p3_fiber_change) {
+        if (destination_fiber) resolve_fiber_tool(m_config, new_filament_id);
+        if (source_fiber && m_writer.filament()->extruder_id() == new_extruder_id)
+            throw std::runtime_error("Fiber inventory cannot be changed by a logical filament alias");
+        require_fiber_safe_script(m_config.change_filament_gcode.value, "change_filament_gcode", FiberMachineProtocol::P3SharedE);
+        m_fiber_pa_zero_established = false;
+        m_fiber_first_approach_pending = destination_fiber;
+        // P3 uses the normal, existing dock-change template and its writer
+        // state synchronization below. Other fiber protocols retain their
+        // independent-inventory transition path.
+    }
+    if ((source_fiber || destination_fiber) && !p3_fiber_change) {
         // Ordinary transitions only; tower participants are checked before tower generation.
         if (destination_fiber) resolve_fiber_tool(m_config, new_filament_id);
         if (source_fiber && m_writer.filament()->extruder_id() == new_extruder_id)
@@ -8525,8 +8540,8 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
     std::string change_filament_gcode = m_config.change_filament_gcode.value;
 
     // Native plastic retraction/lift is writer-owned motion, not custom script
-    // text. Keep it outside template validation (Fiber transitions returned
-    // above), while retaining validation of the actual user template.
+    // text. Keep it outside template validation, while retaining validation
+    // of the actual user template, including P3 shared-channel transitions.
     const bool toolchange_clearance = m_writer.toolchange_requires_z_lift(new_filament_id);
     const std::string toolchange_lift = toolchange_clearance ? std::string() :
         this->retract(false, false, LiftType::SpiralLift, true);
@@ -8538,6 +8553,23 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
 
         toolchange_gcode_parsed = toolchange_lift + placeholder_parser_process("change_filament_gcode", change_filament_gcode, new_filament_id, &dyn_config);
         check_add_eol(toolchange_gcode_parsed);
+        if (m_has_fiber_execution && fiber_machine_protocol(m_config) == FiberMachineProtocol::P3SharedE) {
+            // The custom P3 T command suppresses Writer's duplicate command
+            // below, including its TOOL_BINDING marker. Bind at the actual
+            // dock selection, before any plastic prime in the same template,
+            // so final auditing and preview leave the previous Fiber owner.
+            std::istringstream lines(toolchange_gcode_parsed);
+            std::string annotated, line;
+            while (std::getline(lines, line)) {
+                std::istringstream words(line.substr(0, line.find(';')));
+                std::string command;
+                if (words >> command && command == "T" + std::to_string(new_filament_id))
+                    annotated += ";TOOL_BINDING filament=" + std::to_string(new_filament_id) +
+                        " physical=" + std::to_string(m_config.physical_extruder_map.values.at(new_extruder_id)) + "\n";
+                annotated += line + "\n";
+            }
+            toolchange_gcode_parsed = std::move(annotated);
+        }
         gcode += toolchange_gcode_parsed;
 
         //BBS

@@ -1403,6 +1403,63 @@ TEST_CASE("fiber script boundary rejects unknown macros and unowned E", "[Contin
     CHECK_THROWS(validate_fiber_cut_event("M42 P4 S255 E10\nG4 P100"));
 }
 
+TEST_CASE("P3 fiber binds T5 while retaining shared channel semantics", "[ContinuousFiber][p3][protocol]")
+{
+    PrintConfig config;
+    config.gcode_flavor.value = gcfKlipper;
+    config.single_extruder_multi_material.value = true;
+    config.use_relative_e_distances.value = true;
+    config.filament_slots_bound_to_physical_tools.value = true;
+    config.physical_extruder_map.values = {0,1,2,3,4,5};
+    config.filament_map.values = {1,2,3,4,5,6};
+    config.filament_diameter.values.assign(6,1.75);
+    config.filament_process_type.values.assign(6,"thermoplastic");
+    config.filament_process_type.values[5] = "continuous_fiber";
+    config.toolhead_process_capabilities.values.assign(6,"thermoplastic+continuous_fiber");
+    config.toolhead_filament_capacity.values.assign(6,1);
+    config.toolhead_fiber_protocol_id.values = {"","","","","","p3-shared-e-v1"};
+    config.toolhead_fiber_e_units_per_mm.values.assign(6,1.0);
+    CHECK(fiber_machine_protocol(config) == FiberMachineProtocol::P3SharedE);
+    CHECK_NOTHROW(validate_material_tool_bindings(config));
+    CHECK(resolve_fiber_tool(config,5).physical_tool_id == 5);
+    SECTION("absolute E is not the shared-channel contract") {
+        config.use_relative_e_distances.value = false;
+        CHECK_THROWS(resolve_fiber_tool(config,5));
+    }
+    SECTION("independent heaters cannot masquerade as P3") {
+        config.single_extruder_multi_material.value = false;
+        CHECK_THROWS(resolve_fiber_tool(config,5));
+    }
+    SECTION("linear E units are explicit") {
+        config.toolhead_fiber_e_units_per_mm.values[5] = 2;
+        CHECK_THROWS(resolve_fiber_tool(config,5));
+    }
+    SECTION("another dock cannot claim the T5 protocol") {
+        config.filament_process_type.values[4] = "continuous_fiber";
+        config.toolhead_fiber_protocol_id.values[4] = "p3-shared-e-v1";
+        CHECK_THROWS(resolve_fiber_tool(config,4));
+    }
+}
+
+TEST_CASE("P3 scripts remain scoped to dock boundaries and cut events", "[ContinuousFiber][p3][scripts]")
+{
+    const auto protocol = FiberMachineProtocol::P3SharedE;
+    CHECK_NOTHROW(require_fiber_safe_script("G90\nM83\nG28\nT[initial_tool]\nM109 S{nozzle_temperature_initial_layer[initial_tool]}\nG92 E0\n", "machine_start_gcode", protocol));
+    CHECK_NOTHROW(require_fiber_safe_script("M400\nT5\nM109 S235\nG90\nM83\nG1 Z5 F600\nG1 X100 Y100 F9000\nG1 Z0.2 F600\nG1 E0 F1800\n", "change_filament_gcode", protocol, true));
+    CHECK_NOTHROW(require_fiber_safe_script("{if filament_process_type[next_extruder] != \"continuous_fiber\" and new_retract_length_toolchange > 0}\nG1 E{new_retract_length_toolchange} F{deretraction_speed[next_extruder] * 60}\n{endif}\n", "change_filament_gcode", protocol));
+    CHECK_THROWS(require_fiber_safe_script("G1 E0 F0", "change_filament_gcode", protocol, true));
+    CHECK_NOTHROW(require_fiber_safe_script("M400\nTURN_OFF_HEATERS\nM107\n", "machine_end_gcode", protocol, true));
+    CHECK_NOTHROW(validate_fiber_cut_event("M400\nS0\nM400\n", protocol));
+    CHECK_THROWS(validate_fiber_cut_event("S0", protocol));
+    CHECK_THROWS(validate_fiber_cut_event("M400\nS0\nG1 E1\nM400", protocol));
+    for (const std::string script : {"T6", "G91", "M82", "ACTIVATE_EXTRUDER EXTRUDER=extruder5", "M109 S235 T5", "G92 X0", "G92 E1", "S0"})
+        CHECK_THROWS(require_fiber_safe_script(script,"machine_start_gcode",protocol,true));
+    CHECK_THROWS(require_fiber_safe_script("G1 E1", "filament_start_gcode", protocol, true));
+    CHECK_THROWS(require_fiber_safe_script("T5", "layer_change_gcode", protocol, true));
+    CHECK_THROWS(require_fiber_safe_script(";FIBER_BEGIN v=3", "change_filament_gcode", protocol));
+    CHECK_THROWS(require_fiber_safe_script("T5", "machine_start_gcode", FiberMachineProtocol::Cfsys, true));
+}
+
 TEST_CASE("fiber writer owns linear feed and rejects generic retract repair", "[ContinuousFiber][writer]")
 {
     PrintConfig config;

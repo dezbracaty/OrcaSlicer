@@ -505,18 +505,39 @@ TEST_CASE("mixed-capability fiber exports preserve every physical tool ID", "[li
     std::error_code remove_error;
     std::filesystem::remove(output, remove_error);
     request.output_gcode_path = output.string();
-    // The real P3 profile intentionally has no verified cut/protocol yet.
-    // Selecting material is allowed; exporting it must fail before writing.
+    // P3 declares the shared-channel protocol on T5 only. Other docks may
+    // select fiber material, but cannot export without an execution protocol.
     const auto unconfigured = library->slice(request);
     std::string readiness_diagnostics;
     for (const auto& issue : unconfigured.diagnostics) readiness_diagnostics += issue.message + "\n";
     INFO("unconfigured P3: " << readiness_diagnostics);
-    CHECK_FALSE(unconfigured.success);
-    CHECK_FALSE(std::filesystem::exists(output));
-    CHECK(std::any_of(unconfigured.diagnostics.begin(), unconfigured.diagnostics.end(), [](const auto& issue) {
-        return issue.message.find("no fiber cut command") != std::string::npos ||
-            issue.message.find("Missing continuous-fiber protocol") != std::string::npos;
-    }));
+    if (fiber_tool == 5) {
+        REQUIRE(unconfigured.success);
+        REQUIRE(unconfigured.preview);
+        size_t p3_fiber_segments = 0;
+        for (const auto& segment : unconfigured.preview->segments)
+            if (segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPowered ||
+                segment.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPassive) {
+                ++p3_fiber_segments;
+                CHECK(segment.tool_id == 5);
+                CHECK(segment.filament_id == 5);
+            }
+        REQUIRE(p3_fiber_segments > 0);
+        CHECK(unconfigured.preview->statistics.total_fiber_feed_mm > 0);
+        std::ifstream generated(output);
+        REQUIRE(generated.good());
+        const std::string gcode((std::istreambuf_iterator<char>(generated)), {});
+        CHECK(gcode.find(";FIBER_CUT\nM400\nS0\nM400\n") != std::string::npos);
+        CHECK(gcode.find("G1 E0 F0") == std::string::npos);
+        CHECK(gcode.find(";P3_TOOLCHANGE_BEGIN\nM400\n;TOOL_BINDING filament=5 physical=5\nT5\nM109 S") != std::string::npos);
+    } else {
+        CHECK_FALSE(unconfigured.success);
+        CHECK_FALSE(std::filesystem::exists(output));
+        CHECK(std::any_of(unconfigured.diagnostics.begin(), unconfigured.diagnostics.end(), [](const auto& issue) {
+            return issue.message.find("no fiber cut command") != std::string::npos ||
+                issue.message.find("Missing continuous-fiber protocol") != std::string::npos;
+        }));
+    }
 
     // Explicit software fixture, not P3 firmware acceptance: independent
     // inventory, linear E, and a numeric test actuator, with no machine macros.
