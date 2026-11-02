@@ -44,7 +44,7 @@
     "change_filament_gcode": ";P3_TOOLCHANGE_BEGIN\nM400\nT{next_extruder}\nM109 S{new_filament_temp}\nG90\nM83\n{if toolchange_z > 0}\n;P3_RETURN_XYZ\nG1 Z{min(position[2] + 5, 315)} F600\nG1 X{position[0]} Y{position[1]} F9000\nG1 Z{position[2]} F600\nG1 E{new_retract_length_toolchange} F{deretraction_speed[next_extruder] * 60}\n{e_retracted[next_extruder] = 0}\n{endif}\n;P3_TOOLCHANGE_END\n",
     "machine_start_gcode": ";P3 shared extruder/heater; tool state must already be confirmed by the operator\nG90\nM83\nG28\nT[initial_tool]\nM109 S{nozzle_temperature_initial_layer[initial_tool]}\nG92 E0\n",
     "machine_end_gcode": "M400\nTURN_OFF_HEATERS\nM107\n",
-    "before_layer_change_gcode": ";BEFORE_LAYER_CHANGE\n;[layer_z]",
+    "before_layer_change_gcode": ";BEFORE_LAYER_CHANGE\n;[layer_z]\n{if layer_num == 0}\n;P3 wait after automatic initial dock selection\nM109 S{nozzle_temperature_initial_layer[initial_tool]}\n{endif}\n",
     "layer_change_gcode": ";AFTER_LAYER_CHANGE\n;[layer_z]",
     "default_print_profile": "0.20mm Standard @P3",
     "default_filament_profile": ["Generic PLA @P3", "Generic PLA @P3", "Generic PLA @P3", "Generic PLA @P3", "Generic PLA @P3", "Generic PLA @P3"]

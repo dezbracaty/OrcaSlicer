@@ -185,6 +185,44 @@ std::optional<DecodedPng> decode_png(const std::vector<unsigned char>& encoded)
 }
 } // namespace
 
+namespace {
+std::set<unsigned> require_p3_heat_before_extrusion(const std::string& gcode)
+{
+    std::set<unsigned> tools;
+    bool waiting_for_heat = false;
+    bool saw_extrusion = false;
+    std::istringstream input(gcode);
+    std::size_t line_number = 0;
+    for (std::string line; std::getline(input, line);) {
+        ++line_number;
+        const auto comment = line.find(';');
+        if (comment != std::string::npos) line.resize(comment);
+        std::istringstream command_input(line);
+        std::string command;
+        command_input >> command;
+        if (command.size() > 1 && command.front() == 'T' &&
+            std::all_of(command.begin() + 1, command.end(), [](unsigned char c) { return std::isdigit(c); })) {
+            tools.insert(static_cast<unsigned>(std::stoul(command.substr(1))));
+            waiting_for_heat = true; // P3 dock selection clears the heater target.
+        } else if (command == "M109") {
+            for (std::string parameter; command_input >> parameter;)
+                if (parameter.size() > 1 && parameter.front() == 'S' && std::stod(parameter.substr(1)) > 0)
+                    waiting_for_heat = false;
+        } else if (command == "G0" || command == "G1" || command == "G2" || command == "G3") {
+            for (std::string parameter; command_input >> parameter;)
+                if (parameter.size() > 1 && parameter.front() == 'E' && std::stod(parameter.substr(1)) != 0) {
+                    INFO("P3 extrusion before temperature wait, line " << line_number << ": " << line);
+                    REQUIRE_FALSE(waiting_for_heat);
+                    saw_extrusion = true;
+                }
+        }
+    }
+    REQUIRE(saw_extrusion);
+    REQUIRE_FALSE(tools.empty());
+    return tools;
+}
+} // namespace
+
 TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material", "[libslicer_api][p3][slice]")
 {
     const unsigned physical_tool = GENERATE(0u, 1u, 2u, 3u, 4u, 5u);
@@ -294,6 +332,8 @@ TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material
         std::ifstream generated(request.output_gcode_path);
         REQUIRE(generated.good());
         const std::string gcode((std::istreambuf_iterator<char>(generated)), {});
+        const auto selected_tools = require_p3_heat_before_extrusion(gcode);
+        CHECK(selected_tools == std::set<unsigned>{physical_tool});
         const auto initial_temperature = config->value("nozzle_temperature_initial_layer");
         REQUIRE(initial_temperature);
         CHECK(gcode.find("M109 S" + material_value(*initial_temperature) + "\n") != std::string::npos);
@@ -301,6 +341,64 @@ TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material
         CHECK(gcode.find("DF1004") == std::string::npos);
         CHECK(gcode.find("CF1004") == std::string::npos);
         CHECK(gcode.find(";FIBER_BEGIN") == std::string::npos);
+    }
+}
+
+TEST_CASE("P3 waits after initial selection and later dock changes", "[libslicer_api][p3][tool-heat][slice]")
+{
+    const unsigned scene = GENERATE(0u, 5u, 6u); // T0, T5, or both in every layer.
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "0.20mm Standard @P3";
+    selection.filament_preset_ids.assign(6, "CFSYS TPU 95A");
+    selection.filament_physical_tools = {0, 1, 2, 3, 4, 5};
+    auto created = library->create_config(selection);
+    REQUIRE(created.success);
+    REQUIRE(created.config->apply_patch({
+        {"filament_colour", "#F28E2B;#808080;#808080;#808080;#808080;#4E79A7"},
+        {"nozzle_temperature_initial_layer", "210,210,210,210,210,220"},
+        {"nozzle_temperature", "205,205,205,205,205,215"},
+        {"enable_support", "0"}, {"enable_prime_tower", "0"},
+        {"generate_reinforced_perimeters", "0"}, {"generate_reinforced_infills", "0"}
+    }).success);
+    const auto coupon = [](unsigned tool, float x) {
+        libslicer::SliceObjectInput object;
+        object.name = "P3-heat-T" + std::to_string(tool);
+        libslicer::SliceVolumeInput volume;
+        volume.vertices = {{x,100,0},{x+10,100,0},{x+10,110,0},{x,110,0},
+                           {x,100,0.6f},{x+10,100,0.6f},{x+10,110,0.6f},{x,110,0.6f}};
+        volume.triangles = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                            {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+        volume.default_filament_slot = int(tool + 1);
+        object.volumes.push_back(std::move(volume));
+        return object;
+    };
+    libslicer::SliceRequest request;
+    request.config = created.config->snapshot();
+    if (scene == 6) request.objects = {coupon(0, 100), coupon(5, 120)};
+    else request.objects = {coupon(scene, 100)};
+    const auto output = std::filesystem::temp_directory_path() /
+        ("libslicer-p3-heat-" + std::to_string(scene) + ".gcode");
+    request.output_gcode_path = output.string();
+    const auto sliced = library->slice(request);
+    for (const auto& issue : sliced.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(sliced.success);
+    REQUIRE(sliced.summary.layer_count == 3);
+    std::ifstream input(output);
+    REQUIRE(input.good());
+    const std::string gcode((std::istreambuf_iterator<char>(input)), {});
+    const auto expected = scene == 6 ? std::set<unsigned>{0, 5} : std::set<unsigned>{scene};
+    const auto selected_tools = require_p3_heat_before_extrusion(gcode);
+    CHECK(selected_tools == expected);
+    if (scene == 6) {
+        CHECK(gcode.find("\nM109 S205\n") != std::string::npos);
+        CHECK(gcode.find("\nM109 S215\n") != std::string::npos);
     }
 }
 
