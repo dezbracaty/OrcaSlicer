@@ -22,6 +22,7 @@
 #include "libslic3r/Geometry/ConvexHull.hpp"
 
 #include <float.h>
+#include <stdexcept>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -2578,6 +2579,146 @@ void ModelVolume::update_extruder_count(size_t extruder_count)
     // per-filament config vectors out of range. Ported from BambuStudio (STUDIO-15763).
     if (extruder_id() > extruder_count) {
         this->config.erase("extruder");
+    }
+}
+
+// Only normal, fully loaded FFF object trees are covered by this extraction.
+// GUI_ObjectList::add_volumes_to_object_in_list hides cut connectors; do not
+// silently apply another topology's node rules to such objects.
+static void validate_filament_object_tree(const ModelObject& object, bool needs_layer_extruder = true)
+{
+    if (object.is_cut())
+        throw std::invalid_argument("Material operations do not yet support cut object trees");
+    for (const auto& layer : object.layer_config_ranges)
+        if (needs_layer_extruder && !layer.second.has("extruder"))
+            throw std::invalid_argument("Layer configuration has no required extruder value");
+}
+
+// Data statements from GUI_ObjectList::update_filament_values_for_items,
+// Orca 3c8c667d. Widget text writes and refreshes are omitted.
+void ModelObject::update_filament_references_after_append(size_t filaments_count)
+{
+    validate_filament_object_tree(*this, false);
+    auto* object = this;
+    if (!object->config.has("extruder") || size_t(object->config.extruder()) > filaments_count)
+        object->config.set_key_value("extruder", new ConfigOptionInt(1));
+    static const char* keys[] = {"support_filament", "support_interface_filament"};
+    for (auto key : keys)
+        if (object->config.has(key) && object->config.opt_int(key) > filaments_count)
+            object->config.erase(key);
+    if (object->volumes.size() > 1) {
+        for (auto* volume : object->volumes) {
+            if (!volume->config.has("extruder") || size_t(volume->config.extruder()) > filaments_count)
+                volume->config.erase("extruder");
+            for (auto key : keys)
+                if (volume->config.has(key) && volume->config.opt_int(key) > filaments_count)
+                    volume->config.erase(key);
+        }
+    }
+}
+
+// Data call order from Plater::on_filament_count_change: object-list
+// normalization precedes ModelVolume's existing count/painting update.
+void Model::update_filaments_after_append(size_t count)
+{
+    for (const auto* object : objects)
+        validate_filament_object_tree(*object, false);
+    for (auto* object : objects)
+        object->update_filament_references_after_append(count);
+    for (auto* object : objects)
+        for (auto* volume : object->volumes)
+            volume->update_extruder_count(count);
+}
+
+// Extracted data operations from Orca 3c8c667d GUI_ObjectList.cpp:789-898.
+// No display nodes are synthesized. The original node-existence conditions
+// for fully loaded, non-cut FFF objects are evaluated from the real model.
+void ModelObject::update_filament_references_after_delete(size_t filament_id, int replace_id)
+{
+    validate_filament_object_tree(*this);
+    auto* object            = this;
+    int replace_filament_id = replace_id == -1 ? 1 : (replace_id + 1);
+    if (!object->config.has("extruder"))
+        object->config.set_key_value("extruder", new ConfigOptionInt(1));
+    else if (size_t(object->config.extruder()) == filament_id + 1)
+        object->config.set_key_value("extruder", new ConfigOptionInt(replace_filament_id));
+    else {
+        int new_extruder = object->config.extruder() > filament_id ? object->config.extruder() - 1 : object->config.extruder();
+        object->config.set_key_value("extruder", new ConfigOptionInt(new_extruder));
+    }
+    static const char* keys[] = {"support_filament", "support_interface_filament"};
+    for (auto key : keys) {
+        if (object->config.has(key)) {
+            if (object->config.opt_int(key) == filament_id + 1)
+                object->config.erase(key);
+            else {
+                int new_value = object->config.opt_int(key) > filament_id ? object->config.opt_int(key) - 1 : object->config.opt_int(key);
+                object->config.set_key_value(key, new ConfigOptionInt(new_value));
+            }
+        }
+    }
+    // GetItemByVolumeId: a single volume aliases the object only without
+    // instance/layer children. Multi-volume non-cut objects have volume nodes.
+    if (volumes.size() > 1 || (instances.size() <= 1 && layer_config_ranges.empty())) {
+        for (size_t id = 0; id < object->volumes.size(); ++id) {
+            for (auto key : keys) {
+                if (object->volumes[id]->config.has(key)) {
+                    if (object->volumes[id]->config.opt_int(key) == filament_id + 1)
+                        object->volumes[id]->config.erase(key);
+                    else {
+                        int new_value = object->volumes[id]->config.opt_int(key) > filament_id ?
+                                            object->volumes[id]->config.opt_int(key) - 1 :
+                                            object->volumes[id]->config.opt_int(key);
+                        // Retains the upstream write to object config, including its asymmetry.
+                        object->config.set_key_value(key, new ConfigOptionInt(new_value));
+                    }
+                }
+            }
+            if (!object->volumes[id]->config.has("extruder"))
+                continue;
+            if (size_t(object->volumes[id]->config.extruder()) == filament_id + 1)
+                object->volumes[id]->config.set_key_value("extruder", new ConfigOptionInt(replace_filament_id));
+            else {
+                int new_extruder = object->volumes[id]->config.extruder() > filament_id ? object->volumes[id]->config.extruder() - 1 :
+                                                                                          object->volumes[id]->config.extruder();
+                object->volumes[id]->config.set_key_value("extruder", new ConfigOptionInt(new_extruder));
+            }
+        }
+    }
+    for (auto& layer_range_item : object->layer_config_ranges) {
+        if (layer_range_item.second.has("extruder") && layer_range_item.second.option("extruder")->getInt() == filament_id + 1) {
+            int new_extruder = replace_id == -1 ? 0 : (replace_id + 1);
+            layer_range_item.second.set("extruder", new_extruder);
+        } else {
+            int layer_filament_id = layer_range_item.second.option("extruder")->getInt();
+            int new_extruder      = layer_filament_id > filament_id ? layer_filament_id - 1 : layer_filament_id;
+            layer_range_item.second.set("extruder", new_extruder);
+        }
+    }
+}
+
+// Extracted from Plater::on_filaments_delete (same upstream revision).
+void Model::update_filaments_after_delete(size_t num_filaments, size_t filament_id, int replace_filament_id)
+{
+    for (const auto* object : objects)
+        validate_filament_object_tree(*object);
+    for (ModelObject* mo : objects)
+        for (ModelVolume* mv : mo->volumes)
+            mv->update_extruder_count_when_delete_filament(num_filaments, filament_id + 1, replace_filament_id + 1);
+    for (ModelObject* mo : objects)
+        mo->update_filament_references_after_delete(filament_id, replace_filament_id);
+    for (auto item = plates_custom_gcodes.begin(); item != plates_custom_gcodes.end(); ++item) {
+        auto iter = std::remove_if(item->second.gcodes.begin(), item->second.gcodes.end(),
+                                   [filament_id](const CustomGCode::Item& gcode_item) {
+                                       return (gcode_item.type == CustomGCode::Type::ToolChange && gcode_item.extruder == filament_id + 1);
+                                   });
+        if (replace_filament_id == -1)
+            item->second.gcodes.erase(iter, item->second.gcodes.end());
+        else if (iter != item->second.gcodes.end())
+            iter->extruder = replace_filament_id + 1;
+        for (auto& item : item->second.gcodes)
+            if (item.type == CustomGCode::Type::ToolChange && item.extruder > filament_id)
+                item.extruder--;
     }
 }
 

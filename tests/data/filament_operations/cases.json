@@ -1,0 +1,361 @@
+{
+  "machine": "Flashforge AD5X",
+  "variant": "0.4",
+  "initial_color": [
+    17,
+    34,
+    51,
+    255
+  ],
+  "cases": [
+    {
+      "id": "delete-first",
+      "steps": [
+        {
+          "op": "add",
+          "color": [
+            68,
+            85,
+            102,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "add",
+          "color": [
+            119,
+            136,
+            153,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "remove",
+          "index": 0,
+          "success": true
+        }
+      ],
+      "colors": [
+        [
+          68,
+          85,
+          102,
+          255
+        ],
+        [
+          119,
+          136,
+          153,
+          255
+        ]
+      ]
+    },
+    {
+      "id": "delete-middle",
+      "steps": [
+        {
+          "op": "add",
+          "color": [
+            68,
+            85,
+            102,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "add",
+          "color": [
+            119,
+            136,
+            153,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "remove",
+          "index": 1,
+          "success": true
+        }
+      ],
+      "colors": [
+        [
+          17,
+          34,
+          51,
+          255
+        ],
+        [
+          119,
+          136,
+          153,
+          255
+        ]
+      ]
+    },
+    {
+      "id": "delete-last",
+      "steps": [
+        {
+          "op": "add",
+          "color": [
+            68,
+            85,
+            102,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "add",
+          "color": [
+            119,
+            136,
+            153,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "remove",
+          "index": 2,
+          "success": true
+        }
+      ],
+      "colors": [
+        [
+          17,
+          34,
+          51,
+          255
+        ],
+        [
+          68,
+          85,
+          102,
+          255
+        ]
+      ]
+    },
+    {
+      "id": "replace-with-later",
+      "steps": [
+        {
+          "op": "add",
+          "color": [
+            68,
+            85,
+            102,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "add",
+          "color": [
+            119,
+            136,
+            153,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "remove",
+          "index": 0,
+          "success": true,
+          "replacement": 2
+        }
+      ],
+      "colors": [
+        [
+          68,
+          85,
+          102,
+          255
+        ],
+        [
+          119,
+          136,
+          153,
+          255
+        ]
+      ]
+    },
+    {
+      "id": "replace-with-earlier",
+      "steps": [
+        {
+          "op": "add",
+          "color": [
+            68,
+            85,
+            102,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "add",
+          "color": [
+            119,
+            136,
+            153,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "remove",
+          "index": 2,
+          "success": true,
+          "replacement": 0
+        }
+      ],
+      "colors": [
+        [
+          17,
+          34,
+          51,
+          255
+        ],
+        [
+          68,
+          85,
+          102,
+          255
+        ]
+      ]
+    },
+    {
+      "id": "invalid-request-does-not-change-state",
+      "steps": [
+        {
+          "op": "remove",
+          "index": 0,
+          "success": false
+        },
+        {
+          "op": "add",
+          "color": [
+            68,
+            85,
+            102,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "remove",
+          "index": 9,
+          "success": false
+        },
+        {
+          "op": "remove",
+          "index": 0,
+          "success": false,
+          "replacement": 0
+        },
+        {
+          "op": "remove",
+          "index": 0,
+          "success": false,
+          "replacement": 9
+        },
+        {
+          "op": "remove",
+          "index": 1,
+          "success": true
+        }
+      ],
+      "colors": [
+        [
+          17,
+          34,
+          51,
+          255
+        ]
+      ]
+    },
+    {
+      "id": "capacity-and-repeated-operations",
+      "steps": [
+        {
+          "op": "add",
+          "color": [
+            68,
+            85,
+            102,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "add",
+          "color": [
+            119,
+            136,
+            153,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "add",
+          "color": [
+            170,
+            187,
+            204,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "add",
+          "success": false
+        },
+        {
+          "op": "remove",
+          "index": 3,
+          "success": true
+        },
+        {
+          "op": "remove",
+          "index": 2,
+          "success": true
+        },
+        {
+          "op": "remove",
+          "index": 1,
+          "success": true
+        },
+        {
+          "op": "add",
+          "color": [
+            68,
+            85,
+            102,
+            255
+          ],
+          "success": true
+        },
+        {
+          "op": "remove",
+          "index": 1,
+          "success": true
+        }
+      ],
+      "colors": [
+        [
+          17,
+          34,
+          51,
+          255
+        ]
+      ]
+    }
+  ]
+}

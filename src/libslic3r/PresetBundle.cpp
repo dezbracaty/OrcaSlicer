@@ -8,6 +8,10 @@
 #include "Utils.hpp"
 #include "LocalesUtils.hpp"
 #include "Model.hpp"
+#include "Color.hpp"
+#include "FlushVolCalc.hpp"
+#include "ParameterUtils.hpp"
+#include <stdexcept>
 #include "libslic3r_version.h"
 
 #include <algorithm>
@@ -2965,6 +2969,399 @@ void PresetBundle::export_selections(AppConfig &config)
 }
 
 // BBS
+namespace {
+// Data extraction from Orca 3c8c667d Plater.cpp / PartPlate.cpp.
+// GUI refresh, selection persistence and background scheduling are omitted.
+std::vector<int> project_min_flush_volumes(const DynamicPrintConfig& full_config, size_t nozzle_id)
+{
+    std::vector<int> extra_flush_volumes;
+    // const auto& full_config = wxGetApp().preset_bundle->full_config();
+    // auto& printer_config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+
+    const ConfigOptionFloatsNullable* nozzle_volume_opt = full_config.option<ConfigOptionFloatsNullable>("nozzle_volume");
+    int nozzle_volume_val                               = nozzle_volume_opt ? (int) nozzle_volume_opt->get_at(nozzle_id) : 0;
+
+    const ConfigOptionInt* enable_long_retraction_when_cut_opt = full_config.option<ConfigOptionInt>("enable_long_retraction_when_cut");
+    int machine_enabled_level                                  = 0;
+    if (enable_long_retraction_when_cut_opt) {
+        machine_enabled_level = enable_long_retraction_when_cut_opt->value;
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+                                << boost::format(": get enable_long_retraction_when_cut from config, value=%1%") % machine_enabled_level;
+    }
+    const ConfigOptionBools* long_retractions_when_cut_opt = full_config.option<ConfigOptionBools>("long_retractions_when_cut");
+    bool machine_activated                                 = false;
+    if (long_retractions_when_cut_opt) {
+        machine_activated = long_retractions_when_cut_opt->values[nozzle_id] == 1;
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+                                << boost::format(": get long_retractions_when_cut from config, value=%1%, activated=%2%") %
+                                       long_retractions_when_cut_opt->values[0] % machine_activated;
+    }
+
+    size_t filament_size = full_config.option<ConfigOptionFloats>("filament_diameter")->values.size();
+    std::vector<double> filament_retraction_distance_when_cut(filament_size, 18.0f),
+        printer_retraction_distance_when_cut(filament_size, 18.0f);
+    std::vector<unsigned char> filament_long_retractions_when_cut(filament_size, 0);
+    const ConfigOptionFloats* filament_retraction_distances_when_cut_opt = full_config.option<ConfigOptionFloats>(
+        "filament_retraction_distances_when_cut");
+    if (filament_retraction_distances_when_cut_opt) {
+        filament_retraction_distance_when_cut = filament_retraction_distances_when_cut_opt->values;
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+                                << boost::format(": get filament_retraction_distance_when_cut from config, size=%1%, values=%2%") %
+                                       filament_retraction_distance_when_cut.size() %
+                                       filament_retraction_distances_when_cut_opt->serialize();
+    }
+
+    const ConfigOptionFloats* printer_retraction_distance_when_cut_opt = full_config.option<ConfigOptionFloats>(
+        "retraction_distances_when_cut");
+    if (printer_retraction_distance_when_cut_opt) {
+        printer_retraction_distance_when_cut = printer_retraction_distance_when_cut_opt->values;
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+                                << boost::format(": get retraction_distances_when_cut from config, size=%1%, values=%2%") %
+                                       printer_retraction_distance_when_cut.size() % printer_retraction_distance_when_cut_opt->serialize();
+    }
+
+    const ConfigOptionBools* filament_long_retractions_when_cut_opt = full_config.option<ConfigOptionBools>(
+        "filament_long_retractions_when_cut");
+    if (filament_long_retractions_when_cut_opt) {
+        filament_long_retractions_when_cut = filament_long_retractions_when_cut_opt->values;
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+                                << boost::format(": get filament_long_retractions_when_cut from config, size=%1%, values=%2%") %
+                                       filament_long_retractions_when_cut.size() % filament_long_retractions_when_cut_opt->serialize();
+    }
+
+    for (size_t idx = 0; idx < filament_size; ++idx) {
+        int extra_flush_volume = nozzle_volume_val;
+        int retract_length     = machine_enabled_level && machine_activated ? printer_retraction_distance_when_cut[nozzle_id] : 0;
+
+        unsigned char filament_activated = filament_long_retractions_when_cut[idx];
+        double filament_retract_length   = filament_retraction_distance_when_cut[idx];
+
+        if (filament_activated == 0)
+            retract_length = 0;
+        else if (filament_activated == 1 && machine_enabled_level == LongRectrationLevel::EnableFilament) {
+            if (!std::isnan(filament_retract_length))
+                retract_length = (int) filament_retraction_distance_when_cut[idx];
+            else
+                retract_length = printer_retraction_distance_when_cut[nozzle_id];
+        }
+
+        extra_flush_volume -= PI * 1.75 * 1.75 / 4 * retract_length;
+        extra_flush_volumes.emplace_back(extra_flush_volume);
+    }
+    return extra_flush_volumes;
+}
+
+// Strict=true path of GUI_App::is_support_filament; the original caller
+// always uses that default. The optional PLA/PETG heuristic is not entered.
+bool project_is_support_filament(PresetBundle& bundle, int extruder_id)
+{
+    auto& filament_presets = bundle.filament_presets;
+    auto& filaments        = bundle.filaments;
+    if (extruder_id >= filament_presets.size())
+        return false;
+    Preset* filament = filaments.find_preset(filament_presets[extruder_id]);
+    if (filament == nullptr)
+        return false;
+    auto* support_option = dynamic_cast<ConfigOptionBools*>(filament->config.option("filament_is_support"));
+    if (support_option == nullptr)
+        return false;
+    return support_option->get_at(0);
+}
+
+// wxColour is a GUI colour container; only the original RGBA byte values
+// reach FlushVolCalculator. Invalid input is rejected rather than repaired.
+ColorRGBA project_filament_color(const std::string& text)
+{
+    ColorRGBA value;
+    if (!decode_color(text, value))
+        throw std::invalid_argument("Invalid project material colour: " + text);
+    return value;
+}
+
+void project_auto_calc_flushing_volumes(PresetBundle& bundle, const int modify_id, const int extruder_id)
+{
+    auto* preset_bundle             = &bundle;
+    auto& project_config            = preset_bundle->project_config;
+    const auto& full_config         = bundle.full_config();
+    auto& ams_multi_color_filament  = preset_bundle->ams_multi_color_filment;
+    size_t extruder_nums            = preset_bundle->get_printer_extruder_count();
+    int nozzle_flush_dataset        = full_config.option<ConfigOptionIntsNullable>("nozzle_flush_dataset")->values[extruder_id];
+    std::vector<double> init_matrix = get_flush_volumes_matrix((project_config.option<ConfigOptionFloats>("flush_volumes_matrix"))->values,
+                                                               extruder_id, extruder_nums);
+
+    const std::vector<int>& min_flush_volumes = project_min_flush_volumes(full_config, extruder_id);
+
+    const auto* flush_multi_opt        = project_config.option<ConfigOptionFloats>("flush_multiplier");
+    float flush_multiplier             = flush_multi_opt ? (float) flush_multi_opt->get_at(extruder_id) : 1.f;
+    std::vector<double> matrix         = init_matrix;
+    int m_max_flush_volume             = Slic3r::g_max_flush_volume;
+    unsigned int m_number_of_extruders = (int) (sqrt(init_matrix.size()) + 0.001);
+
+    const std::vector<std::string> extruder_colours = bundle.project_config.option<ConfigOptionStrings>("filament_colour")->values;
+    std::vector<std::vector<ColorRGBA>> multi_colours;
+
+    // Support for multi-color filament
+    for (int i = 0; i < extruder_colours.size(); ++i) {
+        std::vector<ColorRGBA> single_filament;
+        if (i < ams_multi_color_filament.size()) {
+            if (!ams_multi_color_filament[i].empty()) {
+                std::vector<std::string> colors = ams_multi_color_filament[i];
+                for (int j = 0; j < colors.size(); ++j) {
+                    single_filament.push_back(project_filament_color(colors[j]));
+                }
+                multi_colours.push_back(single_filament);
+                continue;
+            }
+        }
+
+        single_filament.push_back(project_filament_color(extruder_colours[i]));
+        multi_colours.push_back(single_filament);
+    }
+
+    if (modify_id >= 0 && modify_id < multi_colours.size()) {
+        for (int i = 0; i < multi_colours.size(); ++i) {
+            // from to modify
+            int from_idx = i;
+            if (from_idx != modify_id) {
+                Slic3r::FlushVolCalculator calculator(min_flush_volumes[from_idx], m_max_flush_volume, nozzle_flush_dataset);
+                int flushing_volume  = 0;
+                bool is_from_support = project_is_support_filament(bundle, from_idx);
+                bool is_to_support   = project_is_support_filament(bundle, modify_id);
+                if (is_to_support) {
+                    flushing_volume = Slic3r::g_flush_volume_to_support;
+                } else {
+                    for (int j = 0; j < multi_colours[from_idx].size(); ++j) {
+                        const ColorRGBA& from = multi_colours[from_idx][j];
+                        for (int k = 0; k < multi_colours[modify_id].size(); ++k) {
+                            const ColorRGBA& to = multi_colours[modify_id][k];
+                            int volume          = calculator.calc_flush_vol(from.a_uchar(), from.r_uchar(), from.g_uchar(), from.b_uchar(),
+                                                                            to.a_uchar(), to.r_uchar(), to.g_uchar(), to.b_uchar());
+                            flushing_volume     = std::max(flushing_volume, volume);
+                        }
+                    }
+                    if (is_from_support)
+                        flushing_volume = std::max(flushing_volume, Slic3r::g_min_flush_volume_from_support);
+                }
+                matrix[m_number_of_extruders * from_idx + modify_id] = flushing_volume;
+            }
+
+            // modify to to
+            int to_idx = i;
+            if (to_idx != modify_id) {
+                Slic3r::FlushVolCalculator calculator(min_flush_volumes[modify_id], m_max_flush_volume, nozzle_flush_dataset);
+                bool is_from_support = project_is_support_filament(bundle, modify_id);
+                bool is_to_support   = project_is_support_filament(bundle, to_idx);
+                int flushing_volume  = 0;
+                if (is_to_support) {
+                    flushing_volume = Slic3r::g_flush_volume_to_support;
+                } else {
+                    for (int j = 0; j < multi_colours[modify_id].size(); ++j) {
+                        const ColorRGBA& from = multi_colours[modify_id][j];
+                        for (int k = 0; k < multi_colours[to_idx].size(); ++k) {
+                            const ColorRGBA& to = multi_colours[to_idx][k];
+                            int volume          = calculator.calc_flush_vol(from.a_uchar(), from.r_uchar(), from.g_uchar(), from.b_uchar(),
+                                                                            to.a_uchar(), to.r_uchar(), to.g_uchar(), to.b_uchar());
+                            flushing_volume     = std::max(flushing_volume, volume);
+                        }
+                    }
+                    if (is_from_support)
+                        flushing_volume = std::max(flushing_volume, Slic3r::g_min_flush_volume_from_support);
+
+                    matrix[m_number_of_extruders * modify_id + to_idx] = flushing_volume;
+                }
+            }
+        }
+    }
+    set_flush_volumes_matrix((project_config.option<ConfigOptionFloats>("flush_volumes_matrix"))->values, matrix, extruder_id,
+                             extruder_nums);
+}
+
+std::vector<LayerPrintSequence> project_other_layers_print_sequence(const DynamicPrintConfig& config)
+{
+    const ConfigOptionInts* other_layers_print_sequence_op     = config.option<ConfigOptionInts>("other_layers_print_sequence");
+    const ConfigOptionInt* other_layers_print_sequence_nums_op = config.option<ConfigOptionInt>("other_layers_print_sequence_nums");
+    if (other_layers_print_sequence_op && other_layers_print_sequence_nums_op) {
+        const std::vector<int>& print_sequence = other_layers_print_sequence_op->values;
+        int sequence_nums                      = other_layers_print_sequence_nums_op->value;
+        // Preconditions of ParameterUtils' original decoding assertions.
+        if (sequence_nums < 0 || (sequence_nums > 0 &&
+            (print_sequence.size() % size_t(sequence_nums) != 0 ||
+             (!print_sequence.empty() && print_sequence.size() / size_t(sequence_nums) < 3))))
+            throw std::invalid_argument("Invalid layer print sequence encoding");
+        auto other_layers_seqs                 = Slic3r::get_other_layers_print_sequence(sequence_nums, print_sequence);
+        return other_layers_seqs;
+    } else
+        return {};
+}
+
+void project_set_other_layers_print_sequence(DynamicPrintConfig& config, const std::vector<LayerPrintSequence>& layer_seq_list)
+{
+    if (layer_seq_list.empty()) {
+        config.erase("other_layers_print_sequence");
+        config.erase("other_layers_print_sequence_nums");
+        return;
+    }
+
+    int sequence_nums;
+    std::vector<int> other_layers_seqs;
+    Slic3r::get_other_layers_print_sequence(layer_seq_list, sequence_nums, other_layers_seqs);
+    ConfigOptionInts* other_layers_print_sequence_op     = config.option<ConfigOptionInts>("other_layers_print_sequence");
+    ConfigOptionInt* other_layers_print_sequence_nums_op = config.option<ConfigOptionInt>("other_layers_print_sequence_nums");
+    if (other_layers_print_sequence_op)
+        other_layers_print_sequence_op->values = other_layers_seqs;
+    else
+        config.set_key_value("other_layers_print_sequence", new ConfigOptionInts(other_layers_seqs));
+    if (other_layers_print_sequence_nums_op)
+        other_layers_print_sequence_nums_op->value = sequence_nums;
+    else
+        config.set_key_value("other_layers_print_sequence_nums", new ConfigOptionInt(sequence_nums));
+}
+
+void project_update_first_layer_print_sequence(DynamicPrintConfig& config, size_t filament_nums)
+{
+    auto other_layers_seqs = project_other_layers_print_sequence(config);
+    if (!other_layers_seqs.empty()) {
+        bool need_update_data = false;
+        for (auto& other_layers_seq : other_layers_seqs) {
+            std::vector<int>& orders = other_layers_seq.second;
+            if (orders.size() > filament_nums) {
+                orders.erase(std::remove_if(orders.begin(), orders.end(), [filament_nums](int n) { return n > filament_nums; }),
+                             orders.end());
+                need_update_data = true;
+            }
+            if (orders.size() < filament_nums) {
+                for (size_t extruder_id = orders.size(); extruder_id < filament_nums; ++extruder_id) {
+                    orders.push_back(extruder_id + 1);
+                    need_update_data = true;
+                }
+            }
+        }
+        if (need_update_data)
+            project_set_other_layers_print_sequence(config, other_layers_seqs);
+    }
+
+    ConfigOptionInts* op_print_sequence_1st = config.option<ConfigOptionInts>("first_layer_print_sequence");
+    if (!op_print_sequence_1st) {
+        return;
+    }
+
+    std::vector<int>& print_sequence_1st = op_print_sequence_1st->values;
+    if (print_sequence_1st.size() == 0 || print_sequence_1st[0] == 0)
+        return;
+
+    if (print_sequence_1st.size() > filament_nums) {
+        print_sequence_1st.erase(std::remove_if(print_sequence_1st.begin(), print_sequence_1st.end(),
+                                                [filament_nums](int n) { return n > filament_nums; }),
+                                 print_sequence_1st.end());
+    } else if (print_sequence_1st.size() < filament_nums) {
+        for (size_t extruder_id = print_sequence_1st.size(); extruder_id < filament_nums; ++extruder_id) {
+            print_sequence_1st.push_back(extruder_id + 1);
+        }
+    }
+}
+
+void project_update_first_layer_print_sequence_when_delete_filament(DynamicPrintConfig& config, size_t filament_id)
+{
+    auto other_layers_seqs = project_other_layers_print_sequence(config);
+    if (!other_layers_seqs.empty()) {
+        bool need_update_data = false;
+        for (auto& other_layers_seq : other_layers_seqs) {
+            std::vector<int>& orders = other_layers_seq.second;
+            orders.erase(std::remove_if(orders.begin(), orders.end(), [filament_id](int n) { return n == filament_id + 1; }), orders.end());
+            for (auto& order : orders) {
+                order = order > filament_id ? order - 1 : order;
+            }
+            need_update_data = true;
+        }
+        if (need_update_data)
+            project_set_other_layers_print_sequence(config, other_layers_seqs);
+    }
+
+    ConfigOptionInts* op_print_sequence_1st = config.option<ConfigOptionInts>("first_layer_print_sequence");
+    if (!op_print_sequence_1st)
+        return;
+
+    std::vector<int>& print_sequence_1st = op_print_sequence_1st->values;
+    if (print_sequence_1st.size() == 0 || print_sequence_1st[0] == 0)
+        return;
+
+    print_sequence_1st.erase(std::remove_if(print_sequence_1st.begin(), print_sequence_1st.end(),
+                                            [filament_id](int n) { return n == filament_id + 1; }),
+                             print_sequence_1st.end());
+    for (auto& order : print_sequence_1st) {
+        order = order > filament_id ? order - 1 : order;
+    }
+}
+
+} // namespace
+
+// Original Sidebar::add_custom_filament and Plater::on_filament_count_change
+// data call sequence. Explicit source/preset parameters are SDK tool adapters.
+void PresetBundle::append_project_filament(Model& model,
+                                           std::vector<DynamicPrintConfig*>& plates,
+                                           const std::string& color,
+                                           std::optional<size_t> source_filament,
+                                           std::optional<std::string> preset_id)
+{
+    const size_t old_count = filament_presets.size();
+    if (!old_count || (source_filament && *source_filament >= old_count))
+        throw std::invalid_argument("Invalid source material");
+    if (preset_id && !filaments.find_preset(*preset_id))
+        throw std::invalid_argument("Unknown material preset");
+    const std::string source_name = filament_presets[source_filament.value_or(old_count - 1)];
+    set_num_filaments(unsigned(old_count + 1), color);
+    filament_presets.back() = preset_id.value_or(source_name);
+    for (auto* config : plates) {
+        if (!config)
+            throw std::invalid_argument("Missing plate configuration");
+        if (auto* mapping = config->option<ConfigOptionInts>("filament_map")) {
+            mapping->values.push_back(1);             // PartPlate::on_filament_added
+            mapping->values.resize(old_count + 1, 1); // PartPlate::set_filament_count
+        }
+        project_update_first_layer_print_sequence(*config, old_count + 1);
+    }
+    model.update_filaments_after_append(old_count + 1);
+    for (size_t extruder_id = 0; extruder_id < get_printer_extruder_count(); ++extruder_id)
+        project_auto_calc_flushing_volumes(*this, int(old_count), int(extruder_id));
+}
+
+// Original Sidebar::delete_filament / Plater::on_filaments_delete data sequence.
+void PresetBundle::remove_project_filament(Model& model,
+                                           std::vector<DynamicPrintConfig*>& plates,
+                                           size_t removed,
+                                           int replacement_after_delete)
+{
+    const size_t old_count    = filament_presets.size();
+    const size_t nozzle_count = printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter")->size();
+    if (old_count <= 1 || removed >= old_count || old_count - 1 < nozzle_count || replacement_after_delete < -1 ||
+        replacement_after_delete >= int(old_count - 1))
+        throw std::invalid_argument("Invalid material deletion or replacement");
+    update_num_filaments(unsigned(removed));
+    for (auto* config : plates) {
+        if (!config)
+            throw std::invalid_argument("Missing plate configuration");
+        if (auto* mapping = config->option<ConfigOptionInts>("filament_map"))
+            if (removed < mapping->values.size())
+                mapping->values.erase(mapping->values.begin() + removed);
+        project_update_first_layer_print_sequence_when_delete_filament(*config, removed);
+    }
+    // The original global Plater configuration is the print preset's data
+    // here. Erasing the override preserves the original default semantics.
+    auto& config              = prints.get_edited_preset().config;
+    static const char* keys[] = {"support_filament", "support_interface_filament"};
+    for (auto key : keys) {
+        if (config.has(key)) {
+            if (config.opt_int(key) == removed + 1)
+                config.erase(key);
+            else {
+                int new_value = config.opt_int(key) > removed ? config.opt_int(key) - 1 : config.opt_int(key);
+                config.set_key_value(key, new ConfigOptionInt(new_value));
+            }
+        }
+    }
+    model.update_filaments_after_delete(old_count - 1, removed, replacement_after_delete);
+}
+
 void PresetBundle::set_num_filaments(unsigned int n, std::vector<std::string> new_colors) {
     int old_filament_count = this->filament_presets.size();
     if (n > old_filament_count && old_filament_count != 0)

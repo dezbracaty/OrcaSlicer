@@ -85,3 +85,20 @@ adapted = (source_dir / "PlaterCalibration.inc").read_text(encoding="utf-8")
 adapted = normalized_body(adapted[adapted.index(origin["start"]):])
 assert adapted == adapt_gui_access(body), "Calibration implementation contains changes outside the GUI adaptation allowlist"
 print("Original algorithms and GUI-only adaptation verified:", origin["revision"])
+
+# Filament data extraction pins its original GUI sources independently of the
+# adapted implementation. This verifies provenance, not semantic equivalence;
+# the native reference and public protocol cases exercise the latter.
+filament_origin = json.loads((root / "tests/data/filament_operations/sources.json").read_text(encoding="utf-8"))
+if shutil.which("git"):
+    checked = 0
+    for source in filament_origin["sources"]:
+        original = subprocess.run(
+            ["git", "-C", str(root), "show", filament_origin["upstream_revision"] + ":" + source["path"]],
+            capture_output=True, check=False)
+        if original.returncode == 0:
+            assert hashlib.sha256(original.stdout).hexdigest() == source["sha256_original_file"], source["path"]
+            for name in source["functions"]:
+                assert name.encode() in original.stdout, name
+            checked += 1
+    print(f"Filament original source files verified: {checked}/{len(filament_origin['sources'])}")

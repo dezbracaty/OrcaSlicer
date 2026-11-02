@@ -202,6 +202,8 @@ struct SliceVolumeInput
     int default_filament_slot{1};
     SliceFacetLabels facet_labels;
     SliceVolumeRole role{SliceVolumeRole::ModelPart};
+    // Caller identity for correlating read-only material edit results.
+    std::string id;
 };
 
 // Geometry-only plane cutting contract. The mesh is expressed in model-local
@@ -283,17 +285,100 @@ struct SliceObjectInput
     std::string model_path;
     std::vector<std::string> support_enforcer_paths;
     std::string name;
-    std::array<double, 16> transform{
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0};
+    std::array<double, 16> transform{1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0};
     std::vector<SliceVolumeInput> volumes;
     std::vector<SliceFiberMaskInput> fiber_masks;
+    std::string id;
+    int default_filament_slot{1};
+    // Complete instance list for an in-memory object. Empty uses transform
+    // for one instance. Instance-specific fiber masks require separate objects.
+    std::vector<std::array<double, 16>> instances;
 };
 
-enum class OutputArtifactOwnership
+struct SliceDiagnostic
 {
+    std::string code;
+    std::string message;
+    bool warning{false};
+    std::string option_key;
+};
+
+// Immutable native model/plate state. Only Library constructs or edits it.
+class LIBSLICER_API ModelSnapshot final
+{
+public:
+    ModelSnapshot() = default;
+    bool valid() const noexcept;
+
+private:
+    class Impl;
+    std::shared_ptr<const Impl> impl_;
+    friend class Library;
+};
+
+struct ModelLoadRequest
+{
+    std::vector<SliceObjectInput> objects;
+    ConfigSnapshot config;
+    bool center_on_build_plate{true};
+    // Existing caller configuration defaults, adapted by the same native
+    // object-reference rules. These carriers never enter the slicing model.
+    std::vector<std::pair<std::string, int>> filament_defaults;
+};
+
+struct ModelLoadResult
+{
+    bool success{false};
+    bool cancelled{false};
+    ModelSnapshot model;
+    std::vector<SliceDiagnostic> diagnostics;
+    explicit operator bool() const noexcept { return success; }
+};
+
+struct AddFilamentRequest
+{
+    ModelSnapshot model;
+    std::optional<std::size_t> physical_tool;
+    std::optional<std::string> preset_id;
+    std::optional<Rgba8> color;
+};
+
+struct RemoveFilamentRequest
+{
+    ModelSnapshot model;
+    std::size_t slot_index{0};
+    std::optional<std::size_t> replacement_slot_index;
+};
+
+struct FilamentVolumeProjection
+{
+    std::string id;
+    int default_filament_slot{0}; // Raw zero means inherit the object.
+    int effective_filament_slot{0};
+    SliceFacetLabels facet_labels;
+};
+
+struct FilamentObjectProjection
+{
+    std::string id;
+    int default_filament_slot{1};
+    std::vector<FilamentVolumeProjection> volumes;
+};
+
+struct FilamentOperationResult
+{
+    bool success{false};
+    ModelSnapshot model;
+    ActiveConfigView view;
+    ConfigSnapshot config;
+    std::vector<ConfigDiagnostic> diagnostics;
+    std::vector<std::string> warnings;
+    std::vector<FilamentObjectProjection> objects;
+    std::vector<std::pair<std::string, int>> filament_defaults;
+    explicit operator bool() const noexcept { return success; }
+};
+
+enum class OutputArtifactOwnership {
     // Created because no output path was requested. The consumer must retain
     // it while needed and remove it when the last preview releases it.
     LibraryTemporary,
@@ -310,15 +395,13 @@ struct OutputArtifact
 
 struct SliceRequest
 {
-    // Each support mesh is associated with exactly one printable object.
-    std::vector<SliceObjectInput> objects;
-    ConfigSnapshot config;
+    ModelSnapshot model;
+    std::size_t plate_index{0};
     std::string output_gcode_path;
     // A sliced G-code 3MF is a packaged print job containing the generated
     // G-code and its slicing metadata. Supplying a path also enables it.
     bool generate_gcode_3mf{false};
     std::string output_gcode_3mf_path;
-    bool center_on_build_plate{true};
     bool generate_preview{true};
     // Development audit mode for the Belt support algorithm. It records and
     // renders every algorithm stage while still exporting the real G-code.
@@ -336,14 +419,6 @@ struct SliceSummary
     std::size_t layer_count{0};
     std::size_t logical_motion_count{0};
     std::size_t render_segment_count{0};
-};
-
-struct SliceDiagnostic
-{
-    std::string code;
-    std::string message;
-    bool warning{false};
-    std::string option_key;
 };
 
 struct SliceCallbacks
@@ -482,6 +557,9 @@ struct ProjectImportResult
 {
     bool success{false};
     bool cancelled{false};
+    ModelSnapshot model;
+    bool can_edit_filaments{false};
+    std::vector<ConfigDiagnostic> filament_edit_diagnostics;
     std::vector<ProjectImportObject> objects;
     std::vector<ProjectImportFilament> filaments;
     std::vector<SliceDiagnostic> diagnostics;
@@ -516,10 +594,11 @@ public:
     SettingsResult reset_active_config_value(std::string_view key);
     ConfigActivationResult set_active_filament_preset(
         std::size_t slot_index, std::string_view preset_id);
-    ConfigActivationResult resize_active_filament_slots(std::size_t slot_count);
-    ConfigActivationResult add_active_filament(std::size_t physical_tool, std::string_view preset_id = {});
+    FilamentOperationResult add_active_filament(const AddFilamentRequest& request);
+    FilamentOperationResult remove_active_filament(const RemoveFilamentRequest& request);
     SettingsResult set_active_filament_color(std::size_t slot_index, Rgba8 color);
     std::vector<ConfigDiagnostic> validate_active_config() const;
+    ModelLoadResult load_model(const ModelLoadRequest& request, const SliceCallbacks& callbacks = {}) const;
     SliceResult slice(const SliceRequest& request, const SliceCallbacks& callbacks = {}) const;
     // Manual calibration mirrors the original calib_dlg -> Plater entries.
     // Include Calibration.hpp for request, task and output definitions.
@@ -535,6 +614,7 @@ public:
 
 private:
     Library();
+    FilamentOperationResult edit_filament(const ModelSnapshot&, const AddFilamentRequest* add, const RemoveFilamentRequest* remove);
     SliceResult slice_impl(const SliceRequest& request, const SliceCallbacks& callbacks,
         const CalibrationTask* calibration, std::size_t plate_index) const;
 

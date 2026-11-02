@@ -1,5 +1,6 @@
 add_executable(libslicer_api_tests
     test_config_api.cpp
+    test_filament_operations.cpp
 )
 
 target_link_libraries(libslicer_api_tests

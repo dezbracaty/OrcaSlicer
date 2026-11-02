@@ -1,0 +1,125 @@
+{
+  "format_version": 1,
+  "upstream_revision": "3c8c667dbd402eb52e24fcc69aea3a1b5c5c72a1",
+  "upstream_repository": "https://github.com/dezbracaty/OrcaSlicer",
+  "source_resolution": "git show <upstream_revision>:<path>; hashes describe original source files, not production output",
+  "sources": [
+    {
+      "path": "src/slic3r/GUI/Plater.cpp",
+      "sha256_original_file": "2de9f150f5d042e2f1696fc82b3c09a0e9092d038bc9e00ec8b00a1fa3e5856f",
+      "functions": [
+        "Sidebar::add_custom_filament",
+        "Sidebar::delete_filament",
+        "Plater::on_filament_count_change",
+        "Plater::on_filaments_delete",
+        "Sidebar::auto_calc_flushing_volumes_internal",
+        "get_min_flush_volumes",
+        "Plater::get_next_color_for_filament"
+      ]
+    },
+    {
+      "path": "src/slic3r/GUI/GUI_ObjectList.cpp",
+      "sha256_original_file": "2c715d9622bed74aa427c945c97901bce9e7353a176b7f6f2ed8782aa8667832",
+      "functions": [
+        "ObjectList::update_filament_values_for_items",
+        "ObjectList::update_filament_values_for_items_when_delete_filament",
+        "ObjectList::add_object_to_list",
+        "ObjectList::add_volumes_to_object_in_list",
+        "can_add_volumes_to_object"
+      ]
+    },
+    {
+      "path": "src/slic3r/GUI/ObjectDataViewModel.cpp",
+      "sha256_original_file": "71b803513dd953c6a651977a546a760ce428bd03240e907a05354db43425b1bb",
+      "functions": [
+        "ObjectDataViewModel::GetItemByVolumeId"
+      ]
+    },
+    {
+      "path": "src/slic3r/GUI/PartPlate.cpp",
+      "sha256_original_file": "76ddda4d29f84258e596b916fb857aedccd6629e648110a9cd808b1f6b9bd1aa",
+      "functions": [
+        "PartPlate::on_filament_added",
+        "PartPlate::on_filament_deleted",
+        "PartPlate::set_filament_count",
+        "PartPlate::update_first_layer_print_sequence",
+        "PartPlate::update_first_layer_print_sequence_when_delete_filament",
+        "PartPlate::get_other_layers_print_sequence",
+        "PartPlate::set_other_layers_print_sequence",
+        "PartPlateList::load_from_3mf_structure",
+        "PartPlateList::reload_all_objects",
+        "PartPlate::intersect_instance",
+        "PartPlate::get_build_volume",
+        "PartPlateList::compute_origin"
+      ]
+    },
+    {
+      "path": "src/slic3r/GUI/GUI_App.cpp",
+      "sha256_original_file": "cc175aca07fcf33c52e7fc0c37538e8698fbcdb86bc21b2ddcb6515aa64c9fbb",
+      "functions": [
+        "is_support_filament"
+      ]
+    },
+    {
+      "path": "src/slic3r/GUI/PartPlate.hpp",
+      "sha256_original_file": "df275665bcc5cd7c18be875939ae5f76797c7aa5fb075c50c5c36a9d729484a2",
+      "functions": [
+        "compute_colum_count"
+      ]
+    }
+  ],
+  "directly_reused_current_native_functions": [
+    "PresetBundle::set_num_filaments",
+    "PresetBundle::update_num_filaments",
+    "PresetBundle::update_multi_material_filament_presets",
+    "ModelVolume::update_extruder_count",
+    "ModelVolume::update_extruder_count_when_delete_filament",
+    "ModelVolume::extruder_id",
+    "TriangleSelector::deserialize",
+    "FlushVolCalculator::calc_flush_vol"
+  ],
+  "adaptations": [
+    {
+      "kind": "context_substitution",
+      "description": "Original wxGetApp access is replaced with actual PresetBundle/Model/plate DynamicPrintConfig references; window refresh, text writes, persisted GUI selection and background scheduling are omitted."
+    },
+    {
+      "kind": "gui_node_reachability",
+      "description": "Only fully loaded non-cut FFF object trees: multi-volume objects have volume nodes; a single volume aliases the object only without instance/layer subtrees. Missing required layer extruder is rejected before the delete data statements. Cut/connector trees are not claimed supported."
+    },
+    {
+      "kind": "colour_container",
+      "description": "wxColour RGBA bytes are adapted through existing ColorRGBA/decode_color and passed to the same FlushVolCalculator. Invalid colour is rejected, not replaced by a default."
+    },
+    {
+      "kind": "strict_branch_extraction",
+      "description": "GUI_App::is_support_filament is called with its default strict_check=true by automatic flushing. Its strict path is extracted; optional PLA/PETG heuristics are not reached."
+    },
+    {
+      "kind": "existing_device_extension",
+      "description": "An optional source filament selects the target physical tool's existing preset; an explicit preset may override that selection. Ordinary Orca append still copies the last preset. Overrides are resolved before new flushing entries are computed."
+    },
+    {
+      "kind": "input_precondition",
+      "description": "Plate sequence decoding assertions are checked before executing the native decoder; no invalid ranges, layer values or material references are silently filled."
+    }
+  ],
+  "compatibility_observations": [
+    "ObjectList writes a decremented volume support setting into object config while retaining the volume value; this asymmetry is intentionally preserved.",
+    "Plater replacement branch retains remove_if's tail and overwrites only the first tail extruder; native tests deliberately record that behavior rather than inventing a clean merge.",
+    "Current committed ModelVolume stale-extruder cleanup and PresetBundle matrix fixes are retained. This is a pinned GUI extraction using current native primitives, not a claim that all production files equal the old upstream commit."
+  ],
+  "acceptance": {
+    "native_tag": "[filament-references]",
+    "native_file": "tests/libslic3r/test_preset_bundle_loading.cpp",
+    "api_file": "tests/libslicer_api/test_filament_operations.cpp",
+    "scenario_file": "tests/data/filament_operations/cases.json"
+  },
+  "verification_limit": "Original-file hashes identify provenance only. No hash of newly written implementation is offered as proof of equivalence; native reference cases, protocol cases and actual slicing are separate validation obligations.",
+  "source_role": "Orca GUI revision retained in this library repository Git history",
+  "approved_native_fix": {
+    "path": "src/libslic3r/GCode/RetractWhenCrossingPerimeters.hpp",
+    "change": "Initialize m_layer to nullptr.",
+    "reason": "Initialize the cache identity before its first comparison. An isolated initialization experiment eliminated cold/repeated export differences; the original retraction rules are unchanged."
+  }
+}

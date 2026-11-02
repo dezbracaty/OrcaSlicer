@@ -3,6 +3,11 @@
 #include <boost/filesystem.hpp>
 
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/TriangleSelector.hpp"
+#include "libslic3r/FlushVolCalc.hpp"
+#include "libslic3r/ParameterUtils.hpp"
+#include <stdexcept>
 
 using namespace Slic3r;
 
@@ -298,3 +303,284 @@ TEST_CASE("Removed Generic parent is normalized into a loaded filament's inherit
     CHECK(bundle.filaments.get_preset_parent(*child)->name == "Generic PLA @System");
 }
 
+// Reference expectations below come from Orca 3c8c667d's GUI_ObjectList and
+// Plater data updates, including their non-symmetric support/custom-code writes.
+// See tests/data/filament_operations/sources.json for the extraction contract.
+TEST_CASE("Orca object deletion preserves absent automatic and explicit assignments", "[filament-references]")
+{
+    const int before     = GENERATE(-1, 0, 1, 2, 3);
+    const int expected[] = {1, 0, 1, 1, 2};
+    CAPTURE(before);
+    Model model;
+    auto* object = model.add_object();
+    object->add_instance();
+    auto* volume = object->add_volume(make_cube(10, 10, 10));
+    if (before >= 0) {
+        object->config.set("extruder", before);
+        volume->config.set("extruder", before);
+    }
+    object->update_filament_references_after_delete(1, -1); // remove material 2
+    CHECK(object->config.extruder() == expected[before + 1]);
+    if (before < 0)
+        CHECK_FALSE(volume->config.has("extruder"));
+    else
+        CHECK(volume->config.extruder() == expected[before + 1]);
+}
+
+TEST_CASE("Orca replacement uses the post-delete target for explicit and layer references", "[filament-references]")
+{
+    Model model;
+    auto* object = model.add_object();
+    object->add_instance();
+    object->add_volume(make_cube(10, 10, 10));
+    object->add_volume(make_cube(10, 10, 10))->config.set("extruder", 2);
+    object->config.set("extruder", 2);
+    object->layer_config_ranges[{0., 1.}].set("extruder", 2);
+    object->layer_config_ranges[{1., 2.}].set("extruder", 3);
+    object->layer_config_ranges[{2., 3.}].set("extruder", 0);
+    object->update_filament_references_after_delete(1, 1); // target old material 3 -> new 2
+    CHECK(object->config.extruder() == 2);
+    CHECK(object->volumes[1]->config.extruder() == 2);
+    CHECK(object->layer_config_ranges.at({0., 1.}).extruder() == 2);
+    CHECK(object->layer_config_ranges.at({1., 2.}).extruder() == 2);
+    CHECK(object->layer_config_ranges.at({2., 3.}).extruder() == 0);
+
+    object->update_filament_references_after_delete(1, -1);
+    CHECK(object->layer_config_ranges.at({0., 1.}).extruder() == 0);
+    CHECK(object->layer_config_ranges.at({1., 2.}).extruder() == 0);
+}
+
+TEST_CASE("Orca single-volume aliases depend on instance and layer children", "[filament-references]")
+{
+    const int tree = GENERATE(0, 1, 2, 3);
+    // 0: object alias; 1: explicit volume nodes; 2: instance subtree; 3: layer subtree.
+    CAPTURE(tree);
+    Model model;
+    auto* object = model.add_object();
+    object->add_instance();
+    auto* volume = object->add_volume(make_cube(10, 10, 10));
+    object->config.set("extruder", 1);
+    volume->config.set("extruder", 2);
+    if (tree == 1)
+        object->add_volume(make_cube(10, 10, 10));
+    if (tree == 2)
+        object->add_instance();
+    if (tree == 3)
+        object->layer_config_ranges[{0., 1.}].set("extruder", 2);
+    object->update_filament_references_after_delete(1, -1);
+    CHECK(volume->config.extruder() == (tree < 2 ? 1 : 2));
+    if (tree == 3)
+        CHECK(object->layer_config_ranges.at({0., 1.}).extruder() == 0);
+}
+
+TEST_CASE("Orca support deletion retains its original object-volume asymmetry", "[filament-references]")
+{
+    Model model;
+    auto* object = model.add_object();
+    object->add_instance();
+    auto* volume = object->add_volume(make_cube(10, 10, 10));
+    object->config.set("extruder", 1);
+    object->config.set("support_filament", 2);
+    object->config.set("support_interface_filament", 3);
+    object->update_filament_references_after_delete(1, -1);
+    CHECK_FALSE(object->config.has("support_filament"));
+    CHECK(object->config.opt_int("support_interface_filament") == 2);
+
+    // The pinned GUI writes this adjusted volume value to the OBJECT, not to
+    // the volume. The test intentionally records that upstream behavior.
+    object->config.set("support_filament", 1);
+    volume->config.set("support_filament", 3);
+    volume->config.set("support_interface_filament", 2);
+    object->update_filament_references_after_delete(1, -1);
+    CHECK(object->config.opt_int("support_filament") == 2);
+    CHECK(volume->config.opt_int("support_filament") == 3);
+    CHECK_FALSE(volume->config.has("support_interface_filament"));
+}
+
+TEST_CASE("Orca append normalizes stale overrides but keeps automatic and inherited values", "[filament-references]")
+{
+    const int before = GENERATE(-1, 0, 2, 5);
+    CAPTURE(before);
+    Model model;
+    auto* object = model.add_object();
+    object->add_instance();
+    auto* inherited     = object->add_volume(make_cube(10, 10, 10));
+    auto* explicit_part = object->add_volume(make_cube(10, 10, 10));
+    if (before >= 0)
+        object->config.set("extruder", before);
+    explicit_part->config.set("extruder", 5);
+    explicit_part->config.set("support_filament", 5);
+    object->config.set("support_interface_filament", 5);
+    object->update_filament_references_after_append(4);
+    CHECK(object->config.extruder() == (before < 0 || before > 4 ? 1 : before));
+    CHECK_FALSE(inherited->config.has("extruder"));
+    CHECK_FALSE(explicit_part->config.has("extruder"));
+    CHECK_FALSE(explicit_part->config.has("support_filament"));
+    CHECK_FALSE(object->config.has("support_interface_filament"));
+    CHECK(explicit_part->extruder_id() == object->config.extruder());
+}
+
+TEST_CASE("Model deletion remaps painted faces through the original triangle selector", "[filament-references]")
+{
+    const int replacement = GENERATE(-1, 0);
+    CAPTURE(replacement);
+    Model model;
+    auto* object = model.add_object();
+    object->add_instance();
+    object->config.set("extruder", 1);
+    auto* volume = object->add_volume(make_cube(10, 10, 10));
+    TriangleSelector selector(volume->mesh());
+    selector.set_facet(0, EnforcerBlockerType(2));
+    selector.set_facet(1, EnforcerBlockerType(3));
+    volume->mmu_segmentation_facets.set(selector);
+    REQUIRE(volume->mmu_segmentation_facets.get_facets(*volume, EnforcerBlockerType(2)).indices.size() == 1);
+    REQUIRE(volume->mmu_segmentation_facets.get_facets(*volume, EnforcerBlockerType(3)).indices.size() == 1);
+    model.update_filaments_after_delete(2, 1, replacement);
+    CHECK(volume->mmu_segmentation_facets.get_facets(*volume, EnforcerBlockerType(2)).indices.size() == 1);
+    CHECK(volume->mmu_segmentation_facets.get_facets(*volume, EnforcerBlockerType(3)).indices.empty());
+    CHECK(volume->mmu_segmentation_facets.get_facets(*volume, EnforcerBlockerType(1)).indices.size() == (replacement < 0 ? 0 : 1));
+    CHECK(volume->mmu_segmentation_facets.get_facets(*volume, EnforcerBlockerType(0)).indices.size() == (replacement < 0 ? 11 : 10));
+}
+
+TEST_CASE("Model deletion preserves non-tool custom code and pinned replacement-tail behavior", "[filament-references]")
+{
+    const int replacement = GENERATE(-1, 0);
+    CAPTURE(replacement);
+    Model model;
+    auto& codes = model.plates_custom_gcodes[0].gcodes;
+    codes.push_back({0.2, CustomGCode::ToolChange, 2, "", ""});
+    codes.push_back({0.4, CustomGCode::ToolChange, 3, "", ""});
+    codes.push_back({0.6, CustomGCode::PausePrint, 2, "", "pause"});
+    model.update_filaments_after_delete(2, 1, replacement);
+    REQUIRE(codes.size() == (replacement < 0 ? 2 : 3));
+    CHECK(codes[0].print_z == 0.4);
+    CHECK(codes[0].type == CustomGCode::ToolChange);
+    CHECK(codes[0].extruder == 2);
+    CHECK(codes[1].print_z == 0.6);
+    CHECK(codes[1].type == CustomGCode::PausePrint);
+    CHECK(codes[1].extruder == 2);
+    CHECK(codes[1].extra == "pause");
+    if (replacement >= 0) {
+        // remove_if's tail is retained and its first extruder overwritten by
+        // Plater::on_filaments_delete. It is not a newly invented merge rule.
+        CHECK(codes[2].type == CustomGCode::PausePrint);
+        CHECK(codes[2].print_z == 0.6);
+        CHECK(codes[2].extruder == 1);
+    }
+}
+
+TEST_CASE("Unsupported object trees fail before other model references are changed", "[filament-references]")
+{
+    Model model;
+    auto* first = model.add_object();
+    first->add_instance();
+    first->add_volume(make_cube(10, 10, 10));
+    first->config.set("extruder", 3);
+    auto* unsupported = model.add_object();
+    unsupported->add_instance();
+    unsupported->add_volume(make_cube(10, 10, 10));
+    SECTION("cut topology")
+    {
+        unsupported->cut_id = CutObjectBase(ObjectID(123), 1, 0);
+        REQUIRE_THROWS_AS(model.update_filaments_after_append(4), std::invalid_argument);
+        REQUIRE_THROWS_AS(model.update_filaments_after_delete(2, 1, -1), std::invalid_argument);
+    }
+    SECTION("layer lacking the original required extruder")
+    {
+        unsupported->layer_config_ranges[{0., 1.}].set("layer_height", 0.2);
+        REQUIRE_THROWS_AS(model.update_filaments_after_delete(2, 1, -1), std::invalid_argument);
+    }
+    CHECK(first->config.extruder() == 3);
+    CHECK_FALSE(first->volumes[0]->config.has("extruder"));
+}
+
+TEST_CASE("Appending a material preserves user flushing entries and computes new colour transitions", "[filament-references]")
+{
+    const bool new_is_support = GENERATE(false, true);
+    CAPTURE(new_is_support);
+    PresetBundle bundle;
+    add_inmemory_preset(bundle.filaments, "Flush Reference A");
+    add_inmemory_preset(bundle.filaments, "Flush Reference B");
+    auto& added = add_inmemory_preset(bundle.filaments, "Flush Reference Added");
+    added.config.set_key_value("filament_is_support", new ConfigOptionBools({new_is_support}));
+    bundle.filament_presets = {"Flush Reference A", "Flush Reference B"};
+    bundle.set_num_filaments(2);
+    bundle.project_config.option<ConfigOptionStrings>("filament_colour")->values     = {"#111111", "#EEEEEE"};
+    bundle.project_config.option<ConfigOptionFloats>("flush_volumes_matrix")->values = {0., 123., 456., 0.};
+
+    // The real defaults are single-nozzle and have no cut-retraction reduction:
+    // their minimum flush volume is zero, not a fabricated machine contract.
+    REQUIRE(bundle.get_printer_extruder_count() == 1);
+    const auto before = bundle.full_config();
+    REQUIRE(before.option<ConfigOptionFloatsNullable>("nozzle_volume")->get_at(0) == 0.);
+    REQUIRE(before.opt_int("enable_long_retraction_when_cut") == 0);
+    const int dataset = before.option<ConfigOptionIntsNullable>("nozzle_flush_dataset")->get_at(0);
+    FlushVolCalculator reference(0, g_max_flush_volume, dataset);
+    const int a_to_added = reference.calc_flush_vol(255, 17, 17, 17, 255, 170, 51, 119);
+    const int b_to_added = reference.calc_flush_vol(255, 238, 238, 238, 255, 170, 51, 119);
+    const int added_to_a = reference.calc_flush_vol(255, 170, 51, 119, 255, 17, 17, 17);
+    const int added_to_b = reference.calc_flush_vol(255, 170, 51, 119, 255, 238, 238, 238);
+
+    Model model;
+    std::vector<DynamicPrintConfig*> plates;
+    bundle.append_project_filament(model, plates, "#AA3377", std::nullopt, "Flush Reference Added");
+    const auto& matrix = bundle.project_config.option<ConfigOptionFloats>("flush_volumes_matrix")->values;
+    REQUIRE(matrix.size() == 9);
+    CHECK(matrix[0] == 0.);
+    CHECK(matrix[1] == 123.);
+    CHECK(matrix[3] == 456.);
+    CHECK(matrix[4] == 0.);
+    CHECK(matrix[8] == 0.);
+    CHECK(matrix[2] == (new_is_support ? g_flush_volume_to_support : a_to_added));
+    CHECK(matrix[5] == (new_is_support ? g_flush_volume_to_support : b_to_added));
+    CHECK(matrix[6] == (new_is_support ? std::max(g_min_flush_volume_from_support, added_to_a) : added_to_a));
+    CHECK(matrix[7] == (new_is_support ? std::max(g_min_flush_volume_from_support, added_to_b) : added_to_b));
+    CHECK(bundle.filament_presets.back() == "Flush Reference Added");
+}
+
+TEST_CASE("Original plate sequences expand on append and compact on material deletion", "[filament-references]")
+{
+    PresetBundle bundle;
+    add_inmemory_preset(bundle.filaments, "Sequence Reference A");
+    add_inmemory_preset(bundle.filaments, "Sequence Reference B");
+    bundle.filament_presets = {"Sequence Reference A", "Sequence Reference B"};
+    bundle.set_num_filaments(2);
+    REQUIRE(bundle.get_printer_extruder_count() == 1);
+
+    DynamicPrintConfig plate;
+    plate.set_key_value("filament_map", new ConfigOptionInts({1, 1}));
+    plate.set_key_value("first_layer_print_sequence", new ConfigOptionInts({2, 1}));
+    const std::vector<LayerPrintSequence> original_layers{{{1, 3}, {2, 1}}, {{4, 8}, {1, 2}}};
+    int sequence_count;
+    std::vector<int> encoded;
+    get_other_layers_print_sequence(original_layers, sequence_count, encoded);
+    plate.set_key_value("other_layers_print_sequence_nums", new ConfigOptionInt(sequence_count));
+    plate.set_key_value("other_layers_print_sequence", new ConfigOptionInts(encoded));
+    Model model;
+    std::vector<DynamicPrintConfig*> plates{&plate};
+    bundle.append_project_filament(model, plates, "#AA3377");
+    CHECK((plate.option<ConfigOptionInts>("filament_map")->values == std::vector<int>{1, 1, 1}));
+    CHECK((plate.option<ConfigOptionInts>("first_layer_print_sequence")->values == std::vector<int>{2, 1, 3}));
+    auto layers = get_other_layers_print_sequence(plate.opt_int("other_layers_print_sequence_nums"),
+                                                  plate.option<ConfigOptionInts>("other_layers_print_sequence")->values);
+    REQUIRE(layers.size() == 2);
+    CHECK(layers[0].first == original_layers[0].first);
+    CHECK(layers[1].first == original_layers[1].first);
+    CHECK((layers[0].second == std::vector<int>{2, 1, 3}));
+    CHECK((layers[1].second == std::vector<int>{1, 2, 3}));
+
+    bundle.prints.get_edited_preset().config.set("support_filament", 2);
+    bundle.prints.get_edited_preset().config.set("support_interface_filament", 3);
+    bundle.remove_project_filament(model, plates, 1, -1);
+    CHECK((plate.option<ConfigOptionInts>("filament_map")->values == std::vector<int>{1, 1}));
+    CHECK((plate.option<ConfigOptionInts>("first_layer_print_sequence")->values == std::vector<int>{1, 2}));
+    layers = get_other_layers_print_sequence(plate.opt_int("other_layers_print_sequence_nums"),
+                                             plate.option<ConfigOptionInts>("other_layers_print_sequence")->values);
+    REQUIRE(layers.size() == 2);
+    CHECK(layers[0].first == original_layers[0].first);
+    CHECK(layers[1].first == original_layers[1].first);
+    CHECK((layers[0].second == std::vector<int>{1, 2}));
+    CHECK((layers[1].second == std::vector<int>{1, 2}));
+    CHECK_FALSE(bundle.prints.get_edited_preset().config.has("support_filament"));
+    CHECK(bundle.prints.get_edited_preset().config.opt_int("support_interface_filament") == 2);
+}

@@ -32,6 +32,8 @@ enum class VendorType {
 };
 namespace Slic3r {
 
+class Model;
+
 struct AMSMapInfo
 {
     /*for new ams mapping*/ // from struct FilamentInfo
@@ -283,6 +285,13 @@ public:
     void            set_num_filaments(unsigned int n, std::vector<std::string> new_colors);
     void            set_num_filaments(unsigned int n, std::string new_col = "");
     void         update_num_filaments(unsigned int to_del_flament_id);
+    // Original Orca project data operations, without window ownership.
+    void append_project_filament(Model&,
+                                 std::vector<DynamicPrintConfig*>& plates,
+                                 const std::string& color,
+                                 std::optional<size_t> source_filament = std::nullopt,
+                                 std::optional<std::string> preset_id  = std::nullopt);
+    void remove_project_filament(Model&, std::vector<DynamicPrintConfig*>& plates, size_t removed, int replacement_after_delete);
 
     void get_ams_cobox_infos(AMSComboInfo &combox_info);
     unsigned int sync_ams_list(std::vector<std::pair<DynamicPrintConfig *,std::string>> &unknowns, bool use_map, std::map<int, AMSMapInfo> &maps, bool enable_append, MergeFilamentInfo &merge_info, bool color_only = false);

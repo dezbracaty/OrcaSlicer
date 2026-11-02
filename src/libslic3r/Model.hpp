@@ -354,6 +354,9 @@ enum class ModelVolumeType : int {
 class ModelObject final : public ObjectBase
 {
 public:
+    // Extracted from Orca GUI_ObjectList; indices are zero-based.
+    void update_filament_references_after_append(size_t count);
+    void update_filament_references_after_delete(size_t removed, int replacement);
     std::string             name;
     //BBS: add module name for assemble
     std::string             module_name;
@@ -1523,6 +1526,8 @@ public:
 class Model final : public ObjectBase
 {
 public:
+    void update_filaments_after_append(size_t count);
+    void update_filaments_after_delete(size_t count, size_t removed, int replacement);
     // Materials are owned by a model and referenced by objects through t_model_material_id.
     // Single material may be shared by multiple models.
     ModelMaterialMap    materials;

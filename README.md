@@ -115,17 +115,24 @@ int main(int argc, char** argv)
     selection.machine_model_id = argv[4];
     selection.machine_variant_id = argv[5];
     // Empty process/material IDs select compatible defaults for this machine.
-    auto configured = library->create_config(selection);
+    auto configured = library->activate_config(selection);
     report(configured.diagnostics);
     if (!configured)
         return 1;
 
-    libslicer::SliceRequest request;
-    request.config = configured.config->snapshot();
-    request.output_gcode_path = argv[3];
+    libslicer::ModelLoadRequest load;
+    load.config = *library->active_config_snapshot();
     libslicer::SliceObjectInput object;
     object.model_path = argv[2];
-    request.objects.push_back(std::move(object));
+    load.objects.push_back(std::move(object));
+    auto loaded = library->load_model(load);
+    report(loaded.diagnostics);
+    if (!loaded)
+        return 1;
+
+    libslicer::SliceRequest request;
+    request.model = loaded.model;
+    request.output_gcode_path = argv[3];
 
     auto result = library->slice(request);
     report(result.diagnostics);
@@ -162,6 +169,51 @@ Pass `external/libslicer/resources` as `LibraryOptions::resource_directory`
 during development. Use `libslicer::core` only for intentional dependencies on
 internal `Slic3r` APIs; it is not part of the installed SDK.
 
+## Project filament operations
+
+`load_model()` converts file or in-memory geometry into an immutable
+`ModelSnapshot` with the matching slicing configuration; `import_project()`
+retains complete native 3MF state in the same snapshot type. Slice requests
+consume this paired snapshot, not separate model/configuration inputs.
+Check `can_edit_filaments` when importing: geometry-only imports with an unknown
+printer do not provide an editable snapshot.
+
+Use `add_active_filament(AddFilamentRequest)` and
+`remove_active_filament(RemoveFilamentRequest)` for material count changes.
+Both requests carry the caller's current model snapshot. Calls and configuration
+changes must be serialized, as with the existing library API; stale-model replay
+for edits is not supported. The library uses the active configuration and updates
+presets, painting and model/plate references together. After success, replace the
+current model with the returned `model`; `config` also exposes the resulting
+configuration for inspection. On failure, the original model and active
+configuration remain unchanged.
+
+Material indices and optional replacement indices are zero-based and refer to
+the list before deletion. Machines with per-tool capacities require an explicit
+`physical_tool` for additions; machine limits and the original Orca minimum
+material count still apply. There is no count-resize API or old add overload.
+A snapshot freezes the configuration used when it was loaded or edited.
+Changing active parameters does not modify an existing snapshot. Load a fresh
+snapshot with the current configuration before slicing changed settings; reusing
+an old snapshot deliberately replays its old configuration. There is no request
+revision check or layout-token mechanism.
+
+For document adapters, supply optional caller IDs on objects and volumes.
+Successful edits return `objects` with the same IDs, each volume's raw binding
+(`0` means inherit), the native effective binding, and updated facet data. Use
+raw binding to retain inheritance; effective binding is a read-only projection,
+not an instruction to make the binding explicit. Object defaults are supplied
+through `SliceObjectInput::default_filament_slot`. An explicit `instances` list
+preserves shared-object instance count; keep instance-specific fiber-mask inputs
+as separate objects using the existing single-instance path.
+
+`ModelLoadRequest::filament_defaults` carries existing caller configuration
+references as `(id, one-based slot)` pairs, including when the document has no
+geometry. Edits return these references under the same IDs. The adapter invokes
+the original `ModelObject` reference-adjustment methods on isolated carriers;
+these carriers never become printable objects. Clients need not implement slot
+renumbering themselves.
+
 ## Runtime resources and API behavior
 
 Ship the installed `share/libslicer` directory with the library. It contains the
@@ -182,8 +234,9 @@ resource root explicitly, as in the example. `find_package` also exposes
   result success, cancellation, and diagnostics; warnings may accompany success.
   `Library::open` returns null on initialization failure.
 - [`Config.hpp`](include/libslicer/Config.hpp): settings metadata, edits,
-  validation, and independent configuration snapshots. Pass a snapshot to each
-  slice. Material slots and physical tool IDs are distinct; use explicit tool
+  validation, and independent configuration snapshots. Supply configuration
+  when loading a model; slicing uses the configuration frozen in that model
+  snapshot. Material slots and physical tool IDs are distinct; use explicit tool
   mappings rather than inferring tools from material types.
   A tool may declare `thermoplastic+continuous_fiber` to accept either process;
   `filament_process_type` identifies the process of each selected material.
@@ -194,7 +247,7 @@ resource root explicitly, as in the example. `find_package` also exposes
 - [`Toolpath.hpp`](include/libslicer/Toolpath.hpp): preview data for rendering.
   Logical motions and render segments have separate counts; retain the preview
   handle while using its data.
-- `slice`, `load_gcode_preview`, and `import_project` are synchronous. Run long
+- `load_model`, `slice`, `load_gcode_preview`, and `import_project` are synchronous. Run long
   operations on an application worker; callbacks do not marshal to the GUI
   thread. Progress is in `[0, 1]`; cancellation is cooperative through
   `SliceCallbacks::is_cancelled`. Keep callbacks thread-safe and copy any
@@ -202,9 +255,14 @@ resource root explicitly, as in the example. `find_package` also exposes
 - The core uses process-wide resource paths. Initialize libraries consistently
   and serialize access to shared mutable library/configuration state; the API
   does not promise unrestricted concurrent use of a `Library` instance.
-- Each `SliceObjectInput` supplies either a model path or in-memory volumes.
-  Transforms are row-major affine matrices in millimetres. Preserve volume
-  roles and facet labels when transferring imported project geometry.
+- Each `SliceObjectInput` passed to `load_model` supplies either a model path
+  or in-memory volumes. Transforms are row-major affine matrices in millimetres.
+  For 3MF projects, use the retained `ModelSnapshot`; the import geometry lists
+  are display projections, not a complete representation to reconstruct.
+- Filament editing currently rejects cut/connector trees and layer ranges
+  missing the original required extruder value. Legacy BBS multi-plate layouts
+  and tiny axis-expanded multi-plate beds report unsupported editing capability
+  rather than returning a misleading complete snapshot.
 - An explicit output path is `CallerOwned` and is never removed by the library.
   An omitted path produces a `LibraryTemporary` artifact: the consumer must
   retain it while needed and remove it when no preview needs it. The ownership

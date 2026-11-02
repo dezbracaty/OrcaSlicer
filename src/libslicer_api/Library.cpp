@@ -5,6 +5,7 @@
 
 #include <libslic3r/PresetBundle.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/BuildVolume.hpp>
 #include <libslic3r/Print.hpp>
 #include <libslic3r/Layer.hpp>
 #include <libslic3r/Tesselate.hpp>
@@ -2365,6 +2366,22 @@ PlaneCutResult cut_mesh_with_plane(const PlaneCutRequest& request)
     return result;
 }
 
+class ModelSnapshot::Impl
+{
+public:
+    Slic3r::Model model;
+    std::vector<Slic3r::PlateData> plates;
+    std::vector<Slic3r::Vec3d> plate_origins;
+    std::shared_ptr<const Slic3r::PresetBundle> presets;
+    std::set<size_t> mask_volume_ids;
+    ConfigSnapshot configuration;
+    std::map<size_t, std::string> object_ids;
+    std::map<size_t, std::string> volume_ids;
+    std::vector<std::pair<std::string, int>> filament_defaults;
+};
+
+bool ModelSnapshot::valid() const noexcept { return impl_ && impl_->configuration.valid(); }
+
 class Library::Impl
 {
 public:
@@ -2377,6 +2394,7 @@ public:
     std::vector<PresetOption> compatible_processes;
     std::vector<PresetOption> compatible_filaments;
     std::uint64_t active_revision{0};
+    unsigned next_filament_color{0};
 };
 
 const char* version() noexcept
@@ -2802,20 +2820,23 @@ ConfigActivationResult Library::activate_config(
     return result;
 }
 
-std::optional<ActiveConfigView> Library::active_config() const
+namespace {
+ActiveConfigView make_active_config_view(const Config& configuration,
+                                         const ResolvedSelection& selection,
+                                         uint64_t revision,
+                                         const std::vector<PresetOption>& processes,
+                                         const std::vector<PresetOption>& filaments,
+                                         const std::vector<const Slic3r::PresetBundle*>& bundles)
 {
-    if (!impl_->active_config || impl_->active_revision == 0) {
-        return std::nullopt;
-    }
     ActiveConfigView view;
-    view.revision = impl_->active_revision;
-    view.selection = impl_->active_selection;
-    view.compatible_processes = impl_->compatible_processes;
-    view.compatible_filaments = impl_->compatible_filaments;
-    view.settings = impl_->active_config->settings();
+    view.revision             = revision;
+    view.selection            = selection;
+    view.compatible_processes = processes;
+    view.compatible_filaments = filaments;
+    view.settings             = configuration.settings();
     view.selection.filament_physical_tools.clear();
 
-    const Slic3r::DynamicPrintConfig config = dynamic_config(impl_->active_config->snapshot());
+    const Slic3r::DynamicPrintConfig config = dynamic_config(configuration.snapshot());
     view.filament_slots.reserve(view.selection.filament_preset_ids.size());
     for (std::size_t index = 0; index < view.selection.filament_preset_ids.size(); ++index) {
         FilamentSlotInfo slot;
@@ -2852,7 +2873,7 @@ std::optional<ActiveConfigView> Library::active_config() const
         }
         const auto tools = tool_config(config);
         for (const auto& option : view.compatible_filaments) {
-            for (const auto& bundle : impl_->vendor_presets) {
+            for (const auto& bundle : bundles) {
                 if (!bundle->printers.find_system_preset_by_model_and_variant(
                         view.selection.machine_model_id, view.selection.machine_variant_id)) continue;
                 const auto* preset = bundle->filaments.find_preset(option.id, false);
@@ -2864,6 +2885,18 @@ std::optional<ActiveConfigView> Library::active_config() const
         view.filament_slots.push_back(std::move(slot));
     }
     return view;
+}
+} // namespace
+
+std::optional<ActiveConfigView> Library::active_config() const
+{
+    if (!impl_->active_config || impl_->active_revision == 0)
+        return std::nullopt;
+    std::vector<const Slic3r::PresetBundle*> bundles;
+    for (const auto& bundle : impl_->vendor_presets)
+        bundles.push_back(bundle.get());
+    return make_active_config_view(*impl_->active_config, impl_->active_selection, impl_->active_revision, impl_->compatible_processes,
+                                   impl_->compatible_filaments, bundles);
 }
 
 std::optional<ConfigSnapshot> Library::active_config_snapshot() const
@@ -2990,106 +3023,253 @@ ConfigActivationResult Library::set_active_filament_preset(
     selection.process_preset_id = impl_->active_selection.process_preset_id;
     selection.filament_preset_ids = impl_->active_selection.filament_preset_ids;
     selection.filament_preset_ids[slot_index] = std::string(preset_id);
+    selection.filament_physical_tools         = current->selection.filament_physical_tools;
     return activate_config(selection);
 }
 
-ConfigActivationResult Library::resize_active_filament_slots(std::size_t slot_count)
+FilamentOperationResult Library::add_active_filament(const AddFilamentRequest& request)
 {
-    ConfigActivationResult result;
-    if (!impl_->active_config) {
-        result.diagnostics.push_back({"configuration", "No slicing configuration is active"});
-        return result;
-    }
-    const auto model = std::find_if(
-        impl_->machines.begin(), impl_->machines.end(), [this](const MachineModelOption& option) {
-            return option.id == impl_->active_selection.machine_model_id;
-        });
-    const MachineVariantOption* variant = nullptr;
-    if (model != impl_->machines.end()) {
-        const auto found = std::find_if(
-            model->variants.begin(), model->variants.end(), [this](const MachineVariantOption& option) {
-                return option.id == impl_->active_selection.machine_variant_id;
-            });
-        if (found != model->variants.end()) variant = &*found;
-    }
-    if (variant == nullptr) {
-        result.diagnostics.push_back({"machine", "The active machine variant is unavailable"});
-        return result;
-    }
-    if (!variant->toolhead_filament_capacity.empty()) {
-        result.diagnostics.push_back({"filament", "Add materials to an explicit physical tool; total slot count does not identify a tool"});
-        return result;
-    }
-    if (slot_count == 0 || slot_count > variant->max_filament_slots) {
-        result.diagnostics.push_back({
-            "filament",
-            "Filament slot count must be between 1 and " +
-                std::to_string(variant->max_filament_slots)});
-        return result;
-    }
-    if (!variant->variable_filament_slots &&
-        slot_count != variant->physical_tool_count) {
-        result.diagnostics.push_back({"filament", "This machine has a fixed filament slot count"});
-        return result;
-    }
-
-    ConfigSelection selection;
-    selection.machine_model_id = impl_->active_selection.machine_model_id;
-    selection.machine_variant_id = impl_->active_selection.machine_variant_id;
-    selection.process_preset_id = impl_->active_selection.process_preset_id;
-    selection.filament_preset_ids = impl_->active_selection.filament_preset_ids;
-    if (selection.filament_preset_ids.empty()) {
-        result.diagnostics.push_back({"filament", "The active configuration has no filament preset"});
-        return result;
-    }
-    selection.filament_preset_ids.resize(slot_count, selection.filament_preset_ids.back());
-    return activate_config(selection);
+    return edit_filament(request.model, &request, nullptr);
 }
 
-ConfigActivationResult Library::add_active_filament(std::size_t physical_tool, std::string_view preset_id)
+FilamentOperationResult Library::remove_active_filament(const RemoveFilamentRequest& request)
 {
-    ConfigActivationResult result;
-    const auto view = active_config();
-    if (!view) {
-        result.diagnostics.push_back({"configuration", "No slicing configuration is active"});
-        return result;
+    return edit_filament(request.model, nullptr, &request);
+}
+
+FilamentOperationResult Library::edit_filament(const ModelSnapshot& model,
+                                               const AddFilamentRequest* add,
+                                               const RemoveFilamentRequest* remove)
+{
+    FilamentOperationResult result;
+    try {
+        if (!impl_->active_config)
+            throw std::invalid_argument("No active configuration");
+        if (!model.valid())
+            throw std::invalid_argument("No model snapshot");
+        const auto before  = dynamic_config(impl_->active_config->snapshot());
+        const auto tools   = tool_config(before);
+        const size_t count = impl_->active_selection.filament_preset_ids.size();
+        const auto current = *active_config();
+        const auto owners  = filament_tool_map(&before, count);
+        auto next_owners   = owners;
+        std::optional<size_t> source;
+        int replacement = -1;
+        if (add) {
+            const MachineVariantOption* variant = nullptr;
+            for (const auto& machine : impl_->machines)
+                if (machine.id == impl_->active_selection.machine_model_id)
+                    for (const auto& item : machine.variants)
+                        if (item.id == impl_->active_selection.machine_variant_id)
+                            variant = &item;
+            if (!variant || count >= variant->max_filament_slots)
+                throw std::invalid_argument("Material capacity exceeded");
+            if (!tools.toolhead_filament_capacity.values.empty()) {
+                if (!add->physical_tool || *add->physical_tool >= tools.toolhead_filament_capacity.size())
+                    throw std::invalid_argument("Specify a physical tool with declared material capacity");
+                const int tool = int(*add->physical_tool);
+                if (std::count(owners.begin(), owners.end(), tool) >= tools.toolhead_filament_capacity.values[tool])
+                    throw std::invalid_argument("Material capacity exceeded for physical tool");
+                const auto found = std::find(owners.begin(), owners.end(), tool);
+                if (found == owners.end())
+                    throw std::invalid_argument("Physical tool has no initialized material");
+                source = size_t(found - owners.begin());
+                next_owners.push_back(tool);
+            } else {
+                if (!variant->variable_filament_slots)
+                    throw std::invalid_argument("This machine has a fixed material count");
+                if (add->physical_tool)
+                    throw std::invalid_argument("This machine does not declare per-tool material capacity");
+                next_owners.push_back(owners.back());
+            }
+            if (add->preset_id) {
+                const auto& allowed = current.filament_slots[source.value_or(count - 1)].compatible_presets;
+                if (std::none_of(allowed.begin(), allowed.end(), [&](const auto& item) { return item.id == *add->preset_id; }))
+                    throw std::invalid_argument("Material preset is incompatible with the target tool");
+            }
+        } else {
+            if (!remove || remove->slot_index >= count || count <= 1 || count <= tools.nozzle_diameter.size())
+                throw std::invalid_argument("Cannot remove this material slot");
+            if (fixed_physical_filament_slots(before))
+                throw std::invalid_argument("This machine has a fixed material count");
+            if (!tools.toolhead_filament_capacity.values.empty() &&
+                std::count(owners.begin(), owners.end(), owners[remove->slot_index]) <= 1)
+                throw std::invalid_argument("Cannot remove the final material of a physical tool");
+            if (remove->replacement_slot_index) {
+                const size_t target = *remove->replacement_slot_index;
+                if (target >= count || target == remove->slot_index)
+                    throw std::invalid_argument("Invalid replacement material slot");
+                replacement = int(target > remove->slot_index ? target - 1 : target);
+            }
+            next_owners.erase(next_owners.begin() + remove->slot_index);
+        }
+        auto state = std::make_shared<ModelSnapshot::Impl>(*model.impl_);
+        std::unique_ptr<Slic3r::PresetBundle> bundle;
+        if (state->presets)
+            bundle = std::make_unique<Slic3r::PresetBundle>(*state->presets);
+        else
+            for (const auto& item : impl_->vendor_presets)
+                if (item->printers.find_system_preset_by_model_and_variant(impl_->active_selection.machine_model_id,
+                                                                           impl_->active_selection.machine_variant_id)) {
+                    bundle = std::make_unique<Slic3r::PresetBundle>(*item);
+                    break;
+                }
+        if (!bundle)
+            throw std::invalid_argument("Printer presets are unavailable");
+        auto loaded = before;
+        loaded.set_key_value("different_settings_to_system",
+                             new Slic3r::ConfigOptionStrings(
+                                 std::vector<std::string>(count + 2, Slic3r::escape_strings_cstyle(loaded.keys()))));
+        loaded.set_key_value("filament_settings_id", new Slic3r::ConfigOptionStrings(impl_->active_selection.filament_preset_ids));
+        bundle->load_config_model("GPlatform.3mf", std::move(loaded));
+        if (bundle->filament_presets.size() != count)
+            throw std::invalid_argument("Original preset loading changed material count");
+        std::map<std::string, std::string> names;
+        for (size_t i = 0; i < count; ++i)
+            names[bundle->filament_presets[i]] = impl_->active_selection.filament_preset_ids[i];
+        std::vector<Slic3r::DynamicPrintConfig*> plates;
+        for (auto& plate : state->plates) {
+            if (!plate.filament_maps.empty())
+                plate.config.set_key_value("filament_map", new Slic3r::ConfigOptionInts(plate.filament_maps));
+            plates.push_back(&plate.config);
+        }
+        // Original Plater palette; reserve a color only after successful commit.
+        static const char* palette[] = {"#00C1AE", "#F4E2C1", "#ED1C24", "#00FF7F", "#F26722", "#FFEB31", "#7841CE", "#115877",
+                                        "#ED1E79", "#2EBDEF", "#345B2F", "#800080", "#FA8173", "#800000", "#F7B763", "#A4C41E"};
+        if (add) {
+            const auto color = add->color ? serialized_color(*add->color) : std::string(palette[impl_->next_filament_color % 16]);
+            bundle->append_project_filament(state->model, plates, color, source, add->preset_id);
+        } else {
+            bundle->remove_project_filament(state->model, plates, remove->slot_index, replacement);
+        }
+        // A caller default is the same scalar extruder reference as an
+        // object's config. Use the extracted original object rule in an
+        // isolated carrier; never add these synthetic objects to state->model.
+        Slic3r::Model default_carriers;
+        for (auto& reference : state->filament_defaults) {
+            auto* carrier = default_carriers.add_object();
+            carrier->config.set("extruder", reference.second);
+            if (add)
+                carrier->update_filament_references_after_append(count + 1);
+            else
+                carrier->update_filament_references_after_delete(remove->slot_index, replacement);
+            reference.second = carrier->config.extruder();
+        }
+        std::vector<std::string> ids;
+        for (const auto& name : bundle->filament_presets) {
+            const auto found = names.find(name);
+            ids.push_back(found == names.end() ? name : found->second);
+        }
+        if (ids.size() != (add ? count + 1 : count - 1))
+            throw std::invalid_argument("Original material operation changed unexpected slot count");
+        if (add && add->preset_id)
+            ids.back() = *add->preset_id;
+        std::vector<int> logical;
+        if (!tools.toolhead_filament_capacity.values.empty()) {
+            for (int physical : next_owners) {
+                const auto& map  = tools.physical_extruder_map.values;
+                const auto found = std::find(map.begin(), map.end(), physical);
+                if (found == map.end() || std::count(map.begin(), map.end(), physical) != 1)
+                    throw std::invalid_argument("Physical tool map is not a permutation");
+                logical.push_back(int(found - map.begin()) + 1);
+            }
+        }
+        auto full = logical.empty() ? bundle->full_config() : bundle->full_config(true, logical);
+        // The native operation owns project values. Preserve unrelated process/printer edits.
+        for (const auto* keys : {&Slic3r::Preset::print_options(), &Slic3r::Preset::printer_options()})
+            for (const auto& key : *keys) {
+                if (key == "support_filament" || key == "support_interface_filament")
+                    continue;
+                if (const auto* value = before.option(key))
+                    full.set_key_value(key, value->clone());
+                else
+                    full.erase(key);
+            }
+        full.set_key_value("filament_settings_id", new Slic3r::ConfigOptionStrings(ids));
+        if (!logical.empty())
+            full.set_key_value("filament_map", new Slic3r::ConfigOptionInts(logical));
+        normalize_filament_identity(full);
+        Slic3r::validate_material_tool_bindings(tool_config(full));
+        auto candidate         = std::unique_ptr<Config>(new Config(serialized_values(full)));
+        result.diagnostics     = candidate->validate();
+        const auto cardinality = filament_cardinality_diagnostics(*candidate, ids.size());
+        result.diagnostics.insert(result.diagnostics.end(), cardinality.begin(), cardinality.end());
+        if (!result.diagnostics.empty())
+            return result;
+        for (auto& plate : state->plates) {
+            if (auto* map = plate.config.option<Slic3r::ConfigOptionInts>("filament_map")) {
+                // CFSYS tool ownership is an explicit protocol extension. Preserve
+                // ordinary Orca's plate mapping, but assign the new owned slot correctly.
+                if (add && !logical.empty()) {
+                    if (map->values.size() != ids.size())
+                        throw std::invalid_argument("Incomplete plate material map");
+                    map->values.back() = logical.back();
+                }
+                plate.filament_maps = map->values;
+            }
+            plate.is_sliced_valid = false;
+        }
+        for (const auto& plate : state->plates) {
+            auto final = full;
+            final.apply(plate.config);
+            if (!plate.filament_maps.empty())
+                final.set_key_value("filament_map", new Slic3r::ConfigOptionInts(plate.filament_maps));
+            Slic3r::validate_material_tool_bindings(tool_config(final));
+        }
+        state->configuration          = candidate->snapshot();
+        state->presets                = std::make_shared<Slic3r::PresetBundle>(*bundle);
+        auto selection                = impl_->active_selection;
+        selection.filament_preset_ids = ids;
+        const auto mapped             = filament_tool_map(&full, ids.size());
+        selection.filament_physical_tools.assign(mapped.begin(), mapped.end());
+        auto filaments = compatible_presets(bundle->filaments, ids.front());
+        result.view    = make_active_config_view(*candidate, selection, impl_->active_revision + 1, impl_->compatible_processes, filaments,
+                                                 {bundle.get()});
+        result.config  = state->configuration;
+        result.model.impl_ = state;
+        result.filament_defaults = state->filament_defaults;
+        // All identity correlation and facet conversion must finish before
+        // the active configuration is committed.
+        for (size_t o = 0; o < state->model.objects.size(); ++o) {
+            const auto* object = state->model.objects[o];
+            FilamentObjectProjection projected;
+            const auto object_id            = state->object_ids.find(object->id().id);
+            projected.id                    = object_id == state->object_ids.end() ? "object-" + std::to_string(o + 1) : object_id->second;
+            projected.default_filament_slot = object->config.has("extruder") ? object->config.extruder() : 1;
+            for (size_t v = 0; v < object->volumes.size(); ++v) {
+                const auto* volume = object->volumes[v];
+                if (state->mask_volume_ids.count(volume->id().id))
+                    continue;
+                FilamentVolumeProjection part;
+                const auto volume_id = state->volume_ids.find(volume->id().id);
+                part.id = volume_id == state->volume_ids.end() ? projected.id + "/part-" + std::to_string(v + 1) : volume_id->second;
+                part.default_filament_slot   = volume->config.has("extruder") ? volume->config.extruder() : 0;
+                part.effective_filament_slot = volume->extruder_id();
+                const auto& labels           = volume->mmu_segmentation_facets.get_data();
+                for (const auto& root : labels.triangles_to_split) {
+                    if (root.triangle_idx < 0 || root.bitstream_start_idx < 0 ||
+                        size_t(root.triangle_idx) >= volume->mesh().its.indices.size() ||
+                        size_t(root.bitstream_start_idx) >= labels.bitstream.size())
+                        throw std::invalid_argument("Invalid returned material facet data");
+                    part.facet_labels.roots.push_back({uint32_t(root.triangle_idx), uint32_t(root.bitstream_start_idx)});
+                }
+                for (bool bit : labels.bitstream)
+                    part.facet_labels.bitstream.push_back(bit ? 1 : 0);
+                projected.volumes.push_back(std::move(part));
+            }
+            result.objects.push_back(std::move(projected));
+        }
+        impl_->active_config.swap(candidate);
+        std::swap(impl_->active_selection, selection);
+        impl_->compatible_filaments.swap(filaments);
+        ++impl_->active_revision;
+        if (add && !add->color)
+            ++impl_->next_filament_color;
+        result.success = true;
+    } catch (const std::exception& error) {
+        result.diagnostics.push_back({"filament", error.what()});
     }
-    const auto config = dynamic_config(impl_->active_config->snapshot());
-    const auto tools = tool_config(config);
-    const auto& capacities = tools.toolhead_filament_capacity.values;
-    if (physical_tool >= capacities.size()) {
-        result.diagnostics.push_back({"filament", "No material capacity declared for this physical tool"});
-        return result;
-    }
-    const auto count = std::count_if(view->filament_slots.begin(), view->filament_slots.end(),
-        [physical_tool](const FilamentSlotInfo& slot) { return slot.physical_tool_index == physical_tool; });
-    if (count >= capacities[physical_tool]) {
-        result.diagnostics.push_back({"filament", "Material capacity exceeded for physical tool " + std::to_string(physical_tool)});
-        return result;
-    }
-    const auto existing = std::find_if(view->filament_slots.begin(), view->filament_slots.end(),
-        [physical_tool](const FilamentSlotInfo& slot) { return slot.physical_tool_index == physical_tool; });
-    // Each tool has an initial slot. Adding another defaults to its selected
-    // material; the operation's target tool, not the material, owns the slot.
-    if (existing == view->filament_slots.end()) {
-        result.diagnostics.push_back({"filament", "Physical tool has no initialized material slot"});
-        return result;
-    }
-    const std::string requested = preset_id.empty() ? existing->preset_id : std::string(preset_id);
-    if (std::none_of(existing->compatible_presets.begin(), existing->compatible_presets.end(),
-        [&requested](const PresetOption& option) { return option.id == requested; })) {
-        result.diagnostics.push_back({"filament", "Material is incompatible with this physical tool"});
-        return result;
-    }
-    ConfigSelection selection;
-    selection.machine_model_id = view->selection.machine_model_id;
-    selection.machine_variant_id = view->selection.machine_variant_id;
-    selection.process_preset_id = view->selection.process_preset_id;
-    selection.filament_preset_ids = view->selection.filament_preset_ids;
-    for (const auto& slot : view->filament_slots) selection.filament_physical_tools.push_back(unsigned(slot.physical_tool_index));
-    selection.filament_preset_ids.push_back(requested);
-    selection.filament_physical_tools.push_back(unsigned(physical_tool));
-    return activate_config(selection);
+    return result;
 }
 
 SettingsResult Library::set_active_filament_color(std::size_t slot_index, Rgba8 color)
@@ -3120,6 +3300,249 @@ std::vector<ConfigDiagnostic> Library::validate_active_config() const
                        std::make_move_iterator(cardinality.begin()),
                        std::make_move_iterator(cardinality.end()));
     return diagnostics;
+}
+
+ModelLoadResult Library::load_model(const ModelLoadRequest& request, const SliceCallbacks& callbacks) const
+{
+    ModelLoadResult result;
+    try {
+        if (!request.config.valid())
+            throw std::invalid_argument("Model loading requires an initialized configuration");
+        if (cancellation_requested(callbacks)) {
+            result.cancelled = true;
+            return result;
+        }
+        auto config = dynamic_config(request.config);
+        normalize_filament_identity(config);
+        Slic3r::validate_material_tool_bindings(tool_config(config));
+        const size_t filament_slot_count = serialized_option_values(config, "filament_diameter").size();
+        report_progress(callbacks, 0.02f, "Loading models");
+        Slic3r::Model plate_model;
+        std::set<size_t> mask_volume_ids;
+        std::map<size_t, std::string> object_ids, volume_ids;
+        std::set<std::string> caller_object_ids, caller_volume_ids, default_ids;
+        for (const auto& reference : request.filament_defaults)
+            if (reference.first.empty() || reference.second < 0 || !default_ids.insert(reference.first).second)
+                throw std::invalid_argument("Invalid or duplicate caller material default");
+        for (const SliceObjectInput& input : request.objects) {
+            const bool has_file_input   = !input.model_path.empty();
+            const bool has_memory_input = !input.volumes.empty();
+            if (has_file_input == has_memory_input) {
+                result.diagnostics.push_back(
+                    {"model", "Each slice object must provide exactly one of model_path or in-memory volumes", false});
+                return result;
+            }
+            if (has_file_input && !input.fiber_masks.empty())
+                throw std::invalid_argument("object=" + input.name + ": masks require in-memory volumes");
+            if (!input.instances.empty() && (has_file_input || !input.fiber_masks.empty()))
+                throw std::invalid_argument("Explicit object instances require in-memory volumes without instance-specific fiber masks");
+            if (!input.id.empty() && !caller_object_ids.insert(input.id).second)
+                throw std::invalid_argument("Duplicate caller object identity");
+            Slic3r::ModelObject* support_target = nullptr;
+
+            if (has_memory_input) {
+                Slic3r::ModelObject* object = plate_model.add_object();
+                object->name                = input.name;
+                if (input.default_filament_slot < 0 || size_t(input.default_filament_slot) > filament_slot_count)
+                    throw std::invalid_argument("Object material default is outside the active configuration");
+                object->config.set("extruder", input.default_filament_slot);
+                if (!input.id.empty())
+                    object_ids.emplace(object->id().id, input.id);
+                for (const SliceVolumeInput& source_volume : input.volumes) {
+                    if (!source_volume.id.empty() && !caller_volume_ids.insert(source_volume.id).second)
+                        throw std::invalid_argument("Duplicate caller volume identity");
+                    if (source_volume.vertices.empty() || source_volume.triangles.empty()) {
+                        result.diagnostics.push_back({"model", "In-memory slice volume has no geometry", false});
+                        return result;
+                    }
+                    std::vector<Slic3r::Vec3f> vertices;
+                    vertices.reserve(source_volume.vertices.size());
+                    for (const auto& vertex : source_volume.vertices) {
+                        vertices.emplace_back(vertex.x, vertex.y, vertex.z);
+                    }
+                    std::vector<Slic3r::Vec3i32> faces;
+                    faces.reserve(source_volume.triangles.size());
+                    for (const auto& triangle : source_volume.triangles) {
+                        if (triangle.vertex_a >= vertices.size() || triangle.vertex_b >= vertices.size() ||
+                            triangle.vertex_c >= vertices.size()) {
+                            result.diagnostics.push_back({"model", "In-memory slice volume has an invalid triangle index", false});
+                            return result;
+                        }
+                        faces.emplace_back(static_cast<int>(triangle.vertex_a), static_cast<int>(triangle.vertex_b),
+                                           static_cast<int>(triangle.vertex_c));
+                    }
+
+                    Slic3r::ModelVolumeType volume_type = Slic3r::ModelVolumeType::MODEL_PART;
+                    if (source_volume.role == SliceVolumeRole::SupportEnforcer) {
+                        volume_type = Slic3r::ModelVolumeType::SUPPORT_ENFORCER;
+                    } else if (source_volume.role == SliceVolumeRole::SupportBlocker) {
+                        volume_type = Slic3r::ModelVolumeType::SUPPORT_BLOCKER;
+                    }
+                    Slic3r::ModelVolume* volume = object->add_volume(Slic3r::TriangleMesh(std::move(vertices), std::move(faces)),
+                                                                     volume_type);
+                    if (!source_volume.id.empty())
+                        volume_ids.emplace(volume->id().id, source_volume.id);
+                    if (source_volume.role == SliceVolumeRole::ModelPart) {
+                        if (source_volume.default_filament_slot < 0 ||
+                            static_cast<std::size_t>(source_volume.default_filament_slot) > filament_slot_count) {
+                            result.diagnostics.push_back(
+                                {"filament", "Model volume default filament slot is outside the active configuration", false});
+                            return result;
+                        }
+                        volume->config.set("extruder", source_volume.default_filament_slot);
+                    }
+                    if (!source_volume.facet_labels.valid()) {
+                        result.diagnostics.push_back(
+                            {"facet_labels", "Facet painting roots and bitstream must either both be present or both be empty", false});
+                        return result;
+                    }
+                    if (!source_volume.facet_labels.empty()) {
+                        Slic3r::TriangleSelector::TriangleSplittingData painting;
+                        painting.triangles_to_split.reserve(source_volume.facet_labels.roots.size());
+                        for (const auto& root : source_volume.facet_labels.roots) {
+                            if (root.triangle_index >= source_volume.triangles.size() ||
+                                root.bitstream_start_index >= source_volume.facet_labels.bitstream.size()) {
+                                result.diagnostics.push_back({"facet_labels", "Facet painting references invalid triangle data", false});
+                                return result;
+                            }
+                            painting.triangles_to_split.emplace_back(static_cast<int>(root.triangle_index),
+                                                                     static_cast<int>(root.bitstream_start_index));
+                        }
+                        painting.bitstream.reserve(source_volume.facet_labels.bitstream.size());
+                        for (const std::uint8_t bit : source_volume.facet_labels.bitstream) {
+                            painting.bitstream.push_back(bit != 0u);
+                        }
+                        painting.update_used_states(0);
+                        for (std::size_t label = filament_slot_count + 1; label < painting.used_states.size(); ++label) {
+                            if (painting.used_states[label]) {
+                                result.diagnostics.push_back({"filament", "Facet painting references a missing filament slot", false});
+                                return result;
+                            }
+                        }
+                        volume->mmu_segmentation_facets.set_data(std::move(painting));
+                    }
+                }
+                std::set<std::string> mask_ids;
+                for (const auto& mask : input.fiber_masks) {
+                    try {
+                        validate_mask_geometry(mask);
+                        if (!mask_ids.insert(mask.id).second)
+                            throw std::invalid_argument("Duplicate mask ID");
+                        if (!mask.enabled)
+                            continue;
+                        const auto patch  = mask_process_patch(mask, config);
+                        const auto parent = mask_matrix(input.transform);
+                        auto mesh         = make_mask_mesh(mask, parent, config.opt_float("resolution"));
+                        // Match native modifier loading: bake the mask-local pose,
+                        // then let add_volume center its mesh while preserving that
+                        // pose in the native volume transformation.
+                        mesh.transform(mask_matrix(mask.mask_to_object));
+                        auto* volume = object->add_volume(std::move(mesh), Slic3r::ModelVolumeType::PARAMETER_MODIFIER);
+                        volume->name = mask.id;
+                        volume->config.apply(patch);
+                        volume->config.set("fiber_mask_process", true);
+                        mask_volume_ids.insert(volume->id().id);
+                    } catch (const std::exception& error) {
+                        throw std::invalid_argument("object=" + input.name + " mask=" + mask.id + ": " + error.what());
+                    }
+                }
+                if (input.instances.empty())
+                    object->add_instance()->set_transformation(Slic3r::Geometry::Transformation(mask_matrix(input.transform)));
+                else
+                    for (const auto& pose : input.instances)
+                        object->add_instance()->set_transformation(Slic3r::Geometry::Transformation(mask_matrix(pose)));
+                support_target = object;
+            } else {
+                const std::string& path = input.model_path;
+                std::error_code error;
+                if (!fs::is_regular_file(path, error) || error) {
+                    result.diagnostics.push_back({"model", "Model file does not exist: " + path, false});
+                    return result;
+                }
+                Slic3r::Model source = Slic3r::Model::read_from_file(path);
+                if (!input.support_enforcer_paths.empty() && source.objects.size() != 1) {
+                    result.diagnostics.push_back(
+                        {"support", "A model with support enforcers must contain exactly one printable object: " + path, false});
+                    return result;
+                }
+                if (!input.id.empty() && source.objects.size() != 1)
+                    throw std::invalid_argument("A caller identity requires a single object file");
+                for (const Slic3r::ModelObject* object : source.objects) {
+                    Slic3r::ModelObject* added = plate_model.add_object(*object);
+                    if (!input.id.empty())
+                        object_ids.emplace(added->id().id, input.id);
+                    if (support_target == nullptr) {
+                        support_target = added;
+                    }
+                }
+            }
+
+            if (!input.support_enforcer_paths.empty()) {
+                const Slic3r::Transform3d target_instance = support_target->instances.empty() ?
+                                                                Slic3r::Transform3d::Identity() :
+                                                                support_target->instances.front()->get_matrix();
+                const Slic3r::Transform3d world_to_target = target_instance.inverse();
+
+                for (const std::string& support_path : input.support_enforcer_paths) {
+                    std::error_code support_error;
+                    if (!fs::is_regular_file(support_path, support_error) || support_error) {
+                        result.diagnostics.push_back({"support", "Support enforcer file does not exist: " + support_path, false});
+                        return result;
+                    }
+                    Slic3r::Model support_source = Slic3r::Model::read_from_file(support_path);
+                    for (const Slic3r::ModelObject* object : support_source.objects) {
+                        const std::size_t instance_count = std::max<std::size_t>(1, object->instances.size());
+                        for (std::size_t instance_index = 0; instance_index < instance_count; ++instance_index) {
+                            Slic3r::TriangleMesh mesh = object->mesh();
+                            if (!object->instances.empty()) {
+                                mesh.transform(object->instances[instance_index]->get_matrix());
+                            }
+                            mesh.transform(world_to_target);
+                            support_target->add_volume(std::move(mesh), Slic3r::ModelVolumeType::SUPPORT_ENFORCER);
+                        }
+                    }
+                    if (cancellation_requested(callbacks)) {
+                        result.cancelled = true;
+                        return result;
+                    }
+                }
+                support_target->invalidate_bounding_box();
+            }
+            if (cancellation_requested(callbacks)) {
+                result.cancelled = true;
+                return result;
+            }
+        }
+        const bool belt_printer = is_belt_config(config);
+        if (request.center_on_build_plate && !plate_model.objects.empty()) {
+            if (belt_printer)
+                center_belt_model_on_x(plate_model, build_plate_center(config).x());
+            else
+                plate_model.center_instances_around_point(build_plate_center(config));
+        }
+
+        auto state               = std::make_shared<ModelSnapshot::Impl>();
+        state->model             = std::move(plate_model);
+        state->mask_volume_ids   = std::move(mask_volume_ids);
+        state->configuration     = request.config;
+        state->object_ids        = std::move(object_ids);
+        state->volume_ids        = std::move(volume_ids);
+        state->filament_defaults = request.filament_defaults;
+        Slic3r::PlateData plate;
+        plate.plate_index = 0;
+        for (size_t o = 0; o < state->model.objects.size(); ++o)
+            for (size_t i = 0; i < state->model.objects[o]->instances.size(); ++i)
+                plate.objects_and_instances.emplace_back(int(o), int(i));
+        state->plates.push_back(std::move(plate));
+        state->plate_origins.emplace_back(Slic3r::Vec3d::Zero());
+        result.model.impl_ = std::move(state);
+        result.success     = true;
+    } catch (const Slic3r::CanceledException&) {
+        result.cancelled = true;
+    } catch (const std::exception& error) {
+        result.diagnostics.push_back({"model", error.what(), false});
+    }
+    return result;
 }
 
 SliceResult Library::slice(const SliceRequest& request, const SliceCallbacks& callbacks) const
@@ -3217,8 +3640,6 @@ SliceResult Library::slice_calibration(const CalibrationTask& task,
         return result;
     }
     SliceRequest request;
-    request.config                = task.impl_->plates[plate_index].config;
-    request.center_on_build_plate = false;
     request.output_gcode_path     = output.output_gcode_path;
     request.generate_preview      = output.generate_preview;
     request.generate_gcode_3mf    = output.generate_gcode_3mf;
@@ -3241,246 +3662,88 @@ SliceResult Library::slice_impl(const SliceRequest& request,
         generated_temporary_paths.clear();
     };
     try {
-        if (request.objects.empty() && calibration == nullptr) {
+        if (!request.model.valid() && calibration == nullptr) {
             result.diagnostics.push_back({"input", "Slice request contains no models", false});
             return result;
         }
-        if (!request.config.valid()) {
+        const auto& configuration = calibration ? calibration->impl_->plates[plate_index].config : request.model.impl_->configuration;
+        if (!configuration.valid()) {
             result.diagnostics.push_back({"config", "Slice request has no initialized configuration", false});
             return result;
         }
         // Keep the original native values: serializing a float-derived layer
         // height and parsing it back can move a layer across a calibration
         // boundary (for example floor(z - 0.4) in the retraction tower).
-        Slic3r::DynamicPrintConfig config = calibration
-            ? calibration->impl_->host->full_config() : dynamic_config(request.config);
-        if (!calibration) normalize_filament_identity(config);
-        Slic3r::validate_material_tool_bindings(tool_config(config));
-        const auto filament_diagnostics = slice_filament_diagnostics(config);
-        if (!filament_diagnostics.empty()) {
-            for (const auto& diagnostic : filament_diagnostics) {
-                result.diagnostics.push_back({
-                    "filament", diagnostic.key + ": " + diagnostic.message, false});
-            }
-            return result;
-        }
-        const std::size_t filament_slot_count =
-            serialized_option_values(config, "filament_diameter").size();
+        Slic3r::DynamicPrintConfig config = calibration ? calibration->impl_->host->full_config() : dynamic_config(configuration);
         if (cancellation_requested(callbacks)) {
             result.cancelled = true;
             return result;
         }
 
-        report_progress(callbacks, 0.02f, "Loading models");
         Slic3r::Model plate_model;
-        if (calibration) plate_model=calibration->impl_->models[plate_index];
+        Slic3r::Vec3d plate_origin = Slic3r::Vec3d::Zero();
+        int native_plate_index     = 0;
         std::set<size_t> mask_volume_ids;
-        for (const SliceObjectInput& input : request.objects) {
-            const bool has_file_input = !input.model_path.empty();
-            const bool has_memory_input = !input.volumes.empty();
-            if (has_file_input == has_memory_input) {
-                result.diagnostics.push_back({
-                    "model",
-                    "Each slice object must provide exactly one of model_path or in-memory volumes",
-                    false});
-                return result;
+        if (calibration) {
+            plate_model = calibration->impl_->models[plate_index];
+        } else {
+            const auto& state = *request.model.impl_;
+            if (request.plate_index >= state.plates.size())
+                throw std::invalid_argument("Plate index is outside the model snapshot");
+            const auto& plate  = state.plates[request.plate_index];
+            plate_origin       = state.plate_origins.at(request.plate_index);
+            native_plate_index = plate.plate_index;
+            config.apply(plate.config);
+            if (!plate.filament_maps.empty())
+                config.set_key_value("filament_map", new Slic3r::ConfigOptionInts(plate.filament_maps));
+            // Model::assign_copy preserves native IDs and raw missing/zero
+            // config. add_object(new_clone) would allocate IDs and normalize 0.
+            plate_model                  = state.model;
+            plate_model.curr_plate_index = native_plate_index;
+            std::vector<std::set<size_t>> selected(state.model.objects.size());
+            std::set<std::pair<int, int>> seen;
+            for (const auto& member : plate.objects_and_instances) {
+                const auto [object_index, instance_index] = member;
+                if (object_index < 0 || size_t(object_index) >= state.model.objects.size() || instance_index < 0 ||
+                    size_t(instance_index) >= state.model.objects[object_index]->instances.size() || !seen.insert(member).second)
+                    throw std::invalid_argument("Invalid or duplicate plate instance");
+                if (state.model.objects[object_index]->instances[instance_index]->printable)
+                    selected[object_index].insert(size_t(instance_index));
             }
-            if (has_file_input && !input.fiber_masks.empty())
-                throw std::invalid_argument("object=" + input.name + ": masks require in-memory volumes");
-            Slic3r::ModelObject* support_target = nullptr;
-
-            if (has_memory_input) {
-                Slic3r::ModelObject* object = plate_model.add_object();
-                object->name = input.name;
-                for (const SliceVolumeInput& source_volume : input.volumes) {
-                    if (source_volume.vertices.empty() || source_volume.triangles.empty()) {
-                        result.diagnostics.push_back({"model", "In-memory slice volume has no geometry", false});
-                        return result;
-                    }
-                    std::vector<Slic3r::Vec3f> vertices;
-                    vertices.reserve(source_volume.vertices.size());
-                    for (const auto& vertex : source_volume.vertices) {
-                        vertices.emplace_back(vertex.x, vertex.y, vertex.z);
-                    }
-                    std::vector<Slic3r::Vec3i32> faces;
-                    faces.reserve(source_volume.triangles.size());
-                    for (const auto& triangle : source_volume.triangles) {
-                        if (triangle.vertex_a >= vertices.size() ||
-                            triangle.vertex_b >= vertices.size() ||
-                            triangle.vertex_c >= vertices.size()) {
-                            result.diagnostics.push_back({"model", "In-memory slice volume has an invalid triangle index", false});
-                            return result;
-                        }
-                        faces.emplace_back(
-                            static_cast<int>(triangle.vertex_a),
-                            static_cast<int>(triangle.vertex_b),
-                            static_cast<int>(triangle.vertex_c));
-                    }
-
-                    Slic3r::ModelVolumeType volume_type = Slic3r::ModelVolumeType::MODEL_PART;
-                    if (source_volume.role == SliceVolumeRole::SupportEnforcer) {
-                        volume_type = Slic3r::ModelVolumeType::SUPPORT_ENFORCER;
-                    } else if (source_volume.role == SliceVolumeRole::SupportBlocker) {
-                        volume_type = Slic3r::ModelVolumeType::SUPPORT_BLOCKER;
-                    }
-                    Slic3r::ModelVolume* volume = object->add_volume(
-                        Slic3r::TriangleMesh(std::move(vertices), std::move(faces)),
-                        volume_type, false);
-                    if (source_volume.role == SliceVolumeRole::ModelPart) {
-                        if (source_volume.default_filament_slot <= 0 ||
-                            static_cast<std::size_t>(source_volume.default_filament_slot) >
-                                filament_slot_count) {
-                            result.diagnostics.push_back({"filament", "Model volume default filament slot is outside the active configuration", false});
-                            return result;
-                        }
-                        volume->config.set("extruder", source_volume.default_filament_slot);
-                    }
-                    if (!source_volume.facet_labels.valid()) {
-                        result.diagnostics.push_back({
-                            "facet_labels",
-                            "Facet painting roots and bitstream must either both be present or both be empty",
-                            false});
-                        return result;
-                    }
-                    if (!source_volume.facet_labels.empty()) {
-                        Slic3r::TriangleSelector::TriangleSplittingData painting;
-                        painting.triangles_to_split.reserve(source_volume.facet_labels.roots.size());
-                        for (const auto& root : source_volume.facet_labels.roots) {
-                            if (root.triangle_index >= source_volume.triangles.size() ||
-                                root.bitstream_start_index >= source_volume.facet_labels.bitstream.size()) {
-                                result.diagnostics.push_back({"facet_labels", "Facet painting references invalid triangle data", false});
-                                return result;
-                            }
-                            painting.triangles_to_split.emplace_back(
-                                static_cast<int>(root.triangle_index),
-                                static_cast<int>(root.bitstream_start_index));
-                        }
-                        painting.bitstream.reserve(source_volume.facet_labels.bitstream.size());
-                        for (const std::uint8_t bit : source_volume.facet_labels.bitstream) {
-                            painting.bitstream.push_back(bit != 0u);
-                        }
-                        painting.update_used_states(0);
-                        for (std::size_t label = filament_slot_count + 1;
-                             label < painting.used_states.size(); ++label) {
-                            if (painting.used_states[label]) {
-                                result.diagnostics.push_back({"filament", "Facet painting references a missing filament slot", false});
-                                return result;
-                            }
-                        }
-                        volume->mmu_segmentation_facets.set_data(std::move(painting));
-                    }
-                }
-                Slic3r::Transform3d transform = Slic3r::Transform3d::Identity();
-                for (int row = 0; row < 4; ++row) {
-                    for (int column = 0; column < 4; ++column) {
-                        transform(row, column) = input.transform[static_cast<std::size_t>(row * 4 + column)];
-                    }
-                }
-                std::set<std::string> mask_ids;
-                for (const auto& mask : input.fiber_masks) {
-                    try {
-                        validate_mask_geometry(mask);
-                        if (!mask_ids.insert(mask.id).second)
-                            throw std::invalid_argument("Duplicate mask ID");
-                        if (!mask.enabled) continue;
-                        const auto patch = mask_process_patch(mask, config);
-                        const auto parent = mask_matrix(input.transform);
-                        auto mesh = make_mask_mesh(mask, parent, config.opt_float("resolution"));
-                        // SDK volumes carry vertices in the common object frame. Native region
-                        // broad-phase discards volume XY offsets, so bake the rigid local pose.
-                        mesh.transform(mask_matrix(mask.mask_to_object));
-                        auto* volume = object->add_volume(std::move(mesh),
-                            Slic3r::ModelVolumeType::PARAMETER_MODIFIER, false);
-                        volume->name = mask.id;
-                        volume->config.apply(patch);
-                        volume->config.set("fiber_mask_process", true);
-                        mask_volume_ids.insert(volume->id().id);
-                    } catch (const std::exception& error) {
-                        throw std::invalid_argument("object=" + input.name + " mask=" + mask.id + ": " + error.what());
-                    }
-                }
-                object->add_instance()->set_transformation(
-                    Slic3r::Geometry::Transformation(transform));
-                support_target = object;
-            } else {
-                const std::string& path = input.model_path;
-                std::error_code error;
-                if (!fs::is_regular_file(path, error) || error) {
-                    result.diagnostics.push_back({"model", "Model file does not exist: " + path, false});
-                    return result;
-                }
-                Slic3r::Model source = Slic3r::Model::read_from_file(path);
-                if (!input.support_enforcer_paths.empty() && source.objects.size() != 1) {
-                    result.diagnostics.push_back({
-                        "support",
-                        "A model with support enforcers must contain exactly one printable object: " + path,
-                        false});
-                    return result;
-                }
-                for (const Slic3r::ModelObject* object : source.objects) {
-                    Slic3r::ModelObject* added = plate_model.add_object(*object);
-                    if (support_target == nullptr) {
-                        support_target = added;
-                    }
-                }
+            for (size_t o = plate_model.objects.size(); o-- > 0;) {
+                auto* object = plate_model.objects[o];
+                for (size_t i = object->instances.size(); i-- > 0;)
+                    if (!selected[o].count(i))
+                        object->delete_instance(i);
+                if (object->instances.empty())
+                    plate_model.delete_object(o);
             }
-
-            if (!input.support_enforcer_paths.empty()) {
-                const Slic3r::Transform3d target_instance = support_target->instances.empty()
-                    ? Slic3r::Transform3d::Identity()
-                    : support_target->instances.front()->get_matrix();
-                const Slic3r::Transform3d world_to_target = target_instance.inverse();
-
-                for (const std::string& support_path : input.support_enforcer_paths) {
-                    std::error_code support_error;
-                    if (!fs::is_regular_file(support_path, support_error) || support_error) {
-                        result.diagnostics.push_back({
-                            "support", "Support enforcer file does not exist: " + support_path, false});
-                        return result;
-                    }
-                    Slic3r::Model support_source = Slic3r::Model::read_from_file(support_path);
-                    for (const Slic3r::ModelObject* object : support_source.objects) {
-                        const std::size_t instance_count = std::max<std::size_t>(1, object->instances.size());
-                        for (std::size_t instance_index = 0; instance_index < instance_count; ++instance_index) {
-                            Slic3r::TriangleMesh mesh = object->mesh();
-                            if (!object->instances.empty()) {
-                                mesh.transform(object->instances[instance_index]->get_matrix());
-                            }
-                            mesh.transform(world_to_target);
-                            support_target->add_volume(
-                                std::move(mesh), Slic3r::ModelVolumeType::SUPPORT_ENFORCER, false);
-                        }
-                    }
-                    if (cancellation_requested(callbacks)) {
-                        result.cancelled = true;
-                        return result;
-                    }
-                }
-                support_target->invalidate_bounding_box();
+            plate_model.plates_custom_gcodes.clear();
+            if (const auto codes = state.model.plates_custom_gcodes.find(plate.plate_index); codes != state.model.plates_custom_gcodes.end())
+                plate_model.plates_custom_gcodes[plate.plate_index] = codes->second;
+            mask_volume_ids = state.mask_volume_ids;
+        }
+        if (!calibration)
+            normalize_filament_identity(config);
+        Slic3r::validate_material_tool_bindings(tool_config(config));
+        const auto filament_diagnostics = slice_filament_diagnostics(config);
+        if (!filament_diagnostics.empty()) {
+            for (const auto& diagnostic : filament_diagnostics) {
+                result.diagnostics.push_back({"filament", diagnostic.key + ": " + diagnostic.message, false});
             }
-            if (cancellation_requested(callbacks)) {
-                result.cancelled = true;
-                return result;
-            }
+            return result;
         }
         if (plate_model.objects.empty()) {
             result.diagnostics.push_back({"model", "Loaded models contain no printable objects", false});
             return result;
         }
-
         const bool belt_printer = is_belt_config(config);
-        if (request.center_on_build_plate) {
-            if (belt_printer)
-                center_belt_model_on_x(plate_model, build_plate_center(config).x());
-            else
-                plate_model.center_instances_around_point(build_plate_center(config));
-        }
 
         report_progress(callbacks, 0.08f, "Validating print");
         Slic3r::Print print;
-        // The SDK has one plate in request coordinates; native Print does not
-        // initialize its plate origin, which validation and export both read.
-        print.set_plate_origin(Slic3r::Vec3d::Zero());
+        // Original PartPlate::set_print: keep world coordinates; the writer applies the offset.
+        print.set_plate_index(native_plate_index);
+        print.set_plate_origin(plate_origin);
         if (belt_printer) {
             const ModelWorldBounds belt_bounds = model_world_bounds(plate_model);
             if (!belt_bounds.valid) {
@@ -3508,6 +3771,7 @@ SliceResult Library::slice_impl(const SliceRequest& request,
             report_progress(callbacks, 0.08f + engine_progress * 0.78f, status.text);
         });
         print.apply(plate_model, config);
+
         if (calibration) print.set_calib_params(calibration->impl_->params);
         validate_effective_mask_regions(print, mask_volume_ids);
 
@@ -4233,27 +4497,106 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                             diagnostic.key, diagnostic.message, true});
                     }
 
-                    *preset_bundle = std::move(candidate_bundle);
-                    impl_->active_config = std::move(active);
-                    impl_->active_selection.machine_model_id = machine->id;
-                    impl_->active_selection.machine_variant_id = variant->id;
-                    impl_->active_selection.printer_preset_id =
-                        preset_bundle->printers.get_selected_preset_name();
-                    impl_->active_selection.process_preset_id =
-                        preset_bundle->prints.get_selected_preset_name();
-                    impl_->active_selection.filament_preset_ids =
-                        preset_bundle->filament_presets;
-                    const auto imported = preset_bundle->full_config();
-                    const auto imported_tools = filament_tool_map(&imported, preset_bundle->filament_presets.size());
-                    impl_->active_selection.filament_physical_tools.assign(imported_tools.begin(), imported_tools.end());
-                    impl_->compatible_processes = compatible_presets(
-                        preset_bundle->prints,
-                        impl_->active_selection.process_preset_id);
-                    impl_->compatible_filaments = compatible_presets(
-                        preset_bundle->filaments,
-                        impl_->active_selection.filament_preset_ids.empty()
-                            ? std::string{}
-                            : impl_->active_selection.filament_preset_ids.front());
+                    auto next_bundle = std::make_unique<Slic3r::PresetBundle>(candidate_bundle);
+                    ResolvedSelection selection;
+                    selection.machine_model_id    = machine->id;
+                    selection.machine_variant_id  = variant->id;
+                    selection.printer_preset_id   = candidate_bundle.printers.get_selected_preset_name();
+                    selection.process_preset_id   = candidate_bundle.prints.get_selected_preset_name();
+                    selection.filament_preset_ids = candidate_bundle.filament_presets;
+                    const auto imported           = candidate_bundle.full_config();
+                    const auto imported_tools     = filament_tool_map(&imported, selection.filament_preset_ids.size());
+                    selection.filament_physical_tools.assign(imported_tools.begin(), imported_tools.end());
+                    auto processes       = compatible_presets(candidate_bundle.prints, selection.process_preset_id);
+                    auto filaments       = compatible_presets(candidate_bundle.filaments, selection.filament_preset_ids.empty() ?
+                                                                                              std::string{} :
+                                                                                              selection.filament_preset_ids.front());
+                    auto state           = std::make_shared<ModelSnapshot::Impl>();
+                    state->model         = model;
+                    state->configuration = active->snapshot();
+                    state->presets       = std::make_shared<Slic3r::PresetBundle>(candidate_bundle);
+                    for (const auto* plate : plate_data) {
+                        if (!plate)
+                            throw std::invalid_argument("Invalid imported plate");
+                        state->plates.push_back(*plate);
+                    }
+                    if (state->plates.empty()) {
+                        Slic3r::PlateData plate;
+                        plate.plate_index = 0;
+                        for (size_t o = 0; o < model.objects.size(); ++o)
+                            for (size_t i = 0; i < model.objects[o]->instances.size(); ++i)
+                                plate.objects_and_instances.emplace_back(int(o), int(i));
+                        state->plates.push_back(std::move(plate));
+                    }
+                    // Original PartPlateList::compute_colum_count / compute_origin,
+                    // Orca 3c8c667d: origins are grid offsets, not bed minimum coordinates.
+                    const auto* area = imported.option<Slic3r::ConfigOptionPoints>("printable_area");
+                    if (!area || area->values.empty())
+                        throw std::invalid_argument("Missing printable area");
+                    auto minimum = area->values.front(), maximum = minimum;
+                    for (const auto& point : area->values) {
+                        minimum = minimum.cwiseMin(point);
+                        maximum = maximum.cwiseMax(point);
+                    }
+                    const int width     = int(maximum.x() - minimum.x());
+                    const int depth     = int(maximum.y() - minimum.y());
+                    const float root    = std::sqrt(float(state->plates.size()));
+                    const float rounded = std::round(root);
+                    const int columns   = root > rounded ? int(rounded) + 1 : int(rounded);
+                    for (const auto& plate : state->plates) {
+                        if (plate.plate_index < 0 || columns <= 0)
+                            throw std::invalid_argument("Invalid plate layout");
+                        state->plate_origins.emplace_back((plate.plate_index % columns) * width * (1. + 1. / 5.),
+                                                          -(plate.plate_index / columns) * depth * (1. + 1. / 5.), 0.);
+                    }
+                    // Original PartPlateList::reload_all_objects rebuilds membership
+                    // geometrically; archive object IDs are not native array indices.
+                    for (auto& plate : state->plates)
+                        plate.objects_and_instances.clear();
+                    const auto epsilon  = Slic3r::BuildVolume::SceneEpsilon;
+                    const double height = imported.opt_float("printable_height");
+                    for (size_t o = 0; o < state->model.objects.size(); ++o) {
+                        const auto* object = state->model.objects[o];
+                        for (size_t i = 0; i < object->instances.size(); ++i) {
+                            const auto box = object->instance_convex_hull_bounding_box(i);
+                            for (size_t k = 0; k < state->plates.size(); ++k) {
+                                const auto& origin = state->plate_origins[k];
+                                const Slic3r::BoundingBoxf3 plate_box(Slic3r::Vec3d(minimum.x() + origin.x() - epsilon,
+                                                                                    minimum.y() + origin.y() - epsilon, -epsilon),
+                                                                      Slic3r::Vec3d(maximum.x() + origin.x() + epsilon,
+                                                                                    maximum.y() + origin.y() + epsilon, height + epsilon));
+                                if (plate_box.intersects(box)) {
+                                    state->plates[k].objects_and_instances.emplace_back(int(o), int(i));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    for (const auto* object : state->model.objects)
+                        for (const auto* volume : object->volumes)
+                            if (volume->config.has("fiber_mask_process") && volume->config.option("fiber_mask_process")->getBool())
+                                state->mask_volume_ids.insert(volume->id().id);
+                    result.filament_edit_diagnostics = active->validate();
+                    if (state->plates.size() > 1 && file_type == Slic3r::En3mfType::From_BBS && file_version < Slic3r::Semver(1, 5, 9))
+                        result.filament_edit_diagnostics.push_back(
+                            {"plate_layout", "Legacy BBS multi-plate layout migration is not yet supported"});
+                    if (state->plates.size() > 1 && (width <= 20 || depth <= 20))
+                        result.filament_edit_diagnostics.push_back(
+                            {"plate_layout", "Small-bed axis-expanded plate layout is not yet supported"});
+                    if (result.filament_edit_diagnostics.empty()) {
+                        result.model.impl_        = std::move(state);
+                        result.can_edit_filaments = true;
+                    }
+                    const auto slot = std::find_if(impl_->vendor_presets.begin(), impl_->vendor_presets.end(),
+                                                   [preset_bundle](const auto& item) { return item.get() == preset_bundle; });
+                    if (slot == impl_->vendor_presets.end())
+                        throw std::logic_error("Imported preset owner disappeared");
+                    // No allocating operations after publishing any part of the import.
+                    slot->swap(next_bundle);
+                    impl_->active_config.swap(active);
+                    std::swap(impl_->active_selection, selection);
+                    impl_->compatible_processes.swap(processes);
+                    impl_->compatible_filaments.swap(filaments);
                     ++impl_->active_revision;
                 } catch (const std::exception& error) {
                     result.diagnostics.push_back({
@@ -4264,6 +4607,9 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
             }
         }
 
+        if (!result.can_edit_filaments && result.filament_edit_diagnostics.empty())
+            result.filament_edit_diagnostics.push_back(
+                {"configuration", "Complete printer configuration is unavailable for material editing"});
         result.success = true;
         release_import_resources();
         report_progress(callbacks, 1.0f, "3MF project ready");

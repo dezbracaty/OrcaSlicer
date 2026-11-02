@@ -19,7 +19,7 @@ public:
 
 private:
     // Last object layer visited, for which a cache of internal islands was created.
-    const Layer                        *m_layer;
+    const Layer* m_layer{nullptr};
     // Internal islands only, referencing data owned by m_layer->regions()->surfaces().
     std::vector<const ExPolygon*>       m_internal_islands;
     // Search structure over internal islands.

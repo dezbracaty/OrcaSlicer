@@ -1,6 +1,7 @@
 // Shared 4xiao model regressions, independent of planner pass/fail decisions.
 // Reports and G-code remain in the build tree.
 #include <libslicer/Library.hpp>
+#include "model_slice_fixture.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/AABBTreeLines.hpp"
@@ -34,6 +35,8 @@
 #endif
 
 namespace {
+using libslicer_test::SliceInput;
+using libslicer_test::load_and_slice;
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
 void require(bool condition, const std::string& message)
@@ -893,12 +896,12 @@ int rounded_model_acceptance(const fs::path& model,size_t expected_layers,int co
         {"outer_reinforced_perimeters_counts",std::to_string(contours)},{"generate_reinforced_infills","1"},{"reinforced_infill_pattern","rectilinear"},
         {"reinforced_infill_density","100%"},{"fiber_resin_fill_density","100%"},{"fiber_fill_debug","1"}};
     require(library->apply_active_config_patch(patch).success,"Rounded acceptance parameters rejected");
-    libslicer::SliceRequest request;request.config=*library->active_config_snapshot();request.center_on_build_plate=false;
+    SliceInput request;request.config=*library->active_config_snapshot();request.center_on_build_plate=false;
     Json effective=Json::object();for(const auto& setting:request.config.values())effective[setting.first]=setting.second;
     for(const auto& setting:patch)require(effective.at(setting.first)==setting.second,"Effective acceptance parameter differs: "+setting.first);
     require(effective.at("fiber_width")=="1" && effective.at("fiber_contour_infill_clearance")=="0","Unexpected rounded acceptance geometry");
     write_json(output/"effective_config.json",effective);request.objects.push_back(read_model(model));request.output_gcode_path=(output/"model.gcode").string();
-    const auto started=std::chrono::steady_clock::now();const auto result=library->slice(request);
+    const auto started=std::chrono::steady_clock::now();const auto result=load_and_slice(*library, request);
     Json report={{"passed",false},{"model_fingerprint",fingerprint(model)},{"slice_success",result.success},{"slice_seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()},
         {"layers",Json::array()},{"failures",Json::array()},{"diagnostics",Json::array()}};
     for(const auto& d:result.diagnostics)report["diagnostics"].push_back({{"code",d.code},{"message",d.message}});
@@ -1004,12 +1007,12 @@ int resin_model(const fs::path& fixture, const fs::path& output, const fs::path&
     const auto applied=library->apply_active_config_patch(patch);
     for(const auto& d:applied.diagnostics)std::cerr<<d.key<<": "<<d.message<<'\n';
     require(applied.success,"Resin regression config rejected");
-    libslicer::SliceRequest request;request.config=*library->active_config_snapshot();request.center_on_build_plate=false;
+    SliceInput request;request.config=*library->active_config_snapshot();request.center_on_build_plate=false;
     Json effective=Json::object();for(const auto& item:request.config.values())effective[item.first]=item.second;
     write_json(output/"effective_config.json",effective);
     for(const auto& item:patch)require(effective[item.first]==item.second,"Effective parameter mismatch: "+item.first);
     request.objects.push_back(read_model(model));request.output_gcode_path=(output/"model.gcode").string();
-    const auto started=std::chrono::steady_clock::now();const auto result=library->slice(request);
+    const auto started=std::chrono::steady_clock::now();const auto result=load_and_slice(*library, request);
     Json report={{"slice_success",result.success},{"slice_seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()},{"diagnostics",Json::array()}};
     for(const auto& d:result.diagnostics)report["diagnostics"].push_back({{"code",d.code},{"message",d.message}});
     write_json(output/"report.json",report);require(result.success && result.preview,"Resin regression slice failed");
@@ -1857,7 +1860,7 @@ int snapshot_benchmark(const fixture_fs::path& model,const fixture_fs::path& sna
     const auto applied=library->apply_active_config_patch(patch);
     for(const auto& d:applied.diagnostics)std::cerr<<d.key<<": "<<d.message<<"\n";
     require(applied.success,"Cannot apply snapshot");
-    libslicer::SliceRequest request;request.config=*library->active_config_snapshot();
+    SliceInput request;request.config=*library->active_config_snapshot();
     Json effective=Json::object();for(const auto& [key,value]:request.config.values())effective[key]=value;
     std::ofstream(output/"effective_config.json")<<effective.dump(2);
     require(effective==pinned.at("settings"),"Effective snapshot differs from pinned full snapshot");
@@ -1907,7 +1910,7 @@ int snapshot_benchmark(const fixture_fs::path& model,const fixture_fs::path& sna
         if(stages.size()==1 || stages.back()["stage"]!=stages[stages.size()-2]["stage"])
             std::cout<<seconds<<" "<<progress<<" "<<stage<<std::endl;
     };
-    const auto result=library->slice(request,callbacks);
+    const auto result=load_and_slice(*library, request,callbacks);
     const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
     for(const auto& d:result.diagnostics)std::cerr<<d.code<<": "<<d.message<<"\n";
     Json report={{"library_image",loaded_library},{"success",result.success},{"slice_seconds",seconds},
@@ -2051,13 +2054,13 @@ int run_acceptance(int argc,char** argv)
         const auto applied=library->apply_active_config_patch(patch);
         for (const auto& d:applied.diagnostics) std::cerr<<d.key<<": "<<d.message<<'\n';
         require(applied.success,"Pinned configuration was rejected");
-        libslicer::SliceRequest request;request.config=*library->active_config_snapshot();
+        SliceInput request;request.config=*library->active_config_snapshot();
         Json effective=Json::object();for(const auto& item:request.config.values())effective[item.first]=item.second;
         write_json(output/"effective_config.json",effective);
         require(effective==config.at("settings"),"Effective configuration differs from pinned full snapshot; inspect effective_config.json");
         if(gap)request.center_on_build_plate=false;
         request.objects.push_back(read_model(model));request.output_gcode_path=(output/"4xiao.gcode").string();
-        const auto start=std::chrono::steady_clock::now();const auto result=library->slice(request);
+        const auto start=std::chrono::steady_clock::now();const auto result=load_and_slice(*library, request);
         const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
         Json diagnostics=Json::array();for(const auto& d:result.diagnostics)diagnostics.push_back({{"code",d.code},{"message",d.message}});
         write_json(output/"slice_diagnostics.json",diagnostics);
