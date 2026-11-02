@@ -422,8 +422,14 @@ TEST_CASE("P3 can select CCF on any tool without changing material ownership", "
         CHECK(std::any_of(slot.compatible_presets.begin(), slot.compatible_presets.end(),
             [](const auto& preset) { return preset.id == "CFSYS CCF"; }));
     }
+    CHECK(initial.view.selection.filament_preset_ids == std::vector<std::string>{
+        "CFSYS TPU 95A", "CFSYS TPU 95A", "CFSYS TPU 95A",
+        "Generic PLA @P3", "CFSYS PA-CF", "CFSYS CCF"});
     CHECK(library->active_config_snapshot()->value("filament_process_type") ==
-        "thermoplastic;thermoplastic;thermoplastic;thermoplastic;thermoplastic;thermoplastic");
+        "thermoplastic;thermoplastic;thermoplastic;thermoplastic;thermoplastic;continuous_fiber");
+    // Exercise reassignment from a thermoplastic baseline after checking the
+    // configured mixed-material defaults.
+    REQUIRE(library->set_active_filament_preset(5, "Generic PLA @P3").success);
     REQUIRE(library->set_active_config_value("layer_height", "0.15").success);
     REQUIRE(library->set_active_filament_color(fiber_tool, {20,40,60,255}).success);
     const auto selected = library->set_active_filament_preset(fiber_tool, "CFSYS CCF");

@@ -47,5 +47,5 @@
     "before_layer_change_gcode": ";BEFORE_LAYER_CHANGE\n;[layer_z]\n{if layer_num == 0}\n;P3 wait after automatic initial dock selection\nM109 S{nozzle_temperature_initial_layer[initial_tool]}\n{endif}\n",
     "layer_change_gcode": ";AFTER_LAYER_CHANGE\n;[layer_z]",
     "default_print_profile": "0.20mm Standard @P3",
-    "default_filament_profile": ["Generic PLA @P3", "Generic PLA @P3", "Generic PLA @P3", "Generic PLA @P3", "Generic PLA @P3", "Generic PLA @P3"]
+    "default_filament_profile": ["CFSYS TPU 95A", "CFSYS TPU 95A", "CFSYS TPU 95A", "Generic PLA @P3", "CFSYS PA-CF", "CFSYS CCF"]
 }
