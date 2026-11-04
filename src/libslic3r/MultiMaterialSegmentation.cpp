@@ -1347,8 +1347,11 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                 // As this region may split existing regions, we collect statistics over all regions for color_idx == 0.
                 color_idx == 0 || config.outer_wall_filament_id == int(color_idx)) {
                 //BBS: the extrusion line width is outer wall rather than inner wall
-                const double nozzle_diameter = print_object.print()->config().nozzle_diameter.get_at(0);
-                double outer_wall_line_width = config.get_abs_value("outer_wall_line_width", nozzle_diameter);
+                // Resolve zero/percentage widths with the same role and nozzle
+                // rules as the perimeter generator. Zero means auto, not a
+                // physical line of zero width.
+                const Flow outer_wall_flow = region->region().flow(print_object, frExternalPerimeter, layer.height);
+                const float outer_wall_line_width = outer_wall_flow.width();
                 out.extrusion_width     = std::max<float>(out.extrusion_width, outer_wall_line_width);
                 out.top_shell_layers    = std::max<int>(out.top_shell_layers, config.top_shell_layers);
                 out.bottom_shell_layers = std::max<int>(out.bottom_shell_layers, config.bottom_shell_layers);
@@ -1356,9 +1359,9 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                              // Gap fill enabled. Enable a single line of 1/2 extrusion width.
                                              0.5f * outer_wall_line_width :
                                              // Gap fill disabled. Enable two lines slightly overlapping.
-                                             outer_wall_line_width + 0.7f * Flow::rounded_rectangle_extrusion_spacing(outer_wall_line_width, float(layer.height));
+                                             outer_wall_line_width + 0.7f * outer_wall_flow.spacing();
                 out.small_region_threshold = scaled<float>(out.small_region_threshold * 0.5f);
-                out.extrusion_spacing = Flow::rounded_rectangle_extrusion_spacing(float(outer_wall_line_width), float(layer.height));
+                out.extrusion_spacing = outer_wall_flow.spacing();
                 ++ out.num_regions;
             }
         assert(out.num_regions > 0);

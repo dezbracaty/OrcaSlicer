@@ -200,11 +200,13 @@ ResolvedFiberTool resolve_fiber_tool(const GCodeConfig& config, unsigned filamen
         physical != 1))
         throw std::invalid_argument("CFSYS requires physical fiber T1 with linear millimeter E");
     if (protocol == "p3-shared-e-v1") {
-        if (config.gcode_flavor != gcfKlipper || !config.single_extruder_multi_material.value ||
+        // Sharing E/heater state does not make P3's six nozzle docks a
+        // single-nozzle MMU. That flag also enables MMU unloading/loading.
+        if (config.gcode_flavor != gcfKlipper || config.single_extruder_multi_material.value ||
             !config.filament_slots_bound_to_physical_tools.value ||
             config.physical_extruder_map.values != std::vector<int>{0,1,2,3,4,5} ||
             physical != 5 || units != 1.0 || !config.use_relative_e_distances.value)
-            throw std::invalid_argument("P3 fiber requires shared-channel Klipper, six bound docks, physical T5 and relative linear millimeter E");
+            throw std::invalid_argument("P3 fiber requires multi-nozzle shared-channel Klipper, six bound docks, physical T5 and relative linear millimeter E");
         if (std::find(config.toolhead_fiber_protocol_id.values.begin(),
                       config.toolhead_fiber_protocol_id.values.end(), "cfsys-v1") !=
             config.toolhead_fiber_protocol_id.values.end())

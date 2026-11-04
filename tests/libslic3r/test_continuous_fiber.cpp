@@ -1407,7 +1407,7 @@ TEST_CASE("P3 fiber binds T5 while retaining shared channel semantics", "[Contin
 {
     PrintConfig config;
     config.gcode_flavor.value = gcfKlipper;
-    config.single_extruder_multi_material.value = true;
+    config.single_extruder_multi_material.value = false;
     config.use_relative_e_distances.value = true;
     config.filament_slots_bound_to_physical_tools.value = true;
     config.physical_extruder_map.values = {0,1,2,3,4,5};
@@ -1426,8 +1426,8 @@ TEST_CASE("P3 fiber binds T5 while retaining shared channel semantics", "[Contin
         config.use_relative_e_distances.value = false;
         CHECK_THROWS(resolve_fiber_tool(config,5));
     }
-    SECTION("independent heaters cannot masquerade as P3") {
-        config.single_extruder_multi_material.value = false;
+    SECTION("single-nozzle MMU mode cannot masquerade as P3") {
+        config.single_extruder_multi_material.value = true;
         CHECK_THROWS(resolve_fiber_tool(config,5));
     }
     SECTION("linear E units are explicit") {
