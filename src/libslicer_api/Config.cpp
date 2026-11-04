@@ -77,7 +77,9 @@ public:
         // Orca stores the active plate in project state rather than in a
         // print preset. It is nevertheless an editable slicing input and is
         // presented alongside process settings by the public three-group API.
-        const std::set<std::string> process_project_keys{"curr_bed_type"};
+        // Tower coordinates are per-plate project state as well. Callers must
+        // be able to place the tower inside printers with an offset bed origin.
+        const std::set<std::string> process_project_keys{"curr_bed_type", "wipe_tower_x", "wipe_tower_y"};
         // Per-slot colors are also project state (they are intentionally not
         // part of Preset::filament_options()), but must travel with a project
         // so facet labels continue to address the correct material colors.
@@ -86,7 +88,8 @@ public:
         items.reserve(process_keys.size() + filament_keys.size() + printer_keys.size());
         for (const auto& [key, option] : Slic3r::print_config_def.options) {
             const bool internal    = !has_presentation_metadata(option);
-            const bool visible     = !internal && option.gui_type != Slic3r::ConfigOptionDef::GUIType::legend;
+            const bool visible     = (!internal || process_project_keys.count(key) != 0) &&
+                                     option.gui_type != Slic3r::ConfigOptionDef::GUIType::legend;
             const bool is_process  = process_keys.count(key) != 0 || process_project_keys.count(key) != 0;
             const bool is_filament = filament_keys.count(key) != 0 ||
                                      filament_project_keys.count(key) != 0;
