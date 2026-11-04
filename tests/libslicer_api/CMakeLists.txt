@@ -27,6 +27,29 @@ target_compile_definitions(orca_plater_tests PRIVATE LIBSLICER_TEST_RESOURCE_DIR
 orcaslicer_copy_test_dlls(orca_plater_tests)
 orcaslicer_discover_tests(orca_plater_tests)
 
+# Keep the ordinary suite on the real SDK. Exact G-code comparisons additionally
+# use the same API object files in a test-only DLL with a private TBB guard.
+add_library(calibration_reference_runtime SHARED
+    calibration_reference_runtime.cpp $<TARGET_OBJECTS:libslicer_api_objects>)
+target_compile_features(calibration_reference_runtime PRIVATE cxx_std_17)
+target_compile_definitions(calibration_reference_runtime PRIVATE LIBSLICER_BUILDING_LIBRARY)
+target_include_directories(calibration_reference_runtime PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(calibration_reference_runtime PRIVATE libslic3r)
+set_target_properties(calibration_reference_runtime PROPERTIES
+    CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
+if(APPLE)
+    target_link_options(calibration_reference_runtime PRIVATE "LINKER:-exported_symbol,__Z*9libslicer*")
+endif()
+add_executable(orca_plater_reference_tests test_orca_plater.cpp ../../src/libslicer_api/Plater.cpp)
+target_link_libraries(orca_plater_reference_tests PRIVATE calibration_reference_runtime libslic3r Catch2::Catch2WithMain)
+target_include_directories(orca_plater_reference_tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
+target_compile_definitions(orca_plater_reference_tests PRIVATE
+    LIBSLICER_CALIBRATION_SERIAL_REFERENCE
+    LIBSLICER_TEST_RESOURCE_DIR="${CMAKE_SOURCE_DIR}/resources")
+orcaslicer_copy_test_dlls(orca_plater_reference_tests)
+catch_discover_tests(orca_plater_reference_tests TEST_SPEC "[orca_plater][slice]"
+    TEST_PREFIX "SerialReference::" ADD_TAGS_AS_LABELS)
+
 # Standard-library-only regressions for the independent entry comparison tool.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)

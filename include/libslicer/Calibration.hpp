@@ -43,6 +43,9 @@ struct CalibrationRequest
     int flow_pass{1};
     enum class FlowPattern { ArchimedeanChords, Monotonic };
     FlowPattern flow_pattern{FlowPattern::ArchimedeanChords};
+    // Zero-based material slot, resolved through the captured tool mapping.
+    // Only Calib_Flow_Rate uses this field; extruder_id keeps its original meaning.
+    std::size_t flow_filament_slot{0};
 };
 
 // GUI-independent state of the original calib_dlg.cpp parameter forms. Values
@@ -82,11 +85,28 @@ LIBSLICER_API CalibrationParameters update_calibration_parameters(
 LIBSLICER_API CalibrationValidationResult validate_calibration_parameters(
     const CalibrationParameters& parameters);
 
+struct FlowCalibrationSample
+{
+    std::string label;
+    double baseline_flow_ratio{0};
+    double calibrated_flow_ratio{0};
+};
+struct CalibrationFlowResult
+{
+    bool success{false};
+    std::vector<std::pair<std::string, std::string>> config_patch;
+    std::vector<SliceDiagnostic> diagnostics;
+    std::size_t logical_extruder_index{0};
+    std::size_t physical_tool_index{0};
+    double nozzle_diameter_mm{0};
+    explicit operator bool() const noexcept { return success; }
+};
 struct CalibrationObject
 {
     SliceObjectInput geometry;
     std::vector<std::pair<std::string, std::string>> object_config;
     std::vector<std::vector<std::pair<std::string, std::string>>> volume_config;
+    std::optional<FlowCalibrationSample> flow_sample;
 };
 struct CalibrationLayerCode
 {
@@ -111,6 +131,10 @@ public:
     CalibrationTask& operator=(const CalibrationTask&) = delete;
     const std::vector<CalibrationPlate>& plates() const noexcept;
     const CalibrationRequest& request() const noexcept;
+    // Read-only, task-local public object indices (after instance expansion).
+    // Patch is based on request().config; consumers must check its revision
+    // atomically before applying. This never changes active configuration.
+    CalibrationFlowResult flow_result(std::size_t plate_index, std::size_t object_index) const;
 
 private:
     CalibrationTask();

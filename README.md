@@ -374,7 +374,7 @@ const CalibrationRequest& CalibrationTask::request() const noexcept;
 | --- | --- | --- |
 | `config` | `ConfigSnapshot`，无有效配置 | SDK 层必填，通常来自 `create_config`、活动配置或已有 Config 的 `snapshot()`。 |
 | `mode` | `CalibMode::Calib_None` | 必须显式选择支持的入口。 |
-| `extruder_id` | int，0 | 原 `Calib_Params` 字段。当前原版 Plater 温度塔用它选择喷嘴尺寸：负数按 0，越界按最后一个喷嘴；不能视为所有模式的物理喷头切换接口。其他模式继续使用原实现的首喷嘴 / 首耗材逻辑。 |
+| `extruder_id` | int，0 | 原 `Calib_Params` 字段。当前原版 Plater 温度塔用它选择喷嘴尺寸：负数按 0，越界按最后一个喷嘴；不能视为所有模式的物理喷头切换接口。流量校准单独使用 `flow_filament_slot`；其他模式保留原行为。 |
 | `start/end/step` | double，均为 0 | 含义随模式变化，见上表。默认值不是可打印的完整参数方案。 |
 | `print_numbers` | bool，true | 原版 PA 数字标识开关，由原生成器使用。 |
 | `freqStartX/freqEndX/freqStartY/freqEndY` | double，均为 0 | 输入整形频率参数，单位 Hz。 |
@@ -385,6 +385,7 @@ const CalibrationRequest& CalibrationTask::request() const noexcept;
 | `flow_linear` | bool，false | false 为比例法，true 为 YOLO 线性法。 |
 | `flow_pass` | int，1 | 仅允许 1 或 2，见下表。 |
 | `flow_pattern` | `FlowPattern::ArchimedeanChords` | 可选 `ArchimedeanChords` 或 `Monotonic`，对应原流量对话框两种顶面图案。 |
+| `flow_filament_slot` | size_t，0 | 流量校准的材料槽，索引从 0 开始。库按捕获快照的 `filament_map`、`physical_extruder_map` 解析逻辑喷嘴和物理工具，拒绝越界、非热塑材料及连续纤维配置。 |
 
 | `flow_linear` | `flow_pass` | 原版测试 |
 | --- | --- | --- |
@@ -425,9 +426,22 @@ const CalibrationRequest& CalibrationTask::request() const noexcept;
 | `CalibrationObject` | `geometry` | 复用 `SliceObjectInput`；网格顶点为 mm，体积自身变换已烘焙进顶点；`transform` 是行主序 4×4 实例矩阵，转换到当前盘局部坐标。 |
 | | `object_config` | 对象级设置的 `(key, serialized_value)` 列表。 |
 | | `volume_config` | 与 `geometry.volumes` 同序的体积级设置列表。 |
+| | `flow_sample` | 仅流量样块提供：原始标记 `label`、本轮基准 `baseline_flow_ratio` 和根据实际对象倍率得到的 `calibrated_flow_ratio`。 |
 | `CalibrationLayerCode` | `print_z / gcode` | 层高度 mm、该层的原始自定义代码。 |
 
 盘局部原点为打印机热床原点；GUI 用于展示多个盘的空间偏移不会加入设备指令。上述引用只在任务存活期间有效。不能把展示网格重新交给普通 `slice()` 来替代 `slice_calibration()`，这样会丢失原生配置精度、对象设置或校准状态。
+
+### 流量样块采纳与精调
+
+流量任务沿用原版四组模型、两种图案、缩放与采样。任务私有配置采用 Manual 映射，将样块的对象、部件和六类特征绑定到所选材料，并关闭支持；不修改活动配置的映射。材料流量及体积速度按材料槽读取，喷嘴按逻辑工具读取。嵌入预设加载时保留请求快照的已编辑数值。生成样块的材料与工具在切片后再校验；用户自定义启动、换料宏仍由设备配置负责，不会被自动改写。
+
+同名材料在任务私有加载副本中使用不同的内部预设名，避免原加载器共用一份 edited preset 而覆盖其他槽的数值；原请求与活动配置仍保留真实预设身份和材料顺序。
+
+调用 `task.flow_result(plateIndex, objectIndex)`，索引与公开 `plates()[plateIndex].objects` 一致。成功返回仅修改目标材料槽 `filament_flow_ratio` 的 `config_patch`，以及 `logical_extruder_index`、`physical_tool_index`、`nozzle_diameter_mm`。失败时读取 `diagnostics`，不要应用补丁。普通比例法相当于本轮基准 × (1 + 标记 / 100)，YOLO 相当于本轮基准 + 标记；接口以原模型实际对象倍率为准，调用方不应再次换算，也不应信任界面提交的最终比例。
+
+App 应在同一配置操作中校验任务捕获的 revision、应用补丁并取得新 revision；成功后立即撤销旧输出的打印/导出资格。仅粗调成功采纳且配置仍为该新 revision 时可继续精调：用新配置、原目标槽及原图案重建表单，再调用 `next_pass`。重复打开应重建同一精调表单，不能重复推进 pass。表单只读 `flow_baseline_ratio` 由库计算。
+
+本次新增字段改变公开 C++ 对象布局，使用旧头文件或旧二进制的消费者必须与 libslicer 一起重编；不支持混用 ABI。SDK 包格式仍为 SDK 3，Orca 仍作为消费端源码输入。
 
 ### 输出与文件所有权
 
@@ -569,20 +583,25 @@ libslicer::SliceResult sliceCalibration(
 
 ### 验证入口
 
-`orca_plater_tests` 检查有效配置、实例矩阵、网格和逐条可执行 G-code；`OrcaPlaterSource` 检查原始副本、底层算法及 GUI 访问替换白名单。精简前后的 19 个逐盘输出基线可通过测试环境变量比较：
+`orca_plater_tests` 链接正式 SDK，检查有效配置、实例矩阵、网格、校准扫描指令及预览。`orca_plater_reference_tests` 另外逐条比较完整可执行 G-code；`OrcaPlaterSource` 检查原始副本、底层算法及 GUI 访问替换白名单。
+
+严格对照使用独立的测试动态库，与正式 SDK 链接完全相同的 `libslicer_api_objects`，仅额外提供测试内的单线程作用域。参考程序与该测试库分别进入各自的 TBB `global_control(1)` 和 `task_arena(1)`。正式 SDK 不包含此测试入口，也不改变生产并发策略或公共 ABI。原始三角面切片会在并行循环中加锁追加交线，交线到达顺序可能改变岛顺序；仅约束参考程序不能保证另一份私有 TBB 的输出逐条一致。正式 SDK 的测试允许这种路径顺序变化，完整指令比较仍由双侧受控的参考测试保留。
+
+同一受控环境生成的逐盘输出基线可通过测试环境变量比较：
 
 ```text
-LIBSLICER_CALIBRATION_WRITE_BASELINE=<directory>   # 用精简前版本保存
-LIBSLICER_CALIBRATION_COMPARE_BASELINE=<directory> # 用当前版本逐条比较
-orca_plater_tests "[orca_plater][slice]" --order lex
+LIBSLICER_CALIBRATION_WRITE_BASELINE=<directory>   # 保存受控对照输出
+LIBSLICER_CALIBRATION_COMPARE_BASELINE=<directory> # 在同一受控条件下逐条比较
+orca_plater_reference_tests "[orca_plater][slice]" --order lex
+orca_plater_tests "[orca_plater][slice]" --order lex # 正式 SDK 的几何、配置与扫描指令
 orca_plater_tests "[orca_plater]~[slice]"            # 独立验证参数与场景
 ```
 
-基线录制与回放必须使用相同的测试集合和顺序；在 Windows 上，还应在加载 DLL 前限制测试进程的 CPU 亲和性，例如在 cmd 中运行 `start "" /b /wait /affinity 1 orca_plater_tests.exe "[orca_plater][slice]" --order lex`。仅在测试程序内部设置线程数不能约束另一份静态链接的 TBB。不同测试顺序的跨进程输出不能直接作为同一初始化条件的基线。
+基线录制与回放必须使用同一参考测试、测试集合和顺序；旧版本在未约束 SDK 私有 TBB 时生成的基线不能直接当作确定性真值。正式 SDK 测试会拒绝上述基线环境变量，避免误录并行输出。
 
 以上变量只影响测试程序，不是产品配置。迁移验证中还用 `LIBSLICER_CALIBRATION_LEGACY_ENUM` 让测试桥接保留的旧 DLL 的开发版枚举序号；它不参与产品执行，也不构成旧 API 别名。完整 wxWidgets 校准界面、设备自动校准及真实打印测量没有在这些测试中执行。
 
-本轮实测：同条件下 19 个盘的旧、新 DLL 指令全部一致（1252514 条断言）；独立场景及参数接口 93 条断言、原预设与耗材回归 104 条断言全部通过。本文完整 C++17 示例已从文档提取、编译运行，生成 G-code、G-code 3MF 和 699 个预览线段。App Release 构建通过。
+历史基线记录与示例运行结果不能替代上述双侧受控的完整指令对照；测试报告应分别注明正式 SDK 和参考测试运行时的结果。
 
 ### 实现来源与精简边界
 

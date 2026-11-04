@@ -3156,6 +3156,21 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
         auto config = dynamic_config(request.config);
         Slic3r::set_resources_dir(impl_->resource_directory);
         const auto params                = orca::dialog_parameters(request, config);
+        // Flow selects a particular material; the embedded-preset loader needs
+        // complete per-variant identity metadata before splitting that material.
+        // This repairs a private copy, never the caller's configuration.
+        if (request.mode == libslicer::CalibMode::Calib_Flow_Rate) {
+            normalize_filament_identity(config);
+            // A request snapshot is authoritative. Orca's project loader would
+            // otherwise replace values not marked dirty with vendor defaults
+            // (including an already calibrated ratio or an edited nozzle).
+            const auto count = config.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size();
+            std::vector<std::string> changed(count + 2,
+                Slic3r::escape_strings_cstyle(Slic3r::Preset::filament_options()));
+            changed.front() = Slic3r::escape_strings_cstyle(Slic3r::Preset::print_options());
+            changed.back() = Slic3r::escape_strings_cstyle(Slic3r::Preset::printer_options());
+            config.set_key_value("different_settings_to_system", new Slic3r::ConfigOptionStrings(std::move(changed)));
+        }
         const Slic3r::PresetBundle* seed = nullptr;
         const auto model                 = config.opt_string("printer_model");
         for (const auto& candidate : impl_->vendor_presets)
@@ -3163,16 +3178,41 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
                 if (std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
                                 [&](const auto& item) { return item.id == model; }))
                     seed = candidate.get();
+        if (request.mode == libslicer::CalibMode::Calib_Flow_Rate) {
+            const auto count = config.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size();
+            auto* names = config.option<Slic3r::ConfigOptionStrings>("filament_settings_id", true);
+            names->values.resize(count, names->values.empty() ? std::string{} : names->values.front());
+            const auto original_names = names->values;
+            auto* inherits = config.option<Slic3r::ConfigOptionStrings>("inherits_group", true);
+            inherits->values.resize(count + 2);
+            // Orca has one edited copy per preset name. A slot matching the
+            // vendor default would otherwise share that copy with another slot
+            // whose flow was edited, losing one of the captured values. Give
+            // repeated materials private identities before the original loader
+            // splits them; request.config retains their real preset identities.
+            for (std::size_t slot = 0; slot < count; ++slot) {
+                if (std::count(original_names.begin(), original_names.end(), original_names[slot]) < 2)
+                    continue;
+                std::string name = "Flow calibration material " + std::to_string(slot + 1);
+                while (std::find(names->values.begin(), names->values.end(), name) != names->values.end() ||
+                       (seed && seed->filaments.find_preset(name, false)))
+                    name += "_";
+                names->values[slot] = std::move(name);
+                inherits->values[slot + 1].clear();
+            }
+        }
         auto task      = std::unique_ptr<CalibrationTask>(new CalibrationTask());
         auto& native   = *task->impl_;
         native.request = request;
         native.host    = std::make_unique<orca::Plater>(config, seed);
         report_progress(callbacks, 0.1f, "Running original Plater calibration");
-        if (request.mode == libslicer::CalibMode::Calib_Flow_Rate)
+        if (request.mode == libslicer::CalibMode::Calib_Flow_Rate) {
+            native.flow_target = orca::resolve_flow_target(config, request.flow_filament_slot);
             native.host->prepare_flow(request.flow_linear, request.flow_pass,
                                       request.flow_pattern == CalibrationRequest::FlowPattern::ArchimedeanChords ?
                                           Slic3r::ipArchimedeanChords :
-                                          Slic3r::ipMonotonic);
+                                          Slic3r::ipMonotonic, *native.flow_target);
+        }
         else if (request.mode == libslicer::CalibMode::Calib_Tolerance_Model)
             native.host->prepare_tolerance();
         else
@@ -3193,7 +3233,7 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
                 return result;
             }
             native.models.push_back(native.host->plate_model(i));
-            auto plate   = orca::describe_plate(native.models.back(), i);
+            auto plate   = orca::describe_plate(native.models.back(), i, native.flow_target);
             plate.config = snapshot;
             native.plates.push_back(std::move(plate));
         }
@@ -3545,6 +3585,15 @@ SliceResult Library::slice_impl(const SliceRequest& request,
         {
             Slic3r::ScopedBeltSupportDebugRecorder debug_scope(belt_support_debug.get());
             print.process();
+        }
+        if (calibration && calibration->impl_->flow_target) {
+            const auto& target = *calibration->impl_->flow_target;
+            const auto used = print.get_slice_used_filaments(false);
+            const auto& effective = print.config();
+            if (used != std::vector<unsigned>{unsigned(target.slot)} ||
+                effective.filament_map.get_at(target.slot) != int(target.logical_extruder + 1) ||
+                effective.physical_extruder_map.get_at(target.logical_extruder) != int(target.physical_tool))
+                throw std::invalid_argument("Flow slicing changed the selected material or tool");
         }
         // Keep planner statistics internal; diagnostics are the existing public
         // channel. Candidates and accepted/rejected fragments are distinct units.
