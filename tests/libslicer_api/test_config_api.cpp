@@ -3088,6 +3088,8 @@ G1 X1 Y2 E1
 
 TEST_CASE("painted model thumbnails preserve filament colors", "[libslicer_api][slice][thumbnail]")
 {
+    const int width_case = GENERATE(0, 1, 2);
+    INFO("width_case=" << width_case);
     libslicer::LibraryOptions options;
     options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
     options.vendors = {"Flashforge"};
@@ -3098,7 +3100,9 @@ TEST_CASE("painted model thumbnails preserve filament colors", "[libslicer_api][
     selection.machine_model_id = "Flashforge Creator 5";
     selection.machine_variant_id = "0.4";
     const auto activated = library->activate_config(
-        selection, {{"filament_colour", "#FF0000FF"}});
+        selection, {{"filament_colour", "#FF0000FF"},
+                    {"outer_wall_line_width", width_case == 0 ? "0.42" : "0"},
+                    {"line_width", width_case == 2 ? "0" : "0.42"}});
     REQUIRE(activated.success);
     REQUIRE(library->set_active_filament_color(0, {255, 0, 0, 255}).success);
     REQUIRE(library->set_active_filament_color(1, {0, 255, 0, 255}).success);
