@@ -249,6 +249,8 @@ TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material
     const auto initial = p3->activate_config(selection);
     for (const auto& issue : initial.diagnostics) UNSCOPED_INFO(issue.message);
     REQUIRE(initial.success);
+    REQUIRE(p3->active_config_snapshot());
+    CHECK(p3->active_config_snapshot()->value("single_extruder_multi_material") == "0");
     REQUIRE(initial.view.filament_slots.size() == 6);
     for (const auto& slot : initial.view.filament_slots) {
         for (const auto& material : materials) {
