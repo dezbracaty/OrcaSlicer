@@ -113,6 +113,7 @@ public:
     std::string prime(GCode &gcodegen);
     void next_layer() { ++ m_layer_idx; m_tool_change_idx = 0; }
     std::string tool_change(GCode &gcodegen, int extruder_id, bool finish_layer);
+    std::string tool_change_with_exclusions(GCode &gcodegen, unsigned filament, double print_z);
     bool is_empty_wipe_tower_gcode(GCode &gcodegen, int extruder_id, bool finish_layer);
     std::string finalize(GCode &gcodegen);
     std::vector<float> used_filament_length() const;
@@ -238,7 +239,7 @@ public:
     const PlaceholderParser& placeholder_parser() const { return m_placeholder_parser_integration.parser; }
     // Process a template through the placeholder parser, collect error messages to be reported
     // inside the generated string and after the G-code export finishes.
-    std::string     placeholder_parser_process(const std::string &name, const std::string &templ, unsigned int current_filament_id, const DynamicConfig *config_override = nullptr);
+    std::string     placeholder_parser_process(const std::string &name, const std::string &templ, unsigned int current_filament_id, const DynamicConfig *config_override = nullptr, bool native_wipe_tower = false);
     bool            enable_cooling_markers() const { return m_enable_cooling_markers; }
     std::string     extrusion_role_to_string_for_parser(const ExtrusionRole &);
 

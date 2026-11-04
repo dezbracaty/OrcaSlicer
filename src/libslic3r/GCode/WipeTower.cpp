@@ -2446,18 +2446,27 @@ WipeTower::ToolChangeResult WipeTower::finish_layer(bool extrude_perimeter, bool
 }
 
 // Appends a toolchange into m_plan and calculates neccessary depth of the corresponding box
+std::vector<std::pair<float, float>> WipeTower::get_z_and_depth_pairs() const
+{
+    std::vector<std::pair<float, float>> result;
+    result.reserve(m_plan.size());
+    for (const auto& layer : m_plan)
+        result.emplace_back(layer.z, layer.depth);
+    return result;
+}
+
 void WipeTower::plan_toolchange(float z_par, float layer_height_par, unsigned int old_tool,
-                                unsigned int new_tool, float wipe_volume, float purge_volume)
+                                unsigned int new_tool, float wipe_volume, float purge_volume, bool prime_only)
 {
 	assert(m_plan.empty() || m_plan.back().z <= z_par + WT_EPSILON);	// refuses to add a layer below the last one
 
 	if (m_plan.empty() || m_plan.back().z + WT_EPSILON < z_par) // if we moved to a new layer, we'll add it to m_plan first
 		m_plan.push_back(WipeTowerInfo(z_par, layer_height_par));
 
-    if (m_first_layer_idx == size_t(-1) && (! m_no_sparse_layers || old_tool != new_tool))
+    if (m_first_layer_idx == size_t(-1) && (! m_no_sparse_layers || old_tool != new_tool || prime_only))
         m_first_layer_idx = m_plan.size() - 1;
 
-    if (old_tool == new_tool)	// new layer without toolchanges - we are done
+    if (old_tool == new_tool && !prime_only)	// new layer without toolchanges - we are done
         return;
 
 	// this is an actual toolchange - let's calculate depth to reserve on the wipe tower
@@ -2502,6 +2511,9 @@ void WipeTower::plan_toolchange(float z_par, float layer_height_par, unsigned in
         depth += nozzle_change_depth;
     }
     WipeTowerInfo::ToolChange tool_change = WipeTowerInfo::ToolChange(old_tool, new_tool, depth, 0.f, 0.f, wipe_volume, length_to_extrude, purge_volume);
+    tool_change.prime_only = prime_only;
+    // Keep a real structure-only layer even when no purge is required.
+    if (prime_only) tool_change.required_depth = std::max(tool_change.required_depth, 2.f * m_perimeter_width);
     tool_change.nozzle_change_depth       = nozzle_change_depth;
     m_plan.back().tool_changes.push_back(tool_change);
 #endif
@@ -2681,6 +2693,7 @@ static WipeTower::ToolChangeResult merge_tcr(WipeTower::ToolChangeResult& first,
     out.extrusions.insert(out.extrusions.end(), second.extrusions.begin(), second.extrusions.end());
     out.end_pos = second.end_pos;
     out.wipe_path = second.wipe_path;
+    out.prime_only = first.prime_only || second.prime_only;
     out.initial_tool = first.initial_tool;
     out.new_tool = second.new_tool;
 
@@ -2757,10 +2770,11 @@ void WipeTower::get_wall_skip_points(const WipeTowerInfo &layer)
     }
     }
 
-WipeTower::ToolChangeResult WipeTower::tool_change_new(size_t new_tool, bool solid_toolchange,bool solid_nozzlechange)
+WipeTower::ToolChangeResult WipeTower::tool_change_new(size_t new_tool, bool solid_toolchange,bool solid_nozzlechange, bool prime_only)
 {
+    if (prime_only) m_current_tool = new_tool;
     m_nozzle_change_result.gcode.clear();
-    if (!m_filament_map.empty() && new_tool < m_filament_map.size() && m_filament_map[m_current_tool] != m_filament_map[new_tool]) {
+    if (!prime_only && !m_filament_map.empty() && new_tool < m_filament_map.size() && m_filament_map[m_current_tool] != m_filament_map[new_tool]) {
         m_nozzle_change_result = nozzle_change_new(m_current_tool, new_tool, solid_nozzlechange);
     }
 
@@ -2825,10 +2839,12 @@ WipeTower::ToolChangeResult WipeTower::tool_change_new(size_t new_tool, bool sol
         writer.set_initial_position(initial_position, m_wipe_tower_width, m_wipe_tower_depth, m_internal_rotation);
 
         writer.append(";" + GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Wipe_Tower_Start) + "\n");
-        toolchange_Unload(writer, cleaning_box, m_filpar[m_current_tool].material,
-                          is_first_layer() ? m_filpar[new_tool].nozzle_temperature_initial_layer : m_filpar[new_tool].nozzle_temperature);
-        toolchange_Change(writer, new_tool, m_filpar[new_tool].material); // Change the tool, set a speed override for soluble and flex materials.
-        toolchange_Load(writer, cleaning_box);
+        if (!prime_only) {
+            toolchange_Unload(writer, cleaning_box, m_filpar[m_current_tool].material,
+                              is_first_layer() ? m_filpar[new_tool].nozzle_temperature_initial_layer : m_filpar[new_tool].nozzle_temperature);
+            toolchange_Change(writer, new_tool, m_filpar[new_tool].material);
+            toolchange_Load(writer, cleaning_box);
+        }
 
         int base_temp = is_first_layer() ? m_filpar[new_tool].nozzle_temperature_initial_layer : m_filpar[new_tool].nozzle_temperature;
         if (interface_layer) {
@@ -2909,7 +2925,9 @@ WipeTower::ToolChangeResult WipeTower::tool_change_new(size_t new_tool, bool sol
     if (m_current_tool < m_used_filament_length.size())
         m_used_filament_length[m_current_tool] += writer.get_and_reset_used_filament_length();
 
-    return construct_tcr(writer, false, old_tool, false, true, purge_volume, interface_layer);
+    auto result = construct_tcr(writer, false, old_tool, false, true, purge_volume, interface_layer);
+    result.prime_only = prime_only;
+    return result;
 }
 
 WipeTower::NozzleChangeResult WipeTower::nozzle_change_new(int old_filament_id, int new_filament_id, bool solid_infill)
@@ -3931,6 +3949,8 @@ void WipeTower::generate_new(std::vector<std::vector<WipeTower::ToolChangeResult
             }
             return candidate_id == -1 ? layer.tool_changes[0].new_tool : candidate_id;
         };
+        if (!layer.tool_changes.empty() && layer.tool_changes.front().prime_only)
+            m_current_tool = layer.tool_changes.front().new_tool;
         int wall_idx = get_wall_filament_for_this_layer();
 
         bool only_generate_wall = m_enable_timelapse_print || (m_enable_wrapping_detection && m_slice_used_filaments <= 1);
@@ -3975,7 +3995,7 @@ void WipeTower::generate_new(std::vector<std::vector<WipeTower::ToolChangeResult
             const auto * block2 = get_block_by_category(m_filpar[layer.tool_changes[i].old_tool].category, false);
             id = std::find_if(m_wipe_tower_blocks.begin(), m_wipe_tower_blocks.end(), [&](const WipeTowerBlock &b) { return &b == block2; }) - m_wipe_tower_blocks.begin();
             bool solid_nozzlechange = solid_blocks_id.count(id);
-            layer_result.emplace_back(tool_change_new(layer.tool_changes[i].new_tool, solid_toolchange,solid_nozzlechange));
+            layer_result.emplace_back(tool_change_new(layer.tool_changes[i].new_tool, solid_toolchange,solid_nozzlechange, layer.tool_changes[i].prime_only));
 
             if (i == 0 && (layer.tool_changes[i].old_tool == wall_idx)) {
 

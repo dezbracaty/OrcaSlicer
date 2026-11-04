@@ -73,7 +73,7 @@ bool is_fiber_mask_parameter(std::string_view key)
 bool is_fiber_execution_parameter(std::string_view key)
 {
     static const std::set<std::string_view> keys={"filament_map","filament_map_mode","physical_extruder_map",
-        "filament_process_type","filament_slots_bound_to_physical_tools","toolhead_process_capabilities","toolhead_filament_capacity","filament_printable",
+        "filament_process_type","filament_exclude_from_wipe_tower","filament_slots_bound_to_physical_tools","toolhead_process_capabilities","toolhead_filament_capacity","filament_printable",
         "extruder_offset","z_offset","nozzle_diameter","printable_area","bed_exclude_area","printable_height",
         "extruder_printable_area","extruder_printable_height","gcode_flavor","single_extruder_multi_material",
         "use_relative_e_distances","use_volumetric_e","enable_arc_fitting","spiral_mode",

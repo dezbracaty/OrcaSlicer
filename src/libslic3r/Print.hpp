@@ -875,6 +875,7 @@ struct WipeTowerData
         used_filament.clear();
         number_of_toolchanges = -1;
         depth = 0.f;
+        height = 0.f;
         brim_width = 0.f;
         rib_offset = Vec2f::Zero();
         wipe_tower_mesh_data  = std::nullopt;

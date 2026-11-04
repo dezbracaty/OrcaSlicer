@@ -4713,3 +4713,250 @@ TEST_CASE("open ring connection settings persist their explicit software trim mu
     CHECK_FALSE(config.apply_patch(libslicer::ConfigScope::FiberMask,{{"fiber_connection_head_trim_widths","-1"}}).success);
     CHECK(config.snapshot().values()==before);
 }
+
+TEST_CASE("wipe tower exclusions preserve model tools and prime a single ordinary material",
+          "[libslicer_api][p3][fiber][wipe-tower-exclusion]")
+{
+    const std::string tower_type = GENERATE(std::string("type1"), std::string("type2"));
+    const unsigned ordinary_materials = GENERATE(1u, 2u);
+    const unsigned shell_layers = GENERATE(0u, 1u);
+    const bool machine_hooks = GENERATE(false, true);
+    CAPTURE(tower_type, ordinary_materials, shell_layers, machine_hooks);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "0.20mm Standard @P3";
+    selection.filament_preset_ids.assign(6, "Generic PLA @P3");
+    selection.filament_preset_ids[5] = "CFSYS CCF";
+    auto created = library->create_config(selection);
+    REQUIRE(created.success);
+    REQUIRE(created.config->snapshot().value("filament_exclude_from_wipe_tower") == "0,0,0,0,0,1");
+    CHECK_FALSE(created.config->set("filament_exclude_from_wipe_tower", "0,0,0,0,0,0").success);
+    const auto settings = created.config->settings();
+    const auto flag = std::find_if(settings.begin(), settings.end(), [](const auto& item) {
+        return item.key == "filament_exclude_from_wipe_tower";
+    });
+    REQUIRE(flag != settings.end());
+    CHECK(flag->visible);
+    CHECK_FALSE(flag->enabled);
+    REQUIRE(created.config->apply_patch({
+        {"filament_colour", "#E02222;#F6F6F3;#3F3F3F;#A0A0A0;#A0A0A0;#FF0080"},
+        {"enable_prime_tower", "1"}, {"wipe_tower_type", tower_type},
+        {"wipe_tower_wall_type", "rectangle"},
+        {"generate_reinforced_perimeters", "1"}, {"outer_reinforced_perimeters_counts", "1"},
+        {"reinforced_perimeters_filament", "6"},
+        {"top_shell_layers", std::to_string(shell_layers)}, {"bottom_shell_layers", std::to_string(shell_layers)},
+        {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
+        {"fiber_layer_height_ratio", "1"}, {"fiber_minimum_path_length", "2"}
+    }).success);
+    if (machine_hooks)
+        REQUIRE(created.config->apply_patch({
+            {"flush_into_infill", "1"}, {"timelapse_type", "0"},
+            {"time_lapse_gcode", ";TEST_FIBER_TIMELAPSE {layer_num}"},
+            {"enable_wrapping_detection", "1"},
+            {"wrapping_detection_gcode", ";TEST_FIBER_WRAPPING {layer_num}"}
+        }).success);
+    libslicer::SliceRequest request;
+    for (unsigned i = 0; i < ordinary_materials; ++i) {
+        libslicer::SliceObjectInput object;
+        object.name = "tower-exclusion-coupon-" + std::to_string(i);
+        libslicer::SliceVolumeInput volume;
+        const float x = 100.f + 75.f * i;
+        volume.vertices = {{x,100,0},{x+60,100,0},{x+60,140,0},{x,140,0},
+                           {x,100,2},{x+60,100,2},{x+60,140,2},{x,140,2}};
+        volume.triangles = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                            {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+        volume.default_filament_slot = int(i + 1);
+        object.volumes.push_back(std::move(volume));
+        request.objects.push_back(std::move(object));
+    }
+    request.config = created.config->snapshot();
+    const auto output = std::filesystem::temp_directory_path() /
+        ("libslicer-wipe-exclusion-" + tower_type + "-" + std::to_string(ordinary_materials) + "-" + std::to_string(shell_layers) + ".gcode");
+    std::filesystem::remove(output);
+    request.output_gcode_path = output.string();
+    const auto result = library->slice(request);
+    std::string diagnostics;
+    for (const auto& d : result.diagnostics) diagnostics += d.code + ": " + d.message + "\n";
+    INFO(diagnostics);
+    REQUIRE(result.success);
+    REQUIRE(result.preview);
+    size_t tower_segments = 0, fiber_segments = 0;
+    std::set<unsigned> model_tools;
+    for (const auto& s : result.preview->segments) {
+        if (s.extrusion_role == libslicer::ToolpathExtrusionRole::WipeTower &&
+            s.motion == libslicer::ToolpathMotionKind::Extrusion) {
+            ++tower_segments;
+            CHECK(s.tool_id < ordinary_materials);
+            CHECK(s.filament_id < ordinary_materials);
+        }
+        if (s.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPowered ||
+            s.deposition == libslicer::ToolpathDepositionKind::ContinuousFiberPassive) {
+            ++fiber_segments;
+            CHECK(s.tool_id == 5);
+        }
+        if (s.motion == libslicer::ToolpathMotionKind::Extrusion &&
+            s.extrusion_role != libslicer::ToolpathExtrusionRole::WipeTower)
+            model_tools.insert(s.tool_id);
+    }
+    CHECK(tower_segments > 0);
+    CHECK(fiber_segments > 0);
+    CHECK(model_tools.count(0) == 1);
+    CHECK(model_tools.count(5) == 1);
+    if (ordinary_materials == 2) CHECK(model_tools.count(1) == 1);
+    std::ifstream generated(output);
+    const std::string gcode((std::istreambuf_iterator<char>(generated)), {});
+    CHECK(gcode.find(";FIBER_CUT\nM400\nS0\nM400\n") != std::string::npos);
+    CHECK(gcode.find("filament_exclude_from_wipe_tower = 0,0,0,0,0,1") != std::string::npos);
+    if (machine_hooks) {
+        const auto tower_start = gcode.find("; WIPE_TOWER_START");
+        REQUIRE(tower_start != std::string::npos);
+        CHECK(gcode.find(";TEST_FIBER_TIMELAPSE 0\n") < tower_start);
+        CHECK(gcode.find(";TEST_FIBER_WRAPPING 0\n") < tower_start);
+    }
+    int previous_tool = -1, physical_changes = 0;
+    std::istringstream commands(gcode);
+    std::string line;
+    const std::regex tool_command("T([0-9]+)");
+    std::smatch match;
+    while (std::getline(commands, line))
+        if (std::regex_match(line, match, tool_command)) {
+            const int tool = std::stoi(match[1].str());
+            if (previous_tool >= 0 && previous_tool != tool) ++physical_changes;
+            previous_tool = tool;
+        }
+    REQUIRE(std::regex_search(gcode, match, std::regex("; total filament change = ([0-9]+)")));
+    CHECK(std::stoi(match[1].str()) == physical_changes);
+    if (tower_type == "type2" && ordinary_materials == 1 && shell_layers == 1) {
+        // Trusting kernel-generated tower motion must not relax user-script checks.
+        REQUIRE(created.config->set("change_filament_gcode", "UNVERIFIED_FIBER_MACRO").success);
+        request.config = created.config->snapshot();
+        request.output_gcode_path = (std::filesystem::temp_directory_path()/"libslicer-wipe-exclusion-unsafe.gcode").string();
+        std::filesystem::remove(request.output_gcode_path);
+        const auto unsafe = library->slice(request);
+        CHECK_FALSE(unsafe.success);
+        CHECK(std::any_of(unsafe.diagnostics.begin(), unsafe.diagnostics.end(), [](const auto& d) {
+            return d.message.find("Unsupported P3") != std::string::npos;
+        }));
+        CHECK_FALSE(std::filesystem::exists(request.output_gcode_path));
+    }
+}
+
+TEST_CASE("ordinary wipe tower uses the legacy path with absent or false exclusion",
+          "[libslicer_api][wipe-tower-exclusion][legacy]")
+{
+    const std::string tower_type = GENERATE(std::string("type1"), std::string("type2"));
+    const bool tower_enabled = GENERATE(false, true);
+    const bool machine_hooks = GENERATE(false, true);
+    CAPTURE(tower_type, tower_enabled, machine_hooks);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3"; selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "0.20mm Standard @P3";
+    selection.filament_preset_ids.assign(6, "Generic PLA @P3");
+    auto created = library->create_config(selection);
+    REQUIRE(created.success);
+    CHECK(created.config->snapshot().value("filament_exclude_from_wipe_tower") == "0,0,0,0,0,0");
+    REQUIRE(created.config->apply_patch({{"enable_prime_tower", tower_enabled ? "1" : "0"},
+        {"wipe_tower_type", tower_type},
+        // Object comment IDs can be unset when object cancellation is disabled.
+        // Keep this fixture deterministic without masking output bytes.
+        {"gcode_label_objects", "0"},
+        {"filament_colour", "#E02222;#F6F6F3;#3F3F3F;#A0A0A0;#A0A0A0;#A0A0A0"}}).success);
+    if (machine_hooks)
+        REQUIRE(created.config->apply_patch({
+            {"timelapse_type", "0"}, {"time_lapse_gcode", ";TEST_LEGACY_TIMELAPSE {layer_num}"},
+            {"enable_wrapping_detection", "1"},
+            {"wrapping_detection_gcode", ";TEST_LEGACY_WRAPPING {layer_num}"}
+        }).success);
+    libslicer::SliceRequest request;
+    for (unsigned i = 0; i < 2; ++i) {
+        libslicer::SliceObjectInput object;
+        object.name = "legacy-two-color-" + std::to_string(i);
+        libslicer::SliceVolumeInput v;
+        const float x = 100.f + 25.f * i;
+        v.vertices = {{x,100,0},{x+20,100,0},{x+20,120,0},{x,120,0},
+                      {x,100,1},{x+20,100,1},{x+20,120,1},{x,120,1}};
+        v.triangles = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                       {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+        v.default_filament_slot = int(i + 1); object.volumes.push_back(std::move(v));
+        request.objects.push_back(std::move(object));
+    }
+    request.output_gcode_path = (std::filesystem::temp_directory_path()/"libslicer-legacy-exclusion.gcode").string();
+    auto run = [&] {
+        request.config = created.config->snapshot();
+        const auto result = library->slice(request);
+        std::string diagnostics;
+        for (const auto& d : result.diagnostics) diagnostics += d.message + "\n";
+        INFO(diagnostics);
+        REQUIRE(result.success);
+        std::ifstream input(request.output_gcode_path);
+        std::string text((std::istreambuf_iterator<char>(input)), {});
+        CHECK(text.find("filament_exclude_from_wipe_tower") == std::string::npos);
+        // Only the existing timestamp is volatile; retain every other byte.
+        return std::regex_replace(text, std::regex("on [0-9]{4}-[0-9]{2}-[0-9]{2} at [0-9:]+"), "on TIMESTAMP");
+    };
+    const auto inherited = run();
+    REQUIRE(created.config->set("filament_exclude_from_wipe_tower", "0,0,0,0,0,0").success);
+    CHECK(run() == inherited);
+}
+
+
+TEST_CASE("wipe tower exclusion handles unused and unavailable participants", "[libslicer_api][wipe-tower-exclusion][boundary]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR; options.vendors = {"P3"};
+    auto library = libslicer::Library::open(options); REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3"; selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "0.20mm Standard @P3";
+    selection.filament_preset_ids.assign(6, "Generic PLA @P3");
+    selection.filament_preset_ids[5] = "CFSYS CCF";
+    auto created = library->create_config(selection); REQUIRE(created.success);
+    REQUIRE(created.config->apply_patch({{"enable_prime_tower", "1"},
+        {"filament_colour", "#E02222;#F6F6F3;#3F3F3F;#A0A0A0;#A0A0A0;#FF0080"}}).success);
+    libslicer::SliceObjectInput object;
+    object.name = "unused-fiber-slot";
+    libslicer::SliceVolumeInput v;
+    v.vertices = {{100,100,0},{120,100,0},{120,120,0},{100,120,0},
+                  {100,100,1},{120,100,1},{120,120,1},{100,120,1}};
+    v.triangles = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                   {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+    object.volumes = {v};
+    libslicer::SliceRequest request;
+    request.objects = {object}; request.config = created.config->snapshot();
+    request.output_gcode_path = (std::filesystem::temp_directory_path()/"libslicer-unused-fiber.gcode").string();
+    const auto unused = library->slice(request);
+    std::string diagnostics;
+    for (const auto& d : unused.diagnostics) diagnostics += d.message + "\n";
+    INFO(diagnostics);
+    REQUIRE(unused.success); REQUIRE(unused.preview);
+    for (const auto& segment : unused.preview->segments) {
+        CHECK(segment.extrusion_role != libslicer::ToolpathExtrusionRole::WipeTower);
+        if (segment.motion == libslicer::ToolpathMotionKind::Extrusion) CHECK(segment.tool_id == 0);
+    }
+    REQUIRE(created.config->set("wipe_tower_filament", "6").success);
+    request.config = created.config->snapshot();
+    const auto invalid_tower = library->slice(request);
+    CHECK_FALSE(invalid_tower.success);
+    CHECK(std::any_of(invalid_tower.diagnostics.begin(), invalid_tower.diagnostics.end(), [](const auto& d) {
+        return d.message.find("excluded from the wipe tower") != std::string::npos;
+    }));
+    REQUIRE(created.config->set("wipe_tower_filament", "0").success);
+    REQUIRE(created.config->set("filament_exclude_from_wipe_tower", "1,1,1,1,1,1").success);
+    request.config = created.config->snapshot();
+    const auto none = library->slice(request);
+    CHECK_FALSE(none.success);
+    CHECK(std::any_of(none.diagnostics.begin(), none.diagnostics.end(), [](const auto& d) {
+        return d.message.find("no participating material") != std::string::npos;
+    }));
+}

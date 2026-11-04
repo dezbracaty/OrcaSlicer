@@ -387,6 +387,7 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             || opt_key == "wipe_tower_rib_width"
             || opt_key == "wipe_tower_fillet_wall"
             || opt_key == "wipe_tower_filament"
+            || opt_key == "filament_exclude_from_wipe_tower"
             || opt_key == "wiping_volumes_extruders"
             || opt_key == "enable_filament_ramming"
             || opt_key == "tool_change_on_wipe_tower"
@@ -564,6 +565,9 @@ std::vector<unsigned int> Print::extruders(bool conside_custom_gcode) const
     }
 
     // If a wipe tower filament is explicitly set, ensure it participates in tool ordering.
+    if (has_wipe_tower() && config().wipe_tower_filament.value > 0 &&
+        filament_excluded_from_wipe_tower(config(), unsigned(config().wipe_tower_filament.value - 1)))
+        throw std::runtime_error("The selected wipe tower material is excluded from the wipe tower");
     if (has_wipe_tower() && config().wipe_tower_filament != 0 && extruders.size() > 1) {
         assert(config().wipe_tower_filament > 0 && config().wipe_tower_filament < int(config().nozzle_diameter.size()));
         extruders.emplace_back(config().wipe_tower_filament - 1); // config value is 1-based
@@ -2782,7 +2786,9 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         using Clock                 = std::chrono::high_resolution_clock;
         auto            startTime   = Clock::now();
         std::optional<const FakeWipeTower *> wipe_tower_opt = {};
-        if (this->has_wipe_tower()) {
+        const auto& exclusions = m_config.filament_exclude_from_wipe_tower.values;
+        const bool exclusion_configured = std::any_of(exclusions.begin(), exclusions.end(), [](auto v) { return v != 0; });
+        if (this->has_wipe_tower() && (!exclusion_configured || !m_wipe_tower_data.tool_changes.empty())) {
             m_fake_wipe_tower.set_pos({m_config.wipe_tower_x.get_at(m_plate_index), m_config.wipe_tower_y.get_at(m_plate_index)});
             wipe_tower_opt = std::make_optional<const FakeWipeTower *>(&m_fake_wipe_tower);
         }
@@ -4233,11 +4239,22 @@ void Print::_make_wipe_tower()
         // Don't generate any wipe tower.
         return;
 
+    const bool exclude_materials = m_wipe_tower_data.tool_ordering.has_wipe_tower_exclusions();
+    std::vector<unsigned> tower_filaments;
+    if (exclude_materials)
+        for (unsigned f : m_wipe_tower_data.tool_ordering.all_extruders())
+            if (!filament_excluded_from_wipe_tower(m_config, f)) {
+                if (is_fiber_filament(m_config, f))
+                    throw std::runtime_error("Continuous fiber cannot participate in wipe tower extrusion");
+                tower_filaments.push_back(f);
+            }
+
     // Check actual participating layers, not merely enable_prime_tower.
     for (const auto& layer : m_wipe_tower_data.tool_ordering.layer_tools())
         if (layer.has_wipe_tower)
             for (unsigned filament : layer.extruders)
-                if (is_fiber_filament(m_config, filament))
+                if (is_fiber_filament(m_config, filament) &&
+                    (!exclude_materials || !filament_excluded_from_wipe_tower(m_config, filament)))
                     throw std::runtime_error("Continuous fiber cannot participate in wipe tower extrusion");
 
     // Check whether there are any layers in m_tool_ordering, which are marked with has_wipe_tower,
@@ -4277,10 +4294,57 @@ void Print::_make_wipe_tower()
     }
     this->throw_if_canceled();
 
+    auto plan_excluded_layers = [&](auto&& plan) {
+        unsigned previous = unsigned(-1);
+        bool first_action = true;
+        const auto filament_maps = get_filament_maps();
+        // A fiber visit does not change the material loaded in an ordinary nozzle.
+        std::vector<unsigned> nozzle_filaments(m_config.nozzle_diameter.size(), unsigned(-1));
+        for (auto& layer : m_wipe_tower_data.tool_ordering.layer_tools()) {
+            for (unsigned f : layer.extruders) {
+                if (layer.has_wipe_tower && std::find(layer.wipe_tower_extruders.begin(), layer.wipe_tower_extruders.end(), f) != layer.wipe_tower_extruders.end()) {
+                    const bool prime_only = previous == unsigned(-1) || previous == f ||
+                        filament_excluded_from_wipe_tower(m_config, previous);
+                    float volume = previous == f && !first_action ? 0.f : float(m_config.prime_volume.value);
+                    float purge_volume = 0.f;
+                    const size_t nozzle = size_t(filament_maps[f] - 1);
+                    const unsigned loaded = nozzle_filaments[nozzle];
+                    if (loaded != unsigned(-1) && loaded != f) {
+                        if (!is_wipe_tower_type2) {
+                            const auto matrix = get_flush_volumes_matrix(m_config.flush_volumes_matrix.values,
+                                nozzle, m_config.nozzle_diameter.size());
+                            purge_volume = float(matrix.at(loaded * number_of_extruders + f));
+                            purge_volume *= m_config.flush_multiplier.get_at(nozzle);
+                            purge_volume = layer.wiping_extrusions().mark_wiping_extrusions(*this, loaded, f, purge_volume);
+                            const float grab_purge_volume = m_config.grab_length.get_at(nozzle) * 2.4;
+                            purge_volume = std::max(0.f, purge_volume - grab_purge_volume);
+                        } else if (m_config.purge_in_prime_tower && m_config.single_extruder_multi_material) {
+                            // Same minimum-tower-volume and model allocation as the native Type2 planner.
+                            volume = float(m_config.flush_volumes_matrix.values.at(loaded * number_of_extruders + f));
+                            volume *= m_config.flush_multiplier.get_at(0);
+                            volume -= float(m_config.filament_minimal_purge_on_wipe_tower.get_at(f));
+                            volume = layer.wiping_extrusions().mark_wiping_extrusions(*this, loaded, f, volume);
+                            volume += float(m_config.filament_minimal_purge_on_wipe_tower.get_at(f));
+                        }
+                    }
+                    plan(float(layer.print_z), float(layer.wipe_tower_layer_height),
+                         prime_only ? f : previous, f, volume, purge_volume, prime_only);
+                    nozzle_filaments[nozzle] = f;
+                    first_action = false;
+                }
+                previous = f;
+            }
+            if (layer.has_wipe_tower)
+                layer.wiping_extrusions().ensure_perimeters_infills_order(*this);
+        }
+    };
+
     if (!is_wipe_tower_type2) {
         // in BBL machine, wipe tower is only use to prime extruder. So just use a global wipe volume.
-        WipeTower wipe_tower(m_config, m_plate_index, m_origin, m_wipe_tower_data.tool_ordering.first_extruder(),
-                             m_wipe_tower_data.tool_ordering.empty() ? 0.f : m_wipe_tower_data.tool_ordering.back().print_z, m_wipe_tower_data.tool_ordering.all_extruders());
+        WipeTower wipe_tower(m_config, m_plate_index, m_origin,
+                             exclude_materials ? tower_filaments.front() : m_wipe_tower_data.tool_ordering.first_extruder(),
+                             m_wipe_tower_data.tool_ordering.empty() ? 0.f : m_wipe_tower_data.tool_ordering.back().print_z,
+                             exclude_materials ? tower_filaments : m_wipe_tower_data.tool_ordering.all_extruders());
         wipe_tower.set_has_tpu_filament(this->has_tpu_filament());
         wipe_tower.set_filament_map(this->get_filament_maps());
         // Set the extruder & material properties at the wipe tower object.
@@ -4295,7 +4359,13 @@ void Print::_make_wipe_tower()
 
         // Lets go through the wipe tower layers and determine pairs of extruder changes for each
         // to pass to wipe_tower (so that it can use it for planning the layout of the tower)
-        {
+        if (exclude_materials) {
+            m_wipe_tower_data.priming = Slic3r::make_unique<std::vector<WipeTower::ToolChangeResult>>();
+            used_filament_ids.insert(tower_filaments.begin(), tower_filaments.end());
+            plan_excluded_layers([&](float z, float h, unsigned old, unsigned next, float v, float purge, bool prime) {
+                wipe_tower.plan_toolchange(z, h, old, next, v, purge, prime);
+            });
+        } else {
         // Get wiping matrix to get number of extruders and convert vector<double> to vector<float>:
         bool               is_mutli_extruder = m_config.nozzle_diameter.values.size() > 1;
         size_t nozzle_nums = m_config.nozzle_diameter.values.size();
@@ -4394,7 +4464,9 @@ void Print::_make_wipe_tower()
             assert(m_wipe_tower_data.tool_ordering.back().wipe_tower_partitions == 0);
             wipe_tower.set_layer(float(m_wipe_tower_data.tool_ordering.back().print_z), float(layer_height), 0, false, true);
         }
-        m_wipe_tower_data.final_purge = Slic3r::make_unique<WipeTower::ToolChangeResult>(wipe_tower.tool_change((unsigned int) (-1)));
+        m_wipe_tower_data.final_purge = Slic3r::make_unique<WipeTower::ToolChangeResult>(
+            exclude_materials && filament_excluded_from_wipe_tower(m_config, m_wipe_tower_data.tool_ordering.last_extruder())
+                ? WipeTower::ToolChangeResult{} : wipe_tower.tool_change((unsigned int) (-1)));
 
         m_wipe_tower_data.used_filament         = wipe_tower.get_used_filament();
         m_wipe_tower_data.number_of_toolchanges = wipe_tower.get_number_of_toolchanges();
@@ -4406,6 +4478,17 @@ void Print::_make_wipe_tower()
                                                   m_wipe_tower_data.depth,
                                                   m_wipe_tower_data.brim_width, {scale_(origin.x()), scale_(origin.y())});
         m_fake_wipe_tower.outer_wall = wipe_tower.get_outer_wall();
+        if (exclude_materials && m_fake_wipe_tower.outer_wall.empty()) {
+            // Prime-only Type1 layers can have no separate outer-wall record.
+            // Its collision fallback uses the Type2 representation: initialize
+            // all of that representation from the native plan, including the
+            // rotation and a zero cone angle for this rectangular tower.
+            m_wipe_tower_data.z_and_depth_pairs = wipe_tower.get_z_and_depth_pairs();
+            m_fake_wipe_tower.set_fake_extrusion_data(wipe_tower.position() + m_fake_wipe_tower.rib_offset,
+                wipe_tower.width(), wipe_tower.get_height(), wipe_tower.get_layer_height(),
+                m_wipe_tower_data.depth, m_wipe_tower_data.z_and_depth_pairs, m_wipe_tower_data.brim_width,
+                config().wipe_tower_rotation_angle.value, 0.f, {origin.x(), origin.y()});
+        }
     } else {
         // Get wiping matrix to get number of extruders and convert vector<double> to vector<float>:
         std::vector<float> flush_matrix(cast<float>(m_config.flush_volumes_matrix.values));
@@ -4426,7 +4509,7 @@ void Print::_make_wipe_tower()
         }
         // Initialize the wipe tower.
         WipeTower2 wipe_tower(m_config, m_default_region_config, m_plate_index, m_origin, wipe_volumes,
-                              m_wipe_tower_data.tool_ordering.first_extruder());
+                              exclude_materials ? tower_filaments.front() : m_wipe_tower_data.tool_ordering.first_extruder());
 
         // wipe_tower.set_retract();
         // wipe_tower.set_zhop();
@@ -4436,11 +4519,16 @@ void Print::_make_wipe_tower()
             wipe_tower.set_extruder(i, m_config);
 
         m_wipe_tower_data.priming = Slic3r::make_unique<std::vector<WipeTower::ToolChangeResult>>(
-            wipe_tower.prime((float)this->skirt_first_layer_height(), m_wipe_tower_data.tool_ordering.all_extruders(), false));
+            exclude_materials ? std::vector<WipeTower::ToolChangeResult>{} :
+                wipe_tower.prime((float)this->skirt_first_layer_height(), m_wipe_tower_data.tool_ordering.all_extruders(), false));
 
         // Lets go through the wipe tower layers and determine pairs of extruder changes for each
         // to pass to wipe_tower (so that it can use it for planning the layout of the tower)
-        {
+        if (exclude_materials) {
+            plan_excluded_layers([&](float z, float h, unsigned old, unsigned next, float v, float, bool prime) {
+                wipe_tower.plan_toolchange(z, h, old, next, v, prime);
+            });
+        } else {
             unsigned int current_extruder_id = m_wipe_tower_data.tool_ordering.all_extruders().back();
             for (auto &layer_tools : m_wipe_tower_data.tool_ordering.layer_tools()) { // for all layers
                 if (!layer_tools.has_wipe_tower)
@@ -4505,7 +4593,9 @@ void Print::_make_wipe_tower()
             assert(m_wipe_tower_data.tool_ordering.back().wipe_tower_partitions == 0);
             wipe_tower.set_layer(float(m_wipe_tower_data.tool_ordering.back().print_z), float(layer_height), 0, false, true);
         }
-        m_wipe_tower_data.final_purge = Slic3r::make_unique<WipeTower::ToolChangeResult>(wipe_tower.tool_change((unsigned int) (-1)));
+        m_wipe_tower_data.final_purge = Slic3r::make_unique<WipeTower::ToolChangeResult>(
+            exclude_materials && filament_excluded_from_wipe_tower(m_config, m_wipe_tower_data.tool_ordering.last_extruder())
+                ? WipeTower::ToolChangeResult{} : wipe_tower.tool_change((unsigned int) (-1)));
 
         m_wipe_tower_data.used_filament         = wipe_tower.get_used_filament();
         m_wipe_tower_data.number_of_toolchanges = wipe_tower.get_number_of_toolchanges();
@@ -4520,6 +4610,15 @@ void Print::_make_wipe_tower()
                                                   m_wipe_tower_data.z_and_depth_pairs, m_wipe_tower_data.brim_width,
                                                   config().wipe_tower_rotation_angle, config().wipe_tower_cone_angle,
                                                   {scale_(origin.x()), scale_(origin.y())});
+    }
+    if (exclude_materials) {
+        unsigned previous = m_wipe_tower_data.tool_ordering.first_extruder();
+        m_wipe_tower_data.number_of_toolchanges = 0;
+        for (const auto& layer : m_wipe_tower_data.tool_ordering)
+            for (unsigned f : layer.extruders) {
+                if (f != previous) ++m_wipe_tower_data.number_of_toolchanges;
+                previous = f;
+            }
     }
 }
 

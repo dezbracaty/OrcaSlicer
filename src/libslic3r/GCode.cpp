@@ -795,8 +795,9 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
             }
         }
 
-        //BBS: increase toolchange count
-        gcodegen.m_toolchange_count++;
+        // Prime-only actions already changed the real tool through set_extruder.
+        if (!tcr.prime_only)
+            gcodegen.m_toolchange_count++;
 
         std::string toolchange_gcode_str;
 
@@ -1083,7 +1084,8 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         config.set_key_value("filament_end_gcode", new ConfigOptionString(end_filament_gcode_str));
         config.set_key_value("change_filament_gcode", new ConfigOptionString(toolchange_gcode_str));
         config.set_key_value("filament_start_gcode", new ConfigOptionString(start_filament_gcode_str));
-        std::string tcr_gcode, tcr_escaped_gcode = gcodegen.placeholder_parser_process("tcr_rotated_gcode", tcr_rotated_gcode, new_filament_id, &config);
+        std::string tcr_gcode, tcr_escaped_gcode = gcodegen.placeholder_parser_process("tcr_rotated_gcode", tcr_rotated_gcode, new_filament_id, &config,
+            gcodegen.m_curr_print->get_tool_ordering().has_wipe_tower_exclusions());
         unescape_string_cstyle(tcr_escaped_gcode, tcr_gcode);
         gcode += tcr_gcode;
         check_add_eol(toolchange_gcode_str);
@@ -1364,7 +1366,8 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         config.set_key_value("toolchange_z", new ConfigOptionFloat(z));
 
         std::string tcr_gcode,
-            tcr_escaped_gcode = gcodegen.placeholder_parser_process("tcr_rotated_gcode", tcr_rotated_gcode, new_extruder_id, &config);
+            tcr_escaped_gcode = gcodegen.placeholder_parser_process("tcr_rotated_gcode", tcr_rotated_gcode, new_extruder_id, &config,
+                gcodegen.m_curr_print->get_tool_ordering().has_wipe_tower_exclusions());
         unescape_string_cstyle(tcr_escaped_gcode, tcr_gcode);
         gcode += tcr_gcode;
         check_add_eol(toolchange_gcode_str);
@@ -1589,10 +1592,45 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         return true;
     }
 
+    std::string WipeTowerIntegration::tool_change_with_exclusions(GCode& gcodegen, unsigned filament, double print_z)
+    {
+        if (filament_excluded_from_wipe_tower(gcodegen.config(), filament))
+            return gcodegen.set_extruder(filament, print_z);
+        if (m_layer_idx < 0 || size_t(m_layer_idx) >= m_tool_changes.size() ||
+            size_t(m_tool_change_idx) >= m_tool_changes[m_layer_idx].size())
+            throw Slic3r::RuntimeError("Missing wipe tower action for participating material");
+        std::string gcode;
+        // Type1 may prepend a separate outer wall for timelapse/wrapping.
+        // Consume that native structure record before the material's priming
+        // action, as the legacy integration does, without counting a fake change.
+        if (gcodegen.wipe_tower_type() == WipeTowerType::Type1 && m_tool_change_idx == 0 &&
+            !m_tool_changes[m_layer_idx].front().is_tool_change) {
+            auto wall = m_tool_changes[m_layer_idx][m_tool_change_idx++];
+            wall.prime_only = true;
+            gcode += gcodegen.set_extruder(unsigned(wall.new_tool), wall.print_z);
+            gcode += append_tcr(gcodegen, wall, wall.new_tool);
+            if (size_t(m_tool_change_idx) >= m_tool_changes[m_layer_idx].size())
+                throw Slic3r::RuntimeError("Missing wipe tower priming action after its outer wall");
+        }
+        const auto& tcr = m_tool_changes[m_layer_idx][m_tool_change_idx++];
+        if (tcr.new_tool != int(filament))
+            throw Slic3r::RuntimeError("Wipe tower action does not match the model tool order");
+        if (tcr.prime_only)
+            gcode += gcodegen.set_extruder(filament, tcr.print_z);
+        gcode += gcodegen.wipe_tower_type() == WipeTowerType::Type2
+            ? append_tcr2(gcodegen, tcr, int(filament))
+            : append_tcr(gcodegen, tcr, int(filament));
+        m_last_wipe_tower_print_z = tcr.print_z;
+        return gcode;
+    }
+
     // Print is finished. Now it remains to unload the filament safely with ramming over the wipe tower.
     std::string WipeTowerIntegration::finalize(GCode &gcodegen)
     {
         std::string gcode;
+        if (gcodegen.writer().filament() &&
+            filament_excluded_from_wipe_tower(gcodegen.config(), gcodegen.writer().filament()->id()))
+            return gcode;
         if (gcodegen.wipe_tower_type() == WipeTowerType::Type2) {
             if (std::abs(gcodegen.writer().get_position().z() - m_final_purge.print_z) > EPSILON)
                 gcode += gcodegen.change_layer(m_final_purge.print_z);
@@ -2888,6 +2926,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
             throw Slic3r::SlicingError(_(L("No object can be printed. Maybe too small")));
         has_wipe_tower = print.has_wipe_tower() && tool_ordering.has_wipe_tower();
         // Orca: support all extruder priming
+        if (tool_ordering.has_wipe_tower_exclusions())
+            initial_extruder_id = tool_ordering.first_extruder();
+        else
         initial_extruder_id = (wipe_tower_type == WipeTowerType::Type2 && has_wipe_tower && !print.config().single_extruder_multi_material_priming) ?
             // The priming towers will be skipped.
             tool_ordering.all_extruders().back() :
@@ -3980,11 +4021,20 @@ void GCode::process_layers(
     	tbb::parallel_pipeline(12, generator & cooling & fan_mover & pa_processor_filter & output);
 }
 
-std::string GCode::placeholder_parser_process(const std::string &name, const std::string &templ, unsigned int current_filament_id, const DynamicConfig *config_override)
+std::string GCode::placeholder_parser_process(const std::string &name, const std::string &templ, unsigned int current_filament_id, const DynamicConfig *config_override, bool native_wipe_tower)
 {
+    // Native tower motion is generated by the kernel, not a machine script.
+    // Each embedded user script is still checked through its own parser call.
+    const unsigned native_owner = current_filament_id == unsigned(-1) && m_writer.filament()
+        ? m_writer.filament()->id() : current_filament_id;
+    if (native_wipe_tower && (name != "tcr_rotated_gcode" || !m_curr_print ||
+        !m_curr_print->get_tool_ordering().has_wipe_tower_exclusions() ||
+        native_owner >= m_config.filament_diameter.size() ||
+        filament_excluded_from_wipe_tower(m_config, native_owner) || is_fiber_filament(m_config, native_owner)))
+        throw Slic3r::RuntimeError("Invalid native wipe tower material");
     const bool synchronized_cfsys_hook = name == "before_layer_change_gcode" &&
         fiber_machine_protocol(m_config) == FiberMachineProtocol::Cfsys;
-    if (m_has_fiber_execution || synchronized_cfsys_hook)
+    if (!native_wipe_tower && (m_has_fiber_execution || synchronized_cfsys_hook))
         require_fiber_safe_script(templ, name.c_str(), fiber_machine_protocol(m_config));
     // Orca: Added CMake config option since debug is rarely used in current workflow.
     // Also changed from throwing error immediately to storing messages till slicing is completed
@@ -4026,7 +4076,7 @@ PlaceholderParserIntegration &ppi = m_placeholder_parser_integration;
     try {
         ppi.update_from_gcodewriter(m_writer);
         std::string output = ppi.parser.process(templ, current_filament_id, config_override, &ppi.output_config, &ppi.context);
-        if (m_has_fiber_execution || synchronized_cfsys_hook)
+        if (!native_wipe_tower && (m_has_fiber_execution || synchronized_cfsys_hook))
             require_fiber_safe_script(output, name.c_str(), fiber_machine_protocol(m_config), true);
         ppi.validate_output_vector_variables();
 
@@ -5456,7 +5506,8 @@ LayerResult GCode::process_layer(
     m_skirt_group_done.resize(print.skirt_brim_groups().size());
     for (unsigned int extruder_id : layer_tools.extruders)
     {
-        if (print.config().skirt_type == stCombined && !print.skirt_brim_groups().empty()) {
+        if (!print.get_tool_ordering().has_wipe_tower_exclusions() &&
+            print.config().skirt_type == stCombined && !print.skirt_brim_groups().empty()) {
             for (size_t group_idx = 0; group_idx < print.skirt_brim_groups().size(); ++group_idx) {
                 const Print::SkirtBrimGroup& group = print.skirt_brim_groups()[group_idx];
                 if (group.skirt.empty())
@@ -5476,7 +5527,11 @@ LayerResult GCode::process_layer(
 
         std::string gcode_toolchange;
         if (has_wipe_tower) {
-            if (!m_wipe_tower->is_empty_wipe_tower_gcode(*this, extruder_id, extruder_id == layer_tools.extruders.back())) {
+            const bool exclusions = print.wipe_tower_data().tool_ordering.has_wipe_tower_exclusions();
+            const bool has_tower_action = exclusions
+                ? !filament_excluded_from_wipe_tower(m_config, extruder_id)
+                : !m_wipe_tower->is_empty_wipe_tower_gcode(*this, extruder_id, extruder_id == layer_tools.extruders.back());
+            if (has_tower_action) {
                 if (need_insert_timelapse_gcode_for_traditional && !has_insert_timelapse_gcode) {
                     bool should_insert = true;
                     if (m_config.nozzle_diameter.values.size() == 2){
@@ -5499,7 +5554,11 @@ LayerResult GCode::process_layer(
                     gcode += insert_wrapping_detection_gcode();
                     has_insert_wrapping_detection_gcode = true;
                 }
-                gcode_toolchange = m_wipe_tower->tool_change(*this, extruder_id, extruder_id == layer_tools.extruders.back());
+                gcode_toolchange = exclusions
+                    ? m_wipe_tower->tool_change_with_exclusions(*this, extruder_id, print_z)
+                    : m_wipe_tower->tool_change(*this, extruder_id, extruder_id == layer_tools.extruders.back());
+            } else if (exclusions) {
+                gcode_toolchange = m_wipe_tower->tool_change_with_exclusions(*this, extruder_id, print_z);
             }
         } else {
             if (need_insert_timelapse_gcode_for_traditional &&
@@ -5531,6 +5590,19 @@ LayerResult GCode::process_layer(
         
         gcode += std::move(gcode_toolchange);
 
+        // An excluded fiber tool may still be selected from the preceding
+        // layer. Ordinary auxiliary extrusion must follow the real toolchange.
+        if (print.get_tool_ordering().has_wipe_tower_exclusions() &&
+            !is_fiber_filament(print.config(), extruder_id) &&
+            print.config().skirt_type == stCombined) {
+            for (size_t group_idx = 0; group_idx < print.skirt_brim_groups().size(); ++group_idx) {
+                const auto& group = print.skirt_brim_groups()[group_idx];
+                if (!group.skirt.empty())
+                    gcode += generate_skirt(print, group.skirt, Point(0, 0), layer.object()->config().skirt_start_angle,
+                        layer_tools, layer, extruder_id, m_skirt_group_done[group_idx]);
+            }
+        }
+
         // let analyzer tag generator aware of a role type change
         if (layer_tools.has_wipe_tower && m_wipe_tower)
             m_last_processor_extrusion_role = erWipeTower;
@@ -5549,8 +5621,11 @@ LayerResult GCode::process_layer(
                     m_fiber_placement_id=inst.model_instance->id().id;
                 const LayerToPrint &layer_to_print = layers[instance_to_print.layer_id];
                 if (print_wipe_extrusions == (is_anything_overridden ? 1 : 0)) {
-                    gcode += generate_object_skirt_group(print, instance_to_print.print_object, layer_tools, layer, extruder_id);
-                    gcode += generate_object_brim(print, instance_to_print.print_object, first_layer);
+                    if (!print.get_tool_ordering().has_wipe_tower_exclusions() ||
+                        !is_fiber_filament(print.config(), extruder_id)) {
+                        gcode += generate_object_skirt_group(print, instance_to_print.print_object, layer_tools, layer, extruder_id);
+                        gcode += generate_object_brim(print, instance_to_print.print_object, first_layer);
+                    }
                 }
 
                 // To control print speed of the 1st object layer printed over raft interface.
@@ -5851,6 +5926,8 @@ void GCode::append_full_config(const Print &print, std::string &str)
     };
     std::ostringstream ss;
     for (const std::string& key : cfg.keys()) {
+        if (is_disabled_wipe_tower_exclusion(key, cfg.option(key)))
+            continue;
         if (!is_banned(key) && !cfg.option(key)->is_nil()) {
             if (key == "wipe_tower_x" || key == "wipe_tower_y") {
                 ss << std::fixed << std::setprecision(3) << "; " << key << " = " << dynamic_cast<const ConfigOptionFloats*>(cfg.option(key))->get_at(print.get_plate_index()) << "\n";

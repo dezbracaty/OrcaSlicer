@@ -18,6 +18,12 @@ namespace Slic3r {
 class Print;
 class PrintObject;
 class LayerTools;
+// A missing material entry participates. Never repeat a different slot's flag.
+inline bool filament_excluded_from_wipe_tower(const GCodeConfig& config, unsigned filament)
+{
+    const auto& values = config.filament_exclude_from_wipe_tower.values;
+    return filament < values.size() && values[filament] != 0;
+}
 namespace CustomGCode { struct Item; }
 class PrintRegion;
 
@@ -151,6 +157,9 @@ public:
     bool						has_support = false;
     // Zero based extruder IDs, ordered to minimize tool switches.
     std::vector<unsigned int> 	extruders;
+    // Populated only for explicit exclusions. Model tools, including fiber,
+    // remain in extruders; these are the tower actions in execution order.
+    std::vector<unsigned int> wipe_tower_extruders;
     // If per layer extruder switches are inserted by the G-code preview slider, this value contains the new (1 based) extruder, with which the whole object layer is being printed with.
     // If not overriden, it is set to 0.
     unsigned int 				extruder_override = 0;
@@ -181,6 +190,7 @@ private:
 class ToolOrdering
 {
 public:
+    bool has_wipe_tower_exclusions() const { return m_wipe_tower_exclusions; }
     enum FilamentChangeMode {
         SingleExt,
         MultiExtBest,
@@ -272,6 +282,7 @@ private:
     std::vector<unsigned int> generate_first_layer_tool_order(const Print& print);
     std::vector<unsigned int> generate_first_layer_tool_order(const PrintObject& object);
 
+    bool m_wipe_tower_exclusions = false;
     std::vector<LayerTools>    m_layer_tools;
     // Zero-based tools actually ranked by the native first-layer rule.
     std::vector<unsigned int> m_applied_first_layer_order;

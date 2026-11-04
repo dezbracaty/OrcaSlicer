@@ -30,6 +30,15 @@
 
 namespace Slic3r {
 
+// The disabled extension is absent on the wire. Keep existing preset, INI,
+// binary configuration and G-code representations unchanged at the default.
+inline bool is_disabled_wipe_tower_exclusion(const std::string& key, const ConfigOption* option)
+{
+    if (key != "filament_exclude_from_wipe_tower") return false;
+    const auto* flags = dynamic_cast<const ConfigOptionBools*>(option);
+    return flags && std::none_of(flags->values.begin(), flags->values.end(), [](auto value) { return value != 0; });
+}
+
 enum GCodeFlavor : unsigned char {
     gcfMarlinLegacy, 
     gcfKlipper, 
@@ -1376,6 +1385,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionStrings,             filament_end_gcode))
     ((ConfigOptionFloatsNullable,      filament_flow_ratio))
     ((ConfigOptionStrings,             filament_process_type))
+    ((ConfigOptionBools,               filament_exclude_from_wipe_tower))
     ((ConfigOptionFloats,              filament_fiber_feed_correction))
     ((ConfigOptionFloats,              toolhead_fiber_e_units_per_mm))
     ((ConfigOptionStrings,             toolhead_fiber_protocol_id))
@@ -2263,9 +2273,12 @@ namespace cereal {
 
     template<class Archive> void save(Archive& archive, const Slic3r::DynamicPrintConfig &config)
     {
-        size_t cnt = config.size();
+        const bool omit_exclusion = Slic3r::is_disabled_wipe_tower_exclusion(
+            "filament_exclude_from_wipe_tower", config.option("filament_exclude_from_wipe_tower"));
+        size_t cnt = config.size() - size_t(omit_exclusion);
         archive(cnt);
         for (auto it = config.cbegin(); it != config.cend(); ++it) {
+            if (omit_exclusion && it->first == "filament_exclude_from_wipe_tower") continue;
             const Slic3r::ConfigOptionDef* optdef = Slic3r::print_config_def.get(it->first);
             assert(optdef != nullptr);
             assert(optdef->serialization_key_ordinal > 0);

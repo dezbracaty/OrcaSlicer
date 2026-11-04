@@ -1,6 +1,10 @@
 #include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
 
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/Layer.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Format/OBJ.hpp"
@@ -31,6 +35,7 @@ struct SliceResult
     bool                      has_wipe_tower_tool_ordering { false };
     int                       total_toolchanges { 0 };
     size_t                    support_layer_count { 0 };
+    size_t                    tower_toolchange_count { 0 };
 };
 
 void setup_test_dirs()
@@ -130,6 +135,9 @@ SliceResult slice_to_gcode(const Model &model, const DynamicPrintConfig &config)
     slice_result.has_wipe_tower_tool_ordering = has_wipe_tower_tool_ordering;
     slice_result.total_toolchanges = print.print_statistics().total_toolchanges;
     slice_result.support_layer_count = support_layer_count;
+    for (const auto& layer : print.wipe_tower_data().tool_changes)
+        for (const auto& action : layer)
+            slice_result.tower_toolchange_count += action.gcode.find("; CP TOOLCHANGE START") != std::string::npos;
     slice_result.content.assign(std::istreambuf_iterator<char>(gcode), std::istreambuf_iterator<char>());
     return slice_result;
 }
@@ -360,4 +368,186 @@ TEST_CASE("changing fiber contour or resin settings preserves slice and walls", 
     CHECK(object->step_state_with_timestamp(posSlice).timestamp == slice_stamp);
     CHECK(object->step_state_with_timestamp(posPerimeters).timestamp == wall_stamp);
     CHECK(object->step_state_with_timestamp(posPrepareInfill).timestamp == preparation_stamp);
+}
+
+TEST_CASE("wipe tower exclusion invalidates and restores cached scheduling", "[slicing][wipe-tower-exclusion][cache]")
+{
+    setup_test_dirs();
+    auto model = load_two_extruder_model();
+    auto config = multi_nozzle_print_config();
+    const auto tower_type = GENERATE(WipeTowerType::Type1, WipeTowerType::Type2);
+    config.set_key_value("wipe_tower_type", new ConfigOptionEnum<WipeTowerType>(tower_type));
+    config.set_key_value("enable_prime_tower", new ConfigOptionBool(true));
+    config.set_key_value("filament_soluble", new ConfigOptionBools({false, false}));
+    config.set_key_value("wipe_tower_wall_type", new ConfigOptionEnum<WipeTowerWallType>(wtwRectangle));
+    Print print;
+    print.set_plate_origin(Vec3d::Zero());
+    CHECK(print.wipe_tower_data().height == 0.f);
+    auto& tower_data = const_cast<WipeTowerData&>(print.wipe_tower_data());
+    tower_data.height = std::numeric_limits<float>::quiet_NaN();
+    tower_data.clear();
+    CHECK(tower_data.height == 0.f);
+    print.apply(model, config);
+    print.process();
+    REQUIRE(print.is_step_done(psWipeTower));
+    REQUIRE_FALSE(print.get_tool_ordering().has_wipe_tower_exclusions());
+    const auto original_actions = print.wipe_tower_data().tool_changes;
+    config.set_key_value("filament_exclude_from_wipe_tower", new ConfigOptionBools({false, true}));
+    print.apply(model, config);
+    CHECK_FALSE(print.is_step_done(psWipeTower));
+    CHECK(print.objects().front()->is_step_done(posSlice));
+    auto& fake = const_cast<FakeWipeTower&>(print.get_fake_wipe_tower());
+    fake.cone_angle = std::numeric_limits<float>::quiet_NaN();
+    fake.rotation_angle = std::numeric_limits<float>::quiet_NaN();
+    fake.z_and_depth_pairs.clear();
+    print.process();
+    REQUIRE(print.get_tool_ordering().has_wipe_tower_exclusions());
+    if (fake.outer_wall.empty()) {
+        CHECK(std::isfinite(fake.cone_angle));
+        CHECK(std::isfinite(fake.rotation_angle));
+        CHECK_FALSE(fake.z_and_depth_pairs.empty());
+    }
+    REQUIRE_FALSE(print.wipe_tower_data().tool_changes.empty());
+    for (const auto& layer : print.wipe_tower_data().tool_changes)
+        for (const auto& action : layer) CHECK(action.new_tool == 0);
+    config.set_key_value("filament_exclude_from_wipe_tower", new ConfigOptionBools({false, false}));
+    print.apply(model, config);
+    CHECK_FALSE(print.is_step_done(psWipeTower));
+    CHECK(print.objects().front()->is_step_done(posSlice));
+    print.process();
+    CHECK_FALSE(print.get_tool_ordering().has_wipe_tower_exclusions());
+    bool second_tool_restored = false;
+    for (const auto& layer : print.wipe_tower_data().tool_changes)
+        for (const auto& action : layer) second_tool_restored |= action.new_tool == 1;
+    CHECK(second_tool_restored);
+    const auto& restored_actions = print.wipe_tower_data().tool_changes;
+    REQUIRE(restored_actions.size() == original_actions.size());
+    for (size_t layer = 0; layer < original_actions.size(); ++layer) {
+        REQUIRE(restored_actions[layer].size() == original_actions[layer].size());
+        for (size_t step = 0; step < original_actions[layer].size(); ++step) {
+            const auto& original = original_actions[layer][step];
+            const auto& restored = restored_actions[layer][step];
+            CHECK_FALSE(restored.prime_only);
+            CHECK(restored.initial_tool == original.initial_tool);
+            CHECK(restored.new_tool == original.new_tool);
+            CHECK(restored.print_z == original.print_z);
+            CHECK(restored.gcode == original.gcode);
+        }
+    }
+}
+
+TEST_CASE("wipe tower exclusion retains native infill and object flushing", "[slicing][wipe-tower-exclusion][flushing]")
+{
+    setup_test_dirs();
+    const auto tower_type = GENERATE(WipeTowerType::Type1, WipeTowerType::Type2);
+    const std::string destination = GENERATE(std::string("flush_into_infill"), std::string("flush_into_objects"));
+    CAPTURE(tower_type, destination);
+    auto model = load_two_extruder_model();
+    auto* excluded = model.add_object(*model.objects.front());
+    excluded->config.set_key_value("extruder", new ConfigOptionInt(3));
+    excluded->instances.front()->set_offset({160.0, 100.0, 0.0});
+    for (auto* object : model.objects) {
+        object->config.set_key_value("flush_into_objects", new ConfigOptionBool(false));
+        object->config.set_key_value("flush_into_infill", new ConfigOptionBool(false));
+    }
+    auto* wiping_object = model.add_object(*model.objects.front());
+    wiping_object->instances.front()->set_offset({200.0, 100.0, 0.0});
+    auto config = multi_nozzle_print_config();
+    config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.4, 0.4}));
+    config.set_key_value("filament_diameter", new ConfigOptionFloats({1.75, 1.75, 1.75}));
+    config.set_key_value("filament_colour", new ConfigOptionStrings({"#FF0000", "#0000FF", "#00FF00"}));
+    config.set_key_value("default_filament_colour", config.option("filament_colour")->clone());
+    config.set_key_value("filament_type", new ConfigOptionStrings({"PLA", "PLA", "PLA"}));
+    config.set_key_value("filament_soluble", new ConfigOptionBools({false, false, false}));
+    config.set_key_value("filament_start_gcode", new ConfigOptionStrings({"", "", ""}));
+    config.set_key_value("filament_end_gcode", new ConfigOptionStrings({"", "", ""}));
+    config.set_key_value("filament_map", new ConfigOptionInts({1, 1, 2}));
+    config.set_key_value("filament_map_mode", new ConfigOptionEnum<FilamentMapMode>(fmmManual));
+    config.set_key_value("single_extruder_multi_material", new ConfigOptionBool(true));
+    config.set_key_value("enable_prime_tower", new ConfigOptionBool(true));
+    config.set_key_value("wipe_tower_type", new ConfigOptionEnum<WipeTowerType>(tower_type));
+    config.set_key_value("wipe_tower_wall_type", new ConfigOptionEnum<WipeTowerWallType>(wtwRectangle));
+    config.set_key_value("filament_exclude_from_wipe_tower", new ConfigOptionBools({false, false, true}));
+    config.set_key_value("brim_type", new ConfigOptionEnum<BrimType>(btNoBrim));
+    config.set_key_value("brim_width", new ConfigOptionFloat(0));
+    config.set_key_value("purge_in_prime_tower", new ConfigOptionBool(true));
+    config.set_key_value("flush_volumes_matrix", new ConfigOptionFloats({0,400,400,400,0,400,400,400,0,
+                                                                        0,400,400,400,0,400,400,400,0}));
+    config.set_key_value("top_shell_layers", new ConfigOptionInt(0));
+    config.set_key_value("bottom_shell_layers", new ConfigOptionInt(0));
+    config.set_key_value("top_shell_thickness", new ConfigOptionFloat(0));
+    config.set_key_value("bottom_shell_thickness", new ConfigOptionFloat(0));
+    config.set_key_value("flush_into_infill", new ConfigOptionBool(false));
+    config.set_key_value("flush_into_objects", new ConfigOptionBool(false));
+    const auto run = [&](bool flushing) {
+        wiping_object->config.set_key_value(destination, new ConfigOptionBool(flushing));
+        Print print;
+        print.set_plate_origin(Vec3d::Zero());
+        print.apply(model, config);
+        print.process();
+        REQUIRE(print.get_filament_maps() == std::vector<int>{1, 1, 2});
+        REQUIRE(print.get_tool_ordering().has_wipe_tower_exclusions());
+        size_t overridden_layers = 0;
+        for (auto& layer : print.wipe_tower_data().tool_ordering.layer_tools()) {
+            overridden_layers += layer.wiping_extrusions().is_anything_overridden();
+            for (const auto* object : print.objects()) {
+                const auto* object_layer = object->get_layer_at_printz(layer.print_z, EPSILON);
+                if (!object_layer) continue;
+                for (const auto* region : object_layer->regions())
+                    for (const auto* collection : {&region->fills, &region->perimeters})
+                        for (const auto* entity : collection->entities) {
+                            const auto* extrusion = dynamic_cast<const ExtrusionEntityCollection*>(entity);
+                            REQUIRE(extrusion != nullptr);
+                            const auto* overrides = layer.wiping_extrusions().get_extruder_overrides(
+                                entity, object, layer.extruder(*extrusion, region->region()), object->instances().size());
+                            if (overrides)
+                                for (int filament : *overrides)
+                                    if (filament >= 0) CHECK(filament < 2);
+                        }
+            }
+        }
+        CHECK((overridden_layers > 0) == flushing);
+        double purge = 0.;
+        for (const auto& layer : print.wipe_tower_data().tool_changes)
+            for (const auto& action : layer) {
+                CHECK(action.new_tool != 2);
+                purge += action.purge_volume;
+            }
+        const auto& used = print.wipe_tower_data().used_filament;
+        return tower_type == WipeTowerType::Type1 ? purge : std::accumulate(used.begin(), used.end(), 0.0);
+    };
+    const double unallocated = run(false);
+    CHECK(unallocated > 0.);
+    CHECK(run(true) < unallocated);
+}
+
+TEST_CASE("wipe tower exclusion preserves pre-tower machine hooks", "[slicing][wipe-tower-exclusion][hooks]")
+{
+    setup_test_dirs();
+    const auto tower_type = GENERATE(WipeTowerType::Type1, WipeTowerType::Type2);
+    auto model = load_two_extruder_model();
+    auto config = multi_nozzle_print_config();
+    config.set_key_value("filament_soluble", new ConfigOptionBools({false, false}));
+    config.set_key_value("enable_prime_tower", new ConfigOptionBool(true));
+    config.set_key_value("wipe_tower_type", new ConfigOptionEnum<WipeTowerType>(tower_type));
+    config.set_key_value("wipe_tower_wall_type", new ConfigOptionEnum<WipeTowerWallType>(wtwRectangle));
+    config.set_key_value("filament_exclude_from_wipe_tower", new ConfigOptionBools({false, true}));
+    config.set_key_value("timelapse_type", new ConfigOptionEnum<TimelapseType>(TimelapseType::tlTraditional));
+    config.set_key_value("time_lapse_gcode", new ConfigOptionString(";TEST_TIMELAPSE {layer_num}"));
+    config.set_key_value("enable_wrapping_detection", new ConfigOptionBool(true));
+    config.set_key_value("wrapping_detection_gcode", new ConfigOptionString(";TEST_WRAPPING {layer_num}"));
+    const auto result = slice_to_gcode(model, config);
+    const auto first_tower = result.content.find("; WIPE_TOWER_START");
+    REQUIRE(first_tower != std::string::npos);
+    const auto first_timelapse = result.content.find(";TEST_TIMELAPSE 0\n");
+    const auto first_wrapping = result.content.find(";TEST_WRAPPING 0\n");
+    CHECK(first_timelapse < first_tower);
+    CHECK(first_wrapping < first_tower);
+    CHECK(result.content.find(";TEST_WRAPPING 0\n", first_wrapping + 1) == std::string::npos);
+    size_t emitted_changes = 0, offset = 0;
+    while ((offset = result.content.find("; CP TOOLCHANGE START", offset)) != std::string::npos) {
+        ++emitted_changes;
+        ++offset;
+    }
+    CHECK(emitted_changes == result.tower_toolchange_count);
 }

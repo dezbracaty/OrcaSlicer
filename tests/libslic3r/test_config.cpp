@@ -1,4 +1,7 @@
 #include <catch2/catch_all.hpp>
+#include <boost/filesystem.hpp>
+#include <fstream>
+#include <iterator>
 
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/PrintConfigConstants.hpp"
@@ -363,6 +366,10 @@ SCENARIO("DynamicPrintConfig serialization", "[Config]") {
             //     // e.what();
             // }
 	    CAPTURE(cfg.diff_report(cfg2));
+            // Only the new optional false field is absent on the wire.
+            // Every original key still participates in strict raw equality.
+            REQUIRE_FALSE(cfg2.has("filament_exclude_from_wipe_tower"));
+            cfg2.set_key_value("filament_exclude_from_wipe_tower", cfg.option("filament_exclude_from_wipe_tower")->clone());
             REQUIRE(cfg == cfg2);
         }
     }
@@ -504,3 +511,65 @@ SCENARIO("update_diff_values_to_child_config tolerates legacy machine-limit vect
 //         }
 //     }
 // }
+
+TEST_CASE("disabled wipe tower exclusion preserves legacy configuration archives", "[Config][wipe-tower-exclusion][legacy]")
+{
+    const std::string key = "filament_exclude_from_wipe_tower";
+    const auto* extension = print_config_def.get(key);
+    REQUIRE(extension != nullptr);
+    for (const auto& [name, definition] : print_config_def.options)
+        if (name != key) CHECK(extension->serialization_key_ordinal > definition.serialization_key_ordinal);
+    // These were adjacent before the extension; preserve the old binary IDs.
+    CHECK(print_config_def.get("filament_fiber_feed_correction")->serialization_key_ordinal ==
+          print_config_def.get("filament_process_type")->serialization_key_ordinal + 1);
+
+    DynamicPrintConfig original;
+    original.set_deserialize_strict("filament_process_type", "thermoplastic");
+    original.set_deserialize_strict("filament_fiber_feed_correction", "0.95");
+    original.set_deserialize_strict("enable_prime_tower", "1");
+    original.set_deserialize_strict("pad_brim_size", "2.4");
+    const auto serialize = [](const DynamicPrintConfig& config) {
+        std::stringstream stream;
+        { cereal::BinaryOutputArchive archive(stream); archive(config); }
+        return stream.str();
+    };
+    auto disabled = original;
+    disabled.set_deserialize_strict(key, "0,0");
+    const auto legacy_bytes = serialize(original);
+    CHECK(serialize(disabled) == legacy_bytes);
+    DynamicPrintConfig restored;
+    { std::stringstream stream(legacy_bytes); cereal::BinaryInputArchive archive(stream); archive(restored); }
+    CHECK(restored == original);
+    PrintConfig effective;
+    effective.apply(restored, true);
+    CHECK_FALSE(effective.filament_exclude_from_wipe_tower.values.front());
+
+    auto enabled = original;
+    enabled.set_deserialize_strict(key, "0,1");
+    const auto enabled_bytes = serialize(enabled);
+    CHECK(enabled_bytes != legacy_bytes);
+    { std::stringstream stream(enabled_bytes); cereal::BinaryInputArchive archive(stream); archive(restored); }
+    CHECK(restored == enabled);
+
+    const auto path = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("wipe-exclusion-%%%%-%%%%.json");
+    disabled.save_to_json(path.string(), "legacy", "user", "2.4.1");
+    std::ifstream json_file(path.string());
+    const std::string json_text((std::istreambuf_iterator<char>(json_file)), {});
+    CHECK(json_text.find(key) == std::string::npos);
+    json_file.close();
+    enabled.save_to_json(path.string(), "fiber", "user", "2.4.1");
+    json_file.open(path.string());
+    const std::string enabled_text((std::istreambuf_iterator<char>(json_file)), {});
+    CHECK(enabled_text.find(key) != std::string::npos);
+    json_file.close();
+    boost::filesystem::remove(path);
+    auto ini_path = path;
+    ini_path.replace_extension(".ini");
+    disabled.save(ini_path.string());
+    std::ifstream ini_file(ini_path.string());
+    const std::string ini_text((std::istreambuf_iterator<char>(ini_file)), {});
+    CHECK(ini_text.find(key) == std::string::npos);
+    CHECK(ini_text.find("filament_fiber_feed_correction = 0.95") != std::string::npos);
+    ini_file.close();
+    boost::filesystem::remove(ini_path);
+}

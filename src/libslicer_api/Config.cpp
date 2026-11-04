@@ -192,6 +192,11 @@ bool key_is(std::string_view key, std::initializer_list<std::string_view> candid
 void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintConfig& config,
                                 ConfigScope scope = ConfigScope::Full)
 {
+    if (item.key == "filament_exclude_from_wipe_tower") {
+        item.enabled = false;
+        const auto* flags = config.option<Slic3r::ConfigOptionBools>(item.key);
+        item.visible = flags && std::any_of(flags->values.begin(), flags->values.end(), [](auto v) { return v != 0; });
+    }
     const bool contour_enabled = boolean_value(config, "generate_reinforced_perimeters");
     const bool infill_enabled  = boolean_value(config, "generate_reinforced_infills");
     const bool concentric=infill_enabled && config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern")==Slic3r::ipConcentric;
@@ -508,6 +513,14 @@ SettingsResult Config::apply_patch(ConfigScope scope,
         return failure(last_key, error.what());
     }
 
+    if (const auto* flags = before.option<Slic3r::ConfigOptionBools>("filament_exclude_from_wipe_tower")) {
+        const auto* changed = candidate.option<Slic3r::ConfigOptionBools>("filament_exclude_from_wipe_tower");
+        const auto* types = before.option<Slic3r::ConfigOptionStrings>("filament_process_type");
+        for (size_t i = 0; changed && types && i < flags->values.size() && i < types->values.size(); ++i)
+            if (flags->values[i] && types->values[i] == "continuous_fiber" &&
+                (i >= changed->values.size() || !changed->values[i]))
+                return failure("filament_exclude_from_wipe_tower", "Continuous fiber exclusion is fixed by the filament preset");
+    }
     auto changed_keys = candidate.diff(before);
     append_presentation_changes(changed_keys, before, candidate, scope);
     if (impl_->override_scope) {

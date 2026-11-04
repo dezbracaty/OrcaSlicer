@@ -62,6 +62,7 @@ public:
 
 	struct ToolChangeResult
 	{
+        bool prime_only = false; // Tool already selected by the normal generator.
 		// Print heigh of this tool change.
 		float					print_z;
 		float 					layer_height;
@@ -185,7 +186,7 @@ public:
 
 	// Appends into internal structure m_plan containing info about the future wipe tower
 	// to be used before building begins. The entries must be added ordered in z.
-	void plan_toolchange(float z_par, float layer_height_par, unsigned int old_tool, unsigned int new_tool, float wipe_volume = 0.f, float prime_volume = 0.f);
+	void plan_toolchange(float z_par, float layer_height_par, unsigned int old_tool, unsigned int new_tool, float wipe_volume = 0.f, float prime_volume = 0.f, bool prime_only = false);
 
 	// Iterates through prepared m_plan, generates ToolChangeResults and appends them to "result"
 	void generate(std::vector<std::vector<ToolChangeResult>> &result);
@@ -196,6 +197,7 @@ public:
 
     Polygon generate_rib_polygon(const box_coordinates &wt_box);
     float get_depth() const { return m_wipe_tower_depth; }
+    std::vector<std::pair<float, float>> get_z_and_depth_pairs() const;
     float get_brim_width() const { return m_wipe_tower_brim_width_real; }
     BoundingBoxf get_bbx() const {
         if (m_outer_wall.empty()) return BoundingBoxf({Vec2d(0,0)});
@@ -391,7 +393,7 @@ public:
 	void generate_wipe_tower_blocks();
     void update_all_layer_depth(float wipe_tower_depth);
 
-    ToolChangeResult   tool_change_new(size_t new_tool, bool solid_change = false, bool solid_nozzlechange=false);
+    ToolChangeResult   tool_change_new(size_t new_tool, bool solid_change = false, bool solid_nozzlechange=false, bool prime_only = false);
     NozzleChangeResult nozzle_change_new(int old_filament_id, int new_filament_id, bool solid_change = false);
     ToolChangeResult   finish_layer_new(bool extrude_perimeter = true, bool extrude_fill = true, bool extrude_fill_wall = true);
     ToolChangeResult   finish_block(const WipeTowerBlock &block, int filament_id, bool extrude_fill = true);
@@ -532,6 +534,7 @@ private:
             size_t new_tool;
 			float required_depth;
             float ramming_depth;
+            bool prime_only = false;
             float first_wipe_line;
             float wipe_volume;
 			float wipe_length;

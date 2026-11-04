@@ -1,4 +1,5 @@
 #include "Config.hpp"
+#include "PrintConfig.hpp"
 #include "format.hpp"
 #include "Utils.hpp"
 #include "LocalesUtils.hpp"
@@ -1473,6 +1474,7 @@ void ConfigBase::save_to_json(const std::string &file, const std::string &name, 
     for (const std::string &opt_key : this->keys())
     {
         const ConfigOption* opt = this->option(opt_key);
+        if (is_disabled_wipe_tower_exclusion(opt_key, opt)) continue;
         if ( opt->is_scalar() ) {
             if (opt->type() == coString && (opt_key != "bed_custom_texture" && opt_key != "bed_custom_model"))
                 //keep \n, \r, \t
@@ -1510,7 +1512,8 @@ void ConfigBase::save(const std::string &file) const
     c.open(file, std::ios::out | std::ios::trunc);
     c << "# " << Slic3r::header_slic3r_generated() << std::endl;
     for (const std::string &opt_key : this->keys())
-        c << opt_key << " = " << this->opt_serialize(opt_key) << std::endl;
+        if (!is_disabled_wipe_tower_exclusion(opt_key, this->option(opt_key)))
+            c << opt_key << " = " << this->opt_serialize(opt_key) << std::endl;
     c.close();
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" <<__LINE__ << boost::format(", saved config to %1%\n")%file;

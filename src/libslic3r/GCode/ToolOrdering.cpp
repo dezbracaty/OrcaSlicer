@@ -465,7 +465,7 @@ void ToolOrdering::sort_and_build_data(const Print& print, unsigned int first_ex
         this->fill_wipe_tower_partitions(print.config(), object_bottom_z, max_layer_height);
     }
 
-    this->collect_extruder_statistics(prime_multi_material);
+    this->collect_extruder_statistics(prime_multi_material && !m_wipe_tower_exclusions);
 }
 
 void ToolOrdering::sort_and_build_data(const PrintObject& object , unsigned int first_extruder, bool prime_multi_material)
@@ -485,7 +485,7 @@ void ToolOrdering::sort_and_build_data(const PrintObject& object , unsigned int 
         this->fill_wipe_tower_partitions(object.print()->config(), object.layers().front()->print_z - object.layers().front()->height, max_layer_height);
     }
 
-    this->collect_extruder_statistics(prime_multi_material);
+    this->collect_extruder_statistics(prime_multi_material && !m_wipe_tower_exclusions);
 }
 
 
@@ -1029,6 +1029,52 @@ void ToolOrdering::fill_wipe_tower_partitions(const PrintConfig &config, coordf_
             lt.wipe_tower_layer_height = lt.print_z - wipe_tower_print_z_last;
             wipe_tower_print_z_last = lt.print_z;
         }
+
+    m_wipe_tower_exclusions = config.enable_prime_tower.value &&
+        std::any_of(m_layer_tools.begin(), m_layer_tools.end(), [&](const LayerTools& lt) {
+            return std::any_of(lt.extruders.begin(), lt.extruders.end(), [&](unsigned f) {
+                return filament_excluded_from_wipe_tower(config, f);
+            });
+        });
+    if (!m_wipe_tower_exclusions)
+        return;
+
+    unsigned structural_filament = unsigned(-1);
+    size_t last_tower_layer = 0;
+    for (size_t i = 0; i < m_layer_tools.size(); ++i)
+        for (unsigned f : m_layer_tools[i].extruders)
+            if (!filament_excluded_from_wipe_tower(config, f)) {
+                if (structural_filament == unsigned(-1)) structural_filament = f;
+                last_tower_layer = i;
+            }
+    if (structural_filament == unsigned(-1))
+        throw std::runtime_error("Wipe tower has no participating material");
+    if (config.wipe_tower_filament.value > 0) {
+        const unsigned selected = unsigned(config.wipe_tower_filament.value - 1);
+        if (filament_excluded_from_wipe_tower(config, selected))
+            throw std::runtime_error("The selected wipe tower material is excluded from the wipe tower");
+        structural_filament = selected;
+    }
+    wipe_tower_print_z_last = 0.;
+    for (size_t i = 0; i < m_layer_tools.size(); ++i) {
+        auto& lt = m_layer_tools[i];
+        lt.wipe_tower_extruders.clear();
+        lt.has_wipe_tower = i <= last_tower_layer;
+        lt.wipe_tower_partitions = 0;
+        if (!lt.has_wipe_tower) continue;
+        for (unsigned f : lt.extruders)
+            if (!filament_excluded_from_wipe_tower(config, f))
+                lt.wipe_tower_extruders.push_back(f);
+        // As in insert_wipe_tower_extruder(), a tower-only ordinary tool may
+        // maintain the structure through a layer containing only fiber.
+        if (lt.wipe_tower_extruders.empty()) {
+            lt.extruders.insert(lt.extruders.begin(), structural_filament);
+            lt.wipe_tower_extruders.push_back(structural_filament);
+        }
+        lt.wipe_tower_partitions = lt.wipe_tower_extruders.size();
+        lt.wipe_tower_layer_height = lt.print_z - wipe_tower_print_z_last;
+        wipe_tower_print_z_last = lt.print_z;
+    }
 }
 
 void ToolOrdering::collect_extruder_statistics(bool prime_multi_material)
@@ -1732,7 +1778,8 @@ void WipingExtrusions::set_support_interface_extruder_override(const PrintObject
 int WipingExtrusions::first_nonsoluble_extruder_on_layer(const PrintConfig& print_config) const
 {
     const LayerTools& lt = *m_layer_tools;
-    for (auto extruders_it = lt.extruders.begin(); extruders_it != lt.extruders.end(); ++extruders_it)
+    const auto& extruders = lt.wipe_tower_extruders.empty() ? lt.extruders : lt.wipe_tower_extruders;
+    for (auto extruders_it = extruders.begin(); extruders_it != extruders.end(); ++extruders_it)
         if (!print_config.filament_soluble.get_at(*extruders_it) && !print_config.filament_is_support.get_at(*extruders_it))
             return (*extruders_it);
 
@@ -1743,7 +1790,8 @@ int WipingExtrusions::first_nonsoluble_extruder_on_layer(const PrintConfig& prin
 int WipingExtrusions::last_nonsoluble_extruder_on_layer(const PrintConfig& print_config) const
 {
     const LayerTools& lt = *m_layer_tools;
-    for (auto extruders_it = lt.extruders.rbegin(); extruders_it != lt.extruders.rend(); ++extruders_it)
+    const auto& extruders = lt.wipe_tower_extruders.empty() ? lt.extruders : lt.wipe_tower_extruders;
+    for (auto extruders_it = extruders.rbegin(); extruders_it != extruders.rend(); ++extruders_it)
         if (!print_config.filament_soluble.get_at(*extruders_it) && !print_config.filament_is_support.get_at(*extruders_it))
             return (*extruders_it);
 
@@ -1949,6 +1997,9 @@ void WipingExtrusions::ensure_perimeters_infills_order(const Print& print)
     const LayerTools& lt = *m_layer_tools;
     unsigned int first_nonsoluble_extruder = first_nonsoluble_extruder_on_layer(print.config());
     unsigned int last_nonsoluble_extruder = last_nonsoluble_extruder_on_layer(print.config());
+    // An excluded fiber tool must not become the fallback for plastic infill.
+    if (!lt.wipe_tower_extruders.empty() && first_nonsoluble_extruder == unsigned(-1))
+        return;
 
     for (const PrintObject* object : print.objects()) {
         // Finds this layer:

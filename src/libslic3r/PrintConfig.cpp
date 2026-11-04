@@ -671,6 +671,15 @@ PrintConfigDef::PrintConfigDef()
     assign_printer_technology_to_unknown(this->options, ptFFF);
     this->init_sla_params();
     assign_printer_technology_to_unknown(this->options, ptSLA);
+
+    // Append opt-in extensions after every original key: Cereal stores their
+    // registration ordinals, so inserting into init_fff_params breaks old data.
+    auto* def = this->add("filament_exclude_from_wipe_tower", coBools);
+    def->label = L("Exclude from wipe tower");
+    def->tooltip = L("This material does not extrude on the wipe tower. Currently fixed by the filament preset.");
+    def->category = L("Continuous fiber");
+    def->printer_technology = ptFFF;
+    def->set_default_value(new ConfigOptionBools{false});
 }
 
 void PrintConfigDef::init_common_params()
@@ -9241,7 +9250,11 @@ t_config_option_keys DynamicPrintConfig::normalize_fdm_2(int num_objects, int us
         ConfigOptionBool *enable_wrapping_opt = this->option<ConfigOptionBool>("enable_wrapping_detection");
         bool enable_wrapping = enable_wrapping_opt != nullptr && enable_wrapping_opt->value;
 
-        if (!is_smooth_timelapse && !enable_wrapping && (used_filaments == 1 || (ps_opt->value == PrintSequence::ByObject && num_objects > 1))) {
+        const auto* excluded = this->option<ConfigOptionBools>("filament_exclude_from_wipe_tower");
+        const bool has_exclusion = excluded && std::any_of(excluded->values.begin(), excluded->values.end(), [](auto v) { return v != 0; });
+        // Before slicing, used_filaments may count only the resin. A declared
+        // exclusion may still require returning to that one resin on the tower.
+        if (!is_smooth_timelapse && !enable_wrapping && ((used_filaments == 1 && !has_exclusion) || (ps_opt->value == PrintSequence::ByObject && num_objects > 1))) {
             if (ept_opt->value) {
                 ept_opt->value = false;
                 changed_keys.push_back("enable_prime_tower");

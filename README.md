@@ -590,6 +590,23 @@ orca_plater_tests "[orca_plater]~[slice]"            # 独立验证参数与场�
 
 内部顶层类型由 18 个收敛为 `Plater / Selection / PartPlate / PartPlateList` 四个。模型导入、共同中心缩放、落床、裁剪及分盘保留；空的 App、MainFrame、Tab、Sidebar、Canvas 等 GUI 兼容类型已删除。这些内部类型实现校准子集，不是完整 wxWidgets GUI。公共枚举与 Orca 的 0～12 原值逐项通过编译期断言，SDK 请求、任务和快照没有直接同名的 Orca 类型，保留各自包装名称。
 
+## 连续纤维与擦拭塔
+
+耗材参数 `filament_exclude_from_wipe_tower` 使用逐耗材布尔值。缺失或全为 false 时沿用原生塔流程；仅实际使用的材料显式排除时，启用排除调度。只有 `CFSYS/filament/fdm_filament_ccf.json` 写入 true，普通耗材、机器和工艺预设不写此字段。纤维预设中的 true 当前锁定，设置接口可显示但不能关闭；不根据材料类型或物理喷头编号补写参数。
+
+两种原生塔均复用原有几何生成。被排除材料保留模型路径和真实换头，不执行塔上卸料、ramming、出料或最终清料。切回普通材料后使用独立的 prime-only 动作，支持一种普通材料与一种纤维共同打印；必要的塔结构层由普通材料维持。无可参与材料、或指定被排除材料作为塔材料时返回诊断。新参数会使塔调度与相关执行缓存失效，不强制重切模型几何。
+
+排除调度复用原生 `WipingExtrusions` 分配冲刷到填充或对象，并修正填充与外墙顺序；候选工具只取参与塔的材料，不能把普通挤出分配给纤维。Type1 保留按喷头计算清料量与扣除抓料量的规则，Type2 保留最小塔冲刷量。普通喷头的已加载材料跨纤维切换保留。导出时两种调度共用原有的塔前延时摄影、缠料检测脚本插入逻辑。
+
+未开启排除时，默认 false 字段不写入 JSON/INI 预设、二进制配置或 G-code 配置注释。新参数在全部原有参数之后注册，保留原有参数的二进制序号。实现来源沿用本仓库的 `ToolOrdering`、`WipeTower`、`WipeTower2` 与 `WipeTowerIntegration`；原始 GUI 参数入口查阅历史提交 `71c30dd1feb73efa40d824ee1e4be05fce7b0827` 的 `Tab.cpp`。排除调度属于当前 fork 的扩展，原生默认分支保持原有语义。
+
+相关检查在现有测试文件中，构建后可运行：
+
+```sh
+build-libslicer/release/arm64/tests/libslicer_api/libslicer_api_tests '[wipe-tower-exclusion],[p3]'
+build-libslicer/release/arm64/tests/libslic3r/libslic3r_tests '[wipe-tower-exclusion],[OrcaIsolation],[slicing][multinozzle],[slicing][multimaterial]'
+```
+
 ## License
 
 See [LICENSE.txt](LICENSE.txt) for the GNU Affero General Public License v3.
