@@ -329,7 +329,7 @@ void Plater::adjust_settings_for_flowrate_calib(ModelObjectPtrs& objects, bool l
     // model is created for a 0.4 nozzle, scale z with nozzle size.
     const ConfigOptionFloats* nozzle_diameter_config = printerConfig->option<ConfigOptionFloats>("nozzle_diameter");
     assert(nozzle_diameter_config->values.size() > 0);
-    float nozzle_diameter = nozzle_diameter_config->values[0];
+    float nozzle_diameter = m_flow_target.nozzle_diameter;
     float xyScale = nozzle_diameter / 0.6;
     //scale z to have 10 layers
     // 2 bottom, 5 top, 3 sparse infill
@@ -349,9 +349,9 @@ void Plater::adjust_settings_for_flowrate_calib(ModelObjectPtrs& objects, bool l
     for (auto* object : objects)
         object->ensure_on_bed();
 
-    auto cur_flowrate = filament_config->option<ConfigOptionFloats>("filament_flow_ratio")->get_at(0);
+    auto cur_flowrate = m_flow_target.baseline_flow_ratio;
     Flow infill_flow = Flow(nozzle_diameter * 1.2f, layer_height, nozzle_diameter);
-    double filament_max_volumetric_speed = filament_config->option<ConfigOptionFloats>("filament_max_volumetric_speed")->get_at(0);
+    double filament_max_volumetric_speed = m_flow_target.max_volumetric_speed;
     double max_infill_speed;
     if (linear)
         max_infill_speed = filament_max_volumetric_speed /
@@ -448,6 +448,7 @@ void Plater::calib_flowrate(bool is_linear, int pass, InfillPattern pattern) {
                       (boost::filesystem::path(Slic3r::resources_dir()) / "calib" / "filament_flow" / "flowrate-test-pass2.3mf").string());
     }
 
+    bind_flow_model();
     // ORCA: pass the pattern
     adjust_settings_for_flowrate_calib(model().objects, is_linear, pass, pattern);
     auto printer_config = &m_presets.printers.get_edited_preset().config;

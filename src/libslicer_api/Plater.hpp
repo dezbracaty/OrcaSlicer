@@ -11,6 +11,13 @@ namespace libslicer::orca {
 using CalibMode    = Slic3r::CalibMode;
 using Calib_Params = Slic3r::Calib_Params;
 
+struct FlowCalibrationTarget
+{
+    std::size_t slot{0}, logical_extruder{0}, physical_tool{0};
+    double nozzle_diameter{0}, baseline_flow_ratio{0}, max_volumetric_speed{0};
+};
+FlowCalibrationTarget resolve_flow_target(const Slic3r::DynamicPrintConfig& config, std::size_t slot);
+
 class Selection
 {
 public:
@@ -66,6 +73,7 @@ public:
 
     void prepare(const Slic3r::Calib_Params& params);
     void prepare_flow(bool linear, int pass, Slic3r::InfillPattern pattern);
+    void prepare_flow(bool linear, int pass, Slic3r::InfillPattern pattern, const FlowCalibrationTarget& target);
     void prepare_tolerance();
     std::size_t plate_count() const;
     Slic3r::Model plate_model(std::size_t index);
@@ -97,6 +105,7 @@ private:
     void add_model(bool imperial_units, std::string path);
     void apply_cut_object_to_model(std::size_t index, const Slic3r::ModelObjectPtrs& pieces);
     void adjust_settings_for_flowrate_calib(Slic3r::ModelObjectPtrs& objects, bool linear, int pass, Slic3r::InfillPattern pattern);
+    void bind_flow_model();
 
     Slic3r::PresetBundle m_presets;
     Slic3r::Model m_model;
@@ -105,5 +114,6 @@ private:
     Selection m_selection;
     PartPlateList m_partplate_list;
     std::vector<std::string> m_notifications;
+    FlowCalibrationTarget m_flow_target;
 };
 } // namespace libslicer::orca

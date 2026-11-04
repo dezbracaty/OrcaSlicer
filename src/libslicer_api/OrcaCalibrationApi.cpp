@@ -5,6 +5,7 @@
 #include <iterator>
 #include <locale>
 #include <sstream>
+#include <iomanip>
 
 namespace libslicer {
 // Keep public names and ordinals aligned with the original core enum.
@@ -129,6 +130,7 @@ Calib_Params dialog_parameters(const CalibrationRequest& request, const DynamicP
         break;
     }
     case libslicer::CalibMode::Calib_Flow_Rate:
+        resolve_flow_target(config, request.flow_filament_slot);
         check(request.flow_pass == 1 || request.flow_pass == 2, "Flow pass must be 1 or 2");
         check(request.flow_pattern == CalibrationRequest::FlowPattern::ArchimedeanChords ||
                   request.flow_pattern == CalibrationRequest::FlowPattern::Monotonic,
@@ -166,7 +168,8 @@ std::vector<SliceDiagnostic> calibration_warnings(const CalibrationRequest& requ
     return {};
 }
 
-CalibrationPlate describe_plate(const Model& model, std::size_t index)
+CalibrationPlate describe_plate(const Model& model, std::size_t index,
+    const std::optional<FlowCalibrationTarget>& flow_target)
 {
     CalibrationPlate plate;
     plate.index = index;
@@ -174,6 +177,16 @@ CalibrationPlate describe_plate(const Model& model, std::size_t index)
         for (const auto* instance : object->instances) {
             CalibrationObject result;
             result.geometry.name = object->name;
+            if (flow_target) {
+                if (object->name.rfind("flowrate_", 0) != 0 || object->name.size() <= 9)
+                    throw std::invalid_argument("Flow resource has an unknown sample label");
+                auto label = object->name.substr(9);
+                if (label.front() == 'm') label.front() = '-';
+                const auto* ratio = object->config.get().option<ConfigOptionFloat>("print_flow_ratio");
+                if (!ratio) throw std::invalid_argument("Flow sample has no effective flow multiplier");
+                result.flow_sample = FlowCalibrationSample{label, flow_target->baseline_flow_ratio,
+                    flow_target->baseline_flow_ratio * ratio->value};
+            }
             const auto matrix    = instance->get_matrix();
             for (int r = 0; r < 4; ++r)
                 for (int c = 0; c < 4; ++c)
@@ -219,10 +232,9 @@ DynamicPrintConfig parameter_config(const ConfigSnapshot& snapshot)
 {
     if (!snapshot.valid()) throw std::invalid_argument("Calibration has no configuration");
     DynamicPrintConfig config;
-    // Form behavior only depends on these two printer settings. It never
-    // consults a process-wide active configuration or a GUI singleton.
-    for (const char* key : {"gcode_flavor", "machine_max_junction_deviation"})
-        config.set_deserialize_strict(key, snapshot.value(key).value_or(Slic3r::FullPrintConfig::defaults().opt_serialize(key)));
+    config.apply(Slic3r::FullPrintConfig::defaults());
+    for (const auto& [key, value] : snapshot.values())
+        if (Slic3r::print_config_def.get(key)) config.set_deserialize_strict(key, value);
     return config;
 }
 bool is_pa(CalibMode mode)
@@ -285,7 +297,23 @@ void refresh_parameters(CalibrationParameters& p)
         if (!print.enabled) print.value = p.mode == CalibMode::Calib_PA_Pattern ? "1" : "0";
         if (p.mode == CalibMode::Calib_PA_Pattern) { show("accelerations"); show("speeds"); }
     }
-    if (flow) { show("flow_type"); show("flow_pattern"); }
+    if (flow) {
+        show("flow_type"); show("flow_pattern"); show("flow_filament_slot"); show("flow_baseline_ratio", false);
+        auto& slots = field(p, "flow_filament_slot").enum_items;
+        slots.clear();
+        const auto count = config.option<Slic3r::ConfigOptionFloats>("filament_diameter")->values.size();
+        for (std::size_t i = 0; i < count; ++i) slots.push_back({std::to_string(i), "Material slot " + std::to_string(i + 1)});
+        auto& baseline = field(p, "flow_baseline_ratio").value;
+        baseline.clear();
+        const int slot = choice(p, "flow_filament_slot");
+        if (slot >= 0) {
+            try {
+                const auto target = orca::resolve_flow_target(config, std::size_t(slot));
+                std::ostringstream text; text.imbue(std::locale::classic()); text << std::setprecision(15) << target.baseline_flow_ratio;
+                baseline = text.str();
+            } catch (const std::exception&) { /* Preflight reports the actionable target diagnostic. */ }
+        }
+    }
     if (temp) { show("filament_type"); field(p, "step").value = "5"; }
     if (shaping || corner) show("test_model");
     auto& models = field(p, "test_model").enum_items;
@@ -357,6 +385,8 @@ CalibrationParameters calibration_parameters(CalibMode mode, const ConfigSnapsho
         {{"0", "PA Tower"}, {"1", "PA Line"}, {"2", "PA Pattern"}});
     enumeration("flow_type", "2", "Calibration type", {{"0", "Pass 1"}, {"1", "Pass 2"}, {"2", "YOLO (Recommended)"}, {"3", "YOLO (Perfectionist)"}});
     enumeration("flow_pattern", "0", "Top surface pattern", {{"0", "Archimedean Chords"}, {"1", "Monotonic"}});
+    enumeration("flow_filament_slot", "0", "Calibration material", {});
+    add("flow_baseline_ratio", "", "Calibration flow baseline", SettingType::Float);
     enumeration("filament_type", "0", "Material temperature range", {{"0", "PLA"}, {"1", "ABS/ASA"}, {"2", "PETG"}, {"3", "PCTG"}, {"4", "TPU"}, {"5", "PA-CF"}, {"6", "PET-CF"}, {"7", "Custom"}});
     enumeration("test_model", "0", "Test model", {});
     enumeration("shaper_type", "", "Shaper type", {});
@@ -491,6 +521,12 @@ CalibrationValidationResult validate_calibration_parameters(const CalibrationPar
         const int flow = choice(p, "flow_type");
         r.flow_linear = flow >= 2; r.flow_pass = flow % 2 + 1;
         r.flow_pattern = choice(p, "flow_pattern") == 1 ? CalibrationRequest::FlowPattern::Monotonic : CalibrationRequest::FlowPattern::ArchimedeanChords;
+        if (p.mode == CalibMode::Calib_Flow_Rate) {
+            option_key = "flow_filament_slot";
+            const int slot = choice(p, "flow_filament_slot");
+            if (slot < 0) throw std::invalid_argument("Choose a valid flow material slot");
+            r.flow_filament_slot = std::size_t(slot);
+        }
         const auto config = parameter_config(p.config);
         option_key.clear();
         // Keep all mode-specific bounds and firmware rules in the existing
@@ -501,6 +537,43 @@ CalibrationValidationResult validate_calibration_parameters(const CalibrationPar
         result.success = true;
     } catch (const std::exception& e) {
         result.diagnostics.push_back({"calibration", e.what(), false, option_key});
+    }
+    return result;
+}
+
+CalibrationFlowResult CalibrationTask::flow_result(std::size_t plate_index, std::size_t object_index) const
+{
+    CalibrationFlowResult result;
+    try {
+        if (!impl_->flow_target || plate_index >= impl_->plates.size() ||
+            object_index >= impl_->plates[plate_index].objects.size())
+            throw std::invalid_argument("Flow sample is outside this calibration task");
+        const auto& sample = impl_->plates[plate_index].objects[object_index].flow_sample;
+        if (!sample || !std::isfinite(sample->calibrated_flow_ratio) || sample->calibrated_flow_ratio <= 0)
+            throw std::invalid_argument("Flow sample has no positive finite calibrated ratio");
+        auto native = parameter_config(impl_->request.config);
+        auto* ratios = native.option<Slic3r::ConfigOptionFloats>("filament_flow_ratio");
+        const auto& target = *impl_->flow_target;
+        // Expand a broadcast without changing the effective value of other slots.
+        while (ratios->values.size() < native.option<Slic3r::ConfigOptionFloats>("filament_diameter")->values.size())
+            ratios->values.push_back(ratios->values.front());
+        ratios->values.at(target.slot) = sample->calibrated_flow_ratio;
+        result.config_patch.emplace_back("filament_flow_ratio", ratios->serialize());
+        auto checked = Config::for_overrides(impl_->request.config, ConfigScope::Full);
+        const auto applied = checked.apply_patch(result.config_patch);
+        const auto validation = applied ? checked.validate() : applied.diagnostics;
+        if (!applied || !validation.empty()) {
+            for (const auto& d : validation) result.diagnostics.push_back({"flow_result", d.message, false, d.key});
+            result.config_patch.clear();
+            return result;
+        }
+        result.logical_extruder_index = target.logical_extruder;
+        result.physical_tool_index = target.physical_tool;
+        result.nozzle_diameter_mm = target.nozzle_diameter;
+        result.success = true;
+    } catch (const std::exception& e) {
+        result.config_patch.clear();
+        result.diagnostics.push_back({"flow_result", e.what(), false});
     }
     return result;
 }

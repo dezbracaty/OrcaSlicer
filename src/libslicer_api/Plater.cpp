@@ -2,11 +2,42 @@
 
 #include <libslic3r/ModelArrange.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
+#include <libslic3r/ContinuousFiber/ContinuousFiberConfig.hpp>
 #include <boost/filesystem/path.hpp>
+#include <cmath>
+#include <sstream>
+#include <iomanip>
 #include <stdexcept>
 
 namespace libslicer::orca {
 using namespace Slic3r;
+
+FlowCalibrationTarget resolve_flow_target(const DynamicPrintConfig& config, std::size_t slot)
+{
+    FullPrintConfig full;
+    full.apply(config, true);
+    const auto require = [](bool valid, const char* message) {
+        if (!valid) throw std::invalid_argument(message);
+    };
+    require(slot < full.filament_diameter.size(), "Flow material slot is outside the configuration");
+    require(slot < full.filament_map.size(), "Flow material has no logical tool mapping");
+    const int logical = full.filament_map.values[slot] - 1;
+    require(logical >= 0 && std::size_t(logical) < full.physical_extruder_map.size() &&
+            std::size_t(logical) < full.nozzle_diameter.size(), "Flow material has an invalid logical tool");
+    const int physical = full.physical_extruder_map.values[logical];
+    require(physical >= 0 && std::size_t(physical) < full.physical_extruder_map.size(), "Flow material has an invalid physical tool");
+    validate_material_tool_bindings(full);
+    require(full.filament_process_type.get_at(slot) == "thermoplastic" &&
+            tool_accepts_process(full, unsigned(physical), "thermoplastic"), "Flow calibration requires a thermoplastic material and tool");
+    require(!continuous_fiber_enabled(full), "Choose a non-fiber process for flow calibration");
+    FlowCalibrationTarget target{slot, std::size_t(logical), std::size_t(physical),
+        full.nozzle_diameter.get_at(logical), full.filament_flow_ratio.get_at(slot), full.filament_max_volumetric_speed.get_at(slot)};
+    require(std::isfinite(target.nozzle_diameter) && target.nozzle_diameter > 0 &&
+            std::isfinite(target.baseline_flow_ratio) && target.baseline_flow_ratio > 0 &&
+            std::isfinite(target.max_volumetric_speed) && target.max_volumetric_speed > 0,
+            "Flow calibration requires positive finite nozzle, flow ratio and volumetric speed");
+    return target;
+}
 
 void Selection::setup_cache()
 {
@@ -150,7 +181,51 @@ void Plater::prepare(const Calib_Params& params)
     default: throw std::invalid_argument("Unsupported Plater calibration entry");
     }
 }
-void Plater::prepare_flow(bool linear, int pass, InfillPattern pattern) { calib_flowrate(linear, pass, pattern); }
+void Plater::prepare_flow(bool linear, int pass, InfillPattern pattern)
+{
+    prepare_flow(linear, pass, pattern, resolve_flow_target(full_config(), 0));
+}
+void Plater::prepare_flow(bool linear, int pass, InfillPattern pattern, const FlowCalibrationTarget& target)
+{
+    const auto effective = resolve_flow_target(full_config(), target.slot);
+    if (effective.logical_extruder != target.logical_extruder || effective.physical_tool != target.physical_tool ||
+        effective.nozzle_diameter != target.nozzle_diameter || effective.baseline_flow_ratio != target.baseline_flow_ratio ||
+        effective.max_volumetric_speed != target.max_volumetric_speed)
+    {
+        std::ostringstream message;
+        message << std::setprecision(17) << "Prepared flow configuration differs from the captured material: flow "
+            << target.baseline_flow_ratio << " -> " << effective.baseline_flow_ratio << ", nozzle "
+            << target.nozzle_diameter << " -> " << effective.nozzle_diameter << ", volumetric speed "
+            << target.max_volumetric_speed << " -> " << effective.max_volumetric_speed << ", logical tool "
+            << target.logical_extruder << " -> " << effective.logical_extruder << ", physical tool "
+            << target.physical_tool << " -> " << effective.physical_tool;
+        throw std::invalid_argument(message.str());
+    }
+    m_flow_target = effective;
+    m_presets.project_config.set_key_value("filament_map_mode", new ConfigOptionEnum<FilamentMapMode>(fmmManual));
+    m_presets.prints.get_edited_preset().config.set_key_value("enable_support", new ConfigOptionBool(false));
+    calib_flowrate(linear, pass, pattern);
+}
+void Plater::bind_flow_model()
+{
+    const int material = int(m_flow_target.slot + 1);
+    const auto bind = [material](ModelConfig& config) {
+        config.set_key_value("extruder", new ConfigOptionInt(material));
+        config.set_key_value("enable_support", new ConfigOptionBool(false));
+        for (const char* key : {"outer_wall_filament_id", "inner_wall_filament_id", "sparse_infill_filament_id",
+                               "internal_solid_filament_id", "top_surface_filament_id", "bottom_surface_filament_id"})
+            config.set_key_value(key, new ConfigOptionInt(material));
+    };
+    for (auto* object : m_model.objects) {
+        if (!object->layer_config_ranges.empty()) throw std::invalid_argument("Flow resource contains layer configuration overrides");
+        bind(object->config);
+        for (auto* volume : object->volumes) {
+            if (!volume->is_model_part() || !volume->material_id().empty() || !volume->mmu_segmentation_facets.empty())
+                throw std::invalid_argument("Flow resource contains unsupported material or painted overrides");
+            bind(volume->config);
+        }
+    }
+}
 void Plater::prepare_tolerance()
 {
     new_project();

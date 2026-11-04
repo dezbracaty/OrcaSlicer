@@ -13,6 +13,11 @@
 #include <algorithm>
 #include <tbb/global_control.h>
 #include <tbb/task_arena.h>
+#ifdef LIBSLICER_CALIBRATION_SERIAL_REFERENCE
+namespace libslicer::testing {
+LIBSLICER_API void with_serial_runtime(const std::function<void()>& run);
+}
+#endif
 #ifdef _WIN32
 #include <Windows.h>
 namespace {
@@ -192,10 +197,37 @@ std::string baseline_key(const CalibrationRequest& request)
     name << std::hex << hash;
     return name.str();
 }
-// Reference: invoke the copied original Plater directly, then its native Print
-// path. Candidate: the public DLL wrapper. Compare effective model/config and
-// every executable G-code line without numeric or instruction normalization.
-void compare_original(Library& library, const CalibrationRequest& request)
+// Both suites compare native geometry/config and slice through the public API.
+// Exact instruction equality requires serial scheduling in BOTH private TBB
+// runtimes. The ordinary SDK suite instead checks the calibration instructions
+// while allowing the upstream parallel slicer to visit islands in any order.
+std::vector<std::string> calibration_commands(const std::string& gcode, libslicer::CalibMode mode)
+{
+    std::vector<std::string> selected;
+    if (mode == libslicer::CalibMode::Calib_Retraction_tower) {
+        std::istringstream lines(gcode);
+        for (std::string line; std::getline(lines, line);)
+            if (line.find("; Calib_Retraction_tower:") == 0)
+                selected.push_back(line);
+    } else if (mode == libslicer::CalibMode::Calib_VFA_Tower || mode == libslicer::CalibMode::Calib_Vol_speed_Tower) {
+        for (const auto& line : commands(gcode))
+            if (line.find("G1 F") == 0)
+                selected.push_back(line);
+        std::sort(selected.begin(), selected.end());
+        selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+    } else {
+        for (const auto& line : commands(gcode)) {
+            if (line.find("SET_PRESSURE_ADVANCE ") == 0 || line.find("M900 ") == 0 ||
+                line.find("M572 ") == 0 || line.find("SET_INPUT_SHAPER ") == 0 ||
+                line.find("M593 ") == 0 || line.find("M104 ") == 0 || line.find("M109 ") == 0 ||
+                line.find("SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=") == 0 ||
+                line.find("M205 ") == 0 || line.find("M566 ") == 0)
+                selected.push_back(line);
+        }
+    }
+    return selected;
+}
+void compare_original_impl(Library& library, const CalibrationRequest& request)
 {
     INFO("mode=" << static_cast<int>(request.mode));
     auto task = prepare(library, request);
@@ -276,6 +308,7 @@ void compare_original(Library& library, const CalibrationRequest& request)
         files.paths.push_back(path);
         print.export_gcode(path, &processor_result);
         const auto expected = commands(read_file(path)), observed = commands(read_file(sliced.output.path));
+#ifdef LIBSLICER_CALIBRATION_SERIAL_REFERENCE
         const auto fixture = baseline_key(request) + "-" + std::to_string(i) + ".commands";
         if (const auto* directory = std::getenv("LIBSLICER_CALIBRATION_WRITE_BASELINE")) {
             std::filesystem::create_directories(directory);
@@ -313,11 +346,41 @@ void compare_original(Library& library, const CalibrationRequest& request)
             INFO("plate=" << i << " line=" << line);
             REQUIRE(observed[line] == expected[line]);
         }
+#else
+        const auto original_calibration = calibration_commands(read_file(path), request.mode);
+        const auto sdk_calibration = calibration_commands(read_file(sliced.output.path), request.mode);
+        // Flow changes object/volume settings; tolerance is a geometry model.
+        // Neither requires dedicated firmware scan commands. Their geometry,
+        // effective configuration and nonempty preview are checked above.
+        if (request.mode != libslicer::CalibMode::Calib_Flow_Rate &&
+            request.mode != libslicer::CalibMode::Calib_Tolerance_Model)
+            REQUIRE_FALSE(sdk_calibration.empty());
+        REQUIRE(sdk_calibration == original_calibration);
+#endif
     }
+}
+void compare_original(Library& library, const CalibrationRequest& request)
+{
+#ifdef LIBSLICER_CALIBRATION_SERIAL_REFERENCE
+    tbb::global_control threads(tbb::global_control::max_allowed_parallelism, 1);
+    tbb::task_arena arena(1);
+    testing::with_serial_runtime([&] {
+        arena.execute([&] { compare_original_impl(library, request); });
+    });
+#else
+    INFO("Exact baselines require orca_plater_reference_tests with both TBB runtimes constrained");
+    REQUIRE(std::getenv("LIBSLICER_CALIBRATION_WRITE_BASELINE") == nullptr);
+    REQUIRE(std::getenv("LIBSLICER_CALIBRATION_COMPARE_BASELINE") == nullptr);
+    compare_original_impl(library, request);
+#endif
 }
 } // namespace
 
+#ifdef LIBSLICER_CALIBRATION_SERIAL_REFERENCE
 TEST_CASE("original Plater entries and public calibration emit identical commands", "[orca_plater][slice]")
+#else
+TEST_CASE("shared SDK calibration preserves native geometry config and calibration commands", "[orca_plater][slice]")
+#endif
 {
     tbb::global_control threads(tbb::global_control::max_allowed_parallelism, 1);
     tbb::task_arena arena(1);
@@ -379,24 +442,32 @@ TEST_CASE("original Plater entries and public calibration emit identical command
             r.mode        = libslicer::CalibMode::Calib_Flow_Rate;
             r.flow_linear = false;
             r.flow_pass   = 1;
+            SECTION("Archimedean Chords") {}
+            SECTION("Monotonic") { r.flow_pattern = CalibrationRequest::FlowPattern::Monotonic; }
         }
         SECTION("flow fine")
         {
             r.mode        = libslicer::CalibMode::Calib_Flow_Rate;
             r.flow_linear = false;
             r.flow_pass   = 2;
+            SECTION("Archimedean Chords") {}
+            SECTION("Monotonic") { r.flow_pattern = CalibrationRequest::FlowPattern::Monotonic; }
         }
         SECTION("flow YOLO")
         {
             r.mode        = libslicer::CalibMode::Calib_Flow_Rate;
             r.flow_linear = true;
             r.flow_pass   = 1;
+            SECTION("Archimedean Chords") {}
+            SECTION("Monotonic") { r.flow_pattern = CalibrationRequest::FlowPattern::Monotonic; }
         }
         SECTION("flow YOLO fine")
         {
             r.mode        = libslicer::CalibMode::Calib_Flow_Rate;
             r.flow_linear = true;
             r.flow_pass   = 2;
+            SECTION("Archimedean Chords") {}
+            SECTION("Monotonic") { r.flow_pattern = CalibrationRequest::FlowPattern::Monotonic; }
         }
         SECTION("input frequency")
         {
@@ -432,7 +503,11 @@ TEST_CASE("original Plater entries and public calibration emit identical command
     });
 }
 
+#ifdef LIBSLICER_CALIBRATION_SERIAL_REFERENCE
 TEST_CASE("original PA Pattern keeps all arranged plates", "[orca_plater][slice]")
+#else
+TEST_CASE("shared SDK PA Pattern keeps all arranged plates", "[orca_plater][slice]")
+#endif
 {
     auto library = open_library();
     auto config  = base_config();

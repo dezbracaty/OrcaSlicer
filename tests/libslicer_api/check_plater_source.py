@@ -83,5 +83,26 @@ def adapt_gui_access(text):
 
 adapted = (source_dir / "PlaterCalibration.inc").read_text(encoding="utf-8")
 adapted = normalized_body(adapted[adapted.index(origin["start"]):])
-assert adapted == adapt_gui_access(body), "Calibration implementation contains changes outside the GUI adaptation allowlist"
-print("Original algorithms and GUI-only adaptation verified:", origin["revision"])
+
+def adapt_flow_target(text):
+    # Intentional SDK extension, separate from the GUI-only adaptation above.
+    # Keep the original formulas, resources and all other calibration entries.
+    start = text.index("// Adjust settings for flowrate calibration")
+    end = text.index("void Plater::calib_temp(", start)
+    section = text[start:end]
+    replacements = {
+        "float nozzle_diameter = nozzle_diameter_config->values[0];":
+            "float nozzle_diameter = m_flow_target.nozzle_diameter;",
+        'auto cur_flowrate = filament_config->option<ConfigOptionFloats>("filament_flow_ratio")->get_at(0);':
+            "auto cur_flowrate = m_flow_target.baseline_flow_ratio;",
+        'double filament_max_volumetric_speed = filament_config->option<ConfigOptionFloats>("filament_max_volumetric_speed")->get_at(0);':
+            "double filament_max_volumetric_speed = m_flow_target.max_volumetric_speed;",
+        "    // ORCA: pass the pattern\n": "    bind_flow_model();\n    // ORCA: pass the pattern\n",
+    }
+    for old, new in replacements.items():
+        assert section.count(old) == 1, f"Flow target adaptation anchor changed: {old}"
+        section = section.replace(old, new)
+    return text[:start] + section + text[end:]
+
+assert adapted == adapt_flow_target(adapt_gui_access(body)), "Calibration changes exceed the explicit GUI/flow-target adaptations"
+print("Original algorithms and explicit GUI/flow-target adaptations verified:", origin["revision"])
