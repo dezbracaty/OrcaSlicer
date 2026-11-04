@@ -10,6 +10,7 @@
 #include <png.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cctype>
 #include <cstdint>
@@ -186,6 +187,76 @@ std::optional<DecodedPng> decode_png(const std::vector<unsigned char>& encoded)
 } // namespace
 
 namespace {
+struct P3ExtrusionCheck {
+    std::size_t xy_extrusions {0};
+    double max_cross_section {0};
+    std::vector<std::string> violations;
+};
+
+// Independent final-G-code check for the P3 thermoplastic coupons below.
+// The machine shares a 1.75 mm feed channel, with Klipper's default limit of
+// 4 * nozzle_diameter^2. Firmware tool macros are outside this static check.
+P3ExtrusionCheck check_p3_linear_extrusion(const std::string& gcode)
+{
+    constexpr double nozzle = 0.4;
+    const double filament_area = std::acos(-1.0) * 1.75 * 1.75 / 4;
+    constexpr double max_area = 4 * nozzle * nozzle;
+    P3ExtrusionCheck result;
+    std::array<double, 4> position {};
+    bool absolute_xyz = true, absolute_e = true;
+    double flow = 1;
+    std::istringstream input(gcode);
+    std::size_t line_number = 0;
+    for (std::string line; std::getline(input, line);) {
+        ++line_number;
+        std::istringstream words(line.substr(0, line.find(';')));
+        std::string command;
+        words >> command;
+        if (command.empty()) continue;
+        if (command == "G90") absolute_xyz = true;
+        if (command == "G91") absolute_xyz = false;
+        if (command == "M82") absolute_e = true;
+        if (command == "M83") absolute_e = false;
+        // Arc fitting is disabled in the fixture; never silently skip an arc.
+        REQUIRE(command != "G2");
+        REQUIRE(command != "G3");
+        if (command != "G0" && command != "G1" && command != "G92" && command != "M221") continue;
+        std::map<char, double> parameters;
+        for (std::string word; words >> word;) {
+            if (word.size() > 1 && std::string("XYZES").find(word.front()) != std::string::npos)
+                parameters[word.front()] = std::stod(word.substr(1));
+        }
+        if (command == "M221" && parameters.count('S')) flow = parameters.at('S') / 100;
+        if (command == "G92") {
+            if (parameters.empty()) position.fill(0);
+            for (std::size_t axis = 0; axis < 4; ++axis)
+                if (parameters.count("XYZE"[axis])) position[axis] = parameters.at("XYZE"[axis]);
+        }
+        if (command != "G0" && command != "G1") continue;
+        auto target = position;
+        for (std::size_t axis = 0; axis < 4; ++axis) {
+            const char name = "XYZE"[axis];
+            if (!parameters.count(name)) continue;
+            const bool absolute = absolute_xyz && (axis != 3 || absolute_e);
+            target[axis] = parameters.at(name) + (absolute ? 0 : position[axis]);
+        }
+        const double dx = target[0] - position[0], dy = target[1] - position[1];
+        const double dz = target[2] - position[2], de = (target[3] - position[3]) * flow;
+        // Like Klipper check_move, retractions and E-only moves do not use
+        // the XY deposition cross-section limit. Tiny positive E is allowed.
+        if (de > 0 && (dx != 0 || dy != 0)) {
+            ++result.xy_extrusions;
+            const double cross_section = filament_area * de / std::sqrt(dx*dx + dy*dy + dz*dz);
+            result.max_cross_section = std::max(result.max_cross_section, cross_section);
+            if (cross_section > max_area && de > nozzle * max_area / filament_area)
+                result.violations.push_back("line " + std::to_string(line_number) + ": " + line +
+                    " (" + std::to_string(cross_section) + " mm^2 > 0.640 mm^2)");
+        }
+        position = target;
+    }
+    return result;
+}
+
 std::set<unsigned> require_p3_heat_before_extrusion(const std::string& gcode)
 {
     std::set<unsigned> tools;
@@ -222,6 +293,106 @@ std::set<unsigned> require_p3_heat_before_extrusion(const std::string& gcode)
     return tools;
 }
 } // namespace
+
+TEST_CASE("P3 extrusion checker catches the MMU tower load", "[libslicer_api][p3][extrusion-check]")
+{
+    const std::string legacy_load = "G90\nM83\nG1 X60.918 Y66.5 Z0.2\n"
+        "G1 E18 F600\nG1 X110.375 E63 F2826\nG1 X60.918 E9 F1978\n";
+    const auto rejected = check_p3_linear_extrusion(legacy_load);
+    REQUIRE(rejected.violations.size() == 1);
+    CHECK(rejected.violations.front().find("line 5:") != std::string::npos);
+    CHECK(rejected.max_cross_section == Catch::Approx(3.0639294367));
+
+    SECTION("absolute E and G92 must not hide excess feed") {
+        const auto absolute = check_p3_linear_extrusion(
+            "G90\nM82\nG1 X60.918 Y66.5\nG92 E100\nG1 X110.375 E163\n");
+        REQUIRE(absolute.violations.size() == 1);
+        CHECK(absolute.max_cross_section == Catch::Approx(rejected.max_cross_section));
+    }
+    SECTION("relative XYZ and flow override affect the limit") {
+        const auto relative = check_p3_linear_extrusion(
+            "G91\nM82\nM221 S200\nG1 X10 E2\nG1 X10 E2\n");
+        CHECK(relative.xy_extrusions == 2);
+        CHECK(relative.violations.size() == 2);
+    }
+    SECTION("normal deposition and Klipper exceptions remain accepted") {
+        const auto accepted = check_p3_linear_extrusion(
+            "G90\nM83\nG1 X10 E0.4\nG1 X20 E-1\nG1 E18\nG1 X20.01 E0.05\n");
+        CHECK(accepted.xy_extrusions == 2);
+        CHECK(accepted.violations.empty());
+    }
+}
+
+TEST_CASE("P3 PLA TPU dock changes stay within extrusion limits with and without tower",
+          "[libslicer_api][p3][wipe-tower][slice]")
+{
+    const bool tower = GENERATE(false, true);
+    INFO("enable_prime_tower=" << tower);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "0.20mm Standard @P3";
+    selection.filament_preset_ids.assign(6, "Generic PLA @P3");
+    selection.filament_preset_ids[3] = "CFSYS TPU 95A";
+    selection.filament_physical_tools = {0, 1, 2, 3, 4, 5};
+    auto created = library->create_config(selection);
+    for (const auto& issue : created.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(created.success);
+    // Load the real preset: overriding this value here would mask a regression.
+    CHECK(created.config->snapshot().value("single_extruder_multi_material") == "0");
+    REQUIRE(created.config->apply_patch({
+        {"filament_colour", "#F28E2B;#4E79A7;#59A14F;#B07AA1;#EDC948;#E15759"},
+        {"enable_prime_tower", tower ? "1" : "0"}, {"wipe_tower_type", "type2"},
+        {"wipe_tower_x", "60"}, {"wipe_tower_y", "60"}, {"prime_tower_width", "60"},
+        {"wipe_tower_wall_type", "rectangle"}, {"enable_arc_fitting", "0"},
+        {"enable_support", "0"}, {"generate_reinforced_perimeters", "0"},
+        {"generate_reinforced_infills", "0"}
+    }).success);
+    libslicer::SliceRequest request;
+    request.config = created.config->snapshot();
+    // Two three-layer coupons force repeated T0/T3 changes in both directions.
+    for (const unsigned tool : {0u, 3u}) {
+        const float x = tool == 0 ? 160.f : 180.f;
+        libslicer::SliceObjectInput object;
+        object.name = "P3-extrusion-T" + std::to_string(tool);
+        libslicer::SliceVolumeInput volume;
+        volume.vertices = {{x,150,0},{x+10,150,0},{x+10,160,0},{x,160,0},
+                           {x,150,0.6f},{x+10,150,0.6f},{x+10,160,0.6f},{x,160,0.6f}};
+        volume.triangles = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                           {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+        volume.default_filament_slot = int(tool + 1);
+        object.volumes.push_back(std::move(volume));
+        request.objects.push_back(std::move(object));
+    }
+    const auto output = std::filesystem::temp_directory_path() /
+        (tower ? "libslicer-p3-pla-tpu-tower.gcode" : "libslicer-p3-pla-tpu-no-tower.gcode");
+    request.output_gcode_path = output.string();
+    const auto sliced = library->slice(request);
+    for (const auto& issue : sliced.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(sliced.success);
+    REQUIRE(sliced.summary.layer_count == 3);
+    REQUIRE(sliced.preview);
+    for (const unsigned tool : {0u, 3u})
+        CHECK(std::any_of(sliced.preview->segments.begin(), sliced.preview->segments.end(),
+            [tool](const auto& segment) { return segment.tool_id == tool && segment.extrusion_delta_mm > 0; }));
+    std::ifstream input(output);
+    REQUIRE(input.good());
+    const std::string gcode((std::istreambuf_iterator<char>(input)), {});
+    CHECK(require_p3_heat_before_extrusion(gcode) == std::set<unsigned>{0, 3});
+    CHECK((gcode.find(";TYPE:Prime tower") != std::string::npos) == tower);
+    CHECK(gcode.find("; CP TOOLCHANGE LOAD") == std::string::npos);
+    CHECK(gcode.find("; Retract(unload)") == std::string::npos);
+    CHECK(gcode.find("; Cooling park") == std::string::npos);
+    const auto checked = check_p3_linear_extrusion(gcode);
+    REQUIRE(checked.xy_extrusions > 0);
+    for (const auto& violation : checked.violations) UNSCOPED_INFO(violation);
+    CHECK(checked.violations.empty());
+}
 
 TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material", "[libslicer_api][p3][slice]")
 {
