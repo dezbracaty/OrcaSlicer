@@ -1158,9 +1158,9 @@ TEST_CASE("CFSYS profiles expose the canonical continuous fiber contract", "[lib
     // therefore contain C-style escaped newlines until a slice config is built.
     CHECK(*cut_gcode == "M400\\nS0\\nM400\\n");
     CHECK(*cut_to_contact == "23");
-    CHECK(*prefeed_extra == "0.5");
+    CHECK(*prefeed_extra == "0.05");
     CHECK(*z_hop_height == "2");
-    CHECK(*landing_length == "2");
+    CHECK(*landing_length == "0.2");
     CHECK_FALSE(config->value("fiber_start_length").has_value());
     CHECK(*landing_speed == "3");
     CHECK(*start_speed == "10");

@@ -18,6 +18,7 @@
     "extruder_offset": ["0x0", "0x0", "0x0", "0x0", "0x0", "0x0"],
     "extruder_colour": ["#F28E2B", "#4E79A7", "#59A14F", "#B07AA1", "#EDC948", "#E15759"],
     "single_extruder_multi_material": "0",
+    "wipe_tower_type": "type2",
     "filament_slots_bound_to_physical_tools": "1",
     "physical_extruder_map": ["0", "1", "2", "3", "4", "5"],
     "toolhead_process_capabilities": ["thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber"],
