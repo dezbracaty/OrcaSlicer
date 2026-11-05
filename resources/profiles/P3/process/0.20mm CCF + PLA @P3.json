@@ -6,7 +6,7 @@
     "instantiation": "true",
     "inherits": "0.20mm Standard @P3",
     "compatible_printers": ["P3 0.4 nozzle"],
-    "description": "P3 T5 continuous-fiber software profile, with PLA matrix on T3. Fiber parameters reference Alpha500; 23 mm cutter-to-contact distance is a user-selected provisional value. The S0 completion semantics and mechanical parameters require machine acceptance before physical printing.",
+    "description": "P3 T5 continuous-fiber software profile, with PLA matrix on T3. Fiber parameters reference Alpha500; the P3 machine preset defines the user-specified 20.55 mm cutter-to-contact distance. The S0 completion semantics and mechanical parameters require machine acceptance before physical printing.",
     "outer_wall_filament_id": "4",
     "inner_wall_filament_id": "4",
     "sparse_infill_filament_id": "4",

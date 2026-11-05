@@ -23,7 +23,7 @@
     "toolhead_process_capabilities": ["thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber"],
     "toolhead_fiber_protocol_id": ["", "", "", "", "", "p3-shared-e-v1"],
     "fiber_cut_gcode": "M400\nS0\nM400\n",
-    "fiber_cut_to_contact_length": "23",
+    "fiber_cut_to_contact_length": "20.55",
     "toolhead_fiber_e_units_per_mm": ["1", "1", "1", "1", "1", "1"],
     "toolhead_filament_capacity": ["1", "1", "1", "1", "1", "1"],
     "physical_tool_sides": ["unknown", "unknown", "unknown", "unknown", "unknown", "unknown"],
