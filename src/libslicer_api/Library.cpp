@@ -3548,6 +3548,15 @@ SliceResult Library::slice_impl(const SliceRequest& request,
             report_progress(callbacks, 0.08f + engine_progress * 0.78f, status.text);
         });
         print.apply(plate_model, config);
+        // The first native apply normalizes the tower before building regions.
+        // A single volume can therefore look like one material even when its
+        // walls and infill use different tools. Once regions exist, reapply the
+        // requested config so the native extruder count decides tower usage.
+        const auto* requested_tower = config.option<Slic3r::ConfigOptionBool>("enable_prime_tower");
+        if (!calibration && requested_tower && requested_tower->value &&
+            config.opt_enum<Slic3r::PrintSequence>("print_sequence") == Slic3r::PrintSequence::ByLayer &&
+            !print.config().enable_prime_tower.value && print.extruders(true).size() > 1)
+            print.apply(plate_model, config);
         if (calibration) print.set_calib_params(calibration->impl_->params);
         validate_effective_mask_regions(print, mask_volume_ids);
 

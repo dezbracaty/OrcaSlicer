@@ -356,7 +356,9 @@ TEST_CASE("P3 PLA TPU dock changes stay within extrusion limits with and without
           "[libslicer_api][p3][wipe-tower][slice]")
 {
     const bool tower = GENERATE(false, true);
+    const bool infill_only = GENERATE(false, true);
     INFO("enable_prime_tower=" << tower);
+    INFO("single object with TPU infill=" << infill_only);
     libslicer::LibraryOptions options;
     options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
     options.vendors = {"P3"};
@@ -382,10 +384,18 @@ TEST_CASE("P3 PLA TPU dock changes stay within extrusion limits with and without
         {"enable_support", "0"}, {"generate_reinforced_perimeters", "0"},
         {"generate_reinforced_infills", "0"}
     }).success);
+    if (infill_only)
+        REQUIRE(created.config->apply_patch({
+            {"outer_wall_filament_id", "1"}, {"inner_wall_filament_id", "1"},
+            {"top_surface_filament_id", "1"}, {"bottom_surface_filament_id", "1"},
+            {"sparse_infill_filament_id", "4"}, {"internal_solid_filament_id", "4"},
+            {"top_shell_layers", "1"}, {"bottom_shell_layers", "1"}
+        }).success);
     libslicer::SliceRequest request;
     request.config = created.config->snapshot();
     // Two three-layer coupons force repeated T0/T3 changes in both directions.
     for (const unsigned tool : {0u, 3u}) {
+        if (infill_only && tool == 3u) continue;
         const float x = tool == 0 ? 160.f : 180.f;
         libslicer::SliceObjectInput object;
         object.name = "P3-extrusion-T" + std::to_string(tool);
@@ -580,8 +590,12 @@ TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material
             const auto original_value = original.value(key);
             REQUIRE(actual_value);
             REQUIRE(original_value);
-            CHECK(material_value(*actual_value) ==
-                  original_value->substr(0, original_value->find(',')));
+            // P3 PLA has a machine-specific flow calibration; the remaining
+            // material parameters continue to match the Alpha500 definition.
+            const std::string expected_value = material == "CFSYS PLA" &&
+                    std::string(key) == "filament_flow_ratio"
+                ? "0.99" : original_value->substr(0, original_value->find(','));
+            CHECK(material_value(*actual_value) == expected_value);
         }
 
         libslicer::SliceRequest request;
