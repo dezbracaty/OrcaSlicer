@@ -4550,23 +4550,18 @@ mz_bool mz_zip_reader_extract_file_to_mem(mz_zip_archive *pZip, const char *pFil
 
 void *mz_zip_reader_extract_to_heap(mz_zip_archive *pZip, mz_uint file_index, size_t *pSize, mz_uint flags)
 {
-    mz_uint64 comp_size, uncomp_size, alloc_size;
-    const mz_uint8 *p = mz_zip_get_cdh(pZip, file_index);
+    mz_uint64 alloc_size;
+    mz_zip_archive_file_stat file_stat;
     void *pBuf;
 
     if (pSize)
         *pSize = 0;
 
-    if (!p)
-    {
-        mz_zip_set_error(pZip, MZ_ZIP_INVALID_PARAMETER);
+    if (!mz_zip_reader_file_stat(pZip, file_index, &file_stat))
         return NULL;
-    }
 
-    comp_size = MZ_READ_LE32(p + MZ_ZIP_CDH_COMPRESSED_SIZE_OFS);
-    uncomp_size = MZ_READ_LE32(p + MZ_ZIP_CDH_DECOMPRESSED_SIZE_OFS);
-
-    alloc_size = (flags & MZ_ZIP_FLAG_COMPRESSED_DATA) ? comp_size : uncomp_size;
+    /* file_stat resolves ZIP64 sizes; the raw 32-bit fields may be sentinels. */
+    alloc_size = (flags & MZ_ZIP_FLAG_COMPRESSED_DATA) ? file_stat.m_comp_size : file_stat.m_uncomp_size;
     if (((sizeof(size_t) == sizeof(mz_uint32))) && (alloc_size > 0x7FFFFFFF))
     {
         mz_zip_set_error(pZip, MZ_ZIP_INTERNAL_ERROR);
