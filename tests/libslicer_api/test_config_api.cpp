@@ -292,6 +292,35 @@ std::set<unsigned> require_p3_heat_before_extrusion(const std::string& gcode)
     REQUIRE_FALSE(tools.empty());
     return tools;
 }
+
+void require_p3_retraction_lengths(const std::string& gcode, const std::set<unsigned>& fiber_tools = {})
+{
+    // P3 exports physical millimetres in relative E mode. Inspect executable
+    // moves, so a material override or change script cannot hide behind the
+    // machine preset's configured value.
+    std::istringstream input(gcode);
+    unsigned tool = 0;
+    std::size_t retractions = 0, line_number = 0;
+    for (std::string line; std::getline(input, line);) {
+        ++line_number;
+        std::istringstream words(line.substr(0, line.find(';')));
+        std::string command;
+        words >> command;
+        REQUIRE(command != "M82");
+        if (command.size() > 1 && command.front() == 'T' &&
+            std::all_of(command.begin()+1, command.end(), [](unsigned char c) { return std::isdigit(c); }))
+            tool = unsigned(std::stoul(command.substr(1)));
+        if (command != "G0" && command != "G1") continue;
+        for (std::string word; words >> word;)
+            if (word.size() > 1 && word.front() == 'E' && std::stod(word.substr(1)) < 0) {
+                INFO("T" << tool << " retraction at line " << line_number << ": " << line);
+                CHECK(fiber_tools.count(tool) == 0);
+                CHECK(std::stod(word.substr(1)) == Catch::Approx(-0.4));
+                ++retractions;
+            }
+    }
+    CHECK(retractions > 0);
+}
 } // namespace
 
 TEST_CASE("P3 extrusion checker catches the MMU tower load", "[libslicer_api][p3][extrusion-check]")
@@ -384,6 +413,7 @@ TEST_CASE("P3 PLA TPU dock changes stay within extrusion limits with and without
     REQUIRE(input.good());
     const std::string gcode((std::istreambuf_iterator<char>(input)), {});
     CHECK(require_p3_heat_before_extrusion(gcode) == std::set<unsigned>{0, 3});
+    require_p3_retraction_lengths(gcode);
     CHECK((gcode.find(";TYPE:Prime tower") != std::string::npos) == tower);
     CHECK(gcode.find("; CP TOOLCHANGE LOAD") == std::string::npos);
     CHECK(gcode.find("; Retract(unload)") == std::string::npos);
@@ -392,6 +422,75 @@ TEST_CASE("P3 PLA TPU dock changes stay within extrusion limits with and without
     REQUIRE(checked.xy_extrusions > 0);
     for (const auto& violation : checked.violations) UNSCOPED_INFO(violation);
     CHECK(checked.violations.empty());
+}
+
+TEST_CASE("P3 0.125 mm mixed preset shares layers between matrix and fiber", "[libslicer_api][p3][preset][slice]")
+{
+    const bool fiber = GENERATE(false, true);
+    INFO("fiber=" << fiber);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "0.125mm CCF + Matrix @P3";
+    auto created = library->create_config(selection);
+    for (const auto& issue : created.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(created.success);
+    CHECK(created.selection.process_preset_id == selection.process_preset_id);
+    const auto defaults = created.config->snapshot();
+    CHECK(defaults.value("layer_height") == "0.125");
+    CHECK(defaults.value("initial_layer_print_height") == "0.125");
+    CHECK(defaults.value("fiber_layer_height_ratio") == "1");
+    CHECK(defaults.value("fiber_width") == "1");
+    CHECK(defaults.value("outer_wall_filament_id") == "5");
+    CHECK(defaults.value("reinforced_perimeters_filament") == "6");
+    CHECK(defaults.value("retraction_length") == "0.4,0.4,0.4,0.4,0.4,0.4");
+    CHECK(defaults.value("retract_length_toolchange") == "0.4,0.4,0.4,0.4,0.4,0.4");
+    CHECK(defaults.value("filament_diameter") == "1.75,1.75,1.75,1.75,1.75,0.4");
+    CHECK(defaults.value("nozzle_temperature_initial_layer") == "230,230,230,210,280,235");
+    CHECK(defaults.value("nozzle_temperature") == "230,230,230,210,270,235");
+    REQUIRE(created.config->set("filament_colour", "#F28E2B;#4E79A7;#59A14F;#B07AA1;#EDC948;#E15759").success);
+    if (!fiber)
+        REQUIRE(created.config->set("generate_reinforced_perimeters", "0").success);
+    libslicer::SliceObjectInput object;
+    object.name = "P3-0125-mixed-coupon";
+    libslicer::SliceVolumeInput volume;
+    volume.vertices = {{100,100,0},{120,100,0},{120,120,0},{100,120,0},
+                       {100,100,2},{120,100,2},{120,120,2},{100,120,2}};
+    volume.triangles = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                       {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+    volume.default_filament_slot = 5;
+    object.volumes.push_back(std::move(volume));
+    libslicer::SliceRequest request;
+    request.objects = {object};
+    request.config = created.config->snapshot();
+    request.output_gcode_path = (std::filesystem::temp_directory_path() /
+        (fiber ? "libslicer-p3-0125-mixed.gcode" : "libslicer-p3-0125-matrix.gcode")).string();
+    const auto sliced = library->slice(request);
+    for (const auto& issue : sliced.diagnostics) UNSCOPED_INFO(issue.message);
+    REQUIRE(sliced.success);
+    REQUIRE(sliced.summary.layer_count == 16);
+    REQUIRE(sliced.preview);
+    std::ifstream input(request.output_gcode_path);
+    REQUIRE(input.good());
+    const std::string gcode((std::istreambuf_iterator<char>(input)), {});
+    const auto tools = require_p3_heat_before_extrusion(gcode);
+    CHECK(tools == (fiber ? std::set<unsigned>{4, 5} : std::set<unsigned>{4}));
+    CHECK((gcode.find(";FIBER_BEGIN ") != std::string::npos) == fiber);
+    CHECK(gcode.find("; CP TOOLCHANGE LOAD") == std::string::npos);
+    require_p3_retraction_lengths(gcode, fiber ? std::set<unsigned>{5} : std::set<unsigned>{});
+    std::istringstream lines(gcode);
+    unsigned layers = 0;
+    for (std::string line; std::getline(lines, line);)
+        if (line.rfind(";Z:", 0) == 0) {
+            ++layers;
+            CHECK(std::stod(line.substr(3)) == Catch::Approx(layers * 0.125));
+        }
+    CHECK(layers == 16);
 }
 
 TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material", "[libslicer_api][p3][slice]")
@@ -600,6 +699,10 @@ TEST_CASE("P3 can select CCF on any tool without changing material ownership", "
         "Generic PLA @P3", "CFSYS PA-CF", "CFSYS CCF"});
     CHECK(library->active_config_snapshot()->value("filament_process_type") ==
         "thermoplastic;thermoplastic;thermoplastic;thermoplastic;thermoplastic;continuous_fiber");
+    // CCF is a 0.4 mm composite feedstock; its deposited fiber_width is a
+    // separate process setting and must not replace the raw material diameter.
+    CHECK(library->active_config_snapshot()->value("filament_diameter") ==
+        "1.75,1.75,1.75,1.75,1.75,0.4");
     // Exercise reassignment from a thermoplastic baseline after checking the
     // configured mixed-material defaults.
     REQUIRE(library->set_active_filament_preset(5, "Generic PLA @P3").success);
@@ -613,11 +716,15 @@ TEST_CASE("P3 can select CCF on any tool without changing material ownership", "
         CHECK(selected.view.filament_slots[slot].physical_tool_index == slot);
     }
     std::string expected_processes;
+    std::string expected_diameters;
     for (unsigned slot = 0; slot < 6; ++slot) {
         if (slot) expected_processes += ';';
         expected_processes += slot == fiber_tool ? "continuous_fiber" : "thermoplastic";
+        if (slot) expected_diameters += ',';
+        expected_diameters += slot == fiber_tool ? "0.4" : "1.75";
     }
     CHECK(library->active_config_snapshot()->value("filament_process_type") == expected_processes);
+    CHECK(library->active_config_snapshot()->value("filament_diameter") == expected_diameters);
     CHECK(selected.view.filament_slots[fiber_tool].color.red == 20);
     CHECK(library->active_config_snapshot()->value("layer_height") == "0.15");
     CHECK(library->active_config_snapshot()->value("filament_map") == "1,2,3,4,5,6");
@@ -700,6 +807,7 @@ TEST_CASE("mixed-capability fiber exports preserve every physical tool ID", "[li
         std::ifstream generated(output);
         REQUIRE(generated.good());
         const std::string gcode((std::istreambuf_iterator<char>(generated)), {});
+        CHECK(gcode.find("; filament_diameter: 1.75,1.75,1.75,1.75,1.75,0.4\n") != std::string::npos);
         CHECK(gcode.find(";FIBER_CUT\nM400\nS0\nM400\n") != std::string::npos);
         CHECK(gcode.find("G1 E0 F0") == std::string::npos);
         CHECK(gcode.find(";P3_TOOLCHANGE_BEGIN\nM400\n;TOOL_BINDING filament=5 physical=5\nT5\nM109 S") != std::string::npos);
