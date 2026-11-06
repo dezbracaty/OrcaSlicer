@@ -652,6 +652,13 @@ LIBSLICER_API std::string encode_project_object_semantics(const ProjectObject&);
 LIBSLICER_API std::string encode_project_part_semantics(const ProjectPart&);
 LIBSLICER_API std::string encode_project_part_annotations(const ProjectPart&);
 LIBSLICER_API std::string encode_project_plate_semantics(const ProjectPlate&);
+// Call only when the machine/material domain changes, before publishing the
+// new configuration to consumers. Preserves unrelated semantics and applicable
+// manual bindings; stale bindings inherit target_config. Does not repair slice
+// requests or user edits. Malformed semantics/invalid snapshots throw.
+LIBSLICER_API std::string synchronize_project_plate_materials(
+    std::string_view semantics, const ConfigSnapshot& target_config,
+    std::vector<ConfigDiagnostic>* diagnostics = nullptr);
 
 class LIBSLICER_API Library final
 {

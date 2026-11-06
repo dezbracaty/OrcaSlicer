@@ -2565,9 +2565,20 @@ void apply_part_annotations(Slic3r::ModelVolume& volume, const std::string& payl
     volume.seam_facets.set_data(native_facets(facets_from_json(j.at("seam_facets")),count,2));
     volume.fuzzy_skin_facets.set_data(native_facets(facets_from_json(j.at("fuzzy_skin_facets")),count,2));
 }
+Slic3r::DynamicPrintConfig effective_plate_settings(const ProjectJson& j) {
+    auto settings = semantic_settings(j);
+    // PartPlate::get_real_filament_maps / get_real_filament_map_mode:
+    // an empty map and Default mode inherit independently from the global config.
+    if (const auto* maps = settings.option<Slic3r::ConfigOptionInts>("filament_map"); maps && maps->values.empty())
+        settings.erase("filament_map");
+    if (const auto* mode = settings.option<Slic3r::ConfigOptionEnum<Slic3r::FilamentMapMode>>("filament_map_mode");
+        mode && mode->value == Slic3r::FilamentMapMode::fmmDefault)
+        settings.erase("filament_map_mode");
+    return settings;
+}
 void apply_plate_semantics(Slic3r::Model& model, Slic3r::DynamicPrintConfig& config, const std::string& payload) {
     const auto j=semantic_json(payload,"plate"); if (j.empty()) return;
-    config.apply(semantic_settings(j));
+    config.apply(effective_plate_settings(j));
     const int mode=j.at("custom_gcode_mode");
     if (mode<0||mode>int(Slic3r::CustomGCode::Mode::MultiExtruder)) throw std::invalid_argument("Invalid custom G-code mode");
     const int index=j.value("native_plate_index",0);
@@ -2690,6 +2701,70 @@ std::string encode_project_part_annotations(const ProjectPart& part) {
 std::string encode_project_plate_semantics(const ProjectPlate& plate) {
     auto code=ProjectJson::array();for(const auto& c:plate.custom_gcodes)code.push_back({{"print_z",c.print_z},{"type",c.type},{"filament_slot",c.filament_slot},{"color",c.color},{"extra",c.extra}});
     return ProjectJson{{"version",1},{"scope","plate"},{"native_plate_index",plate.native_plate_index},{"settings",settings_json(plate.settings,false)},{"custom_gcode_mode",plate.custom_gcode_mode},{"custom_gcodes",code}}.dump();
+}
+
+std::string synchronize_project_plate_materials(std::string_view payload,
+    const ConfigSnapshot& target, std::vector<ConfigDiagnostic>* diagnostics) {
+    if (!target.valid()) throw std::invalid_argument("Plate material synchronization requires a configuration");
+    auto j = semantic_json(payload, "plate");
+    if (j.empty()) return std::string(payload);
+    auto settings = effective_plate_settings(j);
+    auto global = dynamic_config(target);
+    const auto tools = tool_config(global);
+    const auto count = tools.filament_diameter.size();
+    Slic3r::validate_material_tool_bindings(tools);
+    const auto report = [&](const std::string& message) {
+        if (diagnostics) diagnostics->push_back({"filament_map", message});
+    };
+    auto* maps = settings.option<Slic3r::ConfigOptionInts>("filament_map");
+    bool reset = false;
+    if (maps) {
+        const auto previous_count = maps->size();
+        // Native PartPlate::set_filament_count resizes ordinary maps with 1.
+        // Capacity-limited machines must instead use their resolved tool owners.
+        maps->values.resize(count, 1);
+        if (!tools.toolhead_filament_capacity.values.empty())
+            for (size_t i = previous_count; i < count; ++i)
+                maps->values[i] = tools.filament_map.values.at(i);
+        try {
+            auto effective = global;
+            effective.apply(settings);
+            const auto bindings = tool_config(effective);
+            for (int logical : maps->values)
+                if (logical < 1 || size_t(logical) > bindings.nozzle_diameter.size())
+                    throw std::invalid_argument("Plate mapping references a missing tool");
+            if (fixed_physical_filament_slots(global) && maps->values != tools.filament_map.values)
+                throw std::invalid_argument("Plate mapping conflicts with fixed physical material slots");
+            Slic3r::validate_material_tool_bindings(bindings);
+            if (previous_count != count) report("Resized plate material mapping to " + std::to_string(count) + " slots");
+        } catch (const std::invalid_argument& error) {
+            reset = true;
+            report(std::string(error.what()) + "; inheriting target material bindings and mode");
+        }
+        // A fixed-slot machine cannot retain a partial foreign mapping/mode.
+        if (fixed_physical_filament_slots(global) && previous_count != count) {
+            reset = true;
+            report("Foreign plate material domain replaced by target fixed-slot bindings and mode");
+        }
+    }
+    if (fixed_physical_filament_slots(global)) {
+        const auto* mode = settings.option<Slic3r::ConfigOptionEnum<Slic3r::FilamentMapMode>>("filament_map_mode");
+        const auto* target_mode = global.option<Slic3r::ConfigOptionEnum<Slic3r::FilamentMapMode>>("filament_map_mode");
+        if (mode && mode->value != Slic3r::FilamentMapMode::fmmManual && mode->value != target_mode->value) {
+            reset = true;
+            report("Plate automatic mode is incompatible with target fixed-slot bindings; inheriting target mode");
+        }
+    }
+    if (reset) {
+        settings.erase("filament_map");
+        settings.erase("filament_map_mode");
+    }
+    // Only mapping keys are rewritten; retain every other JSON field verbatim.
+    for (const char* key : {"filament_map", "filament_map_mode"}) {
+        j["settings"].erase(key);
+        if (const auto* value = settings.option(key)) j["settings"][key] = value->serialize();
+    }
+    return j.dump();
 }
 
 

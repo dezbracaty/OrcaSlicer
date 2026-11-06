@@ -352,6 +352,134 @@ TEST_CASE("P3 extrusion checker catches the MMU tower load", "[libslicer_api][p3
     }
 }
 
+TEST_CASE("imported single material plate follows P3 material bindings", "[libslicer_api][plate-material-sync][slice]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    REQUIRE(library->activate_config(selection).success);
+    libslicer::ProjectPlate plate;
+    plate.settings = {{"filament_map", "1"}, {"filament_map_mode", "Auto For Flush"}};
+    libslicer::SliceRequest request;
+    request.config = *library->active_config_snapshot();
+    request.project_semantics = libslicer::encode_project_plate_semantics(plate);
+    std::ostringstream evidence;
+    for (const auto* key : {"filament_map", "filament_diameter", "filament_process_type"})
+        evidence << key << "=" << request.config.value(key).value_or("<missing>") << '\n';
+    evidence << "plate filament_map=1 (overrides global at slice time)\n";
+    libslicer::SliceObjectInput object;
+    object.name = "plate-material-coupon";
+    libslicer::SliceVolumeInput volume;
+    volume.vertices = {{100,100,0},{110,100,0},{110,110,0},{100,110,0},
+                       {100,100,0.6f},{110,100,0.6f},{110,110,0.6f},{100,110,0.6f}};
+    volume.triangles = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                        {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+    volume.default_filament_slot = 1;
+    object.volumes = {volume};
+    request.objects = {object};
+    // The unsynchronized request must remain invalid: no repair at slice time.
+    const auto stale = library->slice(request);
+    REQUIRE_FALSE(stale.success);
+    REQUIRE(std::any_of(stale.diagnostics.begin(), stale.diagnostics.end(), [](const auto& d) {
+        return d.message.find("Every material must have a process type and tool mapping") != std::string::npos;
+    }));
+    std::vector<libslicer::ConfigDiagnostic> sync_diagnostics;
+    request.project_semantics = libslicer::synchronize_project_plate_materials(
+        request.project_semantics, request.config, &sync_diagnostics);
+    const auto settings = nlohmann::json::parse(request.project_semantics)["settings"];
+    CHECK_FALSE(settings.contains("filament_map"));
+    CHECK_FALSE(settings.contains("filament_map_mode"));
+    CHECK_FALSE(sync_diagnostics.empty());
+    const auto sliced = library->slice(request);
+    for (const auto& issue : sliced.diagnostics) evidence << issue.message << '\n';
+    INFO(evidence.str());
+    REQUIRE(sliced.success);
+    REQUIRE(sliced.preview);
+    CHECK(std::any_of(sliced.preview->segments.begin(), sliced.preview->segments.end(), [](const auto& segment) {
+        return segment.tool_id == 0 && segment.extrusion_delta_mm > 0;
+    }));
+    CHECK(std::none_of(sliced.preview->segments.begin(), sliced.preview->segments.end(), [](const auto& segment) {
+        return segment.tool_id != 0 && segment.extrusion_delta_mm > 0;
+    }));
+    std::ifstream input(sliced.output.path);
+    const std::string gcode((std::istreambuf_iterator<char>(input)), {});
+    CHECK(gcode.find("; filament_map = 1,2,3,4,5,6") != std::string::npos);
+    for (const std::string illegal : {"7,2,3,4,5,6", "1,1,3,4,5,6", "1,2,3,4,6,5"}) {
+        plate.settings = {{"filament_map", illegal}, {"filament_map_mode", "Manual"}};
+        request.project_semantics = libslicer::encode_project_plate_semantics(plate);
+        CHECK_FALSE(library->slice(request).success);
+    }
+    if (sliced.output.ownership == libslicer::OutputArtifactOwnership::LibraryTemporary)
+        std::filesystem::remove(sliced.output.path);
+}
+
+TEST_CASE("plate material synchronization preserves local semantics and rejects stale owners",
+          "[libslicer_api][plate-material-sync]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3", "CFSYS", "Flashforge"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    REQUIRE(library->activate_config(selection).success);
+    const auto target = *library->active_config_snapshot();
+    libslicer::ProjectPlate plate;
+    plate.native_plate_index = 2;
+    plate.custom_gcode_mode = 1;
+    plate.custom_gcodes = {{1,4,0,"",";keep-custom-code"}};
+    plate.settings = {{"filament_map", "1,2,3,4,5,6"}, {"filament_map_mode", "Manual"},
+                      {"sparse_infill_density", "23%"}, {"wipe_tower_x", "30,40,50"}};
+    const auto original = libslicer::encode_project_plate_semantics(plate);
+    CHECK(libslicer::synchronize_project_plate_materials(original, target) == original);
+    for (const std::string bad : {"1", "7,2,3,4,5,6", "1,1,3,4,5,6", "1,2,3,4,6,5"}) {
+        plate.settings[0].second = bad;
+        const auto source = nlohmann::json::parse(libslicer::encode_project_plate_semantics(plate));
+        std::vector<libslicer::ConfigDiagnostic> diagnostics;
+        const auto synced = nlohmann::json::parse(libslicer::synchronize_project_plate_materials(source.dump(), target, &diagnostics));
+        CHECK_FALSE(diagnostics.empty());
+        auto expected = source;
+        expected["settings"].erase("filament_map");
+        expected["settings"].erase("filament_map_mode");
+        CHECK(synced == expected);
+    }
+    // Native empty-map/absent-mode inheritance does not become an override.
+    plate.settings = {{"filament_map", ""}};
+    const auto inherited = nlohmann::json::parse(libslicer::synchronize_project_plate_materials(
+        libslicer::encode_project_plate_semantics(plate), target));
+    CHECK(inherited["settings"].empty());
+    CHECK(libslicer::synchronize_project_plate_materials("", target).empty());
+    CHECK_THROWS(libslicer::synchronize_project_plate_materials("{}", target));
+
+    selection.machine_model_id = "Flashforge AD5X";
+    REQUIRE(library->activate_config(selection).success);
+    REQUIRE(library->resize_active_filament_slots(2).success);
+    plate.settings = {{"filament_map", "1,1"}, {"filament_map_mode", "Manual"}, {"wall_loops", "4"}};
+    auto payload = libslicer::encode_project_plate_semantics(plate);
+    REQUIRE(library->resize_active_filament_slots(4).success);
+    auto synced = libslicer::synchronize_project_plate_materials(payload, *library->active_config_snapshot());
+    CHECK(nlohmann::json::parse(synced)["settings"]["filament_map"] == "1,1,1,1");
+    CHECK(nlohmann::json::parse(synced)["settings"]["filament_map_mode"] == "Manual");
+    REQUIRE(library->resize_active_filament_slots(1).success);
+    synced = libslicer::synchronize_project_plate_materials(synced, *library->active_config_snapshot());
+    CHECK(nlohmann::json::parse(synced)["settings"]["filament_map"] == "1");
+    CHECK(nlohmann::json::parse(synced)["settings"]["wall_loops"] == "4");
+
+    selection.machine_model_id = "Flashforge Creator 5";
+    REQUIRE(library->activate_config(selection).success);
+    REQUIRE(library->resize_active_filament_slots(4).success);
+    plate.settings = {{"filament_map", "2,1,4,3"}, {"filament_map_mode", "Manual"}};
+    payload = libslicer::encode_project_plate_semantics(plate);
+    CHECK(libslicer::synchronize_project_plate_materials(payload, *library->active_config_snapshot()) == payload);
+}
+
 TEST_CASE("P3 PLA TPU dock changes stay within extrusion limits with and without tower",
           "[libslicer_api][p3][wipe-tower][slice]")
 {
