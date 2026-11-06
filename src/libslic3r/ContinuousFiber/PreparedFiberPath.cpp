@@ -3,6 +3,7 @@
 #include "../GCodeWriter.hpp"
 #include "../PrintBase.hpp"
 #include "ContinuousFiberConfig.hpp"
+#include "ContinuousFiberFillStrategy.hpp"
 #include <algorithm>
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cmath>
@@ -1316,6 +1317,18 @@ bool certify_fiber_coverage(const PreparedFiberPath& path,const FrozenFiberExecu
     }
     const auto actual=execution_primitives(execution,context);
     const auto reference=geometry_primitives(path.draft());
+    const auto inside_execution_domain=[&](const ExPolygons& outer) {
+        if(inside_material_domain(path,outer))return true;
+        // P/G bounds include directed arithmetic padding, which is not
+        // deposited material. A long strand tangent to a boundary can exceed
+        // the area tolerance with that padding alone. For Cartesian G1 moves,
+        // check the frozen butt/round-join stroke using the same physical
+        // coverage representation as Finalizer. The independent P/G proof
+        // below still rejects a changed stroke or rotated short butt cap.
+        if(context.transform.belt || !execution.arcs().empty())return false;
+        return inside_material_domain(path,fiber_contour_coverage(
+            frozen_fiber_deposition(execution,context),0.5*path.width_mm));
+    };
     // Fixed machine-grid differences prove one translation of the entire G1
     // route. This does not infer a normal/cap bound from endpoint proximity.
     bool translated=!context.transform.belt && actual.size()==reference.size();
@@ -1331,7 +1344,7 @@ bool certify_fiber_coverage(const PreparedFiberPath& path,const FrozenFiberExecu
             execution.nozzle_offset-execution.placement.origin;
         // A <= one-grid translation is paid by the directed numerical bounds
         // at every convex component, including the angular caps of joins.
-        if(shift.norm()<=SCALING_FACTOR && inside_material_domain(path,path.possible_coverage))return true;
+        if(shift.norm()<=SCALING_FACTOR && inside_execution_domain(path.possible_coverage))return true;
     }
     const bool native_linear_fallback=context.export_arcs && execution.arcs().empty();
     // A native material contract can require a tighter actual stroke proof.
@@ -1341,7 +1354,7 @@ bool certify_fiber_coverage(const PreparedFiberPath& path,const FrozenFiberExecu
         native_linear_fallback);
     const auto outside=diff_ex(bounds.second,path.possible_coverage);
     const auto missing=diff_ex(path.guaranteed_components,bounds.first);
-    if(!outside.empty() || !missing.empty() || !inside_material_domain(path,bounds.second)) {
+    if(!outside.empty() || !missing.empty() || !inside_execution_domain(bounds.second)) {
         std::ostringstream message;message<<std::setprecision(17)
             <<"Actual fiber stroke cannot satisfy the frozen material contract: outside_P_mm2="
             <<std::abs(area(outside))*SCALING_FACTOR*SCALING_FACTOR

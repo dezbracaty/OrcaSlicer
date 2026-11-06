@@ -166,12 +166,19 @@ Linesf boundary_lines(const ExPolygons& domain)
     return result;
 }
 
-std::vector<Row> scan_rows(const ExPolygons& domain, coord_t origin, coord_t pitch, bool full)
+std::vector<Row> scan_rows(const ExPolygons& domain, coord_t origin, coord_t pitch, bool full, bool fit_full)
 {
     const auto box = get_extents(domain);
     if (empty(box)) return {};
     coord_t first = origin + coord_t(std::floor(double(box.min.y() - origin) / pitch)) * pitch;
     if (full) first += (pitch + coord_t(SCALED_EPSILON)) / 2; // Same grid phase as FillRectilinear.
+    if (fit_full) {
+        // Rounded full-density returns keep their physical pitch. Fit the
+        // maximum number of rows and share only the unavoidable remainder
+        // between the two boundaries, instead of losing a row to grid phase.
+        const coord_t remainder = (box.max.y() - box.min.y()) % pitch;
+        first = box.min.y() + remainder / 2;
+    }
     if (first > box.max.y()) return {};
     const size_t count = size_t((box.max.y() - first) / pitch) + 1;
     if (count > 1000000) throw std::length_error("Fiber infill exceeds scanline capacity");
@@ -188,8 +195,29 @@ std::vector<Row> scan_rows(const ExPolygons& domain, coord_t origin, coord_t pit
         rows.at(size_t((a.y() - first) / pitch)).scans.push_back(
             {unscale<double>(std::min(a.x(), b.x())), unscale<double>(std::max(a.x(), b.x()))});
     }
-    for (auto& row : rows)
+    if (fit_full) {
+        // Open-path clipping omits a scan coincident with a polygon edge.
+        // Such an edge is a valid tangent centerline, including hole edges;
+        // retain it without expanding the material or moving the endpoints.
+        for (const auto& ring : to_polygons(domain)) for (const auto& edge : ring.lines()) {
+            const coord_t y=edge.a.y();
+            if(edge.a.y()!=edge.b.y() || y<first || y>box.max.y() || (y-first)%pitch!=0)continue;
+            rows.at(size_t((y-first)/pitch)).scans.push_back({
+                unscale<double>(std::min(edge.a.x(),edge.b.x())),
+                unscale<double>(std::max(edge.a.x(),edge.b.x()))});
+        }
+    }
+    for (auto& row : rows) {
         std::sort(row.scans.begin(), row.scans.end(), [](const auto& a, const auto& b) { return a.lo < b.lo; });
+        if(fit_full) {
+            std::vector<Scan> merged;
+            for(const auto& scan:row.scans) {
+                if(!merged.empty() && scan.lo<=merged.back().hi)merged.back().hi=std::max(merged.back().hi,scan.hi);
+                else merged.push_back(scan);
+            }
+            row.scans=std::move(merged);
+        }
+    }
     return rows;
 }
 
@@ -282,8 +310,11 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
     if (result.centerline_domain.empty()) return result;
     // Columns are the scan and transverse axes. This frame has determinant -1.
     Eigen::Matrix2d frame;
-    frame << -std::sin(rotation_radians), std::cos(rotation_radians),
-              std::cos(rotation_radians), std::sin(rotation_radians);
+    const auto cardinal_zero=[](double value) {
+        return std::abs(value)<4*std::numeric_limits<double>::epsilon()?0.:value;
+    };
+    const double sine=cardinal_zero(std::sin(rotation_radians)),cosine=cardinal_zero(std::cos(rotation_radians));
+    frame << -sine, cosine, cosine, sine;
     ExPolygons local = result.centerline_domain;
     for (auto& region : local) {
         const auto transform = [&](Polygon& ring) {
@@ -292,7 +323,8 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
         };
         transform(region.contour); for (auto& hole : region.holes) transform(hole);
     }
-    auto rows = scan_rows(local, scaled(frame.transpose() * mm(grid_origin)).y(), pitch_scaled, config.infill_density == 100);
+    auto rows = scan_rows(local, scaled(frame.transpose() * mm(grid_origin)).y(), pitch_scaled,
+        config.infill_density == 100, config.infill_density == 100 && radius > 0);
     const auto edges = boundary_lines(local);
     const auto tree = AABBTreeLines::build_aabb_tree_over_indexed_lines(edges);
     const auto shape = radius > 0 ? std::optional<ReturnShape>(make_return(radius, pitch)) : std::nullopt;

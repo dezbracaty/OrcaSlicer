@@ -4202,6 +4202,34 @@ TEST_CASE("contour clearance and infill half width are applied once", "[Continuo
     }
 }
 
+TEST_CASE("full density plate fiber retains every width of material", "[ContinuousFiber][BoundaryInfill][PlatePacking]")
+{
+    ContinuousFiberConfig config;
+    config.infill_flow=Flow(1.f,.125f,.4f);
+    config.infill_density=100;
+    config.infill_bend_radius_mm=.5;
+    config.infill_enabled=true;
+    auto contour_id=test_id();contour_id.parent.purpose=FiberPathPurpose::Contour;
+    const auto contour=finalize_independent(straight_path(1,.5,229,.5,1),
+        {rectangle(0,0,230,25)},config,contour_id);
+    REQUIRE(contour.prepared);
+    CHECK(unscale<double>(get_extents(contour.prepared->contour_to_infill_keepout).max.y())==Catch::Approx(1).margin(.000002));
+    CHECK(unscale<double>(get_extents(contour.prepared->resin_exclusion).max.y())>1);
+    for(const auto& material:std::vector<ExPolygons>{{rectangle(0,0,230,25)}, {rectangle(1,1,229,24)}}) {
+        const auto generated=ContinuousFiberFillStrategy::generate_rectilinear(material,config,PI/2,Point::new_scale(115,12.5));
+        std::set<coord_t> rows;
+        for(const auto& path:generated.paths)for(size_t i=1;i<path.geometry.points.size();++i) {
+            const auto& a=path.geometry.points[i-1];const auto& b=path.geometry.points[i];
+            if(std::abs(unscale<double>(b.x()-a.x()))>200 && a.y()==b.y())rows.insert(a.y());
+        }
+        const auto box=get_extents(material);
+        CHECK(rows.size()==size_t(std::llround(unscale<double>(box.size().y()))));
+        REQUIRE_FALSE(rows.empty());
+        CHECK(unscale<double>(*rows.begin())==Catch::Approx(unscale<double>(box.min.y())+.5).margin(.000002));
+        CHECK(unscale<double>(*rows.rbegin())==Catch::Approx(unscale<double>(box.max.y())-.5).margin(.000002));
+    }
+}
+
 TEST_CASE("distant fiber islands cannot disconnect boundary returns", "[ContinuousFiber][BoundaryInfill]")
 {
     Polygon polygon;
@@ -7150,6 +7178,29 @@ TEST_CASE("material bitmap expansion is restricted to enabled fiber tasks", "[Co
     // HEAD records only the first forbidden tool. Preserve that ordinary
     // behavior here; the stricter complete bitmap belongs to fiber planning.
     CHECK(masks[2].count(0)==size_t(reinforced));
+}
+
+TEST_CASE("long boundary fiber certifies its deposited stroke without counting envelope padding as material",
+    "[ContinuousFiber][BoundaryCertification]")
+{
+    ContinuousFiberConfig config;
+    config.cut_to_contact_length_mm=0;
+    config.z_hop_height_mm=0;
+    const ExPolygons domain{rectangle(0,0,230,25)};
+    const auto result=finalize_independent(straight_path(.5,.5,229.5,.5,1),domain,config,test_id());
+    REQUIRE(result.prepared);
+    REQUIRE(result.prepared->outside_domain.empty());
+    auto context=fiber_fixture_context();
+    const auto execution=compile_fiber_execution(result.prepared->draft(),*context,context->placements.front(),0);
+    CHECK_NOTHROW(certify_fiber_coverage(*result.prepared,execution,*context));
+    auto shifted=execution;
+    auto commands=std::make_shared<FrozenFiberCommands>(*execution.commands);
+    for(auto& span:commands->spans) {
+        span.from.y()-=.00006;
+        for(auto& command:span.commands)command.target.y()-=.00006;
+    }
+    shifted.commands=commands;
+    CHECK_THROWS_AS(certify_fiber_coverage(*result.prepared,shifted,*context),FiberExecutionError);
 }
 
 TEST_CASE("component coverage preserves short butt caps and rejects tiny distorted edges", "[ContinuousFiber][R4]")

@@ -85,6 +85,10 @@ struct ContinuousFiberConfig {
 
     bool enabled() const { return contour_enabled || infill_enabled; }
     bool concentric_infill() const { return infill_enabled && infill_pattern==ipConcentric && infill_density>0; }
+    bool packed_rectilinear_infill() const {
+        return infill_enabled && infill_pattern==ipRectilinear && infill_density==100 &&
+            infill_bend_radius_mm>0 && contour_infill_clearance_mm==0;
+    }
     bool active_on_layer(size_t layer_id) const
     {
         return enabled() && layer_interval > 0 && layer_id % size_t(layer_interval) == 0;

@@ -891,7 +891,13 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     prepared->contour_resin_exclusion=intersection_ex(contour_envelope,prepared->resin_exclusion);
     // The two final clips have different domains/safety policies. Only their
     // identical pre-clip envelope can be shared when no clearance was requested.
-    if(same_contour_envelope)
+    // Full-density rounded rows may touch the nominal contour footprint when
+    // no material gap was requested. The execution uncertainty belongs to the
+    // resin/P/G allocation above, not to an additional manufacturing clearance
+    // that can remove an entire fixed-width row from the infill domain.
+    if(config.packed_rectilinear_infill())
+        prepared->contour_to_infill_keepout=intersection_ex(union_ex(contour_occupancy),allowed_domain,ApplySafetyOffset::Yes);
+    else if(same_contour_envelope)
         prepared->contour_to_infill_keepout=intersection_ex(contour_envelope,allowed_domain,ApplySafetyOffset::Yes);
     else
         prepared->contour_to_infill_keepout=intersection_ex(

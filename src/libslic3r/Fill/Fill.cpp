@@ -2312,8 +2312,11 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     FiberValidationResult infill_result;
     if (!concentric && config.infill_enabled && config.infill_density > 0.0) {
         SurfaceFill infill_job = original_job;
-        const ExPolygons infill_allowed_domain = ContinuousFiberFillStrategy::build_infill_domain(
-            planning_area, contour_result.contour_to_infill_keepout);
+        // A safety expansion of the clip would introduce an unrequested gap
+        // at nominal contact and remove one whole row from an exact-width core.
+        const ExPolygons infill_allowed_domain = config.packed_rectilinear_infill() ?
+            diff_ex(planning_area,contour_result.contour_to_infill_keepout,ApplySafetyOffset::No) :
+            ContinuousFiberFillStrategy::build_infill_domain(planning_area,contour_result.contour_to_infill_keepout);
         infill_job.expolygons = infill_allowed_domain;
         if (!infill_job.expolygons.empty()) {
             apply_fiber_infill_params(infill_job.params, config, domain.policy);
@@ -2325,8 +2328,12 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
                 direction->angle = infill_job.params.angle;
                 direction->fixed_angle = infill_job.params.fixed_angle;
                 const auto orientation = direction->infill_direction(infill_job.surface);
+                // Fill's legacy float angle loses cardinal alignment on long
+                // plates. Preserve the explicit fiber direction in double.
+                const double rotation = config.rectilinear_angle_radians ?
+                    *config.rectilinear_angle_radians + PI/2 : double(orientation.first);
                 const auto candidates = ContinuousFiberFillStrategy::generate_rectilinear(
-                    infill_allowed_domain, config, orientation.first, orientation.second);
+                    infill_allowed_domain, config, rotation, orientation.second);
                 infill_result = FiberPathValidator::validate_infill(candidates, infill_allowed_domain, config, domain_id);
             }
         }
