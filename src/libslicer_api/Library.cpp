@@ -5,6 +5,8 @@
 
 #include <libslic3r/PresetBundle.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/BuildVolume.hpp>
+#include <libslic3r/ClipperUtils.hpp>
 #include <libslic3r/Print.hpp>
 #include <libslic3r/Layer.hpp>
 #include <libslic3r/Tesselate.hpp>
@@ -39,6 +41,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <unordered_map>
@@ -1667,6 +1670,45 @@ std::vector<int> filament_tool_map(const Slic3r::DynamicPrintConfig* config,
     return result;
 }
 
+// Value-only material descriptions shared by active views and remapped
+// scenes. A snapshot has no preset catalog, so compatibility choices are added
+// only by active_config after this conversion.
+std::vector<FilamentSlotInfo> project_filament_slots(const Slic3r::DynamicPrintConfig& config, std::size_t count)
+{
+    std::vector<FilamentSlotInfo> slots;
+    slots.reserve(count);
+    const auto tool_map = filament_tool_map(&config,count);
+    for (std::size_t index = 0; index < count; ++index) {
+        FilamentSlotInfo slot;
+        slot.index=index;
+        slot.preset_id=option_value_at(config,"filament_settings_id",index);
+        slot.preset_name=slot.preset_id;
+        slot.vendor = option_value_at(config, "filament_vendor", index);
+        slot.material_type = option_value_at(config, "filament_type", index);
+        slot.color = rgba8_color(option_value_at(config, "filament_colour", index));
+        if (const auto* diameters = config.option<Slic3r::ConfigOptionFloats>("filament_diameter");
+            diameters != nullptr && index < diameters->values.size()) {
+            slot.diameter_mm = diameters->values[index];
+        }
+        slot.physical_tool_index = static_cast<std::size_t>(tool_map[index]);
+        slot.physical_tool_name = "Nozzle " + std::to_string(slot.physical_tool_index);
+        if (const auto* roles = config.option<Slic3r::ConfigOptionStrings>("toolhead_process_capabilities");
+            roles != nullptr && slot.physical_tool_index < roles->values.size()) {
+            slot.physical_tool_role = roles->values[slot.physical_tool_index];
+        }
+        if (const auto* sides = config.option<Slic3r::ConfigOptionStrings>("physical_tool_sides");
+            sides != nullptr && slot.physical_tool_index < sides->values.size()) {
+            slot.physical_tool_side = sides->values[slot.physical_tool_index];
+        }
+        if (const auto* nozzles = config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter");
+            nozzles != nullptr && slot.physical_tool_index < nozzles->values.size()) {
+            slot.nozzle_diameter_mm = nozzles->values[slot.physical_tool_index];
+        }
+        slots.push_back(std::move(slot));
+    }
+    return slots;
+}
+
 std::optional<Slic3r::BeltCoordinateSystem> belt_coordinates_from_gcode(const std::string& source_path)
 {
     std::ifstream input(source_path);
@@ -2365,6 +2407,35 @@ PlaneCutResult cut_mesh_with_plane(const PlaneCutRequest& request)
     return result;
 }
 
+class ConfigurationState::Impl {
+public:
+    std::unique_ptr<Config> config;
+    ResolvedSelection selection;
+    std::vector<PresetOption> compatible_processes, compatible_filaments;
+    std::shared_ptr<Slic3r::PresetBundle> bundle;
+    ProjectMachine machine;
+    ActiveConfigView prepared_view;
+    std::string resource_directory;
+    Impl() = default;
+    Impl(const Impl& other) :
+        config(other.config ? std::make_unique<Config>(*other.config) : nullptr),
+        selection(other.selection), compatible_processes(other.compatible_processes),
+        compatible_filaments(other.compatible_filaments),
+        bundle(other.bundle ? std::make_shared<Slic3r::PresetBundle>(*other.bundle) : nullptr),
+        machine(other.machine), prepared_view(other.prepared_view), resource_directory(other.resource_directory) {}
+};
+ConfigurationState::ConfigurationState() = default;
+bool ConfigurationState::valid() const noexcept { return impl_ && bool(impl_->config); }
+const ActiveConfigView& ConfigurationState::view() const {
+    if (!valid()) throw std::logic_error("No configuration in state");
+    return impl_->prepared_view;
+}
+const ProjectMachine& ConfigurationState::machine() const {
+    if (!valid()) throw std::logic_error("No configuration in state");
+    return impl_->machine;
+}
+ConfigSnapshot ConfigurationState::snapshot() const { return valid() ? impl_->config->snapshot() : ConfigSnapshot{}; }
+
 class Library::Impl
 {
 public:
@@ -2372,12 +2443,297 @@ public:
     std::vector<std::unique_ptr<Slic3r::PresetBundle>> vendor_presets;
     std::vector<MachineModelOption> machines;
     std::vector<BuildPlateOption> build_plates;
-    std::unique_ptr<Config> active_config;
-    ResolvedSelection active_selection;
-    std::vector<PresetOption> compatible_processes;
-    std::vector<PresetOption> compatible_filaments;
+    std::shared_ptr<ConfigurationState::Impl> active = std::make_shared<ConfigurationState::Impl>();
     std::uint64_t active_revision{0};
+    std::size_t filament_color_cursor{0};
+    std::shared_ptr<const void> capture_origin=std::make_shared<const char>(0);
+    void apply_installed_machine_capabilities(ProjectMachine& machine, const ResolvedSelection& selection) const;
+    void prepare(const std::shared_ptr<ConfigurationState::Impl>& state);
 };
+
+
+namespace {
+using ProjectJson = nlohmann::json;
+
+const std::set<std::string>& project_material_keys() {
+    static const std::set<std::string> keys={"extruder","outer_wall_filament_id","inner_wall_filament_id","sparse_infill_filament_id","internal_solid_filament_id","top_surface_filament_id","bottom_surface_filament_id","support_filament","support_interface_filament","reinforced_infill_filament","reinforced_perimeters_filament","wipe_tower_filament"};
+    return keys;
+}
+ProjectJson settings_json(const ProjectSettings& settings, bool strip_extruder = true) {
+    auto j = ProjectJson::object();
+    for (const auto& entry : settings) if (!strip_extruder || entry.first != "extruder") j[entry.first] = entry.second;
+    return j;
+}
+ProjectSettings project_settings(const Slic3r::DynamicPrintConfig& config, bool strip_extruder = true) {
+    auto values = serialized_values(config);
+    if (strip_extruder) values.erase(std::remove_if(values.begin(), values.end(), [](const auto& v) { return v.first == "extruder"; }), values.end());
+    return values;
+}
+ProjectJson facets_json(const SliceFacetLabels& facets) {
+    auto roots = ProjectJson::array();
+    for (const auto& r : facets.roots) roots.push_back({{"triangle_index",r.triangle_index},{"bitstream_start_index",r.bitstream_start_index}});
+    return {{"roots",roots},{"bitstream",facets.bitstream}};
+}
+SliceFacetLabels export_facets(const Slic3r::FacetsAnnotation& facets, const SliceCallbacks* callbacks = nullptr) {
+    SliceFacetLabels result;
+    std::size_t checked=0;
+    for (const auto& r : facets.get_data().triangles_to_split) {
+        if(callbacks&&((checked++&0x3fff)==0)&&cancellation_requested(*callbacks))throw Slic3r::CanceledException();
+        if (r.triangle_idx < 0 || r.bitstream_start_idx < 0) throw std::invalid_argument("Negative facet index");
+        result.roots.push_back({unsigned(r.triangle_idx),unsigned(r.bitstream_start_idx)});
+    }
+    for (bool b : facets.get_data().bitstream) {if(callbacks&&((checked++&0x3fff)==0)&&cancellation_requested(*callbacks))throw Slic3r::CanceledException();result.bitstream.push_back(b ? 1 : 0);}
+    return result;
+}
+SliceFacetLabels facets_from_json(const ProjectJson& j) {
+    SliceFacetLabels out;
+    for (const auto& r : j.at("roots")) {
+        const auto index=r.at("triangle_index"),offset=r.at("bitstream_start_index");
+        if(!index.is_number_integer()||!offset.is_number_integer()||index<0||offset<0||index>std::numeric_limits<std::uint32_t>::max()||offset>std::numeric_limits<std::uint32_t>::max())throw std::invalid_argument("Facet root indices must be unsigned integers");
+        out.roots.push_back({index.get<unsigned>(),offset.get<unsigned>()});
+    }
+    for(const auto& bit:j.at("bitstream")){if(!bit.is_number_integer()||(bit!=0&&bit!=1))throw std::invalid_argument("Facet bitstream values must be binary integers");out.bitstream.push_back(bit.get<std::uint8_t>());}
+    return out;
+}
+Slic3r::TriangleSelector::TriangleSplittingData native_facets(const SliceFacetLabels& data, std::size_t triangles, int maximum_state) {
+    if (!data.valid()) throw std::invalid_argument("Facet roots/bitstream mismatch");
+    Slic3r::TriangleSelector::TriangleSplittingData out;
+    for (const auto& r : data.roots) {
+        if (r.triangle_index > unsigned(std::numeric_limits<int>::max()) ||
+            r.bitstream_start_index > unsigned(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("Facet root exceeds native index range");
+        out.triangles_to_split.emplace_back(int(r.triangle_index),int(r.bitstream_start_index));
+    }
+    for (auto bit : data.bitstream) {
+        if (bit > 1) throw std::invalid_argument("Facet bit is not binary");
+        out.bitstream.push_back(bit != 0);
+    }
+    out.validate(triangles,static_cast<Slic3r::EnforcerBlockerType>(maximum_state));
+    out.update_used_states(0);
+    return out;
+}
+ProjectJson semantic_json(std::string_view payload, const char* scope) {
+    if (payload.empty()) return ProjectJson::object();
+    auto j=ProjectJson::parse(payload);
+    if (!j.is_object() || j.at("version")!=1 || j.at("scope")!=scope) throw std::invalid_argument("Unknown project semantics version/scope");
+    std::set<std::string> fields={"version","scope"};
+    const std::string owner=scope;
+    if(owner=="object")fields.insert({"settings","layer_ranges","layer_height_profile","brim_points"});
+    else if(owner=="part")fields.insert("settings");
+    else if(owner=="part_annotations")fields.insert({"support_facets","seam_facets","fuzzy_skin_facets"});
+    else if(owner=="plate")fields.insert({"settings","native_plate_index","custom_gcode_mode","custom_gcodes"});
+    for(auto it=j.begin();it!=j.end();++it)if(!fields.count(it.key()))throw std::invalid_argument("Unknown project semantic field: "+it.key());
+    return j;
+}
+Slic3r::DynamicPrintConfig semantic_settings(const ProjectJson& j) {
+    Slic3r::DynamicPrintConfig out;
+    if (!j.contains("settings")) return out;
+    if (!j.at("settings").is_object()) throw std::invalid_argument("Project settings must be an object");
+    for (auto it=j.at("settings").begin();it!=j.at("settings").end();++it) {
+        if (!it.value().is_string() || !Slic3r::print_config_def.get(it.key())) throw std::invalid_argument("Unknown project setting: "+it.key());
+        out.set_deserialize_strict(it.key(),it.value().get<std::string>());
+    }
+    return out;
+}
+void apply_object_semantics(Slic3r::ModelObject& object, const std::string& payload) {
+    const auto j=semantic_json(payload,"object"); if (j.empty()) return;
+    if (j.contains("settings") && j.at("settings").contains("extruder")) throw std::invalid_argument("Object material slot must use its dedicated field");
+    object.config.apply(semantic_settings(j));
+    for (const auto& r : j.at("layer_ranges")) {
+        const double low=r.at("minimum_z"), high=r.at("maximum_z");
+        if (!std::isfinite(low)||!std::isfinite(high)||low<0||high<=low) throw std::invalid_argument("Invalid layer range");
+        auto& target=object.layer_config_ranges[{low,high}]; target.assign_config(semantic_settings(r));
+    }
+    const auto profile=j.at("layer_height_profile").get<std::vector<double>>();
+    if (profile.size()%2) throw std::invalid_argument("Layer profile must contain Z/height pairs");
+    double previous=-1;
+    for (std::size_t i=0;i<profile.size();i+=2) {
+        if (!std::isfinite(profile[i])||profile[i]<0||profile[i]<previous||!std::isfinite(profile[i+1])||profile[i+1]<=0) throw std::invalid_argument("Invalid layer profile");
+        previous=profile[i];
+    }
+    object.layer_height_profile.set(profile);
+    for (const auto& b : j.at("brim_points")) {
+        const float x=b.at("x"),y=b.at("y"),z=b.at("z"),radius=b.at("head_front_radius");
+        if (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||!std::isfinite(radius)||radius<0) throw std::invalid_argument("Invalid brim point");
+        object.brim_points.emplace_back(x,y,z,radius);
+    }
+}
+void apply_part_annotations(Slic3r::ModelVolume& volume, const std::string& payload) {
+    const auto j=semantic_json(payload,"part_annotations"); if(j.empty())return;
+    const auto count=volume.mesh().its.indices.size();
+    volume.supported_facets.set_data(native_facets(facets_from_json(j.at("support_facets")),count,2));
+    volume.seam_facets.set_data(native_facets(facets_from_json(j.at("seam_facets")),count,2));
+    volume.fuzzy_skin_facets.set_data(native_facets(facets_from_json(j.at("fuzzy_skin_facets")),count,2));
+}
+void apply_plate_semantics(Slic3r::Model& model, Slic3r::DynamicPrintConfig& config, const std::string& payload) {
+    const auto j=semantic_json(payload,"plate"); if (j.empty()) return;
+    config.apply(semantic_settings(j));
+    const int mode=j.at("custom_gcode_mode");
+    if (mode<0||mode>int(Slic3r::CustomGCode::Mode::MultiExtruder)) throw std::invalid_argument("Invalid custom G-code mode");
+    const int index=j.value("native_plate_index",0);
+    if(index<0)throw std::invalid_argument("Invalid native plate index");
+    model.curr_plate_index=index;
+    auto& code=model.plates_custom_gcodes[index]; code.mode=static_cast<Slic3r::CustomGCode::Mode>(mode);
+    for (const auto& c : j.at("custom_gcodes")) {
+        const double z=c.at("print_z");const int type=c.at("type"),slot=c.at("filament_slot");
+        if(!std::isfinite(z)||z<0||type<0||type>=int(Slic3r::CustomGCode::Unknown))throw std::invalid_argument("Invalid custom G-code item");
+        // Native Custom/Pause/Template never consume Item::extruder. Historical
+        // archives may contain an uninitialized sentinel there; preserve it.
+        if((type==int(Slic3r::CustomGCode::ColorChange)&&slot<0)||
+           (type==int(Slic3r::CustomGCode::ToolChange)&&slot<1))throw std::invalid_argument("Invalid custom G-code material reference");
+        code.gcodes.push_back({z,static_cast<Slic3r::CustomGCode::Type>(type),slot,c.at("color").get<std::string>(),c.at("extra").get<std::string>()});
+    }
+}
+// Bed3D::set_shape / calc_printable_bounding_box -> Plater::set_bed_shape ->
+// PartPlateList::reset_size(int,int,int). In particular, do not retain .25 mm
+// or infer a stride directly from a floating-point printable-area width.
+// Bed3D::detect_type and its effective STL check, without rendering/UI state.
+std::pair<bool,std::string> project_bed_model(Slic3r::PresetBundle& bundle,const Slic3r::DynamicPrintConfig& config) {
+    using namespace Slic3r;
+    const auto shape=make_counter_clockwise(config.option<ConfigOptionPoints>("printable_area")->values);
+    bool system=false;std::string model;
+    for(const Preset* preset=&bundle.printers.get_selected_preset();preset;preset=bundle.printers.get_preset_parent(*preset)) {
+        const auto* area=preset->config.option<ConfigOptionPoints>("printable_area");
+        if(!area || shape!=make_counter_clockwise(area->values))continue;
+        if(preset->is_system)model=PresetUtils::system_printer_bed_model(*preset);
+        else if(const auto* name=preset->config.option<ConfigOptionString>("printer_model");name&&!name->value.empty())
+            model=bundle.get_stl_model_for_printer_model(name->value);
+        if(!model.empty()){system=true;break;}
+    }
+    if(const auto* custom=config.option<ConfigOptionString>("bed_custom_model");custom&&!custom->value.empty())model=custom->value;
+    std::error_code error;auto extension=fs::u8path(model).extension().string();
+    std::transform(extension.begin(),extension.end(),extension.begin(),[](unsigned char c){return char(std::tolower(c));});
+    if(extension!=".stl" || !fs::exists(fs::u8path(model),error) || error)model.clear();
+    return {system,model};
+}
+bool project_bed_inputs_changed(const Slic3r::DynamicPrintConfig& before,const Slic3r::DynamicPrintConfig& after) {
+    // Exclusion/clearance changes refresh PartPlate but Bed3D keeps its cached
+    // bounding box; they must not recompute the axes-dependent dimensions.
+    for(const char* key:{"printable_area","printable_height","extruder_printable_area","extruder_printable_height"}) {
+        const auto* a=before.option(key);const auto* b=after.option(key);
+        if(bool(a)!=bool(b))return true;
+        if(a) {
+            if(std::string_view(key)=="printable_area") {
+                if(Slic3r::make_counter_clockwise(static_cast<const Slic3r::ConfigOptionPoints*>(a)->values)!=
+                   Slic3r::make_counter_clockwise(static_cast<const Slic3r::ConfigOptionPoints*>(b)->values))return true;
+            } else if(a->serialize()!=b->serialize())return true;
+        }
+    }
+    return false;
+}
+float project_axes_length(const MachineVariantOption& machine) {
+    Slic3r::Pointfs shape;
+    for (const auto& p:machine.printable_area) shape.emplace_back(p.x,p.y);
+    return .1f*float(Slic3r::BuildVolume(shape,machine.printable_height,{},{}).bounding_volume().max_size());
+}
+std::array<int,3> project_native_plate_size(const MachineVariantOption& machine, float axes_length) {
+    Slic3r::Pointfs shape;
+    for (const auto& p:machine.printable_area) shape.emplace_back(p.x,p.y);
+    auto bounds=Slic3r::BuildVolume(shape,machine.printable_height,{},{}).bounding_volume();
+    const auto size=bounds.size();
+    if (size.x()>0 && size.y()>0 && !bounds.defined) bounds.defined=true;
+    bounds.min.z()=bounds.max.z()=0;
+    bounds.merge(Slic3r::Vec3d(axes_length,axes_length,axes_length));
+    constexpr double tip_radius=1.25;
+    bounds.merge(bounds.min+Slic3r::Vec3d(-tip_radius,-tip_radius,bounds.max.z()));
+    return {int(bounds.max.x()-bounds.min.x()-tip_radius),
+            int(bounds.max.y()-bounds.min.y()-tip_radius),int(machine.printable_height)};
+}
+ProjectMachine describe_project_machine(const Slic3r::DynamicPrintConfig& config, bool validate = true) {
+    ProjectMachine machine; machine.project_local=true;
+    machine.model.id=option_value_at(config,"printer_model",0);
+    machine.model.name=option_value_at(config,"printer_settings_id",0);
+    if(machine.model.id.empty()) machine.model.id=machine.model.name.empty()?"project-printer":machine.model.name;
+    if(machine.model.name.empty())machine.model.name=machine.model.id;
+    auto& v=machine.variant;
+    v.id=option_value_at(config,"printer_variant",0);
+    v.name=v.id;v.printer_preset_id=option_value_at(config,"printer_settings_id",0);
+    const auto* nozzles=config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter");
+    if(!nozzles||nozzles->values.empty())throw std::invalid_argument("Project has no nozzle diameter");
+    v.physical_tool_count=nozzles->values.size();v.nozzle_diameter=nozzles->values.front();
+    if(v.id.empty())v.id=nozzles->serialize();if(v.name.empty())v.name=v.id;
+    for(double diameter:nozzles->values)if(validate && (!std::isfinite(diameter)||diameter<=0))throw std::invalid_argument("Invalid project nozzle diameter");
+    populate_printable_volume(config,v);
+    if(v.printable_area.size()<3||!std::isfinite(v.printable_height)||v.printable_height<0)throw std::invalid_argument("Project has no valid printable volume");
+    const auto* multi=config.option<Slic3r::ConfigOptionBool>("single_extruder_multi_material");
+    v.variable_filament_slots=multi&&multi->value;
+    const auto* fixed=config.option<Slic3r::ConfigOptionBool>("filament_slots_bound_to_physical_tools");
+    v.filament_slots_bound_to_physical_tools=fixed&&fixed->value;
+    const auto* capacity=config.option<Slic3r::ConfigOptionInts>("toolhead_filament_capacity");
+    v.max_filament_slots=std::max(v.physical_tool_count,serialized_option_values(config,"filament_diameter").size());
+    if(capacity&&!capacity->values.empty()) {
+        v.toolhead_filament_capacity=capacity->values;v.max_filament_slots=0;
+        if(validate && capacity->size()!=v.physical_tool_count)throw std::invalid_argument("Project material capacity does not match nozzles");
+        for(int c:capacity->values){if(validate && c<1)throw std::invalid_argument("Invalid material capacity");if(c>0)v.max_filament_slots+=std::size_t(c);}
+        v.variable_filament_slots=v.max_filament_slots>v.physical_tool_count;
+    }
+    machine.model.variants.push_back(v);return machine;
+}
+void mark_full_config_authoritative(Slic3r::DynamicPrintConfig& config) {
+    const auto count=serialized_option_values(config,"filament_colour").size();
+    std::vector<std::string> dirty(count+2,Slic3r::escape_strings_cstyle(Slic3r::Preset::filament_options()));
+    dirty.front()=Slic3r::escape_strings_cstyle(Slic3r::Preset::print_options());
+    dirty.back()=Slic3r::escape_strings_cstyle(Slic3r::Preset::printer_options());
+    config.set_key_value("different_settings_to_system",new Slic3r::ConfigOptionStrings(std::move(dirty)));
+}
+}
+std::string encode_project_object_semantics(const ProjectObject& object) {
+    auto ranges=ProjectJson::array(), brim=ProjectJson::array();
+    for(const auto& r:object.layer_ranges)ranges.push_back({{"minimum_z",r.minimum_z},{"maximum_z",r.maximum_z},{"settings",settings_json(r.settings,false)}});
+    for(const auto& b:object.brim_points)brim.push_back({{"x",b.x},{"y",b.y},{"z",b.z},{"head_front_radius",b.head_front_radius}});
+    return ProjectJson{{"version",1},{"scope","object"},{"settings",settings_json(object.settings)},{"layer_ranges",ranges},{"layer_height_profile",object.layer_height_profile},{"brim_points",brim}}.dump();
+}
+std::string encode_project_part_semantics(const ProjectPart& part) {return ProjectJson{{"version",1},{"scope","part"},{"settings",settings_json(part.settings)}}.dump();}
+std::string encode_project_part_annotations(const ProjectPart& part) {
+    return ProjectJson{{"version",1},{"scope","part_annotations"},{"support_facets",facets_json(part.support_facets)},{"seam_facets",facets_json(part.seam_facets)},{"fuzzy_skin_facets",facets_json(part.fuzzy_skin_facets)}}.dump();
+}
+std::string encode_project_plate_semantics(const ProjectPlate& plate) {
+    auto code=ProjectJson::array();for(const auto& c:plate.custom_gcodes)code.push_back({{"print_z",c.print_z},{"type",c.type},{"filament_slot",c.filament_slot},{"color",c.color},{"extra",c.extra}});
+    return ProjectJson{{"version",1},{"scope","plate"},{"native_plate_index",plate.native_plate_index},{"settings",settings_json(plate.settings,false)},{"custom_gcode_mode",plate.custom_gcode_mode},{"custom_gcodes",code}}.dump();
+}
+
+
+void Library::Impl::apply_installed_machine_capabilities(ProjectMachine& machine, const ResolvedSelection& selection) const {
+    if (machine.project_local) return;
+    for (const auto& installed : machines) {
+        if (installed.id != selection.machine_model_id) continue;
+        const auto catalog = std::find_if(installed.variants.begin(), installed.variants.end(),
+            [&](const MachineVariantOption& variant) { return variant.id == selection.machine_variant_id; });
+        auto& effective = machine.variant;
+        // Older installed MMU profiles declare their feed capacity in the
+        // catalog, independently of the current material palette. Preserve the
+        // full configuration's geometry, tool mode and explicit capacities.
+        if (catalog != installed.variants.end() && effective.toolhead_filament_capacity.empty() &&
+            catalog->toolhead_filament_capacity.empty() && effective.variable_filament_slots &&
+            catalog->variable_filament_slots && !effective.filament_slots_bound_to_physical_tools &&
+            !catalog->filament_slots_bound_to_physical_tools &&
+            effective.physical_tool_count == catalog->physical_tool_count)
+            effective.max_filament_slots = std::max(effective.max_filament_slots, catalog->max_filament_slots);
+        machine.model = installed;
+        break;
+    }
+}
+void Library::Impl::prepare(const std::shared_ptr<ConfigurationState::Impl>& state) {
+    state->resource_directory=resource_directory;
+    if (!state->config) return;
+    auto full=dynamic_config(state->config->snapshot());
+    if(state->bundle) {
+        mark_full_config_authoritative(full);
+        state->bundle->load_config_model("GPlatform active project.3mf",full);
+        state->selection.printer_preset_id=state->bundle->printers.get_selected_preset_name();
+        state->selection.process_preset_id=state->bundle->prints.get_selected_preset_name();
+        state->selection.filament_preset_ids=state->bundle->filament_presets;
+        state->compatible_processes=compatible_presets(state->bundle->prints,state->selection.process_preset_id);
+        state->compatible_filaments=compatible_presets(state->bundle->filaments,state->selection.filament_preset_ids.empty()?"":state->selection.filament_preset_ids.front());
+    }
+    const bool local=state->machine.project_local;
+    const auto previous_capacity=state->machine.variant.max_filament_slots;
+    state->machine=describe_project_machine(full);state->machine.project_local=local;
+    if(local && state->machine.variant.toolhead_filament_capacity.empty()) state->machine.variant.max_filament_slots=std::max(state->machine.variant.max_filament_slots,previous_capacity);
+    apply_installed_machine_capabilities(state->machine,state->selection);
+    Library viewer;viewer.impl_->resource_directory=resource_directory;viewer.impl_->active=state;viewer.impl_->active_revision=1;
+    state->prepared_view=*viewer.active_config();state->prepared_view.revision=0;
+}
 
 const char* version() noexcept
 {
@@ -2540,8 +2896,11 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
 {
     ConfigCreateResult result;
     try {
-        const Slic3r::PresetBundle* source_presets = nullptr;
+        const bool editing_project = impl_->active->bundle &&
+            selection.machine_model_id == impl_->active->selection.machine_model_id && selection.machine_variant_id == impl_->active->selection.machine_variant_id;
+        const Slic3r::PresetBundle* source_presets = editing_project ? impl_->active->bundle.get() : nullptr;
         for (const auto& presets : impl_->vendor_presets) {
+            if (editing_project) break;
             if (presets->printers.find_system_preset_by_model_and_variant(
                     selection.machine_model_id, selection.machine_variant_id) != nullptr) {
                 source_presets = presets.get();
@@ -2556,18 +2915,19 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
         const Slic3r::Preset* printer = selected.printers.find_system_preset_by_model_and_variant(
             selection.machine_model_id, selection.machine_variant_id);
 
-        std::string printer_name = printer->name;
+        std::string printer_name = printer ? printer->name : (editing_project ? impl_->active->selection.printer_preset_id : std::string{});
+        if (printer_name.empty()) throw std::invalid_argument("Machine has no printer preset");
         const bool same_active_machine =
-            selection.machine_model_id == impl_->active_selection.machine_model_id &&
-            selection.machine_variant_id == impl_->active_selection.machine_variant_id &&
-            !impl_->active_selection.printer_preset_id.empty() &&
+            selection.machine_model_id == impl_->active->selection.machine_model_id &&
+            selection.machine_variant_id == impl_->active->selection.machine_variant_id &&
+            !impl_->active->selection.printer_preset_id.empty() &&
             selected.printers.find_preset(
-                impl_->active_selection.printer_preset_id, false) != nullptr;
+                impl_->active->selection.printer_preset_id, false) != nullptr;
         if (same_active_machine) {
             // A project import may leave the selected preset edited with
             // custom values. Keep it while changing process or filament
             // choices for the same physical machine.
-            printer_name = impl_->active_selection.printer_preset_id;
+            printer_name = impl_->active->selection.printer_preset_id;
         }
         const bool keep_edited_printer = same_active_machine &&
             selected.printers.get_selected_preset_name() == printer_name;
@@ -2601,7 +2961,7 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
             throw std::runtime_error("Selected machine has no compatible process preset");
         }
         const bool keep_edited_process = keep_edited_printer &&
-            process_name == impl_->active_selection.process_preset_id &&
+            process_name == impl_->active->selection.process_preset_id &&
             selected.prints.get_selected_preset_name() == process_name;
         if (!keep_edited_process) {
             selected.prints.select_preset_by_name(process_name, true);
@@ -2659,7 +3019,7 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
                 throw std::runtime_error("Selected machine has no compatible filament preset");
         }
         const bool keep_edited_filament = keep_edited_process &&
-            filament_names == impl_->active_selection.filament_preset_ids &&
+            filament_names == impl_->active->selection.filament_preset_ids &&
             selected.filaments.get_selected_preset_name() == filament_names.front();
         if (!keep_edited_filament) {
             selected.filaments.select_preset_by_name(filament_names.front(), true);
@@ -2681,9 +3041,9 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
         auto full_config = selected.full_config();
         auto physical_tools = selection.filament_physical_tools;
         const auto tools = tool_config(full_config);
-        if (physical_tools.empty() && same_active_machine && impl_->active_config &&
-            result.selection.filament_preset_ids.size() == impl_->active_selection.filament_preset_ids.size()) {
-            const auto previous = dynamic_config(impl_->active_config->snapshot());
+        if (physical_tools.empty() && same_active_machine && impl_->active->config &&
+            result.selection.filament_preset_ids.size() == impl_->active->selection.filament_preset_ids.size()) {
+            const auto previous = dynamic_config(impl_->active->config->snapshot());
             const auto previous_tools = filament_tool_map(&previous, result.selection.filament_preset_ids.size());
             physical_tools.assign(previous_tools.begin(), previous_tools.end());
         }
@@ -2728,8 +3088,8 @@ ConfigActivationResult Library::activate_config(
     const std::vector<std::pair<std::string, std::string>>& patch)
 {
     ConfigActivationResult result;
-    const std::vector<std::string> previous_colors = impl_->active_config
-        ? config_vector_values(*impl_->active_config, "filament_colour")
+    const std::vector<std::string> previous_colors = impl_->active->config
+        ? config_vector_values(*impl_->active->config, "filament_colour")
         : std::vector<std::string>{};
     auto created = create_config(selection);
     if (!created) {
@@ -2737,15 +3097,15 @@ ConfigActivationResult Library::activate_config(
         return result;
     }
 
-    if (impl_->active_config && selection.machine_model_id == impl_->active_selection.machine_model_id &&
-        selection.machine_variant_id == impl_->active_selection.machine_variant_id &&
-        selection.process_preset_id == impl_->active_selection.process_preset_id) {
-        const auto previous = dynamic_config(impl_->active_config->snapshot());
+    if (impl_->active->config && selection.machine_model_id == impl_->active->selection.machine_model_id &&
+        selection.machine_variant_id == impl_->active->selection.machine_variant_id &&
+        selection.process_preset_id == impl_->active->selection.process_preset_id) {
+        const auto previous = dynamic_config(impl_->active->config->snapshot());
         auto candidate = dynamic_config(created.config->snapshot());
         for (const auto* keys : {&Slic3r::Preset::print_options(), &Slic3r::Preset::printer_options()})
             for (const auto& key : *keys)
                 if (const auto* value = previous.option(key)) candidate.set_key_value(key, value->clone());
-        const auto& old_ids = impl_->active_selection.filament_preset_ids;
+        const auto& old_ids = impl_->active->selection.filament_preset_ids;
         const auto& new_ids = created.selection.filament_preset_ids;
         for (const auto& key : Slic3r::Preset::filament_options()) {
             const auto* old_value = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(previous.option(key));
@@ -2792,10 +3152,23 @@ ConfigActivationResult Library::activate_config(
         return result;
     }
 
-    impl_->active_config = std::move(created.config);
-    impl_->active_selection = std::move(created.selection);
-    impl_->compatible_processes = std::move(created.compatible_processes);
-    impl_->compatible_filaments = std::move(created.compatible_filaments);
+    auto next_state = std::make_shared<ConfigurationState::Impl>(*impl_->active);
+    next_state->config = std::move(created.config);
+    next_state->selection = std::move(created.selection);
+    next_state->compatible_processes = std::move(created.compatible_processes);
+    next_state->compatible_filaments = std::move(created.compatible_filaments);
+    const bool same_context = next_state->bundle && next_state->selection.machine_model_id == impl_->active->selection.machine_model_id && next_state->selection.machine_variant_id == impl_->active->selection.machine_variant_id;
+    if (!same_context) {
+        next_state->bundle.reset();next_state->machine.project_local=false;
+        for(const auto& seed:impl_->vendor_presets)if(seed->printers.find_system_preset_by_model_and_variant(next_state->selection.machine_model_id,next_state->selection.machine_variant_id)){next_state->bundle=std::make_shared<Slic3r::PresetBundle>(*seed);break;}
+    }
+    try {
+        impl_->prepare(next_state);
+    } catch(const std::exception& error) {
+        result.diagnostics.push_back({"configuration",error.what()});
+        return result;
+    }
+    impl_->active = std::move(next_state);
     ++impl_->active_revision;
     result.success = true;
     result.view = *active_config();
@@ -2804,54 +3177,33 @@ ConfigActivationResult Library::activate_config(
 
 std::optional<ActiveConfigView> Library::active_config() const
 {
-    if (!impl_->active_config || impl_->active_revision == 0) {
+    if (!impl_->active->config || impl_->active_revision == 0) {
         return std::nullopt;
     }
     ActiveConfigView view;
     view.revision = impl_->active_revision;
-    view.selection = impl_->active_selection;
-    view.compatible_processes = impl_->compatible_processes;
-    view.compatible_filaments = impl_->compatible_filaments;
-    view.settings = impl_->active_config->settings();
+    view.selection = impl_->active->selection;
+    view.compatible_processes = impl_->active->compatible_processes;
+    view.compatible_filaments = impl_->active->compatible_filaments;
+    view.settings = impl_->active->config->settings();
     view.selection.filament_physical_tools.clear();
 
-    const Slic3r::DynamicPrintConfig config = dynamic_config(impl_->active_config->snapshot());
-    view.filament_slots.reserve(view.selection.filament_preset_ids.size());
-    for (std::size_t index = 0; index < view.selection.filament_preset_ids.size(); ++index) {
-        FilamentSlotInfo slot;
-        slot.index = index;
-        slot.preset_id = view.selection.filament_preset_ids[index];
-        const auto preset = std::find_if(
-            view.compatible_filaments.begin(), view.compatible_filaments.end(),
-            [&slot](const PresetOption& option) { return option.id == slot.preset_id; });
-        slot.preset_name = preset == view.compatible_filaments.end()
-            ? slot.preset_id
-            : preset->name;
-        slot.vendor = option_value_at(config, "filament_vendor", index);
-        slot.material_type = option_value_at(config, "filament_type", index);
-        slot.color = rgba8_color(option_value_at(config, "filament_colour", index));
-        if (const auto* diameters = config.option<Slic3r::ConfigOptionFloats>("filament_diameter");
-            diameters != nullptr && index < diameters->values.size()) {
-            slot.diameter_mm = diameters->values[index];
-        }
-        const auto tool_map = filament_tool_map(&config, view.selection.filament_preset_ids.size());
-        slot.physical_tool_index = static_cast<std::size_t>(tool_map[index]);
+    const Slic3r::DynamicPrintConfig config = dynamic_config(impl_->active->config->snapshot());
+    view.filament_slots=project_filament_slots(config,view.selection.filament_preset_ids.size());
+    for (std::size_t index = 0; index < view.filament_slots.size(); ++index) {
+        auto& slot=view.filament_slots[index];
+        slot.preset_id=view.selection.filament_preset_ids[index];
+        const auto preset=std::find_if(view.compatible_filaments.begin(),view.compatible_filaments.end(),
+            [&slot](const PresetOption& option){return option.id==slot.preset_id;});
+        slot.preset_name=preset==view.compatible_filaments.end()?slot.preset_id:preset->name;
         view.selection.filament_physical_tools.push_back(unsigned(slot.physical_tool_index));
-        slot.physical_tool_name = "Nozzle " + std::to_string(slot.physical_tool_index);
-        if (const auto* roles = config.option<Slic3r::ConfigOptionStrings>("toolhead_process_capabilities");
-            roles != nullptr && slot.physical_tool_index < roles->values.size()) {
-            slot.physical_tool_role = roles->values[slot.physical_tool_index];
-        }
-        if (const auto* sides = config.option<Slic3r::ConfigOptionStrings>("physical_tool_sides");
-            sides != nullptr && slot.physical_tool_index < sides->values.size()) {
-            slot.physical_tool_side = sides->values[slot.physical_tool_index];
-        }
-        if (const auto* nozzles = config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter");
-            nozzles != nullptr && slot.physical_tool_index < nozzles->values.size()) {
-            slot.nozzle_diameter_mm = nozzles->values[slot.physical_tool_index];
-        }
         const auto tools = tool_config(config);
         for (const auto& option : view.compatible_filaments) {
+            if (impl_->active->bundle) {
+                const auto* preset=impl_->active->bundle->filaments.find_preset(option.id,false);
+                if(preset && Slic3r::tool_accepts_process(tools,unsigned(slot.physical_tool_index),preset_process(*preset))) slot.compatible_presets.push_back({option.id,option.name,option.id==slot.preset_id});
+                continue;
+            }
             for (const auto& bundle : impl_->vendor_presets) {
                 if (!bundle->printers.find_system_preset_by_model_and_variant(
                         view.selection.machine_model_id, view.selection.machine_variant_id)) continue;
@@ -2861,29 +3213,28 @@ std::optional<ActiveConfigView> Library::active_config() const
                 break;
             }
         }
-        view.filament_slots.push_back(std::move(slot));
     }
     return view;
 }
 
 std::optional<ConfigSnapshot> Library::active_config_snapshot() const
 {
-    return impl_->active_config
-        ? std::optional<ConfigSnapshot>{impl_->active_config->snapshot()}
+    return impl_->active->config
+        ? std::optional<ConfigSnapshot>{impl_->active->config->snapshot()}
         : std::nullopt;
 }
 
 SettingsResult Library::apply_active_config_patch(
     const std::vector<std::pair<std::string, std::string>>& patch)
 {
-    if (!impl_->active_config) {
+    if (!impl_->active->config) {
         return settings_failure("configuration", "No slicing configuration is active");
     }
-    if (!tool_config(dynamic_config(impl_->active_config->snapshot())).toolhead_filament_capacity.values.empty()) {
+    if (!tool_config(dynamic_config(impl_->active->config->snapshot())).toolhead_filament_capacity.values.empty()) {
         for (const auto& entry : patch) if (tool_owned_setting(entry.first))
             return settings_failure(entry.first, "Use material selection to change a material; physical tool ownership is preserved");
     }
-    if (fixed_physical_filament_slots(dynamic_config(impl_->active_config->snapshot()))) {
+    if (fixed_physical_filament_slots(dynamic_config(impl_->active->config->snapshot()))) {
         const auto mapping_edit = std::find_if(patch.begin(), patch.end(), [](const auto& entry) {
             return entry.first == "filament_map" || entry.first == "filament_map_mode";
         });
@@ -2892,16 +3243,16 @@ SettingsResult Library::apply_active_config_patch(
                                     "Filament-to-tool mapping is fixed by the selected machine");
         }
     }
-    Config candidate = *impl_->active_config;
+    Config candidate = *impl_->active->config;
     SettingsResult result = candidate.apply_patch(patch);
     if (!result) return result;
     SettingsResult normalized = normalize_filament_colors(
-        candidate, impl_->active_selection.filament_preset_ids.size());
+        candidate, impl_->active->selection.filament_preset_ids.size());
     if (!normalized) return normalized;
     append_changed_items(result.changed_items, std::move(normalized.changed_items));
     auto diagnostics = candidate.validate();
     auto cardinality = filament_cardinality_diagnostics(
-        candidate, impl_->active_selection.filament_preset_ids.size());
+        candidate, impl_->active->selection.filament_preset_ids.size());
     diagnostics.insert(diagnostics.end(),
                        std::make_move_iterator(cardinality.begin()),
                        std::make_move_iterator(cardinality.end()));
@@ -2911,7 +3262,16 @@ SettingsResult Library::apply_active_config_patch(
         result.changed_items.clear();
         return result;
     }
-    impl_->active_config = std::make_unique<Config>(std::move(candidate));
+    auto next_state = std::make_shared<ConfigurationState::Impl>(*impl_->active);
+    next_state->config = std::make_unique<Config>(std::move(candidate));
+    try {
+        impl_->prepare(next_state);
+    } catch(const std::exception& error) {
+        // Native preset splitting may reject structurally incomplete vectors.
+        // Return an ordinary failed edit; never publish a partial candidate.
+        return settings_failure("configuration",error.what());
+    }
+    impl_->active = std::move(next_state);
     ++impl_->active_revision;
     return result;
 }
@@ -2923,27 +3283,27 @@ SettingsResult Library::set_active_config_value(std::string_view key, std::strin
 
 SettingsResult Library::reset_active_config_value(std::string_view key)
 {
-    if (!impl_->active_config) {
+    if (!impl_->active->config) {
         return settings_failure("configuration", "No slicing configuration is active");
     }
     if (tool_owned_setting(key) &&
-        !tool_config(dynamic_config(impl_->active_config->snapshot())).toolhead_filament_capacity.values.empty())
+        !tool_config(dynamic_config(impl_->active->config->snapshot())).toolhead_filament_capacity.values.empty())
         return settings_failure(std::string(key), "Cannot reset material ownership or physical tool capabilities");
     if ((key == "filament_map" || key == "filament_map_mode") &&
-        fixed_physical_filament_slots(dynamic_config(impl_->active_config->snapshot()))) {
+        fixed_physical_filament_slots(dynamic_config(impl_->active->config->snapshot()))) {
         return settings_failure(std::string(key),
                                 "Filament-to-tool mapping is fixed by the selected machine");
     }
-    Config candidate = *impl_->active_config;
+    Config candidate = *impl_->active->config;
     SettingsResult result = candidate.reset(key);
     if (!result) return result;
     SettingsResult normalized = normalize_filament_colors(
-        candidate, impl_->active_selection.filament_preset_ids.size());
+        candidate, impl_->active->selection.filament_preset_ids.size());
     if (!normalized) return normalized;
     append_changed_items(result.changed_items, std::move(normalized.changed_items));
     auto diagnostics = candidate.validate();
     auto cardinality = filament_cardinality_diagnostics(
-        candidate, impl_->active_selection.filament_preset_ids.size());
+        candidate, impl_->active->selection.filament_preset_ids.size());
     diagnostics.insert(diagnostics.end(),
                        std::make_move_iterator(cardinality.begin()),
                        std::make_move_iterator(cardinality.end()));
@@ -2953,7 +3313,16 @@ SettingsResult Library::reset_active_config_value(std::string_view key)
         result.changed_items.clear();
         return result;
     }
-    impl_->active_config = std::make_unique<Config>(std::move(candidate));
+    auto next_state = std::make_shared<ConfigurationState::Impl>(*impl_->active);
+    next_state->config = std::make_unique<Config>(std::move(candidate));
+    try {
+        impl_->prepare(next_state);
+    } catch(const std::exception& error) {
+        // Native preset splitting may reject structurally incomplete vectors.
+        // Return an ordinary failed edit; never publish a partial candidate.
+        return settings_failure("configuration",error.what());
+    }
+    impl_->active = std::move(next_state);
     ++impl_->active_revision;
     return result;
 }
@@ -2961,12 +3330,12 @@ SettingsResult Library::reset_active_config_value(std::string_view key)
 ConfigActivationResult Library::set_active_filament_preset(
     std::size_t slot_index, std::string_view preset_id)
 {
-    if (!impl_->active_config) {
+    if (!impl_->active->config) {
         ConfigActivationResult result;
         result.diagnostics.push_back({"configuration", "No slicing configuration is active"});
         return result;
     }
-    if (slot_index >= impl_->active_selection.filament_preset_ids.size()) {
+    if (slot_index >= impl_->active->selection.filament_preset_ids.size()) {
         ConfigActivationResult result;
         result.diagnostics.push_back({"filament", "Filament slot index is out of range"});
         return result;
@@ -2978,17 +3347,17 @@ ConfigActivationResult Library::set_active_filament_preset(
         result.diagnostics.push_back({"filament", "Material is incompatible with this physical tool"});
         return result;
     }
-    if (impl_->active_selection.filament_preset_ids[slot_index] == preset_id) {
+    if (impl_->active->selection.filament_preset_ids[slot_index] == preset_id) {
         ConfigActivationResult result;
         result.success = true;
         result.view = *active_config();
         return result;
     }
     ConfigSelection selection;
-    selection.machine_model_id = impl_->active_selection.machine_model_id;
-    selection.machine_variant_id = impl_->active_selection.machine_variant_id;
-    selection.process_preset_id = impl_->active_selection.process_preset_id;
-    selection.filament_preset_ids = impl_->active_selection.filament_preset_ids;
+    selection.machine_model_id = impl_->active->selection.machine_model_id;
+    selection.machine_variant_id = impl_->active->selection.machine_variant_id;
+    selection.process_preset_id = impl_->active->selection.process_preset_id;
+    selection.filament_preset_ids = impl_->active->selection.filament_preset_ids;
     selection.filament_preset_ids[slot_index] = std::string(preset_id);
     return activate_config(selection);
 }
@@ -2996,22 +3365,26 @@ ConfigActivationResult Library::set_active_filament_preset(
 ConfigActivationResult Library::resize_active_filament_slots(std::size_t slot_count)
 {
     ConfigActivationResult result;
-    if (!impl_->active_config) {
+    if (!impl_->active->config) {
         result.diagnostics.push_back({"configuration", "No slicing configuration is active"});
         return result;
     }
     const auto model = std::find_if(
         impl_->machines.begin(), impl_->machines.end(), [this](const MachineModelOption& option) {
-            return option.id == impl_->active_selection.machine_model_id;
+            return option.id == impl_->active->selection.machine_model_id;
         });
-    const MachineVariantOption* variant = nullptr;
-    if (model != impl_->machines.end()) {
+    // A project may reuse an installed preset with different effective tools.
+    // Enforce the same prepared capacity that the caller can inspect.
+    const MachineVariantOption* variant = impl_->active->machine.model.id.empty()
+        ? nullptr : &impl_->active->machine.variant;
+    if (variant == nullptr && model != impl_->machines.end()) {
         const auto found = std::find_if(
             model->variants.begin(), model->variants.end(), [this](const MachineVariantOption& option) {
-                return option.id == impl_->active_selection.machine_variant_id;
+                return option.id == impl_->active->selection.machine_variant_id;
             });
         if (found != model->variants.end()) variant = &*found;
     }
+    if (variant == nullptr && impl_->active->bundle) variant = &impl_->active->machine.variant;
     if (variant == nullptr) {
         result.diagnostics.push_back({"machine", "The active machine variant is unavailable"});
         return result;
@@ -3034,10 +3407,10 @@ ConfigActivationResult Library::resize_active_filament_slots(std::size_t slot_co
     }
 
     ConfigSelection selection;
-    selection.machine_model_id = impl_->active_selection.machine_model_id;
-    selection.machine_variant_id = impl_->active_selection.machine_variant_id;
-    selection.process_preset_id = impl_->active_selection.process_preset_id;
-    selection.filament_preset_ids = impl_->active_selection.filament_preset_ids;
+    selection.machine_model_id = impl_->active->selection.machine_model_id;
+    selection.machine_variant_id = impl_->active->selection.machine_variant_id;
+    selection.process_preset_id = impl_->active->selection.process_preset_id;
+    selection.filament_preset_ids = impl_->active->selection.filament_preset_ids;
     if (selection.filament_preset_ids.empty()) {
         result.diagnostics.push_back({"filament", "The active configuration has no filament preset"});
         return result;
@@ -3054,7 +3427,7 @@ ConfigActivationResult Library::add_active_filament(std::size_t physical_tool, s
         result.diagnostics.push_back({"configuration", "No slicing configuration is active"});
         return result;
     }
-    const auto config = dynamic_config(impl_->active_config->snapshot());
+    const auto config = dynamic_config(impl_->active->config->snapshot());
     const auto tools = tool_config(config);
     const auto& capacities = tools.toolhead_filament_capacity.values;
     if (physical_tool >= capacities.size()) {
@@ -3094,14 +3467,14 @@ ConfigActivationResult Library::add_active_filament(std::size_t physical_tool, s
 
 SettingsResult Library::set_active_filament_color(std::size_t slot_index, Rgba8 color)
 {
-    if (!impl_->active_config) {
+    if (!impl_->active->config) {
         return settings_failure("configuration", "No slicing configuration is active");
     }
-    const std::size_t slot_count = impl_->active_selection.filament_preset_ids.size();
+    const std::size_t slot_count = impl_->active->selection.filament_preset_ids.size();
     if (slot_index >= slot_count) {
         return settings_failure("filament", "Filament slot index is out of range");
     }
-    std::vector<std::string> colors = config_vector_values(*impl_->active_config, "filament_colour");
+    std::vector<std::string> colors = config_vector_values(*impl_->active->config, "filament_colour");
     if (colors.empty()) colors.push_back("#00AE42");
     colors.resize(slot_count, colors.back());
     colors[slot_index] = serialized_color(color);
@@ -3110,12 +3483,12 @@ SettingsResult Library::set_active_filament_color(std::size_t slot_index, Rgba8 
 
 std::vector<ConfigDiagnostic> Library::validate_active_config() const
 {
-    if (!impl_->active_config) {
+    if (!impl_->active->config) {
         return {{"configuration", "No slicing configuration is active"}};
     }
-    auto diagnostics = impl_->active_config->validate();
+    auto diagnostics = impl_->active->config->validate();
     auto cardinality = filament_cardinality_diagnostics(
-        *impl_->active_config, impl_->active_selection.filament_preset_ids.size());
+        *impl_->active->config, impl_->active->selection.filament_preset_ids.size());
     diagnostics.insert(diagnostics.end(),
                        std::make_move_iterator(cardinality.begin()),
                        std::make_move_iterator(cardinality.end()));
@@ -3178,6 +3551,7 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
                 if (std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
                                 [&](const auto& item) { return item.id == model; }))
                     seed = candidate.get();
+        if (impl_->active->bundle && model == impl_->active->selection.machine_model_id) seed=impl_->active->bundle.get();
         if (request.mode == libslicer::CalibMode::Calib_Flow_Rate) {
             const auto count = config.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size();
             auto* names = config.option<Slic3r::ConfigOptionStrings>("filament_settings_id", true);
@@ -3295,6 +3669,14 @@ SliceResult Library::slice_impl(const SliceRequest& request,
         Slic3r::DynamicPrintConfig config = calibration
             ? calibration->impl_->host->full_config() : dynamic_config(request.config);
         if (!calibration) normalize_filament_identity(config);
+        Slic3r::Model plate_model;
+        if (!calibration) apply_plate_semantics(plate_model, config, request.project_semantics);
+        // Imported projects may intentionally retain editable invalid values.
+        // Reject them before Print::validate builds layers (negative heights
+        // can otherwise enter the native layer-generation loop).
+        for (const auto& problem:config.validate())
+            result.diagnostics.push_back({"config",problem.first+": "+problem.second,false});
+        if (!result.diagnostics.empty()) return result;
         Slic3r::validate_material_tool_bindings(tool_config(config));
         const auto filament_diagnostics = slice_filament_diagnostics(config);
         if (!filament_diagnostics.empty()) {
@@ -3312,7 +3694,6 @@ SliceResult Library::slice_impl(const SliceRequest& request,
         }
 
         report_progress(callbacks, 0.02f, "Loading models");
-        Slic3r::Model plate_model;
         if (calibration) plate_model=calibration->impl_->models[plate_index];
         std::set<size_t> mask_volume_ids;
         for (const SliceObjectInput& input : request.objects) {
@@ -3332,6 +3713,10 @@ SliceResult Library::slice_impl(const SliceRequest& request,
             if (has_memory_input) {
                 Slic3r::ModelObject* object = plate_model.add_object();
                 object->name = input.name;
+                apply_object_semantics(*object, input.project_semantics);
+                const int object_slot = input.default_filament_slot > 0 ? input.default_filament_slot : request.default_filament_slot;
+                if (object_slot <= 0 || std::size_t(object_slot) > filament_slot_count) throw std::invalid_argument("Object material slot outside active configuration");
+                object->config.set("extruder", object_slot);
                 for (const SliceVolumeInput& source_volume : input.volumes) {
                     if (source_volume.vertices.empty() || source_volume.triangles.empty()) {
                         result.diagnostics.push_back({"model", "In-memory slice volume has no geometry", false});
@@ -3357,22 +3742,25 @@ SliceResult Library::slice_impl(const SliceRequest& request,
                             static_cast<int>(triangle.vertex_c));
                     }
 
-                    Slic3r::ModelVolumeType volume_type = Slic3r::ModelVolumeType::MODEL_PART;
-                    if (source_volume.role == SliceVolumeRole::SupportEnforcer) {
-                        volume_type = Slic3r::ModelVolumeType::SUPPORT_ENFORCER;
-                    } else if (source_volume.role == SliceVolumeRole::SupportBlocker) {
-                        volume_type = Slic3r::ModelVolumeType::SUPPORT_BLOCKER;
+                    Slic3r::ModelVolumeType volume_type;
+                    switch (source_volume.role) {
+                    case SliceVolumeRole::ModelPart: volume_type=Slic3r::ModelVolumeType::MODEL_PART;break;
+                    case SliceVolumeRole::SupportEnforcer: volume_type=Slic3r::ModelVolumeType::SUPPORT_ENFORCER;break;
+                    case SliceVolumeRole::SupportBlocker: volume_type=Slic3r::ModelVolumeType::SUPPORT_BLOCKER;break;
+                    case SliceVolumeRole::NegativeVolume: volume_type=Slic3r::ModelVolumeType::NEGATIVE_VOLUME;break;
+                    case SliceVolumeRole::ParameterModifier: volume_type=Slic3r::ModelVolumeType::PARAMETER_MODIFIER;break;
+                    default: throw std::invalid_argument("Unknown slice volume role");
                     }
                     Slic3r::ModelVolume* volume = object->add_volume(
-                        Slic3r::TriangleMesh(std::move(vertices), std::move(faces)),
-                        volume_type, false);
-                    if (source_volume.role == SliceVolumeRole::ModelPart) {
-                        if (source_volume.default_filament_slot <= 0 ||
-                            static_cast<std::size_t>(source_volume.default_filament_slot) >
-                                filament_slot_count) {
-                            result.diagnostics.push_back({"filament", "Model volume default filament slot is outside the active configuration", false});
-                            return result;
-                        }
+                        Slic3r::TriangleMesh(std::move(vertices), std::move(faces)), volume_type, false);
+                    volume->set_transformation(mask_matrix(source_volume.local_transform));
+                    const auto semantics=semantic_json(source_volume.project_semantics,"part");
+                    if (semantics.contains("settings") && semantics.at("settings").contains("extruder")) throw std::invalid_argument("Part material slot must use its dedicated field");
+                    volume->config.apply(semantic_settings(semantics));
+                    apply_part_annotations(*volume, source_volume.surface_annotations);
+                    if (!source_volume.inherit_object_filament) {
+                        if (source_volume.default_filament_slot <= 0 || std::size_t(source_volume.default_filament_slot)>filament_slot_count)
+                            throw std::invalid_argument("Volume material slot outside active configuration");
                         volume->config.set("extruder", source_volume.default_filament_slot);
                     }
                     if (!source_volume.facet_labels.valid()) {
@@ -3383,30 +3771,7 @@ SliceResult Library::slice_impl(const SliceRequest& request,
                         return result;
                     }
                     if (!source_volume.facet_labels.empty()) {
-                        Slic3r::TriangleSelector::TriangleSplittingData painting;
-                        painting.triangles_to_split.reserve(source_volume.facet_labels.roots.size());
-                        for (const auto& root : source_volume.facet_labels.roots) {
-                            if (root.triangle_index >= source_volume.triangles.size() ||
-                                root.bitstream_start_index >= source_volume.facet_labels.bitstream.size()) {
-                                result.diagnostics.push_back({"facet_labels", "Facet painting references invalid triangle data", false});
-                                return result;
-                            }
-                            painting.triangles_to_split.emplace_back(
-                                static_cast<int>(root.triangle_index),
-                                static_cast<int>(root.bitstream_start_index));
-                        }
-                        painting.bitstream.reserve(source_volume.facet_labels.bitstream.size());
-                        for (const std::uint8_t bit : source_volume.facet_labels.bitstream) {
-                            painting.bitstream.push_back(bit != 0u);
-                        }
-                        painting.update_used_states(0);
-                        for (std::size_t label = filament_slot_count + 1;
-                             label < painting.used_states.size(); ++label) {
-                            if (painting.used_states[label]) {
-                                result.diagnostics.push_back({"filament", "Facet painting references a missing filament slot", false});
-                                return result;
-                            }
-                        }
+                        auto painting=native_facets(source_volume.facet_labels,source_volume.triangles.size(),int(std::min(filament_slot_count,std::size_t(Slic3r::EnforcerBlockerType::ExtruderMax))));
                         volume->mmu_segmentation_facets.set_data(std::move(painting));
                     }
                 }
@@ -3521,6 +3886,7 @@ SliceResult Library::slice_impl(const SliceRequest& request,
         // The SDK has one plate in request coordinates; native Print does not
         // initialize its plate origin, which validation and export both read.
         print.set_plate_origin(Slic3r::Vec3d::Zero());
+        print.set_plate_index(plate_model.curr_plate_index);
         if (belt_printer) {
             const ModelWorldBounds belt_bounds = model_world_bounds(plate_model);
             if (!belt_bounds.valid) {
@@ -3955,6 +4321,688 @@ GCodePreviewResult Library::load_gcode_preview(const GCodePreviewRequest& reques
     return result;
 }
 
+std::uint64_t Library::configuration_revision() const noexcept { return impl_->active_revision; }
+ConfigurationState Library::capture_configuration() const {
+    ConfigurationState state;
+    state.impl_=impl_->active;
+    state.captured_revision_=impl_->active_revision;
+    state.filament_color_cursor_=impl_->filament_color_cursor;
+    state.capture_origin_=impl_->capture_origin;
+    return state;
+}
+ConfigurationInstallResult Library::install_configuration(const ConfigurationState& state, std::uint64_t expected_revision) {
+    ConfigurationInstallResult result;
+    if (impl_->active_revision!=expected_revision) { result.diagnostics.push_back({"revision","Configuration changed before project commit"});return result; }
+    if (!state.impl_ || (!state.impl_->resource_directory.empty()&&state.impl_->resource_directory!=impl_->resource_directory)) {
+        result.diagnostics.push_back({"configuration","Configuration belongs to a different library resource context"});return result;
+    }
+    if(impl_->active_revision==std::numeric_limits<std::uint64_t>::max()) {result.diagnostics.push_back({"revision","Configuration revision exhausted"});return result;}
+    result.previous=capture_configuration();
+    impl_->active=state.impl_;
+    impl_->filament_color_cursor=state.filament_color_cursor_;
+    result.revision=++impl_->active_revision;
+    result.success=true;return result;
+}
+std::optional<ProjectMachine> Library::active_project_machine() const {
+    if(!impl_->active->config)return std::nullopt;
+    if(!impl_->active->machine.model.id.empty())return impl_->active->machine;
+    auto machine=describe_project_machine(dynamic_config(impl_->active->config->snapshot()));
+    machine.project_local=false;
+    impl_->apply_installed_machine_capabilities(machine,impl_->active->selection);
+    return machine;
+}
+ProjectReadResult Library::read_project(const ProjectReadRequest& request, const SliceCallbacks& callbacks) const {
+    return read_project(request, callbacks, {});
+}
+
+ProjectReadResult Library::read_project(const ProjectReadRequest& request, const SliceCallbacks& callbacks,
+                                      const ProjectDecisionCallback& decisions) const {
+    using namespace Slic3r;
+    ProjectReadResult result;
+    result.replace_document = request.mode == ProjectReadMode::Project;
+    PlateDataPtrs plates;
+    std::vector<Preset*> presets;
+    struct ImportOwner {
+        PlateDataPtrs& plates;
+        std::vector<Preset*>& presets;
+        ~ImportOwner() {
+            release_PlateData_list(plates);
+            for (auto* p : presets) if (p) { delete p->loading_substitutions; p->loading_substitutions=nullptr; delete p; }
+        }
+    } owner{plates,presets};
+    struct DecisionRequired {};
+    const auto check_cancel=[&] { if (cancellation_requested(callbacks)) throw CanceledException(); };
+    const auto cancelled_after_exception=[&]() noexcept {
+        try { return cancellation_requested(callbacks); } catch (...) { return false; }
+    };
+    const auto diagnostic=[&](std::string code, std::string message, std::string context={}, std::string severity="warning") {
+        result.diagnostics.push_back({std::move(severity),std::move(code),std::move(context),std::move(message)});
+    };
+    const auto ask=[&](ProjectDecisionKind kind, const char* key, const char* message,
+                       std::size_t object=std::size_t(-1), std::size_t instance=std::size_t(-1)) {
+        check_cancel();
+        ProjectDecisionAnswer answer;
+        if (decisions) answer=decisions({kind,object,instance,message});
+        else if (kind==ProjectDecisionKind::LegacyInfillRotation && request.accept_legacy_infill_rotation_fix)
+            answer=ProjectDecisionAnswer::Yes;
+        else {
+            result.required_decisions.push_back(key);
+            diagnostic("project.decision_required",message,key,"info");
+            throw DecisionRequired{};
+        }
+        check_cancel();
+        if (answer==ProjectDecisionAnswer::Cancel) throw CanceledException();
+        if (answer!=ProjectDecisionAnswer::Yes && answer!=ProjectDecisionAnswer::No)
+            throw std::invalid_argument("Invalid project decision answer");
+        return answer==ProjectDecisionAnswer::Yes;
+    };
+    try {
+        check_cancel();
+        std::error_code error;
+        if (request.path.empty() || !fs::is_regular_file(fs::u8path(request.path),error) || error) {
+            diagnostic("project.input","3MF input is not a readable regular file",{},"error"); return result;
+        }
+        const auto context=request.configuration ? *request.configuration : capture_configuration();
+        if (context.capture_origin_.lock()!=impl_->capture_origin || context.impl_!=impl_->active || context.captured_revision_!=impl_->active_revision)
+            throw std::invalid_argument("Project context is stale or belongs to a different library");
+        result.configuration_revision=context.captured_revision_;
+        result.filament_color_cursor=request.filament_color_cursor.value_or(context.filament_color_cursor_);
+        auto state=std::make_shared<ConfigurationState::Impl>(*context.impl_);
+        state->resource_directory=impl_->resource_directory;
+        // A GUI always has a selected bundle. A fresh SDK Library may bootstrap
+        // a project from its installed catalog, without activating global state.
+        if (!state->bundle) {
+            if (request.mode==ProjectReadMode::Geometry)
+                throw std::invalid_argument("Geometry import requires a captured current configuration");
+            state->bundle=impl_->vendor_presets.empty() ? std::make_shared<PresetBundle>()
+                : std::make_shared<PresetBundle>(*impl_->vendor_presets.front());
+        }
+        auto& bundle=*state->bundle;
+        // Plater::load_project -> reset: discard embedded presets locally. The
+        // document replacement itself is performed by the caller at commit.
+        const auto entry_config=bundle.full_config();
+        const auto entry_bed_model=project_bed_model(bundle,entry_config);
+        if (result.replace_document) bundle.reset_project_embedded_presets();
+        auto current=bundle.full_config();
+        const auto sync_nozzle_count=[&] {
+            const auto& printer=bundle.printers.get_edited_preset();
+            if (printer.printer_technology()==ptFFF && !printer.config.opt_bool("single_extruder_multi_material")) {
+                if (const auto* nozzles=printer.config.option<ConfigOptionFloats>("nozzle_diameter"))
+                    bundle.set_num_filaments(nozzles->values.size());
+            }
+        };
+        if (result.replace_document) { sync_nozzle_count(); current=bundle.full_config(); }
+        auto current_machine=describe_project_machine(current,false);
+        ProjectBedContext bed;
+        bed.minimum_x=bed.minimum_y=std::numeric_limits<double>::max();
+        bed.maximum_x=bed.maximum_y=-std::numeric_limits<double>::max();
+        for (const auto& point:current_machine.variant.printable_area) {
+            bed.minimum_x=std::min(bed.minimum_x,point.x); bed.minimum_y=std::min(bed.minimum_y,point.y);
+            bed.maximum_x=std::max(bed.maximum_x,point.x); bed.maximum_y=std::max(bed.maximum_y,point.y);
+        }
+        // force_print_bed_update still respects Bed3D::set_shape's equal-input
+        // short-circuit. Preserve the caller's cached dimensions in that case.
+        const auto current_bed_model=project_bed_model(bundle,current);
+        const bool reset_bed_changed=result.replace_document &&
+            (project_bed_inputs_changed(entry_config,current)||entry_bed_model!=current_bed_model||
+             (request.bed&&(request.bed->shape_position_mm.x!=0||request.bed->shape_position_mm.y!=0)));
+        if(reset_bed_changed) {
+            // An explicit snapshot belongs to the entry printer, before reset.
+            // set_shape consumes that printer's old axes, then updates them.
+            const auto entry_machine=describe_project_machine(entry_config,false);
+            const float old_axes=request.bed ? request.bed->axes_length_mm.value_or(project_axes_length(entry_machine.variant))
+                : project_axes_length(entry_machine.variant);
+            bed.native_plate_size=project_native_plate_size(current_machine.variant,old_axes);
+            bed.axes_length_mm=project_axes_length(current_machine.variant);
+        } else if(request.bed) bed=*request.bed;
+        if (!std::isfinite(bed.minimum_x)||!std::isfinite(bed.minimum_y)||!std::isfinite(bed.maximum_x)||!std::isfinite(bed.maximum_y)||
+            bed.maximum_x<=bed.minimum_x||bed.maximum_y<=bed.minimum_y)
+            throw std::invalid_argument("Project current bed context is invalid");
+        if (result.replace_document) { bed.current_plate_empty=true; bed.occupied_hulls.clear(); }
+        Vec2d bed_center((bed.minimum_x+bed.maximum_x)/2,(bed.minimum_y+bed.maximum_y)/2);
+        Vec3d bed_size(bed.maximum_x-bed.minimum_x-2,bed.maximum_y-bed.minimum_y-2,-1);
+        bool load_model=true, load_config=result.replace_document;
+        LoadStrategy strategy=LoadStrategy::LoadModel;
+        if (load_config) strategy=strategy|LoadStrategy::LoadConfig|LoadStrategy::CheckVersion|LoadStrategy::LoadAuxiliary;
+        DynamicPrintConfig loaded;
+        ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Enable);
+        En3mfType type=En3mfType::From_BBS;
+        Semver version;
+        report_progress(callbacks,0.03f,"Reading 3MF without modifying the active project");
+        auto model=Model::read_from_archive(request.path,&loaded,&substitutions,type,strategy,&plates,&presets,&version,
+            [&](int stage,int position,int total,bool& cancel) {
+                cancel=cancellation_requested(callbacks);
+                if (!cancel) report_progress(callbacks,std::clamp((float(stage)+(total?float(position)/float(total):0))/float(IMPORT_STAGE_MAX),0.03f,0.70f),"Reading 3MF");
+            });
+        check_cancel();
+        auto scene=std::make_shared<ProjectScene>();
+        scene->producer=type==En3mfType::From_Orca?"OrcaSlicer":type==En3mfType::From_BBS?"BambuStudio":type==En3mfType::From_Prusa?"PrusaSlicer":"Other";
+        scene->version=version.to_string(); scene->kind=loaded.empty()?ProjectContainerKind::Model:ProjectContainerKind::Project;
+        // Plater.cpp:6092. This must precede producer fallback, and logical
+        // filament IDs must not be clamped to a physical nozzle capacity.
+        bool expanded_filaments=false;
+        if (type==En3mfType::From_Prusa || (load_model && !load_config)) {
+            std::set<int> extruderIds;
+            for (auto* object:model.objects) {
+                if (object->config.option("extruder")) extruderIds.insert(object->config.extruder());
+                for (auto* volume:object->volumes) {
+                    if (volume->config.option("extruder")) extruderIds.insert(volume->config.extruder());
+                    for (int extruder:volume->get_extruders()) extruderIds.insert(extruder);
+                }
+            }
+            const int size=extruderIds.empty()?0:*extruderIds.rbegin();
+            static constexpr const char* colors[]={"#00C1AE","#F4E2C1","#ED1C24","#00FF7F","#F26722","#FFEB31","#7841CE","#115877","#ED1E79","#2EBDEF","#345B2F","#800080","#FA8173","#800000","#F7B763","#A4C41E"};
+            int filament_size=int(bundle.filament_presets.size());
+            while (filament_size<MAXIMUM_EXTRUDER_NUMBER && filament_size<size) {
+                bundle.set_num_filaments(filament_size+1,colors[result.filament_color_cursor++ % std::size(colors)]);
+                ++filament_size; expanded_filaments=true;
+            }
+        }
+        // Original Plater.cpp:6139-6297. Preserve this if/else-if tree: an
+        // earlier version branch deliberately prevents the later empty check.
+        const Semver app_version=*Semver::parse(SoftFever_VERSION);
+        const auto rotation_template=[&]() -> std::string& {
+            auto* option=loaded.option<ConfigOptionString>("sparse_infill_rotate_template");
+            if (!option) throw std::invalid_argument("Legacy alpha project is missing sparse_infill_rotate_template");
+            return option->value;
+        };
+        const auto infill_pattern=[&] {
+            const auto* option=loaded.option<ConfigOptionEnum<InfillPattern>>("sparse_infill_pattern");
+            if (!option) throw std::invalid_argument("Legacy alpha project is missing sparse_infill_pattern");
+            return option->value;
+        };
+        // ORCA_PROJECT_COMPATIBILITY_BEGIN
+        if (type == En3mfType::From_Prusa) {
+            // do not reset the model config
+            load_config = false;
+            if (request.mode != ProjectReadMode::Geometry)
+                diagnostic("project.geometry_fallback", "The 3MF is not supported by OrcaSlicer, loading geometry data only.", {}, "info");
+        }
+        else if (type == En3mfType::From_Orca) {
+            // OrcaSlicer file (has OrcaSlicer tag) - compare version with SoftFever_VERSION
+            // Migration fix for OrcaSlicer 2.3.1-alpha sparse infill rotation template
+            if (load_config && (version < app_version) && version == Semver("2.3.1-alpha")) {
+                if (!rotation_template().empty()) {
+                    const auto _sparse_infill_pattern =
+                        infill_pattern();
+                    bool is_safe_to_rotate = _sparse_infill_pattern == ipRectilinear || _sparse_infill_pattern == ipLine ||
+                                             _sparse_infill_pattern == ipZigZag || _sparse_infill_pattern == ipCrossZag ||
+                                             _sparse_infill_pattern == ipLockedZag;
+                    if (!is_safe_to_rotate) {
+                        if (ask(ProjectDecisionKind::LegacyInfillRotation, "legacy_infill_rotation_fix", "Clear the legacy OrcaSlicer 2.3.1-alpha infill rotation template?")) {
+                            rotation_template() = "";
+                        }
+                    }
+                }
+            } else if (load_config && (version > app_version)) {
+                if (substitutions.unrecogized_keys.size() > 0) {
+                    diagnostic("project.newer_version", "The 3MF version may not be fully compatible.", version.to_string());
+                }
+                else {
+                    //if the minor version is not matched
+                    if (version.min() != app_version.min()) {
+                        diagnostic("project.newer_version", "The 3MF version may not be fully compatible.", version.to_string());
+                    }
+                }
+            }
+            else if (load_config && loaded.empty()) {
+                load_config = false;
+                diagnostic("project.geometry_fallback", "The 3MF file was generated by an old OrcaSlicer version, loading geometry data only.", {}, "info");
+            }
+        }
+        else if (type == En3mfType::From_BBS) {
+            // No OrcaSlicer tag - check Bambu/Application version
+            Semver orca_tag_start_version(2, 3, 2);
+            if (version <= orca_tag_start_version) {
+                // Compatible old version (before OrcaSlicer tagging was introduced after 2.3.2).
+                // Any version prior or equal to 2.3.2 is older than the current one, no version warnings needed.
+                // Still apply migration fixes for known old versions.
+                if (load_config && (version == Semver("2.3.1-alpha"))) {
+                    if (!rotation_template().empty()) {
+                        const auto _sparse_infill_pattern =
+                            infill_pattern();
+                        bool is_safe_to_rotate = _sparse_infill_pattern == ipRectilinear || _sparse_infill_pattern == ipLine ||
+                                                 _sparse_infill_pattern == ipZigZag || _sparse_infill_pattern == ipCrossZag ||
+                                                 _sparse_infill_pattern == ipLockedZag;
+                        if (!is_safe_to_rotate) {
+                            if (ask(ProjectDecisionKind::LegacyInfillRotation, "legacy_infill_rotation_fix", "Clear the legacy OrcaSlicer 2.3.1-alpha infill rotation template?")) {
+                                rotation_template() = "";
+                            }
+                        }
+                    }
+                }
+                else if (load_config && loaded.empty()) {
+                    load_config = false;
+                    diagnostic("project.geometry_fallback", "The 3MF file was generated by an older version, loading geometry data only.", {}, "info");
+                }
+            } else {
+                // BambuStudio project (version > 2.3.2 without OrcaSlicer tag)
+                // Report that a BambuStudio project is being imported and compare with SLIC3R_VERSION
+                Semver slic3r_version = *(Semver::parse(SLIC3R_VERSION));
+                if (load_config && loaded.empty()) {
+                    load_config = false;
+                    diagnostic("project.geometry_fallback", "The 3MF file was generated by BambuStudio, loading geometry data only.", {}, "info");
+                }
+                else if (load_config && (version > slic3r_version)) {
+                    // BambuStudio file version is newer than our compatible SLIC3R_VERSION
+                    if (substitutions.unrecogized_keys.size() > 0) {
+                        diagnostic("project.bambu_version", "The 3MF version may not be fully compatible.", version.to_string());
+                    } else {
+                        diagnostic("project.bambu_version", "The 3MF version may not be fully compatible.", version.to_string());
+                    }
+                } else if (load_config) {
+                    // BambuStudio version is older or same as our SLIC3R_VERSION
+                    diagnostic("project.bambu_version", "The 3MF was created by BambuStudio. Some settings may differ from OrcaSlicer.", {}, "info");
+                }
+            }
+        }
+        else if (type == En3mfType::From_Other) {
+            // Generic CAD/other 3MF without slicer metadata: import geometry silently.
+            if (load_config && loaded.empty()) {
+                load_config = false;
+            }
+        }
+        else if (load_config && loaded.empty()) {
+            load_config = false;
+            diagnostic("project.geometry_fallback", "The 3MF file was generated by an old OrcaSlicer version, loading geometry data only.", {}, "info");
+        }
+        else if (!load_config) {
+            // reset config except color
+            for (ModelObject *model_object : model.objects) {
+                bool has_extruder = model_object->config.has("extruder");
+                int  extruder_id  = -1;
+                // save the extruder information before reset
+                if (has_extruder) { extruder_id = model_object->config.extruder(); }
+
+                model_object->config.reset();
+
+                // restore the extruder after reset
+                if (has_extruder) { model_object->config.set("extruder", extruder_id); }
+
+                // Is there any modifier or advanced config data?
+                for (ModelVolume *model_volume : model_object->volumes) {
+                    has_extruder = model_volume->config.has("extruder");
+                    if (has_extruder) { extruder_id = model_volume->config.extruder(); }
+
+                    model_volume->config.reset();
+
+                    if (has_extruder) { model_volume->config.set("extruder", extruder_id); }
+                }
+            }
+        }
+        // ORCA_PROJECT_COMPATIBILITY_END
+        for (const auto& key:substitutions.unrecogized_keys) {
+            if (PrintConfigDef::is_obsolete_key(key)) diagnostic("project.obsolete_setting","Native Orca retired this setting",key,"info");
+            else { result.ignored_settings.push_back(key); diagnostic("project.unknown_setting_ignored","Native Orca omitted an unrecognized setting",key,"info"); }
+        }
+        if (!substitutions.empty()) diagnostic("project.settings_migrated","Native Orca compatibility substitutions were applied",{},"info");
+        const bool legacy_layout=load_model&&load_config&&!loaded.empty()&&!plates.empty()&&
+            (type==En3mfType::From_BBS||type==En3mfType::From_Orca)&&version<Semver(1,5,9);
+        const float current_axes=project_axes_length(current_machine.variant);
+        const float captured_axes=bed.axes_length_mm.value_or(current_axes);
+        const auto previous_plate_size=bed.native_plate_size ? *bed.native_plate_size : project_native_plate_size(current_machine.variant,captured_axes);
+        DynamicPrintConfig resolved=current;
+        bool is_project_file=false;
+        if (!presets.empty() && load_config) {
+            const auto changed=bundle.load_project_embedded_presets(presets,ForwardCompatibilitySubstitutionRule::Enable);
+            if (!changed.empty()) diagnostic("project.preset_substitutions","Native Orca migrated embedded presets",{},"info");
+        }
+        if (load_config && !loaded.empty()) {
+            DynamicPrintConfig config; config.apply(FullPrintConfig::defaults()); config+=std::move(loaded);
+            for (const auto& problem:config.validate()) diagnostic("project.invalid_configuration",problem.second,problem.first);
+            Preset::normalize(config);
+            // Plater.cpp:6402-6447: original legacy prime tower migration.
+            if ((type==En3mfType::From_BBS||type==En3mfType::From_Orca)&&version<Semver(2,0,0)) {
+                auto* colors=config.option<ConfigOptionStrings>("filament_colour",true);
+                const auto count=colors->values.size();
+                if (auto* prime=config.option<ConfigOptionFloats>("filament_prime_volume");prime&&!prime->values.empty()&&count>1)
+                    prime->values.resize(count,prime->values.front());
+                config.option<ConfigOptionEnum<WipeTowerWallType>>("wipe_tower_wall_type",true)->value=wtwRectangle;
+                config.option<ConfigOptionPercent>("prime_tower_infill_gap",true)->value=100;
+                config.option<ConfigOptionInts>("filament_adhesiveness_category",true)->values.assign(count,100);
+                auto& dirty=config.option<ConfigOptionStrings>("different_settings_to_system",true)->values; dirty.resize(count+2);
+                const auto add_dirty=[&](std::size_t i,std::initializer_list<const char*> keys) {
+                    std::vector<std::string> values; unescape_strings_cstyle(dirty[i],values);
+                    for (const auto* key:keys) values.emplace_back(key); dirty[i]=escape_strings_cstyle(values);
+                };
+                add_dirty(0,{"wipe_tower_wall_type","prime_tower_infill_gap"});
+                for (std::size_t i=1;i<=count;++i) add_dirty(i,{"filament_adhesiveness_category"});
+            }
+            std::set<std::string> modified_gcodes;
+            const int validity=bundle.validate_presets(fs::u8path(request.path).filename().string(),config,modified_gcodes);
+            if (validity!=VALIDATE_PRESETS_SUCCESS) {
+                std::string keys; for (const auto& key:modified_gcodes) { if (!keys.empty()) keys+='\n'; keys+=key; }
+                diagnostic("project.preset_gcode_warning","The 3MF contains modified G-code or customized printer/filament presets.",keys);
+            }
+            std::optional<ConfigOptionFloats> tower_x,tower_y;
+            if (const auto* value=config.opt<ConfigOptionFloats>("wipe_tower_x")) tower_x=*value;
+            if (const auto* value=config.opt<ConfigOptionFloats>("wipe_tower_y")) tower_y=*value;
+            bundle.load_config_model(fs::u8path(request.path).filename().string(),std::move(config),version);
+            sync_nozzle_count();
+            auto& project=bundle.project_config;
+            if (tower_x) *project.opt<ConfigOptionFloats>("wipe_tower_x")=*tower_x;
+            if (tower_y) *project.opt<ConfigOptionFloats>("wipe_tower_y")=*tower_y;
+            if (const auto* colors=project.opt<ConfigOptionStrings>("filament_colour")) {
+                const auto count=colors->size();
+                auto* map=project.opt<ConfigOptionInts>("filament_map",true);
+                if (map->size()!=count) map->values.resize(count,1);
+                auto* multi=project.opt<ConfigOptionStrings>("filament_multi_colour",true);
+                if (multi->size()!=count) multi->values.resize(count);
+                for (std::size_t i=0;i<count;++i) {
+                    const auto values=split_string(multi->values[i],' ');
+                    if (values.empty()||values.front()!=colors->values[i]) multi->values[i]=colors->values[i];
+                }
+                auto* types=project.opt<ConfigOptionStrings>("filament_colour_type",true);
+                if (types->size()!=count) {
+                    types->values.resize(count);
+                    for (auto& value:types->values) if (value.empty()) value="1";
+                }
+            }
+            is_project_file=true;
+        }
+        resolved=bundle.full_config();
+        if (is_project_file) {
+            // load_current_presets updates the visible bed before load_model_objects.
+            const auto loaded_machine=describe_project_machine(resolved,false);
+            bed.minimum_x=bed.minimum_y=std::numeric_limits<double>::max();
+            bed.maximum_x=bed.maximum_y=-std::numeric_limits<double>::max();
+            for (const auto& p:loaded_machine.variant.printable_area) {
+                bed.minimum_x=std::min(bed.minimum_x,p.x); bed.minimum_y=std::min(bed.minimum_y,p.y);
+                bed.maximum_x=std::max(bed.maximum_x,p.x); bed.maximum_y=std::max(bed.maximum_y,p.y);
+            }
+            bed_center={(bed.minimum_x+bed.maximum_x)/2,(bed.minimum_y+bed.maximum_y)/2};
+            bed_size={bed.maximum_x-bed.minimum_x-2,bed.maximum_y-bed.minimum_y-2,-1};
+        }
+        result.load_config=load_config;
+        scene->mode=load_config?ProjectReadMode::Project:ProjectReadMode::Geometry;
+        // Plater.cpp:6767-6882 and 7114-7243: native model postprocessing.
+        if (!is_project_file) {
+            if (const int removed=model.removed_objects_with_zero_volume();removed>0)
+                diagnostic("project.zero_volume_removed","Objects with zero volume removed",std::to_string(removed),"info");
+            if (model.looks_like_saved_in_meters()) {
+                if (ask(ProjectDecisionKind::ConvertMeters,"convert_meters","The object may be in meters. Scale to millimetres?")) model.convert_from_meters(true);
+            } else if (model.looks_like_imperial_units()) {
+                if (ask(ProjectDecisionKind::ConvertInches,"convert_inches","The object may be in inches. Scale to millimetres?")) model.convert_from_imperial_units(true);
+            }
+        }
+        if (!is_project_file && model.looks_like_multipart_object()) {
+            if (ask(ProjectDecisionKind::MultipartObject,"multipart_object","Load objects positioned at multiple heights as one object with multiple parts?"))
+                model.convert_multipart_object(int(serialized_option_values(current,"filament_colour").size()));
+        }
+        for (auto* object:model.objects) if (!object->instances.empty()) object->ensure_on_bed(is_project_file);
+        if (!is_project_file) model.center_instances_around_point(bed_center);
+        if (!is_project_file) model.plates_custom_gcodes.clear();
+        std::vector<ModelInstance*> new_instances;
+        for (std::size_t oi=0;oi<model.objects.size();++oi) {
+            check_cancel(); auto* object=model.objects[oi]; object->sort_volumes(true);
+            if (object->instances.empty()) { object->center_around_origin(); new_instances.push_back(object->add_instance()); }
+            for (std::size_t ii=0;ii<object->instances.size();++ii) {
+                auto* instance=object->instances[ii];
+                const Vec3d ratio=object->instance_bounding_box(ii).size().cwiseQuotient(bed_size);
+                const double max_ratio=std::max(ratio(0),ratio(1));
+                if (max_ratio>10000) {
+                    diagnostic("project.oversized_mesh_scaled","The object was scaled down to avoid coordinate overflow.",object->name,"info");
+                    object->scale_mesh_after_creation(1./max_ratio); object->origin_translation=Vec3d::Zero(); object->center_around_origin(); break;
+                } else if (max_ratio>10 && ask(ProjectDecisionKind::ScaleOversizedInstance,"scale_oversized_instance",
+                    "Scale the oversized object down to fit the print bed?",oi,ii))
+                    instance->set_scaling_factor(instance->get_scaling_factor()/max_ratio);
+            }
+            object->ensure_on_bed(is_project_file);
+            for (auto* instance:object->instances) if (!instance->is_assemble_initialized())
+                instance->set_assemble_transformation(instance->get_transformation());
+        }
+        // AUTOPLACEMENT_ON_LOAD is defined in original Plater.cpp:7112. Keep
+        // GLCanvas3D::get_empty_cells' original per-hull accumulation/order.
+        if (!new_instances.empty()) {
+            for (auto* instance:new_instances) {
+            std::vector<Polygon> hulls;
+            for (const auto& values:bed.occupied_hulls) {
+                Polygon polygon;
+                for (const auto& p:values) {
+                    if (!std::isfinite(p.x)||!std::isfinite(p.y)) throw std::invalid_argument("Non-finite occupied hull");
+                    polygon.points.emplace_back(scale_(p.x),scale_(p.y));
+                }
+                if (!polygon.empty()) hulls.push_back(std::move(polygon));
+            }
+            for (auto* object:model.objects) {
+                auto* first=object->instances.front();
+                Polygon hull=object->convex_hull_2d(Geometry::assemble_transform({0.,0.,first->get_offset().z()},first->get_rotation(),first->get_scaling_factor(),first->get_mirror()));
+                if (hull.empty()) continue;
+                for (auto* instance:object->instances) {
+                    Geometry::Transformation transformation;
+                    transformation.set_offset({scale_(instance->get_offset().x()),scale_(instance->get_offset().y()),0.});
+                    transformation.set_rotation(Z,instance->get_rotation().z()-first->get_rotation().z());
+                    hulls.push_back(hull.transform(transformation.get_matrix()));
+                }
+            }
+                Vec2f start=bed_center.cast<float>(), target=start;
+                if (!bed.current_plate_empty) {
+                    std::vector<Vec2f> cells,empty;
+                    const float step=10;
+                    const auto min_x=start.x()-step*int((start.x()-bed.minimum_x)/step);
+                    const auto min_y=start.y()-step*int((start.y()-bed.minimum_y)/step);
+                    for (float x=min_x;x<bed.maximum_x-step/2;x+=step)
+                        for (float y=min_y;y<bed.maximum_y-step/2;y+=step) cells.emplace_back(x,y);
+                    for (const auto& hull:hulls) for (const auto& cell:cells)
+                        if (!hull.contains(Point(scale_(cell.x()),scale_(cell.y())))) empty.push_back(cell);
+                    std::sort(empty.begin(),empty.end(),[start](const Vec2f& a,const Vec2f& b) { return (a-start).norm()<(b-start).norm(); });
+                    if (!empty.empty()) target=empty.front();
+                    else { const float offset=float(.05*std::max(bed.maximum_x-bed.minimum_x,bed.maximum_y-bed.minimum_y)); target+=Vec2f(offset,offset); }
+                }
+                instance->set_offset({target.x(),target.y(),instance->get_offset().z()});
+            }
+        }
+        // Native project file settings are already processed. DTO conversion
+        // must not introduce a second producer/mode-based cleanup policy.
+        ProjectMachine machine=describe_project_machine(resolved,false);
+        const std::size_t count=load_config?std::max<std::size_t>(1,plates.size()):1;
+        const float root=std::sqrt(float(count)), rounded=std::round(root);
+        const int columns=root>rounded?int(rounded)+1:int(rounded);
+        // Temporary pre-config legacy reset_size(int(old_width+1.25),...) has
+        // no local model instances yet. Loading the new presets updates plate
+        // dimensions before load_model_objects assigns the imported instances.
+        // Bed3D updates its cached bounds in update_model_offset BEFORE it
+        // changes the axes length to the new volume. Project reset has already
+        // refreshed the current printer's axes; consume that previous length.
+        const auto loaded_plate_size=load_config &&
+            (project_bed_inputs_changed(current,resolved)||current_bed_model!=project_bed_model(bundle,resolved))
+            ? project_native_plate_size(machine.variant,current_axes):previous_plate_size;
+        const double source_width=loaded_plate_size[0], source_depth=loaded_plate_size[1];
+        std::vector<Vec3d> origins;
+        for (std::size_t i=0;i<count;++i) {
+            ProjectPlate plate; plate.id="plate-"+std::to_string(i+1); plate.name="Plate "+std::to_string(i+1); plate.native_plate_index=int(i);
+            const Vec3d origin(double(i%columns)*source_width*1.2,-double(i/columns)*source_depth*1.2,0);
+            origins.push_back(origin);
+            if (load_config && i<plates.size()) {
+                plate.name=plates[i]->plate_name.empty()?plate.name:plates[i]->plate_name;
+                plate.locked=plates[i]->locked; plate.settings=project_settings(plates[i]->config,false);
+                const auto& path=plates[i]->gcode_file;
+                if (!path.empty() && fs::exists(fs::u8path(path))) {
+                    std::ifstream input(fs::u8path(path),std::ios::binary);
+                    if (!input) throw std::runtime_error("Cannot read extracted plate G-code");
+                    plate.gcode.assign(std::istreambuf_iterator<char>(input),{});
+                    // Original load_files activates embedded jobs only in the
+                    // no-model branch. A model project's cached bytes are an
+                    // attachment, not an already valid native slice result.
+                    if (model.objects.empty()) {
+                        plate.slice_result_valid=true;
+                        // Bytes and detached previews outlive the reader's
+                        // temporary backup folder.
+                        auto preview_callbacks=callbacks;
+                        preview_callbacks.progress=[&](float progress,std::string_view message) {
+                            report_progress(callbacks,.8f+.15f*progress,message);
+                        };
+                        const auto parsed=load_gcode_preview({path},preview_callbacks);
+                        check_cancel();
+                        if (parsed.preview) {
+                            auto detached=std::make_shared<ToolpathPreview>(*parsed.preview);
+                            detached->source_path.clear(); plate.preview=std::move(detached);
+                        }
+                        if (!parsed.success) diagnostic("project.preview_unavailable","Plate G-code is valid but has no drawable preview.",plate.id);
+                    }
+                }
+            }
+            if (load_config) {
+                const auto it=model.plates_custom_gcodes.find(int(i));
+                if (it!=model.plates_custom_gcodes.end()) {
+                    plate.custom_gcode_mode=int(it->second.mode);
+                    for (const auto& c:it->second.gcodes) plate.custom_gcodes.push_back({c.print_z,int(c.type),c.extruder,c.color,c.extra});
+                }
+            }
+            const Vec3d final_origin(legacy_layout?double(i%columns)*previous_plate_size[0]*1.2:origin.x(),
+                legacy_layout?-double(i/columns)*previous_plate_size[1]*1.2:origin.y(),0);
+            plate.native_size_mm=legacy_layout?previous_plate_size:loaded_plate_size;
+            plate.origin_mm={final_origin.x(),final_origin.y(),0}; scene->plates.push_back(std::move(plate));
+        }
+        if (model.objects.empty() && load_model && load_config) {
+            for (std::size_t i=0;i<scene->plates.size();++i) if (scene->plates[i].slice_result_valid) {
+                scene->active_plate_index=i; scene->preview_only=true; scene->kind=ProjectContainerKind::GCodeJob; break;
+            }
+        }
+        int max_slot=1;
+        for(std::size_t oi=0;oi<model.objects.size();++oi){
+            check_cancel();const auto* object=model.objects[oi];ProjectObject out;out.id="object-"+std::to_string(oi+1);out.name=object->name;
+            if(object->config.has("extruder"))out.default_filament_slot=object->config.extruder();
+            if(out.default_filament_slot<0)diagnostic("project.material_reference","Object material slot is invalid",out.id);
+            max_slot=std::max(max_slot,out.default_filament_slot);
+            {out.settings=project_settings(object->config.get());for(const auto& r:object->layer_config_ranges)out.layer_ranges.push_back({r.first.first,r.first.second,project_settings(r.second.get(),false)});out.layer_height_profile=object->layer_height_profile.get();for(const auto& b:object->brim_points)out.brim_points.push_back({b.pos.x(),b.pos.y(),b.pos.z(),b.head_front_radius});}
+
+            for(std::size_t pi=0;pi<object->volumes.size();++pi){
+                check_cancel();const auto* volume=object->volumes[pi];ProjectPart part;part.id=out.id+"/part-"+std::to_string(pi+1);part.name=volume->name;
+                switch(volume->type()){
+                case Slic3r::ModelVolumeType::MODEL_PART:part.role=ProjectPartRole::Model;break;
+                case Slic3r::ModelVolumeType::NEGATIVE_VOLUME:part.role=ProjectPartRole::NegativeVolume;break;
+                case Slic3r::ModelVolumeType::PARAMETER_MODIFIER:part.role=ProjectPartRole::ParameterModifier;break;
+                case Slic3r::ModelVolumeType::SUPPORT_ENFORCER:part.role=ProjectPartRole::SupportEnforcer;break;
+                case Slic3r::ModelVolumeType::SUPPORT_BLOCKER:part.role=ProjectPartRole::SupportBlocker;break;
+                default:throw std::invalid_argument("Unsupported model volume role");}
+                if(volume->config.has("extruder")&&volume->config.extruder()<0)diagnostic("project.material_reference","Part material slot is invalid",part.id);
+                part.explicit_filament_binding=volume->config.has("extruder")&&volume->config.extruder()!=0;
+                if(part.explicit_filament_binding)part.default_filament_slot=volume->config.extruder();max_slot=std::max(max_slot,part.default_filament_slot);
+                const auto matrix=volume->get_matrix();for(int r=0;r<4;++r)for(int c=0;c<4;++c)part.local_transform[std::size_t(r*4+c)]=matrix(r,c);if (!matrix.matrix().allFinite()) throw std::invalid_argument("Non-finite part transform");
+                auto mesh=std::make_shared<ProjectMesh>();const auto& native=volume->mesh().its;
+                std::size_t mesh_checks=0;
+                for(const auto& v:native.vertices){if((mesh_checks++&0x3fff)==0)check_cancel();if(!v.allFinite())throw std::invalid_argument("Non-finite mesh vertex");mesh->vertices.push_back({v.x(),v.y(),v.z()});}
+                for(const auto& t:native.indices){if((mesh_checks++&0x3fff)==0)check_cancel();if(t.minCoeff()<0||std::size_t(t.maxCoeff())>=mesh->vertices.size())throw std::invalid_argument("Invalid triangle index");mesh->triangles.push_back({unsigned(t(0)),unsigned(t(1)),unsigned(t(2))});}
+                if(mesh->vertices.empty()||mesh->triangles.empty()) { diagnostic("project.empty_volume","Skipping empty model volume",part.id,"info"); continue; }
+                part.settings=project_settings(volume->config.get());
+                part.material_facets=export_facets(volume->mmu_segmentation_facets,&callbacks);part.support_facets=export_facets(volume->supported_facets,&callbacks);part.seam_facets=export_facets(volume->seam_facets,&callbacks);part.fuzzy_skin_facets=export_facets(volume->fuzzy_skin_facets,&callbacks);
+                const auto material=native_facets(part.material_facets,mesh->triangles.size(),int(Slic3r::EnforcerBlockerType::ExtruderMax));
+                for(std::size_t state=1;state<material.used_states.size();++state)if(material.used_states[state])max_slot=std::max(max_slot,int(state));
+                native_facets(part.support_facets,mesh->triangles.size(),2);native_facets(part.seam_facets,mesh->triangles.size(),2);native_facets(part.fuzzy_skin_facets,mesh->triangles.size(),2);
+                part.mesh=mesh;out.parts.push_back(std::move(part));
+            }
+            for(std::size_t ii=0;ii<object->instances.size();++ii){
+                ProjectInstance instance;instance.id=out.id+"/instance-"+std::to_string(ii+1);instance.name=object->name;instance.printable=object->printable&&object->instances[ii]->printable;
+                auto matrix=object->instances[ii]->get_matrix();int plate_index=-1;
+                if(!load_config || plates.empty())plate_index=0;
+                else {
+                    // Original PartPlate::intersect_instance uses plate/instance bounding-box intersection.
+                    const auto bounds=object->instance_convex_hull_bounding_box(ii);
+                    double min_x=std::numeric_limits<double>::max(),min_y=min_x,max_x=-min_x,max_y=-min_x;
+                    for(const auto& p:machine.variant.printable_area){min_x=std::min(min_x,p.x);min_y=std::min(min_y,p.y);max_x=std::max(max_x,p.x);max_y=std::max(max_y,p.y);}
+                    for(std::size_t p=0;p<count;++p){Slic3r::BoundingBoxf3 bed(Slic3r::Vec3d(min_x-BuildVolume::SceneEpsilon,min_y-BuildVolume::SceneEpsilon,-BuildVolume::SceneEpsilon)+origins[p],Slic3r::Vec3d(max_x+BuildVolume::SceneEpsilon,max_y+BuildVolume::SceneEpsilon,machine.variant.printable_height+BuildVolume::SceneEpsilon)+origins[p]);if(bed.intersects(bounds)){plate_index=int(p);break;}}
+                }
+                if(plate_index>=0){instance.plate_id=scene->plates[std::size_t(plate_index)].id;matrix.translation()-=origins[std::size_t(plate_index)];}
+                for(int r=0;r<4;++r)for(int c=0;c<4;++c)instance.transform[std::size_t(r*4+c)]=matrix(r,c);if (!matrix.matrix().allFinite()) throw std::invalid_argument("Non-finite instance transform");out.instances.push_back(std::move(instance));
+            }
+            scene->objects.push_back(std::move(out));
+        }
+        // Build configuration from the actual working bundle, including a
+        // geometry-only palette expansion or a project-entry reset fallback.
+        result.configuration_changed=result.replace_document || expanded_filaments;
+        if (result.configuration_changed) {
+            state->config=std::unique_ptr<Config>(new Config(serialized_values(resolved)));
+            state->machine=machine;
+            state->machine.project_local=true;
+            state->selection.machine_model_id=machine.model.id;
+            state->selection.machine_variant_id=machine.variant.id;
+            state->selection.printer_preset_id=bundle.printers.get_selected_preset_name();
+            state->selection.process_preset_id=bundle.prints.get_selected_preset_name();
+            state->selection.filament_preset_ids=bundle.filament_presets;
+            for (const auto& seed:impl_->vendor_presets)
+                if (seed->printers.find_system_preset_by_model_and_variant(machine.model.id,machine.variant.id)) {
+                    state->machine.project_local=false; break;
+                }
+            impl_->apply_installed_machine_capabilities(state->machine,state->selection);
+            state->compatible_processes=compatible_presets(bundle.prints,state->selection.process_preset_id);
+            state->compatible_filaments=compatible_presets(bundle.filaments,state->selection.filament_preset_ids.empty()?"":state->selection.filament_preset_ids.front());
+            Library viewer; viewer.impl_->resource_directory=impl_->resource_directory;
+            viewer.impl_->active=state; viewer.impl_->active_revision=1;
+            state->prepared_view=*viewer.active_config(); state->prepared_view.revision=0;
+            result.configuration.impl_=state;
+            result.configuration.filament_color_cursor_=result.filament_color_cursor;
+        }
+        if (result.configuration_changed) scene->source_filaments=state->prepared_view.filament_slots;
+        else if (context.valid()) scene->source_filaments=context.view().filament_slots;
+        // These are diagnostics, not a new file-acceptance policy. Native slice
+        // validation is responsible for invalid settings and material bindings.
+        if (max_slot>int(scene->source_filaments.size()))
+            diagnostic("project.material_reference","Model references a filament outside the current palette",std::to_string(max_slot));
+        check_cancel(); report_progress(callbacks,1.f,"3MF candidate prepared"); check_cancel();
+        result.scene=std::move(scene); result.success=true;
+    } catch (const DecisionRequired&) {
+        result.scene.reset(); result.configuration={}; result.ignored_settings.clear();
+    } catch (const CanceledException&) {
+        result.cancelled=true; result.scene.reset(); result.configuration={}; result.ignored_settings.clear();
+    } catch (const std::exception& e) {
+        if (cancelled_after_exception()) result.cancelled=true;
+        else diagnostic("project.read_failed",e.what(),{},"error");
+        result.scene.reset(); result.configuration={}; result.ignored_settings.clear();
+    } catch (...) {
+        result.cancelled=cancelled_after_exception();
+        if (!result.cancelled) diagnostic("project.read_failed","Project callback or native reader threw a non-standard exception",{},"error");
+        result.scene.reset(); result.configuration={}; result.ignored_settings.clear();
+    }
+    return result;
+}
+ProjectReadResult Library::remap_project_materials(const ProjectReadResult& input,const std::vector<unsigned>& mapping,const ConfigSnapshot& target,const SliceCallbacks& callbacks) const {
+    ProjectReadResult result;
+    try {
+        if(!input.success||!input.scene||input.scene->mode!=ProjectReadMode::Geometry||!target.valid())throw std::invalid_argument("Material mapping requires a successful geometry candidate and target configuration");
+        const auto config=dynamic_config(target);const auto count=serialized_option_values(config,"filament_diameter").size();
+        if(mapping.size()!=input.scene->source_filaments.size())throw std::invalid_argument("Material mapping does not cover every source slot");
+        for(unsigned slot:mapping)if(slot==0||slot>count)throw std::invalid_argument("Mapped material slot is outside the target configuration");
+        auto scene=std::make_shared<ProjectScene>(*input.scene);
+        const auto map_slot=[&](int slot){if(slot==0)return 0;if(slot<0||std::size_t(slot)>mapping.size())throw std::invalid_argument("Source material reference outside mapping");return int(mapping[std::size_t(slot-1)]);};
+        const auto& keys=project_material_keys();
+        const auto map_settings=[&](ProjectSettings& settings){for(auto& p:settings)if(keys.count(p.first)){std::size_t end=0;int slot=std::stoi(p.second,&end);if(end!=p.second.size())throw std::invalid_argument("Invalid serialized material reference");p.second=std::to_string(map_slot(slot));}};
+        for(auto& object:scene->objects){
+            if(cancellation_requested(callbacks)){result.cancelled=true;return result;}
+            // A zero source object slot inherits source project material 1.
+            // Geometry import must anchor that inheritance to the user's map,
+            // rather than accidentally inheriting the target project's default.
+            const int source_slot=scene->mode==ProjectReadMode::Geometry&&object.default_filament_slot==0?1:object.default_filament_slot;
+            object.default_filament_slot=map_slot(source_slot);map_settings(object.settings);for(auto& range:object.layer_ranges)map_settings(range.settings);
+            for(auto& part:object.parts){
+                if(cancellation_requested(callbacks)){result.cancelled=true;return result;}
+                part.default_filament_slot=map_slot(part.default_filament_slot);map_settings(part.settings);
+                if(!part.material_facets.empty()){
+                    std::vector<Slic3r::Vec3f> vertices;std::vector<Slic3r::Vec3i32> triangles;for(const auto& v:part.mesh->vertices)vertices.emplace_back(v.x,v.y,v.z);for(const auto& t:part.mesh->triangles)triangles.emplace_back(int(t.vertex_a),int(t.vertex_b),int(t.vertex_c));
+                    Slic3r::TriangleMesh mesh(std::move(vertices),std::move(triangles));Slic3r::TriangleSelector selector(mesh);
+                    selector.deserialize(native_facets(part.material_facets,part.mesh->triangles.size(),int(Slic3r::EnforcerBlockerType::ExtruderMax)));
+                    Slic3r::EnforcerBlockerStateMap states{};states[0]=Slic3r::EnforcerBlockerType::NONE;
+                    for(std::size_t i=1;i<states.size();++i){const int slot=i<=mapping.size()?int(mapping[i-1]):0;if(slot>int(Slic3r::EnforcerBlockerType::ExtruderMax))throw std::invalid_argument("Mapped painted material exceeds native painting capacity");states[i]=static_cast<Slic3r::EnforcerBlockerType>(slot);}
+                    if(cancellation_requested(callbacks)){result.cancelled=true;return result;}
+                    selector.remap_triangle_state(states);
+                    if(cancellation_requested(callbacks)){result.cancelled=true;return result;}
+                    const auto data=selector.serialize();part.material_facets={};for(const auto& r:data.triangles_to_split)part.material_facets.roots.push_back({unsigned(r.triangle_idx),unsigned(r.bitstream_start_idx)});for(bool bit:data.bitstream)part.material_facets.bitstream.push_back(bit?1:0);
+                }
+            }
+        }
+        if(cancellation_requested(callbacks)){result.cancelled=true;return result;}
+        // The returned geometry now belongs to target's material domain.
+        // Discard the source palette-expansion candidate: installing it would
+        // undo the caller's explicit mapping back to the existing materials.
+        scene->source_filaments=project_filament_slots(config,count);
+        result=input;
+        result.configuration={};result.configuration_changed=false;
+        result.filament_color_cursor=impl_->filament_color_cursor;
+        result.scene=std::move(scene);result.success=true;
+    } catch(const std::exception& e){result.diagnostics.push_back({"error","project.material_mapping",{},e.what()});}
+    return result;
+}
+
 ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                                             const SliceCallbacks& callbacks) const
 {
@@ -4291,27 +5339,27 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                             diagnostic.key, diagnostic.message, true});
                     }
 
-                    *preset_bundle = std::move(candidate_bundle);
-                    impl_->active_config = std::move(active);
-                    impl_->active_selection.machine_model_id = machine->id;
-                    impl_->active_selection.machine_variant_id = variant->id;
-                    impl_->active_selection.printer_preset_id =
-                        preset_bundle->printers.get_selected_preset_name();
-                    impl_->active_selection.process_preset_id =
-                        preset_bundle->prints.get_selected_preset_name();
-                    impl_->active_selection.filament_preset_ids =
-                        preset_bundle->filament_presets;
-                    const auto imported = preset_bundle->full_config();
-                    const auto imported_tools = filament_tool_map(&imported, preset_bundle->filament_presets.size());
-                    impl_->active_selection.filament_physical_tools.assign(imported_tools.begin(), imported_tools.end());
-                    impl_->compatible_processes = compatible_presets(
-                        preset_bundle->prints,
-                        impl_->active_selection.process_preset_id);
-                    impl_->compatible_filaments = compatible_presets(
-                        preset_bundle->filaments,
-                        impl_->active_selection.filament_preset_ids.empty()
-                            ? std::string{}
-                            : impl_->active_selection.filament_preset_ids.front());
+                    auto next=std::make_shared<ConfigurationState::Impl>();
+                    next->resource_directory=impl_->resource_directory;
+                    next->bundle=std::make_shared<Slic3r::PresetBundle>(std::move(candidate_bundle));
+                    next->config=std::move(active);
+                    next->machine=describe_project_machine(dynamic_config(next->config->snapshot()));
+                    next->machine.project_local=false;
+                    next->selection.machine_model_id=machine->id;
+                    next->selection.machine_variant_id=variant->id;
+                    next->selection.printer_preset_id=next->bundle->printers.get_selected_preset_name();
+                    next->selection.process_preset_id=next->bundle->prints.get_selected_preset_name();
+                    next->selection.filament_preset_ids=next->bundle->filament_presets;
+                    impl_->apply_installed_machine_capabilities(next->machine,next->selection);
+                    const auto imported=next->bundle->full_config();
+                    const auto imported_tools=filament_tool_map(&imported,next->bundle->filament_presets.size());
+                    next->selection.filament_physical_tools.assign(imported_tools.begin(),imported_tools.end());
+                    next->compatible_processes=compatible_presets(next->bundle->prints,next->selection.process_preset_id);
+                    next->compatible_filaments=compatible_presets(next->bundle->filaments,next->selection.filament_preset_ids.empty()?std::string{}:next->selection.filament_preset_ids.front());
+                    Library viewer;viewer.impl_->resource_directory=impl_->resource_directory;viewer.impl_->active=next;viewer.impl_->active_revision=1;
+                    next->prepared_view=*viewer.active_config();next->prepared_view.revision=0;
+                    if(cancellation_requested(callbacks)){result.cancelled=true;release_import_resources();return result;}
+                    impl_->active=std::move(next);
                     ++impl_->active_revision;
                 } catch (const std::exception& error) {
                     result.diagnostics.push_back({

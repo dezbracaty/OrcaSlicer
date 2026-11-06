@@ -891,16 +891,12 @@ TEST_CASE("configuration exposes one grouped settings snapshot", "[libslicer_api
     std::set<std::string> unique_keys;
     for (const auto& item : items) {
         INFO(item.key);
-        const bool conditionally_hidden = item.key == "fiber_concentric_corner_stabilization_length" ||
-            item.key == "fiber_corner_stabilization_length" || item.key == "fiber_infill_angle_sequence" ||
-            item.key == "fiber_finish_extension_length" || item.key == "fiber_finish_overlap_length" ||
-            item.key == "fiber_finish_motion_speed";
-        CHECK(item.visible == !conditionally_hidden);
         CHECK(unique_keys.insert(item.key).second);
     }
 
     const auto* layer_height = find_item(items, "layer_height");
     REQUIRE(layer_height != nullptr);
+    CHECK(layer_height->visible);
     CHECK(layer_height->group == libslicer::SettingGroup::Process);
     CHECK(layer_height->type == libslicer::SettingType::Float);
     CHECK(layer_height->element_type == libslicer::SettingType::Float);
@@ -909,10 +905,12 @@ TEST_CASE("configuration exposes one grouped settings snapshot", "[libslicer_api
 
     const auto* nozzle_temperature = find_item(items, "nozzle_temperature");
     REQUIRE(nozzle_temperature != nullptr);
+    CHECK(nozzle_temperature->visible);
     CHECK(nozzle_temperature->group == libslicer::SettingGroup::Filament);
 
     const auto* nozzle_diameter = find_item(items, "nozzle_diameter");
     REQUIRE(nozzle_diameter != nullptr);
+    CHECK(nozzle_diameter->visible);
     CHECK(nozzle_diameter->group == libslicer::SettingGroup::Printer);
     CHECK(nozzle_diameter->type == libslicer::SettingType::List);
     CHECK(nozzle_diameter->element_type == libslicer::SettingType::Float);
@@ -924,6 +922,17 @@ TEST_CASE("configuration exposes one grouped settings snapshot", "[libslicer_api
     CHECK(bed_type->type == libslicer::SettingType::Enum);
     CHECK(bed_type->enum_items.size() == 6);
     CHECK_FALSE(bed_type->value.empty());
+    // Preset-owned exclusions are hidden by default, unlike editable public settings.
+    const auto* preset_owned = find_item(items, "filament_exclude_from_wipe_tower");
+    REQUIRE(preset_owned != nullptr);
+    CHECK_FALSE(preset_owned->visible);
+    CHECK_FALSE(preset_owned->enabled);
+    for(const char* key:{"fiber_infill_angle_sequence","fiber_corner_stabilization_length",
+            "fiber_concentric_corner_stabilization_length","fiber_finish_extension_length",
+            "fiber_finish_motion_speed","fiber_finish_overlap_length"}) {
+        const auto* conditional=find_item(items,key);REQUIRE(conditional);
+        CHECK_FALSE(conditional->visible);CHECK_FALSE(conditional->enabled);
+    }
     CHECK(find_item(items, "missing_option") == nullptr);
 }
 
@@ -2528,8 +2537,13 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
     REQUIRE(library != nullptr);
 
     libslicer::ConfigSelection selection;
+    // Keep the seed's four physical tools and define every tool/material.
+    // Only the first two materials participate in this controlled fixture.
     selection.machine_model_id = "Flashforge Creator 5";
     selection.machine_variant_id = "0.4";
+    const auto seed=library->create_config(selection);REQUIRE(seed);
+    REQUIRE_FALSE(seed.selection.filament_preset_ids.empty());
+    selection.filament_preset_ids.assign(4,seed.selection.filament_preset_ids.front());
     const auto activated = library->activate_config(selection, {
         {"generate_reinforced_perimeters", "1"},
         {"outer_reinforced_perimeters_counts", "2"},
@@ -2552,16 +2566,16 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
         {"fiber_start_stabilization_length", "2"},
         {"fiber_start_speed", "10"},
         {"fiber_cut_gcode", "M400\nM42 P4 S255\nG4 P100\n; TEST_FIBER_CUT"},
-        {"filament_process_type", "thermoplastic;continuous_fiber"},
-        {"filament_fiber_feed_correction", "1,1"},
-        {"toolhead_process_capabilities", swapped_physical_tools ? "continuous_fiber;thermoplastic" : "thermoplastic;continuous_fiber"},
-        {"toolhead_fiber_protocol_id", swapped_physical_tools ? "linear-e-v1;" : ";linear-e-v1"},
-        {"toolhead_fiber_e_units_per_mm", swapped_physical_tools ? "2,1" : "1,2"},
+        {"filament_process_type", "thermoplastic;continuous_fiber;thermoplastic;thermoplastic"},
+        {"filament_fiber_feed_correction", "1,1,1,1"},
+        {"toolhead_process_capabilities", swapped_physical_tools ? "continuous_fiber;thermoplastic;thermoplastic;thermoplastic" : "thermoplastic;continuous_fiber;thermoplastic;thermoplastic"},
+        {"toolhead_fiber_protocol_id", swapped_physical_tools ? "linear-e-v1;;;" : ";linear-e-v1;;"},
+        {"toolhead_fiber_e_units_per_mm", swapped_physical_tools ? "2,1,1,1" : "1,2,1,1"},
         {"use_relative_e_distances", execution_case == 0 ? "0" : "1"},
         {"z_offset", "0.7"},
         {"fiber_contour_feed_ratio", "1.02"},
         {"fiber_infill_feed_ratio", "1.05"},
-        {"physical_extruder_map", swapped_physical_tools ? "1,0" : "0,1"},
+        {"physical_extruder_map", swapped_physical_tools ? "1,0,2,3" : "0,1,2,3"},
         {"fiber_tail_min_speed", "3"},
         {"fiber_tail_max_speed", "3"},
         {"enable_prime_tower", "0"},
@@ -2571,6 +2585,7 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
     for (const auto& issue : activated.diagnostics) activation_diagnostics += issue.key + ": " + issue.message + "\n";
     INFO(activation_diagnostics);
     REQUIRE(activated.success);
+    REQUIRE(library->active_config()->filament_slots.size()==4);
     // Synthetic, explicitly command-only machine. Production CFSYS firmware
     // macros are deliberately not treated as an audited software fixture.
     std::vector<std::pair<std::string, std::string>> script_patch;
@@ -2579,7 +2594,17 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
     for (const auto& [key, value] : before_scripts->values())
         if (key.size() >= 6 && key.compare(key.size()-6, 6, "_gcode") == 0 &&
             key != "fiber_cut_gcode" && key != "emit_machine_limits_to_gcode")
-            script_patch.emplace_back(key, "");
+        {
+            // Native filament scripts are string vectors. A bare empty string
+            // means zero elements, not an empty script for each material.
+            std::string empty_scripts;
+            if(key.rfind("filament_",0)==0) {
+                for(std::size_t i=0;i<library->active_config()->filament_slots.size();++i) {
+                    if(i)empty_scripts+=';';empty_scripts+="\"\"";
+                }
+            }
+            script_patch.emplace_back(key,empty_scripts);
+        }
     const auto cleared_scripts = library->apply_active_config_patch(script_patch);
     std::string script_diagnostics;
     for (const auto& issue : cleared_scripts.diagnostics) script_diagnostics += issue.key + ": " + issue.message + "\n";
@@ -2597,7 +2622,12 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
     if (validation_model) request.objects.push_back(binary_stl_on_bed(validation_model));
     else request.objects = {{std::string(LIBSLICER_TEST_DATA_DIR) + "/two_20mm_cubes.obj", {}}};
     request.config = *config;
+    request.project_semantics=R"({"version":1,"scope":"plate","settings":{"filament_map_mode":"Manual","filament_map":"1,2,3,4","filament_printable":"15,15,15,15"},"custom_gcode_mode":0,"custom_gcodes":[]})";
     request.output_gcode_path = output.string();
+    std::ostringstream execution_configuration;
+    for(const char* key:{"nozzle_diameter","filament_process_type","toolhead_process_capabilities","physical_extruder_map","filament_map","filament_map_mode","filament_printable"})
+        execution_configuration<<key<<"="<<config->value(key).value_or("<absent>")<<"\n";
+    INFO(execution_configuration.str());
     const auto sliced = library->slice(request);
     const std::string diagnostic = sliced.diagnostics.empty()
         ? std::string{}
@@ -5403,4 +5433,998 @@ TEST_CASE("wipe tower exclusion handles unused and unavailable participants", "[
     CHECK(std::any_of(none.diagnostics.begin(), none.diagnostics.end(), [](const auto& d) {
         return d.message.find("no participating material") != std::string::npos;
     }));
+}
+
+
+namespace {
+std::filesystem::path project_candidate_fixture(const libslicer::ConfigSnapshot& config, bool foreign, const libslicer::ProjectSettings& overrides={}, std::string application="BambuStudio-2.0.0", bool mandatory_extension=false) {
+    nlohmann::json settings=nlohmann::json::object();settings["name"]="project_settings";
+    for(const auto& v:config.values())settings[v.first]=v.second;
+    if(foreign){settings["printer_model"]="Independent Project Printer";settings["printer_settings_id"]="Independent Project Printer 0.4";settings["inherits_group"]="";}
+    for(const auto& value:overrides)settings[value.first]=value.second;
+    const auto path=std::filesystem::temp_directory_path()/(foreign?"libslicer-project-candidate-foreign.3mf":"libslicer-project-candidate.3mf");
+    std::string mesh=R"xml(<?xml version="1.0"?><model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><metadata name="Application">BambuStudio-2.0.0</metadata><metadata name="BambuStudio:3mfVersion">1</metadata><resources><object id="1" type="model"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/><vertex x="0" y="10" z="0"/><vertex x="0" y="0" z="10"/></vertices><triangles><triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="1" v3="3"/><triangle v1="0" v2="3" v3="2"/><triangle v1="1" v2="2" v3="3"/></triangles></mesh></object></resources><build><item objectid="1" transform="1 0 0 0 1 0 0 0 1 50 50 0"/></build></model>)xml";
+    mesh.replace(mesh.find("BambuStudio-2.0.0"),std::string("BambuStudio-2.0.0").size(),application);
+    if(mandatory_extension)mesh.insert(mesh.find(" unit=")," xmlns:unsupported=\"https://example.test/unsupported\" requiredextensions=\"unsupported\"");
+    const std::string relationships=R"xml(<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>)xml";
+    const std::string content=R"xml(<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>)xml";
+    const auto text=settings.dump();mz_zip_archive archive{};REQUIRE(mz_zip_writer_init_file(&archive,path.string().c_str(),0));
+    for(const auto& entry:std::vector<std::pair<std::string,std::string>>{{"_rels/.rels",relationships},{"[Content_Types].xml",content},{"3D/3dmodel.model",mesh},{"Metadata/project_settings.config",text}})
+        REQUIRE(mz_zip_writer_add_mem(&archive,entry.first.c_str(),entry.second.data(),entry.second.size(),MZ_DEFAULT_COMPRESSION));
+    REQUIRE(mz_zip_writer_finalize_archive(&archive));REQUIRE(mz_zip_writer_end(&archive));return path;
+}
+std::unique_ptr<libslicer::Library> project_test_library() {
+    libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"Flashforge"};
+    auto library=libslicer::Library::open(options);REQUIRE(library);
+    libslicer::ConfigSelection selection;selection.machine_model_id="Flashforge AD5X";selection.machine_variant_id="0.4";
+    const auto activated=library->activate_config(selection);for(const auto& d:activated.diagnostics)INFO(d.message);REQUIRE(activated.success);return library;
+}
+}
+TEST_CASE("installed material capacity is independent of the current palette", "[libslicer_api][configuration-machine-capacity]") {
+    auto library=project_test_library();
+    const auto& models=library->machine_models();
+    const auto model=std::find_if(models.begin(),models.end(),[](const auto& m){return m.id=="Flashforge AD5X";});
+    REQUIRE(model!=models.end());
+    const auto catalog=std::find_if(model->variants.begin(),model->variants.end(),[](const auto& v){return v.id=="0.4";});
+    REQUIRE(catalog!=model->variants.end());REQUIRE(catalog->max_filament_slots>1);
+    const auto check=[&](std::size_t count){
+        const auto machine=library->active_project_machine();REQUIRE(machine);CHECK_FALSE(machine->project_local);
+        CHECK(machine->model.id==model->id);CHECK(machine->variant.id==catalog->id);
+        CHECK(machine->variant.max_filament_slots==catalog->max_filament_slots);
+        CHECK(machine->variant.physical_tool_count==catalog->physical_tool_count);
+        CHECK(machine->variant.variable_filament_slots==catalog->variable_filament_slots);
+        CHECK(machine->variant.filament_slots_bound_to_physical_tools==catalog->filament_slots_bound_to_physical_tools);
+        CHECK(machine->variant.toolhead_filament_capacity==catalog->toolhead_filament_capacity);
+        REQUIRE(library->active_config());CHECK(library->active_config()->filament_slots.size()==count);
+    };
+    check(1);
+    const auto source=project_candidate_fixture(*library->active_config_snapshot(),false);
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});
+    for(const auto& d:candidate.diagnostics)INFO(d.code<<": "<<d.message);
+    REQUIRE(candidate.success);CHECK_FALSE(candidate.configuration.machine().project_local);
+    CHECK(candidate.configuration.machine().variant.max_filament_slots==catalog->max_filament_slots);
+    CHECK(candidate.configuration.view().filament_slots.size()==1);check(1);
+    std::filesystem::remove(source);
+    REQUIRE(library->set_active_filament_color(0,{0x12,0x34,0x56,0xff}).success);check(1);
+    REQUIRE(library->set_active_config_value("layer_height","0.16").success);check(1);
+    const auto one=library->capture_configuration();
+    REQUIRE(library->resize_active_filament_slots(catalog->max_filament_slots).success);check(catalog->max_filament_slots);
+    const auto before=*library->active_config_snapshot();const auto revision=library->configuration_revision();
+    CHECK_FALSE(library->resize_active_filament_slots(catalog->max_filament_slots+1).success);
+    CHECK(library->configuration_revision()==revision);CHECK(library->active_config_snapshot()->values()==before.values());
+    REQUIRE(library->resize_active_filament_slots(1).success);check(1);
+    REQUIRE(library->resize_active_filament_slots(2).success);
+    REQUIRE(library->install_configuration(one,library->configuration_revision()).success);check(1);
+}
+TEST_CASE("known project machine overrides retain their effective capabilities", "[libslicer_api][project-candidate][configuration-machine-capacity]") {
+    const bool two_tools=GENERATE(false,true);CAPTURE(two_tools);
+    auto library=project_test_library();
+    if(two_tools)REQUIRE(library->resize_active_filament_slots(2).success);
+    libslicer::ProjectSettings overrides={{"printable_area","0x0,190x0,190x170,0x170"},{"printable_height","210"},
+        {"nozzle_diameter",two_tools?"0.6,0.6":"0.6"},{"filament_slots_bound_to_physical_tools","0"},
+        {"toolhead_filament_capacity",two_tools?"":"2"},{"filament_map",two_tools?"1,2":"1"},
+        {"filament_map_mode","Manual"},{"physical_extruder_map",two_tools?"0,1":"0"},
+        {"toolhead_process_capabilities",two_tools?"thermoplastic;thermoplastic":"thermoplastic"}};
+    // A known-printer project must declare its printer edits as dirty, just as
+    // native Orca does; otherwise native preset reconciliation restores them.
+    std::string dirty(two_tools?"\"\";\"\";\"\";\"":"\"\";\"\";\"");
+    for(const auto& entry:overrides){if(dirty.back()!='"')dirty+=';';dirty+=entry.first;}
+    dirty+='"';overrides.emplace_back("different_settings_to_system",std::move(dirty));
+    const auto source=project_candidate_fixture(*library->active_config_snapshot(),false,overrides);
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});
+    for(const auto& d:candidate.diagnostics)INFO(d.code<<": "<<d.message);
+    REQUIRE(candidate.success);REQUIRE(candidate.configuration.valid());
+    const auto check=[&](const libslicer::ProjectMachine& machine){
+        CHECK_FALSE(machine.project_local);CHECK(machine.model.id=="Flashforge AD5X");
+        CHECK(machine.variant.nozzle_diameter==Catch::Approx(0.6));CHECK(machine.variant.printable_width==190);
+        CHECK(machine.variant.printable_depth==170);CHECK(machine.variant.printable_height==210);
+        CHECK(machine.variant.physical_tool_count==(two_tools?2:1));CHECK(machine.variant.max_filament_slots==2);
+        CHECK(machine.variant.toolhead_filament_capacity==(two_tools?std::vector<int>{}:std::vector<int>{2}));
+    };
+    check(candidate.configuration.machine());
+    REQUIRE(library->install_configuration(candidate.configuration,library->configuration_revision()).success);
+    REQUIRE(library->set_active_config_value("layer_height","0.16").success);
+    REQUIRE(library->active_project_machine());check(*library->active_project_machine());
+    const auto before=*library->active_config_snapshot();const auto revision=library->configuration_revision();
+    CHECK_FALSE(library->resize_active_filament_slots(3).success);
+    CHECK(library->active_config_snapshot()->values()==before.values());CHECK(library->configuration_revision()==revision);
+    if(!two_tools){
+        REQUIRE(library->add_active_filament(0).success);check(*library->active_project_machine());
+        CHECK(library->active_config()->filament_slots.size()==2);CHECK_FALSE(library->add_active_filament(0).success);
+    }
+    std::filesystem::remove(source);
+}
+TEST_CASE("project preparation is readonly and configuration installation is explicit", "[libslicer_api][project-candidate]") {
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();const auto revision=library->active_config()->revision;
+    const auto source=project_candidate_fixture(before,false);
+    libslicer::ProjectReadRequest request{source.string(),libslicer::ProjectReadMode::Project};
+    const auto candidate=library->read_project(request);std::ostringstream diagnostics;for(const auto& d:candidate.diagnostics)diagnostics<<d.code<<": "<<d.message<<"\n";INFO(diagnostics.str());REQUIRE(candidate.success);REQUIRE(candidate.scene);REQUIRE(candidate.configuration.valid());
+    CHECK(library->active_config_snapshot()->values()==before.values());CHECK(library->active_config()->revision==revision);
+    std::filesystem::remove(source); // Prepared data must remain usable without the source file.
+    CHECK(candidate.scene->objects.front().parts.front().mesh->triangles.size()==4);
+    CHECK_FALSE(library->install_configuration(candidate.configuration,revision+1).success);
+    const auto installed=library->install_configuration(candidate.configuration,revision);REQUIRE(installed.success);CHECK(installed.revision>revision);
+    const auto restored=library->install_configuration(installed.previous,installed.revision);REQUIRE(restored.success);CHECK(restored.revision>installed.revision);
+    CHECK(library->active_config_snapshot()->values()==before.values());
+    CHECK_FALSE(candidate.configuration.snapshot().values().empty());
+}
+TEST_CASE("empty configuration restore preserves the compare-and-swap revision", "[libslicer_api][project-candidate]") {
+    auto source_library=project_test_library();
+    const auto source=project_candidate_fixture(*source_library->active_config_snapshot(),false);
+    libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"Flashforge"};
+    auto library=libslicer::Library::open(options);REQUIRE(library);REQUIRE_FALSE(library->active_config());
+    const auto empty=library->capture_configuration();const auto initial=library->configuration_revision();
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});REQUIRE(candidate.success);
+    const auto installed=library->install_configuration(candidate.configuration,initial);REQUIRE(installed.success);
+    const auto restored=library->install_configuration(empty,installed.revision);REQUIRE(restored.success);
+    CHECK_FALSE(library->active_config());CHECK(library->configuration_revision()==restored.revision);
+    CHECK_FALSE(library->install_configuration(candidate.configuration,initial).success);
+    const auto reinstalled=library->install_configuration(candidate.configuration,library->configuration_revision());REQUIRE(reinstalled.success);
+    CHECK(reinstalled.revision>restored.revision);CHECK(library->active_config()->revision==reinstalled.revision);
+    std::filesystem::remove(source);
+}
+TEST_CASE("geometry mapping and cancellation preserve active state", "[libslicer_api][project-candidate]") {
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();const auto revision=library->active_config()->revision;
+    const auto source=project_candidate_fixture(before,false);libslicer::ProjectReadRequest request{source.string(),libslicer::ProjectReadMode::Geometry};
+    libslicer::SliceCallbacks cancelled;cancelled.is_cancelled=[] {return true;};
+    const auto aborted=library->read_project(request,cancelled);CHECK(aborted.cancelled);CHECK_FALSE(aborted.success);
+    const auto candidate=library->read_project(request);for(const auto& d:candidate.diagnostics)INFO(d.message);REQUIRE(candidate.success);CHECK_FALSE(candidate.configuration.valid());
+    std::vector<unsigned> mapping(candidate.scene->source_filaments.size(),1);
+    const auto mapped=library->remap_project_materials(candidate,mapping,before);REQUIRE(mapped.success);
+    CHECK(mapped.scene->objects.front().parts.front().mesh==candidate.scene->objects.front().parts.front().mesh);
+    mapping.front()=999;CHECK_FALSE(library->remap_project_materials(candidate,mapping,before).success);
+    bool cancel_at_finish=false;libslicer::SliceCallbacks late_cancel;
+    late_cancel.progress=[&](float progress,std::string_view){if(progress>=1.0f)cancel_at_finish=true;};late_cancel.is_cancelled=[&]{return cancel_at_finish;};
+    const auto cancelled_candidate=library->read_project(request,late_cancel);CHECK(cancelled_candidate.cancelled);CHECK_FALSE(cancelled_candidate.success);CHECK_FALSE(cancelled_candidate.scene);
+    CHECK(library->active_config_snapshot()->values()==before.values());CHECK(library->active_config()->revision==revision);std::filesystem::remove(source);
+}
+TEST_CASE("foreign project printer supports editing without installing the model", "[libslicer_api][project-candidate]") {
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();const auto source=project_candidate_fixture(before,true);
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});std::ostringstream diagnostics;for(const auto& d:candidate.diagnostics)diagnostics<<d.code<<": "<<d.message<<"\n";INFO(diagnostics.str());REQUIRE(candidate.success);REQUIRE(candidate.configuration.machine().project_local);
+    auto installed=library->install_configuration(candidate.configuration,library->active_config()->revision);REQUIRE(installed.success);
+    CHECK(library->active_project_machine()->model.id=="Independent Project Printer");
+    REQUIRE(library->set_active_config_value("layer_height","0.16").success);CHECK(library->active_config_snapshot()->value("layer_height")=="0.16");
+    // Native update_compatible(Never) keeps the selected filament even when
+    // the foreign printer has no compatible installed alternatives.
+    const auto view=*library->active_config();REQUIRE_FALSE(view.filament_slots.empty());
+    CHECK(view.filament_slots.front().preset_id==candidate.configuration.view().filament_slots.front().preset_id);
+    CHECK(view.selection.filament_preset_ids==candidate.configuration.view().selection.filament_preset_ids);
+    CHECK(library->active_project_machine()->model.id=="Independent Project Printer");CHECK(library->active_config_snapshot()->value("layer_height")=="0.16");
+    CHECK(std::none_of(library->machine_models().begin(),library->machine_models().end(),[](const auto& m){return m.id=="Independent Project Printer";}));std::filesystem::remove(source);
+}
+TEST_CASE("project codecs separate material ownership and topology dependent annotations", "[libslicer_api][project-candidate]") {
+    libslicer::ProjectObject object;object.default_filament_slot=2;object.settings={{"extruder","2"},{"layer_height","0.12"}};
+    object.layer_ranges.push_back({1,2,{{"extruder","2"},{"layer_height","0.1"}}});
+    const auto object_json=nlohmann::json::parse(libslicer::encode_project_object_semantics(object));CHECK_FALSE(object_json["settings"].contains("extruder"));CHECK(object_json["settings"]["layer_height"]=="0.12");CHECK(object_json["layer_ranges"][0]["settings"]["extruder"]=="2");
+    libslicer::ProjectPart part;part.settings={{"extruder","3"},{"sparse_infill_density","25%"}};part.support_facets.roots={{0,0}};part.support_facets.bitstream={0,0,1,0};
+    const auto part_json=nlohmann::json::parse(libslicer::encode_project_part_semantics(part));CHECK_FALSE(part_json["settings"].contains("extruder"));CHECK_FALSE(part_json.contains("support_facets"));
+    const auto annotations=nlohmann::json::parse(libslicer::encode_project_part_annotations(part));CHECK(annotations["scope"]=="part_annotations");CHECK_FALSE(annotations.contains("settings"));CHECK(annotations["support_facets"]["bitstream"].size()==4);
+}
+
+
+TEST_CASE("native project semantics preserve mirrored painted volume frames", "[libslicer_api][project-candidate][slice]") {
+    auto library=project_test_library();
+    REQUIRE(library->apply_active_config_patch({{"layer_height","0.2"},{"initial_layer_print_height","0.2"},{"sparse_infill_density","100%"},{"enable_prime_tower","0"}}).success);
+    const auto config=*library->active_config_snapshot();
+    libslicer::SliceVolumeInput body;
+    body.vertices={{0,0,0},{10,0,0},{10,10,0},{0,10,0},{0,0,10},{10,0,10},{10,10,10},{0,10,10}};
+    body.triangles={{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},{1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+    body.facet_labels.roots={{2,0},{3,4}};body.facet_labels.bitstream={0,0,1,0,0,0,1,0};
+    body.local_transform={-1,0,0,10,0,1,0,0,0,0,1,0,0,0,0,1};
+    body.inherit_object_filament=true;
+    libslicer::SliceObjectInput object;object.name="mirrored-project-cube";object.default_filament_slot=1;object.volumes={body};object.transform[3]=50;object.transform[7]=50;
+    libslicer::ProjectPlate plate;plate.custom_gcode_mode=1;plate.custom_gcodes.push_back({1.0,4,0,"",";PROJECT_CUSTOM_GCODE"});
+    libslicer::SliceRequest request;request.objects={object};request.config=config;request.generate_preview=false;request.center_on_build_plate=false;request.project_semantics=libslicer::encode_project_plate_semantics(plate);
+    auto baseline=library->slice(request);for(const auto& d:baseline.diagnostics)INFO(d.message);REQUIRE(baseline.success);CHECK(baseline.summary.layer_count>0);
+    std::ifstream input(baseline.output.path);const std::string gcode((std::istreambuf_iterator<char>(input)),{});CHECK(gcode.find(";PROJECT_CUSTOM_GCODE")!=std::string::npos);
+    auto modifier=body;modifier.facet_labels={};modifier.inherit_object_filament=true;modifier.role=libslicer::SliceVolumeRole::NegativeVolume;
+    modifier.local_transform={0.6,0,0,2,0,0.6,0,2,0,0,1,0,0,0,0,1};
+    request.objects.front().volumes.push_back(modifier);
+    auto negative=library->slice(request);for(const auto& d:negative.diagnostics)INFO(d.message);REQUIRE(negative.success);CHECK(negative.summary.filament_used_mm<baseline.summary.filament_used_mm);
+    request.objects.front().volumes.pop_back();
+    libslicer::ProjectObject semantics;semantics.layer_height_profile={0,0.2,1,0.1,10,0.1};request.objects.front().project_semantics=libslicer::encode_project_object_semantics(semantics);
+    auto variable=library->slice(request);for(const auto& d:variable.diagnostics)INFO(d.message);REQUIRE(variable.success);CHECK(variable.summary.layer_count>baseline.summary.layer_count);
+    request.objects.front().volumes.front().facet_labels.bitstream={0,0,1,1}; // Extension marker without its following nibble.
+    CHECK_FALSE(library->slice(request).success);
+    for(const auto* result:{&baseline,&negative,&variable})if(result->output.ownership==libslicer::OutputArtifactOwnership::LibraryTemporary)std::filesystem::remove(result->output.path);
+}
+
+TEST_CASE("native project plate index selects its own wipe tower coordinates", "[libslicer_api][project-candidate][slice]") {
+    auto library=project_test_library();
+    REQUIRE(library->resize_active_filament_slots(2).success);
+    REQUIRE(library->apply_active_config_patch({{"enable_prime_tower","1"},{"wipe_tower_x","15,140"},{"wipe_tower_y","15,25"},{"prime_tower_width","30"},{"wipe_tower_rotation_angle","0"}}).success);
+    libslicer::SliceRequest request;request.config=*library->active_config_snapshot();request.center_on_build_plate=false;
+    for(unsigned slot=1;slot<=2;++slot){
+        libslicer::SliceObjectInput object;object.name="plate-tower-coupon";
+        const float x=60.f+25.f*(slot-1);libslicer::SliceVolumeInput volume;
+        volume.vertices={{x,80,0},{x+15,80,0},{x+15,95,0},{x,95,0},{x,80,1},{x+15,80,1},{x+15,95,1},{x,95,1}};
+        volume.triangles={{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},{1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+        volume.default_filament_slot=int(slot);object.volumes={volume};request.objects.push_back(object);
+    }
+    double minimum_x[2];
+    for(int index=0;index<2;++index){
+        libslicer::ProjectPlate plate;plate.native_plate_index=index;request.project_semantics=libslicer::encode_project_plate_semantics(plate);
+        const auto result=library->slice(request);for(const auto& d:result.diagnostics)INFO(d.message);REQUIRE(result.success);REQUIRE(result.preview);
+        minimum_x[index]=std::numeric_limits<double>::max();
+        for(const auto& segment:result.preview->segments)if(segment.extrusion_role==libslicer::ToolpathExtrusionRole::WipeTower&&segment.motion==libslicer::ToolpathMotionKind::Extrusion)
+            minimum_x[index]=std::min(minimum_x[index],double(std::min(segment.start_mm.x,segment.end_mm.x)));
+        REQUIRE(minimum_x[index]!=std::numeric_limits<double>::max());
+        if(result.output.ownership==libslicer::OutputArtifactOwnership::LibraryTemporary)std::filesystem::remove(result.output.path);
+    }
+    CHECK(minimum_x[1]-minimum_x[0]==Catch::Approx(125.0).margin(0.1));
+}
+
+TEST_CASE("legacy project unknown settings are reported without an import gate", "[libslicer_api][project-candidate]") {
+    auto library=project_test_library();
+    const auto before=*library->active_config_snapshot();
+    const std::string source=std::string(LIBSLICER_TEST_RESOURCE_DIR)+"/calib/pressure_advance/pa_pattern.3mf";
+    const auto candidate=library->read_project({source,libslicer::ProjectReadMode::Project});
+    std::ostringstream diagnostics;for(const auto& d:candidate.diagnostics)diagnostics<<d.code<<": "<<d.message<<"\n";INFO(diagnostics.str());
+    REQUIRE(candidate.success);CHECK(candidate.configuration.valid());CHECK(candidate.required_decisions.empty());
+    CHECK(std::any_of(candidate.diagnostics.begin(),candidate.diagnostics.end(),[](const auto& d){return d.code=="project.unknown_setting_ignored"&&d.context=="end_print_exhaust_fan_speed";}));
+    CHECK(std::any_of(candidate.diagnostics.begin(),candidate.diagnostics.end(),[](const auto& d){return d.code=="project.obsolete_setting"&&d.context=="bed_temperature_difference";}));
+    const auto geometry=library->read_project({source,libslicer::ProjectReadMode::Geometry});REQUIRE(geometry.success);REQUIRE(geometry.scene);CHECK_FALSE(geometry.scene->objects.empty());
+    CHECK(library->active_config_snapshot()->values()==before.values());
+}
+
+TEST_CASE("unknown settings do not require opt in and retain complete diagnostics", "[libslicer_api][project-candidate]") {
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();const auto revision=library->configuration_revision();
+    libslicer::ProjectReadRequest request{std::string(LIBSLICER_TEST_RESOURCE_DIR)+"/calib/pressure_advance/pa_pattern.3mf",libslicer::ProjectReadMode::Project};
+    const auto strict=library->read_project(request);REQUIRE(strict.success);
+    CHECK(strict.required_decisions.empty());
+    request.accept_unknown_settings=true;const auto accepted=library->read_project(request);
+    std::ostringstream diagnostics;for(const auto& d:accepted.diagnostics)diagnostics<<d.code<<": "<<d.message<<"\n";INFO(diagnostics.str());
+    REQUIRE(accepted.success);CHECK(accepted.required_decisions.empty());
+    CHECK(accepted.ignored_settings==strict.ignored_settings);
+    CHECK(accepted.configuration.snapshot().values()==strict.configuration.snapshot().values());
+    const std::vector<std::string> ignored={"chamber_temp_control","end_print_exhaust_fan_speed","end_print_exhaust_fan_time"};
+    CHECK(accepted.ignored_settings==ignored);CHECK(accepted.configuration.valid());
+    REQUIRE(accepted.scene->plates.front().custom_gcodes.size()==4);
+    // Original PA XML stores literal attribute newlines. Orca's RapidXML
+    // reader preserves them; an XML-normalizing adapter would turn the entire
+    // custom program into a comment. Counts come from the fixed raw fixture.
+    const std::array<std::size_t,4> custom_sizes{17813,12396,7400,7388};
+    const std::array<std::size_t,4> custom_newlines{953,602,380,378};
+    for(std::size_t i=0;i<custom_sizes.size();++i){
+        const auto& extra=accepted.scene->plates.front().custom_gcodes[i].extra;
+        CHECK(extra.size()==custom_sizes[i]);CHECK(std::size_t(std::count(extra.begin(),extra.end(),'\n'))==custom_newlines[i]);
+    }
+    CHECK(accepted.scene->plates.front().custom_gcodes.front().extra.find("\nG1 E-.8 F1800\n")!=std::string::npos);
+    CHECK(accepted.scene->plates.front().custom_gcodes.front().type==4);
+    CHECK(accepted.scene->plates.front().custom_gcodes.front().filament_slot==-858993460);
+    for(const auto& key:ignored){CHECK_FALSE(accepted.configuration.snapshot().value(key));CHECK(std::any_of(accepted.diagnostics.begin(),accepted.diagnostics.end(),[&](const auto& d){return d.code=="project.unknown_setting_ignored"&&d.severity!="error"&&d.context==key;}));}
+    bool finish=false;libslicer::SliceCallbacks cancel;cancel.progress=[&](float p,std::string_view){finish=p>=1.f;};cancel.is_cancelled=[&]{return finish;};
+    const auto aborted=library->read_project(request,cancel);CHECK(aborted.cancelled);CHECK_FALSE(aborted.success);CHECK(aborted.ignored_settings.empty());
+    const auto invalid=project_candidate_fixture(before,false,{{"future_setting","1"},{"nozzle_diameter","-1"},{"different_settings_to_system","\"\";\"\";\"nozzle_diameter\""}});
+    request.path=invalid.string();const auto editable=library->read_project(request);REQUIRE(editable.success);
+    CHECK(editable.configuration.snapshot().value("nozzle_diameter")=="-1");
+    CHECK(std::any_of(editable.diagnostics.begin(),editable.diagnostics.end(),[](const auto& d){return d.code=="project.invalid_configuration";}));
+    const auto installed=library->install_configuration(editable.configuration,revision);REQUIRE(installed.success);
+    const auto normal=project_candidate_fixture(before,false);
+    CHECK(library->read_project({normal.string(),libslicer::ProjectReadMode::Geometry}).success);
+    CHECK(library->read_project({normal.string(),libslicer::ProjectReadMode::Project}).success);
+    REQUIRE(library->install_configuration(installed.previous,installed.revision).success);
+    const auto structural=project_candidate_fixture(before,false,{{"future_setting","1"}},"BambuStudio-2.0.0",true);
+    request.path=structural.string();const auto extension=library->read_project(request);REQUIRE(extension.success);
+    CHECK(extension.required_decisions.empty()); // Native reader accepts this extension declaration.
+    CHECK(library->configuration_revision()>revision);CHECK(library->active_config_snapshot()->values()==before.values());std::filesystem::remove(structural);
+}
+
+TEST_CASE("import preserves native custom tool references for later validation", "[libslicer_api][project-candidate]") {
+    const int type=GENERATE(0,2);const int slot=GENERATE(-1,999);CAPTURE(type,slot);
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();const auto revision=library->configuration_revision();
+    const auto source=project_candidate_fixture(before,false,{{"future_setting","1"}});
+    const std::string custom="<custom_gcodes_per_layer><plate><plate_info id=\"1\"/><layer top_z=\"0.2\" type=\""+std::to_string(type)+"\" extruder=\""+std::to_string(slot)+"\" color=\"#FF0000\" extra=\"\"/><mode value=\"MultiExtruder\"/></plate></custom_gcodes_per_layer>";
+    REQUIRE(mz_zip_add_mem_to_archive_file_in_place(source.string().c_str(),"Metadata/custom_gcode_per_layer.xml",custom.data(),custom.size(),nullptr,0,MZ_DEFAULT_COMPRESSION));
+    libslicer::ProjectReadRequest request{source.string(),libslicer::ProjectReadMode::Project};request.accept_unknown_settings=true;
+    const auto candidate=library->read_project(request);REQUIRE(candidate.success);REQUIRE(candidate.configuration.valid());
+    REQUIRE(candidate.scene->plates.front().custom_gcodes.size()==1);
+    CHECK(candidate.scene->plates.front().custom_gcodes.front().filament_slot==slot);
+    CHECK(library->configuration_revision()==revision);CHECK(library->active_config_snapshot()->values()==before.values());std::filesystem::remove(source);
+}
+
+TEST_CASE("legacy rotation supports yes no cancellation and one file read", "[libslicer_api][project-candidate][project-orca-parity]") {
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();
+    const libslicer::ProjectSettings rotation_settings={{"future_setting","1"},{"sparse_infill_pattern","gyroid"},{"sparse_infill_rotate_template","1"},
+        {"different_settings_to_system","\"sparse_infill_pattern;sparse_infill_rotate_template\";\"\";\"\""}};
+    const auto source=project_candidate_fixture(before,false,rotation_settings,"OrcaSlicer-2.3.1-alpha");
+    libslicer::ProjectReadRequest request{source.string(),libslicer::ProjectReadMode::Project};
+    const auto strict=library->read_project(request);REQUIRE_FALSE(strict.success);
+    CHECK(strict.required_decisions==std::vector<std::string>{"legacy_infill_rotation_fix"});
+    request.accept_unknown_settings=true;const auto unknown=library->read_project(request);CHECK_FALSE(unknown.success);CHECK(unknown.ignored_settings.empty());CHECK(unknown.required_decisions==std::vector<std::string>{"legacy_infill_rotation_fix"});
+    request.accept_unknown_settings=false;request.accept_legacy_infill_rotation_fix=true;
+    const auto legacy=library->read_project(request);REQUIRE(legacy.success);CHECK(legacy.required_decisions.empty());
+    request.accept_unknown_settings=true;const auto both=library->read_project(request);for(const auto& d:both.diagnostics)INFO(d.message);REQUIRE(both.success);
+    CHECK(both.ignored_settings==std::vector<std::string>{"future_setting"});CHECK(both.configuration.snapshot().value("sparse_infill_rotate_template")=="");
+    int called=0;
+    // A callback No overrides the transitional true bool. Removing the source
+    // at the decision proves that this workflow never opens the archive again.
+    const auto kept=library->read_project(request,{},[&](const libslicer::ProjectDecision& decision) {
+        ++called; CHECK(decision.kind==libslicer::ProjectDecisionKind::LegacyInfillRotation);
+        std::filesystem::remove(source); return libslicer::ProjectDecisionAnswer::No;
+    });
+    REQUIRE(kept.success);CHECK(called==1);CHECK(kept.configuration.snapshot().value("sparse_infill_rotate_template")=="1");
+    project_candidate_fixture(before,false,rotation_settings,"OrcaSlicer-2.3.1-alpha");
+    const auto cancelled=library->read_project(request,{},[](const auto&) { return libslicer::ProjectDecisionAnswer::Cancel; });
+    CHECK(cancelled.cancelled);CHECK_FALSE(cancelled.success);CHECK_FALSE(cancelled.scene);CHECK_FALSE(cancelled.configuration.valid());
+    const auto failed=library->read_project(request,{},[](const auto&)->libslicer::ProjectDecisionAnswer { throw std::runtime_error("decision failed"); });
+    CHECK_FALSE(failed.success);CHECK_FALSE(failed.cancelled);CHECK_FALSE(failed.scene);
+    const auto nonstandard=library->read_project(request,{},[](const auto&)->libslicer::ProjectDecisionAnswer { throw 7; });
+    CHECK_FALSE(nonstandard.success);CHECK_FALSE(nonstandard.cancelled);CHECK_FALSE(nonstandard.scene);CHECK_FALSE(nonstandard.configuration.valid());
+    CHECK(library->active_config_snapshot()->values()==before.values());std::filesystem::remove(source);
+}
+
+TEST_CASE("external project fixture preserves complete native scene semantics", "[libslicer_api][project-external]") {
+    const char* source=std::getenv("LIBSLICER_PROJECT_TEST_INPUT");
+    if(!source)SKIP("Set LIBSLICER_PROJECT_TEST_INPUT to the independently generated complete-project fixture");
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();
+    const auto candidate=library->read_project({source,libslicer::ProjectReadMode::Project});
+    std::ostringstream messages;for(const auto& d:candidate.diagnostics)messages<<d.code<<": "<<d.message<<"\n";INFO(messages.str());
+    REQUIRE(candidate.success);REQUIRE(candidate.scene);REQUIRE(candidate.configuration.valid());
+    CHECK(candidate.configuration.machine().project_local);CHECK(candidate.scene->plates.size()==2);
+    REQUIRE_FALSE(candidate.scene->objects.empty());
+    std::set<libslicer::ProjectPartRole> roles;std::set<std::string> plate_ids;
+    bool object_settings=false,part_settings=false,ranges=false,profile=false,brim=false,mmu=false,support=false,seam=false,fuzzy=false,custom=false;
+    std::size_t instances=0;
+    for(const auto& object:candidate.scene->objects){
+        object_settings|=!object.settings.empty();ranges|=!object.layer_ranges.empty();profile|=!object.layer_height_profile.empty();brim|=!object.brim_points.empty();
+        for(const auto& part:object.parts){roles.insert(part.role);part_settings|=!part.settings.empty();mmu|=!part.material_facets.empty();support|=!part.support_facets.empty();seam|=!part.seam_facets.empty();fuzzy|=!part.fuzzy_skin_facets.empty();}
+        for(const auto& instance:object.instances){++instances;if(!instance.plate_id.empty())plate_ids.insert(instance.plate_id);}
+    }
+    for(const auto& plate:candidate.scene->plates)custom|=!plate.custom_gcodes.empty();
+    CHECK(roles.size()==5);CHECK(instances>=2);CHECK(plate_ids.size()==2);CHECK(object_settings);CHECK(part_settings);CHECK(ranges);CHECK(profile);CHECK(brim);CHECK(mmu);CHECK(support);CHECK(seam);CHECK(fuzzy);CHECK(custom);
+    CHECK(library->active_config_snapshot()->values()==before.values());
+}
+
+TEST_CASE("production model references require their declared package relationships", "[libslicer_api][project-candidate][project-relationships]") {
+    // Reproduce the production_ext shape without depending on Downloads. The
+    // valid archive differs only by the required source model relationship.
+    const int relationship=GENERATE(0,1,2,3,4); // missing part, wrong target, valid, unrelated/shadowed namespace
+    const auto mode=GENERATE(libslicer::ProjectReadMode::Geometry,libslicer::ProjectReadMode::Project);
+    CAPTURE(relationship,mode);
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();
+    const auto revision=library->configuration_revision();
+    const auto source=project_candidate_fixture(before,false);
+    const auto configuration=read_zip_entry(source,"Metadata/project_settings.config");
+    const auto normal_model=read_zip_entry(source,"3D/3dmodel.model");
+    const std::string content=R"xml(<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>)xml";
+    const std::string root_rels=R"xml(<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="root" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>)xml";
+    std::string root=R"xml(<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p"><resources/><build><item objectid="2" p:path="/3D/Objects/sub.model" transform="1 0 0 0 1 0 0 0 1 50 50 0"/></build></model>)xml";
+    if(relationship>=3){
+        root.assign(normal_model.begin(),normal_model.end());
+        root.insert(root.find(" unit="),relationship==3?" xmlns:q=\"https://example.test/optional-metadata\"":" xmlns:q=\"http://schemas.microsoft.com/3dmanufacturing/production/2015/06\"");
+        root.insert(root.find(" objectid="),relationship==3?" q:path=\"/unrelated/model.model\"":" xmlns:q=\"https://example.test/optional-metadata\" q:path=\"/unrelated/model.model\"");
+    }
+    const std::string child=R"xml(<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources><object id="1" type="model"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/><vertex x="0" y="10" z="0"/><vertex x="0" y="0" z="10"/></vertices><triangles><triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="1" v3="3"/><triangle v1="0" v2="3" v3="2"/><triangle v1="1" v2="2" v3="3"/></triangles></mesh></object><object id="2" type="model"><components><component objectid="1"/></components></object></resources></model>)xml";
+    const std::string child_rels=std::string(R"xml(<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target=")xml")+(relationship==1?"/3D/Objects/wrong.model":"/3D/Objects/sub.model")+R"xml(" Id="child" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>)xml";
+    mz_zip_archive archive{};REQUIRE(mz_zip_writer_init_file(&archive,source.string().c_str(),0));
+    const auto add=[&](const char* name,const std::string& text){REQUIRE(mz_zip_writer_add_mem(&archive,name,text.data(),text.size(),MZ_DEFAULT_COMPRESSION));};
+    add("[Content_Types].xml",content);add("_rels/.rels",root_rels);add("3D/3dmodel.model",root);add("3D/Objects/sub.model",child);
+    REQUIRE(mz_zip_writer_add_mem(&archive,"Metadata/project_settings.config",configuration.data(),configuration.size(),MZ_DEFAULT_COMPRESSION));
+    if(relationship==1||relationship==2)add("3D/_rels/3dmodel.model.rels",child_rels);
+    REQUIRE(mz_zip_writer_finalize_archive(&archive));REQUIRE(mz_zip_writer_end(&archive));
+    const auto result=library->read_project({source.string(),mode});
+    for(const auto& diagnostic:result.diagnostics)INFO(diagnostic.code<<": "<<diagnostic.message);
+    CHECK(library->configuration_revision()==revision);CHECK(library->active_config_snapshot()->values()==before.values());
+    if(relationship<2){
+        CHECK_FALSE(result.success);CHECK_FALSE(result.cancelled);CHECK_FALSE(result.scene);CHECK_FALSE(result.configuration.valid());
+        REQUIRE(result.diagnostics.size()==1);CHECK(result.diagnostics.front().code=="project.read_failed");
+    }else{
+        REQUIRE(result.success);REQUIRE(result.scene);REQUIRE(result.scene->objects.size()==1);
+        const auto& object=result.scene->objects.front();REQUIRE(object.parts.size()==1);REQUIRE(object.instances.size()==1);
+        const auto& part=object.parts.front();REQUIRE(part.mesh);CHECK(part.mesh->vertices.size()==4);CHECK(part.mesh->triangles.size()==4);
+        std::array<double,3> minimum{1e9,1e9,1e9},maximum{-1e9,-1e9,-1e9};
+        for(const auto& vertex:part.mesh->vertices){
+            const std::array<double,3> point{vertex.x,vertex.y,vertex.z};std::array<double,3> local{},world{};
+            for(std::size_t i=0;i<3;++i){local[i]=part.local_transform[i*4+3];for(std::size_t j=0;j<3;++j)local[i]+=part.local_transform[i*4+j]*point[j];}
+            for(std::size_t i=0;i<3;++i){world[i]=object.instances.front().transform[i*4+3];for(std::size_t j=0;j<3;++j)world[i]+=object.instances.front().transform[i*4+j]*local[j];minimum[i]=std::min(minimum[i],world[i]);maximum[i]=std::max(maximum[i],world[i]);}
+        }
+        if(mode==libslicer::ProjectReadMode::Geometry){CHECK(minimum==std::array<double,3>{105,105,0});CHECK(maximum==std::array<double,3>{115,115,10});}
+        else {CHECK(minimum==std::array<double,3>{50,50,0});CHECK(maximum==std::array<double,3>{60,60,10});}
+        CHECK(result.configuration.valid()==(mode==libslicer::ProjectReadMode::Project));
+    }
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("geometry default material inheritance follows the explicit source material map", "[libslicer_api][project-material-inherit][slice]") {
+    const bool explicit_legacy_zero=GENERATE(false,true);CAPTURE(explicit_legacy_zero);
+    auto library=project_test_library();REQUIRE(library->resize_active_filament_slots(1).success);
+    REQUIRE(library->apply_active_config_patch({{"enable_prime_tower","0"}}).success);
+    const auto source=project_candidate_fixture(*library->active_config_snapshot(),false);
+    if(explicit_legacy_zero){
+        const std::string metadata=R"xml(<config><object id="1"><metadata key="extruder" value="0"/><part id="1" subtype="normal_part"><metadata key="extruder" value="1"/></part></object></config>)xml";
+        REQUIRE(mz_zip_add_mem_to_archive_file_in_place(source.string().c_str(),"Metadata/model_settings.config",metadata.data(),metadata.size(),nullptr,0,MZ_DEFAULT_COMPRESSION));
+    }
+    const auto geometry=library->read_project({source.string(),libslicer::ProjectReadMode::Geometry});REQUIRE(geometry.success);
+    REQUIRE(geometry.scene->source_filaments.size()==1);REQUIRE(geometry.scene->objects.front().default_filament_slot==1);
+    REQUIRE_FALSE(geometry.scene->objects.front().parts.front().explicit_filament_binding);
+    REQUIRE(library->resize_active_filament_slots(2).success);const auto target=*library->active_config_snapshot();
+    const auto mapped=library->remap_project_materials(geometry,{2},target);REQUIRE(mapped.success);
+    const auto& object=mapped.scene->objects.front();
+    CHECK(object.default_filament_slot==2);
+    libslicer::SliceObjectInput input;input.name="mapped-inherited-material";input.default_filament_slot=object.default_filament_slot;input.transform=object.instances.front().transform;
+    for(const auto& part:object.parts){
+        libslicer::SliceVolumeInput volume;for(const auto& v:part.mesh->vertices)volume.vertices.push_back({v.x,v.y,v.z});
+        for(const auto& t:part.mesh->triangles)volume.triangles.push_back({t.vertex_a,t.vertex_b,t.vertex_c});
+        volume.inherit_object_filament=!part.explicit_filament_binding;volume.default_filament_slot=part.default_filament_slot;volume.local_transform=part.local_transform;input.volumes.push_back(volume);
+    }
+    libslicer::SliceRequest request;request.objects={input};request.config=target;request.default_filament_slot=1;request.center_on_build_plate=false;
+    const auto sliced=library->slice(request);for(const auto& d:sliced.diagnostics)INFO(d.message);REQUIRE(sliced.success);REQUIRE(sliced.preview);
+    std::set<unsigned> used;for(const auto& segment:sliced.preview->segments)if(segment.motion==libslicer::ToolpathMotionKind::Extrusion&&segment.extrusion_role>=libslicer::ToolpathExtrusionRole::InnerWall&&segment.extrusion_role<=libslicer::ToolpathExtrusionRole::GapInfill)used.insert(segment.filament_id);
+    CHECK(used==std::set<unsigned>{1}); // Preview IDs are zero based: source material 1 was explicitly mapped to target slot 2.
+    if(sliced.output.ownership==libslicer::OutputArtifactOwnership::LibraryTemporary)std::filesystem::remove(sliced.output.path);std::filesystem::remove(source);
+}
+
+TEST_CASE("Prusa inherited source material follows an explicit geometry material map", "[libslicer_api][project-material-prusa][slice]") {
+    auto library=project_test_library();REQUIRE(library->resize_active_filament_slots(1).success);
+    REQUIRE(library->apply_active_config_patch({{"enable_prime_tower","0"}}).success);
+    const char* external=std::getenv("LIBSLICER_PRUSA_PROJECT_TEST_INPUT");
+    const auto source=external?std::filesystem::path(external):project_candidate_fixture(*library->active_config_snapshot(),false,{},"PrusaSlicer-2.8.0");
+    const auto geometry=library->read_project({source.string(),libslicer::ProjectReadMode::Geometry});
+    for(const auto& d:geometry.diagnostics)INFO(d.message);
+    REQUIRE(geometry.success);REQUIRE(geometry.scene);REQUIRE(geometry.scene->producer=="PrusaSlicer");
+    REQUIRE(geometry.scene->source_filaments.size()==1);REQUIRE(geometry.scene->objects.size()==1);
+    REQUIRE(geometry.scene->objects.front().default_filament_slot==0);
+    REQUIRE_FALSE(geometry.scene->objects.front().parts.front().explicit_filament_binding);
+    REQUIRE(library->resize_active_filament_slots(2).success);const auto target=*library->active_config_snapshot();
+    auto empty_scene=std::make_shared<libslicer::ProjectScene>(*geometry.scene);empty_scene->source_filaments.clear();
+    auto empty_candidate=geometry;empty_candidate.scene=empty_scene;
+    const auto empty_mapping=library->remap_project_materials(empty_candidate,{},target);CHECK_FALSE(empty_mapping.success);
+    const auto mapped=library->remap_project_materials(geometry,{2},target);REQUIRE(mapped.success);
+    const auto& object=mapped.scene->objects.front();CHECK(object.default_filament_slot==2);
+    CHECK_FALSE(object.parts.front().explicit_filament_binding);
+    // Project candidates are not remapped, and retain their own dynamic
+    // default. Explicit Geometry part assignments map independently.
+    auto project_scene=std::make_shared<libslicer::ProjectScene>(*geometry.scene);project_scene->mode=libslicer::ProjectReadMode::Project;
+    project_scene->objects.front().parts.front().explicit_filament_binding=true;project_scene->objects.front().parts.front().default_filament_slot=1;
+    auto project_candidate=geometry;project_candidate.scene=project_scene;
+    const auto mapped_project=library->remap_project_materials(project_candidate,{2},target);CHECK_FALSE(mapped_project.success);
+    CHECK(project_candidate.scene->objects.front().default_filament_slot==0);
+    project_scene->mode=libslicer::ProjectReadMode::Geometry;
+    const auto explicit_part=library->remap_project_materials(project_candidate,{2},target);REQUIRE(explicit_part.success);
+    CHECK(explicit_part.scene->objects.front().parts.front().explicit_filament_binding);
+    CHECK(explicit_part.scene->objects.front().parts.front().default_filament_slot==2);
+    libslicer::SliceObjectInput input;input.name="prusa-source-inherited-material";input.default_filament_slot=object.default_filament_slot;input.transform=object.instances.front().transform;
+    input.project_semantics=libslicer::encode_project_object_semantics(object);
+    // Keep the complete external indexed mesh/annotations; print it at 10% size
+    // so the actual filament-consumption regression remains a focused test.
+    if(external)for(std::size_t r=0;r<3;++r)for(std::size_t c=0;c<4;++c)input.transform[r*4+c]*=.1;
+    for(const auto& part:object.parts){
+        libslicer::SliceVolumeInput volume;for(const auto& v:part.mesh->vertices)volume.vertices.push_back({v.x,v.y,v.z});
+        for(const auto& t:part.mesh->triangles)volume.triangles.push_back({t.vertex_a,t.vertex_b,t.vertex_c});
+        volume.inherit_object_filament=!part.explicit_filament_binding;volume.default_filament_slot=part.default_filament_slot;volume.local_transform=part.local_transform;
+        volume.project_semantics=libslicer::encode_project_part_semantics(part);volume.surface_annotations=libslicer::encode_project_part_annotations(part);volume.facet_labels=part.material_facets;
+        input.volumes.push_back(std::move(volume));
+    }
+    libslicer::SliceRequest request;request.objects={input};request.config=target;request.default_filament_slot=1;request.center_on_build_plate=false;
+    const auto sliced=library->slice(request);for(const auto& d:sliced.diagnostics)INFO(d.message);REQUIRE(sliced.success);REQUIRE(sliced.preview);
+    std::set<unsigned> used;for(const auto& segment:sliced.preview->segments)if(segment.motion==libslicer::ToolpathMotionKind::Extrusion&&segment.extrusion_role>=libslicer::ToolpathExtrusionRole::InnerWall&&segment.extrusion_role<=libslicer::ToolpathExtrusionRole::GapInfill)used.insert(segment.filament_id);
+    CHECK(used==std::set<unsigned>{1});
+    if(sliced.output.ownership==libslicer::OutputArtifactOwnership::LibraryTemporary)std::filesystem::remove(sliced.output.path);
+    if(!external)std::filesystem::remove(source);
+}
+
+namespace {
+void rewrite_project_fixture(const std::filesystem::path& path,
+    std::map<std::string,std::string> replacements, const std::set<std::string>& removed={})
+{
+    mz_zip_archive reader{}; REQUIRE(mz_zip_reader_init_file(&reader,path.string().c_str(),0));
+    for (mz_uint i=0;i<mz_zip_reader_get_num_files(&reader);++i) {
+        mz_zip_archive_file_stat stat{}; REQUIRE(mz_zip_reader_file_stat(&reader,i,&stat));
+        const std::string name=stat.m_filename;
+        if (removed.count(name)||replacements.count(name)) continue;
+        std::string bytes(std::size_t(stat.m_uncomp_size),'\0');
+        REQUIRE(mz_zip_reader_extract_to_mem(&reader,i,bytes.data(),bytes.size(),0));
+        replacements.emplace(name,std::move(bytes));
+    }
+    REQUIRE(mz_zip_reader_end(&reader));
+    mz_zip_archive writer{}; REQUIRE(mz_zip_writer_init_file(&writer,path.string().c_str(),0));
+    for (const auto& [name,bytes]:replacements)
+        REQUIRE(mz_zip_writer_add_mem(&writer,name.c_str(),bytes.data(),bytes.size(),MZ_DEFAULT_COMPRESSION));
+    REQUIRE(mz_zip_writer_finalize_archive(&writer)); REQUIRE(mz_zip_writer_end(&writer));
+}
+std::string project_model_xml(const std::filesystem::path& path) {
+    const auto bytes=read_zip_entry(path,"3D/3dmodel.model"); return {bytes.begin(),bytes.end()};
+}
+void replace_project_text(std::string& text,const std::string& from,const std::string& to) {
+    const auto offset=text.find(from); REQUIRE(offset!=std::string::npos); text.replace(offset,from.size(),to);
+}
+std::array<double,6> project_world_bounds(const libslicer::ProjectScene& scene) {
+    std::array<double,6> bounds{1e100,1e100,1e100,-1e100,-1e100,-1e100};
+    for (const auto& object:scene.objects) for (const auto& instance:object.instances) for (const auto& part:object.parts) {
+        std::array<double,3> origin{};
+        for (const auto& plate:scene.plates) if (plate.id==instance.plate_id) origin=plate.origin_mm;
+        for (const auto& vertex:part.mesh->vertices) {
+            const std::array<double,4> local{vertex.x,vertex.y,vertex.z,1}; std::array<double,4> world{}, volume{};
+            for (int r=0;r<4;++r) for(int c=0;c<4;++c) volume[r]+=part.local_transform[r*4+c]*local[c];
+            for (int r=0;r<4;++r) for(int c=0;c<4;++c) world[r]+=instance.transform[r*4+c]*volume[c];
+            for(int r=0;r<3;++r) {bounds[r]=std::min(bounds[r],world[r]+origin[r]);bounds[r+3]=std::max(bounds[r+3],world[r]+origin[r]);}
+        }
+    }
+    return bounds;
+}
+}
+
+TEST_CASE("project contexts reject stale and foreign captures", "[libslicer_api][project-orca-parity]") {
+    auto library=project_test_library();
+    const auto source=project_candidate_fixture(*library->active_config_snapshot(),false);
+    libslicer::ProjectReadRequest request{source.string(),libslicer::ProjectReadMode::Geometry};
+    request.configuration=library->capture_configuration();
+    const auto revision=library->configuration_revision();
+    REQUIRE(library->read_project(request).success);
+    REQUIRE(library->set_active_config_value("layer_height","0.16").success);
+    const auto after=*library->active_config_snapshot();
+    const auto stale=library->read_project(request);CHECK_FALSE(stale.success);CHECK_FALSE(stale.scene);
+    auto other=project_test_library(); request.configuration=other->capture_configuration();
+    CHECK_FALSE(library->read_project(request).success);
+    request.configuration=library->capture_configuration();
+    const auto fresh=library->read_project(request); REQUIRE(fresh.success);
+    CHECK(fresh.configuration_revision==library->configuration_revision());CHECK(fresh.configuration_revision>revision);
+    CHECK(library->active_config_snapshot()->values()==after.values());
+    // Deliberately share the exact immutable state and match both revisions.
+    // Pointer/revision alone must not turn another Library's capture into ours.
+    const auto shared=library->capture_configuration();
+    REQUIRE(other->install_configuration(shared,other->configuration_revision()).success);
+    REQUIRE(library->install_configuration(shared,library->configuration_revision()).success);
+    REQUIRE(other->install_configuration(shared,other->configuration_revision()).success);
+    REQUIRE(library->configuration_revision()==other->configuration_revision());
+    request.configuration=other->capture_configuration();
+    CHECK_FALSE(library->read_project(request).success);
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("project entry lifecycle is independent of geometry fallback", "[libslicer_api][project-orca-parity]") {
+    auto library=project_test_library(); const auto before=*library->active_config_snapshot();
+    const auto source=project_candidate_fixture(before,false,{},"CAD-1.0");
+    auto model=project_model_xml(source);
+    replace_project_text(model,"<metadata name=\"BambuStudio:3mfVersion\">1</metadata>","");
+    rewrite_project_fixture(source,{{"3D/3dmodel.model",model}},{"Metadata/project_settings.config"});
+    for (const auto mode:{libslicer::ProjectReadMode::Geometry,libslicer::ProjectReadMode::Project}) {
+        const auto candidate=library->read_project({source.string(),mode});
+        for(const auto& d:candidate.diagnostics) INFO(d.code<<": "<<d.message);
+        REQUIRE(candidate.success);CHECK(candidate.scene->producer=="Other");CHECK_FALSE(candidate.load_config);
+        CHECK(candidate.replace_document==(mode==libslicer::ProjectReadMode::Project));
+        CHECK(candidate.scene->mode==libslicer::ProjectReadMode::Geometry);CHECK(candidate.required_decisions.empty());
+        CHECK(candidate.configuration_changed==(mode==libslicer::ProjectReadMode::Project));
+    }
+    CHECK(library->active_config_snapshot()->values()==before.values());std::filesystem::remove(source);
+}
+
+TEST_CASE("native auto drop and project sinking rules survive DTO conversion", "[libslicer_api][project-orca-parity]") {
+    const bool auto_drop=GENERATE(false,true); const double z=GENERATE(-2.,5.);
+    const auto mode=GENERATE(libslicer::ProjectReadMode::Geometry,libslicer::ProjectReadMode::Project);
+    CAPTURE(auto_drop,z,mode);
+    auto library=project_test_library();const auto source=project_candidate_fixture(*library->active_config_snapshot(),false);
+    auto model=project_model_xml(source);
+    replace_project_text(model,"<item objectid=\"1\"",std::string("<item auto_drop=\"")+(auto_drop?"1":"0")+"\" objectid=\"1\"");
+    replace_project_text(model,"50 50 0\"","50 50 "+std::to_string(z)+"\"");
+    rewrite_project_fixture(source,{{"3D/3dmodel.model",model}});
+    const auto candidate=library->read_project({source.string(),mode});REQUIRE(candidate.success);
+    const auto bounds=project_world_bounds(*candidate.scene);
+    const double expected=auto_drop?(mode==libslicer::ProjectReadMode::Project&&z<0?z:0.):z;
+    CHECK(bounds[2]==Catch::Approx(expected).margin(1e-6)); CHECK(bounds[5]-bounds[2]==Catch::Approx(10.));
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("geometry retains native object settings and expands logical filaments", "[libslicer_api][project-orca-parity]") {
+    auto library=project_test_library(); const auto before=*library->active_config_snapshot();
+    const auto revision=library->configuration_revision();
+    const auto source=project_candidate_fixture(before,false);
+    const std::string settings=R"(<config><object id="1"><metadata key="extruder" value="3"/><metadata key="layer_height" value="0.12"/><part id="1" subtype="normal_part"><metadata key="extruder" value="3"/><metadata key="sparse_infill_density" value="45%"/></part></object></config>)";
+    rewrite_project_fixture(source,{{"Metadata/model_settings.config",settings}});
+    libslicer::ProjectReadRequest request{source.string(),libslicer::ProjectReadMode::Geometry};request.filament_color_cursor=2;
+    const auto candidate=library->read_project(request);for(const auto& d:candidate.diagnostics) INFO(d.code<<": "<<d.message);
+    REQUIRE(candidate.success); REQUIRE(candidate.configuration_changed); REQUIRE(candidate.configuration.valid());
+    CHECK_FALSE(candidate.load_config); CHECK_FALSE(candidate.replace_document);
+    REQUIRE(candidate.scene->source_filaments.size()==3);CHECK(candidate.filament_color_cursor==4);
+    CHECK(candidate.scene->source_filaments[1].color.red==0xED);CHECK(candidate.scene->source_filaments[2].color.green==0xFF);
+    CHECK(candidate.scene->objects.front().default_filament_slot==3);
+    CHECK(candidate.scene->objects.front().settings==libslicer::ProjectSettings{{"layer_height","0.12"}});
+    CHECK(library->configuration_revision()==revision);CHECK(library->active_config_snapshot()->values()==before.values());
+    const auto installed=library->install_configuration(candidate.configuration,revision);REQUIRE(installed.success);
+    REQUIRE(library->active_config()->filament_slots.size()==3);
+    auto expanded_settings=settings;
+    for(auto at=expanded_settings.find("value=\"3\"");at!=std::string::npos;at=expanded_settings.find("value=\"3\"",at+9))
+        expanded_settings.replace(at,9,"value=\"5\"");
+    rewrite_project_fixture(source,{{"Metadata/model_settings.config",expanded_settings}});
+    request.filament_color_cursor.reset();
+    const auto continued=library->read_project(request);REQUIRE(continued.success);
+    CHECK(continued.filament_color_cursor==6);REQUIRE(continued.scene->source_filaments.size()==5);
+    CHECK(continued.scene->source_filaments[3].color.red==0xF2);
+    REQUIRE(library->install_configuration(installed.previous,installed.revision).success);
+    const auto restarted=library->read_project(request);REQUIRE(restarted.success);
+    CHECK(restarted.filament_color_cursor==4);REQUIRE(restarted.scene->source_filaments.size()==5);
+    CHECK(restarted.scene->source_filaments[1].color.red==0x00);
+    CHECK(library->active_config_snapshot()->values()==before.values());std::filesystem::remove(source);
+}
+
+TEST_CASE("readable invalid project settings import but cannot slice", "[libslicer_api][project-orca-parity]") {
+    auto library=project_test_library();
+    const auto source=project_candidate_fixture(*library->active_config_snapshot(),false,{{"layer_height","-0.1"},{"different_settings_to_system","layer_height;\"\";\"\""}});
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});
+    for(const auto& d:candidate.diagnostics) INFO(d.code<<": "<<d.message);
+    REQUIRE(candidate.success);REQUIRE(candidate.configuration.valid());
+    CHECK(candidate.configuration.snapshot().value("layer_height")=="-0.1");
+    CHECK(std::any_of(candidate.diagnostics.begin(),candidate.diagnostics.end(),[](const auto& d){return d.code=="project.invalid_configuration";}));
+    libslicer::SliceRequest request;request.config=candidate.configuration.snapshot();
+    const auto& object=candidate.scene->objects.front();libslicer::SliceObjectInput input;
+    input.transform=object.instances.front().transform;
+    for(const auto& part:object.parts) {
+        libslicer::SliceVolumeInput volume;volume.local_transform=part.local_transform;
+        for(const auto& p:part.mesh->vertices)volume.vertices.push_back({p.x,p.y,p.z});
+        for(const auto& t:part.mesh->triangles)volume.triangles.push_back({t.vertex_a,t.vertex_b,t.vertex_c});
+        input.volumes.push_back(std::move(volume));
+    }
+    request.objects.push_back(std::move(input));
+    const auto sliced=library->slice(request);CHECK_FALSE(sliced.success);
+    CHECK(std::any_of(sliced.diagnostics.begin(),sliced.diagnostics.end(),[](const auto& d){return d.message.find("layer_height")!=std::string::npos||d.message.find("layer height")!=std::string::npos||d.message.find("Layer height")!=std::string::npos;}));
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("native unit questions support no yes and external cancellation", "[libslicer_api][project-orca-parity]") {
+    auto library=project_test_library(); const auto source=project_candidate_fixture(*library->active_config_snapshot(),false);
+    auto model=project_model_xml(source);
+    for(const auto axis:{"x","y","z"}) {
+        const auto from=std::string(axis)+"=\"10\"";const auto to=std::string(axis)+"=\"0.01\"";
+        for(auto at=model.find(from);at!=std::string::npos;at=model.find(from,at+to.size())) model.replace(at,from.size(),to);
+    }
+    rewrite_project_fixture(source,{{"3D/3dmodel.model",model}});
+    const libslicer::ProjectReadRequest request{source.string(),libslicer::ProjectReadMode::Geometry};
+    const auto absent=library->read_project(request);CHECK_FALSE(absent.success);CHECK(absent.required_decisions==std::vector<std::string>{"convert_meters"});
+    for(const bool yes:{false,true}) {
+        int decisions=0;
+        const auto candidate=library->read_project(request,{},[&](const auto& decision){++decisions;CHECK(decision.kind==libslicer::ProjectDecisionKind::ConvertMeters);return yes?libslicer::ProjectDecisionAnswer::Yes:libslicer::ProjectDecisionAnswer::No;});
+        REQUIRE(candidate.success);CHECK(decisions==1);const auto bounds=project_world_bounds(*candidate.scene);
+        CHECK(bounds[3]-bounds[0]==Catch::Approx(yes?10.:.01).margin(1e-5));
+    }
+    bool cancelled=false;libslicer::SliceCallbacks callbacks;callbacks.is_cancelled=[&]{return cancelled;};
+    const auto result=library->read_project(request,callbacks,[&](const auto&){cancelled=true;return libslicer::ProjectDecisionAnswer::No;});
+    CHECK(result.cancelled);CHECK_FALSE(result.scene);CHECK_FALSE(result.configuration.valid());std::filesystem::remove(source);
+}
+
+TEST_CASE("native gcode job validity is separate from drawable preview", "[libslicer_api][project-orca-parity]") {
+    const bool drawable=GENERATE(false,true);
+    auto library=project_test_library(); const auto source=project_candidate_fixture(*library->active_config_snapshot(),false);
+    auto model=project_model_xml(source);
+    const auto begin=model.find("<resources>");const auto end=model.find("</build>")+8;REQUIRE(begin!=std::string::npos);
+    model.replace(begin,end-begin,"<resources/><build/>");
+    const std::string plates=R"(<config><plate><metadata key="plater_id" value="1"/><metadata key="gcode_file" value="Metadata/plate_1.gcode"/></plate></config>)";
+    const std::string gcode=drawable?
+        "; standalone minimal G-code\nG90\nM83\n;LAYER_CHANGE\n;Z:0.2\nG1 Z0.2\nG1 X10 Y10 F1200\n;TYPE:Outer wall\nG1 X30 Y10 E1\nG1 X30 Y30 E1\n":
+        "; a valid job file with no drawable extrusion\nG90\n";
+    rewrite_project_fixture(source,{{"3D/3dmodel.model",model},{"Metadata/model_settings.config",plates},{"Metadata/plate_1.gcode",gcode}});
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});
+    for(const auto& d:candidate.diagnostics) INFO(d.code<<": "<<d.message);
+    REQUIRE(candidate.success);REQUIRE(candidate.scene);CHECK(candidate.scene->objects.empty());
+    REQUIRE(candidate.scene->plates.size()==1);CHECK(candidate.scene->plates[0].slice_result_valid);
+    CHECK(candidate.scene->plates[0].gcode==gcode);
+    if(drawable){REQUIRE(candidate.scene->plates[0].preview);CHECK_FALSE(candidate.scene->plates[0].preview->segments.empty());}
+    else CHECK_FALSE(candidate.scene->plates[0].preview);
+    CHECK(candidate.scene->kind==libslicer::ProjectContainerKind::GCodeJob);CHECK(candidate.scene->preview_only);
+    std::filesystem::remove(source);CHECK(candidate.scene->plates[0].gcode==gcode);
+    if(drawable)CHECK_FALSE(candidate.scene->plates[0].preview->segments.empty());
+}
+
+TEST_CASE("downloaded 3mf corpus exercises both native import entries", "[libslicer_api][project-corpus]") {
+    const char* directory=std::getenv("LIBSLICER_PROJECT_CORPUS");
+    if(!directory) SKIP("Set LIBSLICER_PROJECT_CORPUS to the archived Downloads corpus");
+    auto library=project_test_library();std::vector<std::filesystem::path> files;
+    for(const auto& entry:std::filesystem::recursive_directory_iterator(directory)) if(entry.is_regular_file()&&entry.path().extension()==".3mf")files.push_back(entry.path());
+    std::sort(files.begin(),files.end());REQUIRE_FALSE(files.empty());
+    nlohmann::json results=nlohmann::json::array();
+    for(const auto& path:files) for(const auto mode:{libslicer::ProjectReadMode::Geometry,libslicer::ProjectReadMode::Project}) {
+        const auto before=*library->active_config_snapshot();const auto revision=library->configuration_revision();
+        nlohmann::json decisions=nlohmann::json::array();
+        const auto candidate=library->read_project({path.string(),mode},{},[&](const auto& decision){decisions.push_back(int(decision.kind));return libslicer::ProjectDecisionAnswer::No;});
+        nlohmann::json diagnostics=nlohmann::json::array();for(const auto& d:candidate.diagnostics)diagnostics.push_back({{"code",d.code},{"message",d.message}});
+        results.push_back({{"file",path.string()},{"mode",int(mode)},{"success",candidate.success},{"load_config",candidate.load_config},{"replace_document",candidate.replace_document},{"decisions_no",decisions},{"diagnostics",diagnostics},{"objects",candidate.scene?candidate.scene->objects.size():0}});
+        CHECK(library->configuration_revision()==revision);CHECK(library->active_config_snapshot()->values()==before.values());
+        // Malformed fixtures may correctly fail; the report preserves the exact
+        // native outcome. GUI equivalence is checked independently below.
+        CHECK_FALSE(candidate.cancelled);CHECK(candidate.required_decisions.empty());
+        if(candidate.success){REQUIRE(candidate.scene);CHECK(candidate.replace_document==(mode==libslicer::ProjectReadMode::Project));}
+    }
+    if(const char* output=std::getenv("LIBSLICER_PROJECT_CORPUS_REPORT")){std::ofstream file(output);REQUIRE(file.good());file<<results.dump(2)<<'\n';}
+}
+
+TEST_CASE("empty project configuration respects the original producer branch order", "[libslicer_api][project-orca-parity]") {
+    const bool orca=GENERATE(false,true);const std::string version=GENERATE(std::string("99.0.0"),std::string("2.3.1-alpha"),std::string("1.0.0"));
+    CAPTURE(orca,version);
+    auto library=project_test_library();const auto source=project_candidate_fixture(*library->active_config_snapshot(),false,{},"BambuStudio-"+version);
+    auto model=project_model_xml(source);
+    if(orca)model.insert(model.find("<resources>"),"<metadata name=\"OrcaSlicer\">"+version+"</metadata>");
+    rewrite_project_fixture(source,{{"3D/3dmodel.model",model}},{"Metadata/project_settings.config"});
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});
+    for(const auto& d:candidate.diagnostics)INFO(d.code<<": "<<d.message);
+    if(version=="2.3.1-alpha") {
+        // Preserve the alpha branch instead of inventing an empty-config
+        // fallback. Its missing required field is a read error, never a null
+        // dereference through original DynamicConfig::opt_string.
+        CHECK_FALSE(candidate.success);CHECK_FALSE(candidate.scene);
+        CHECK(std::any_of(candidate.diagnostics.begin(),candidate.diagnostics.end(),[](const auto& d){return d.message.find("missing sparse_infill_rotate_template")!=std::string::npos;}));
+    } else {
+        REQUIRE(candidate.success);CHECK(candidate.replace_document);
+        CHECK(candidate.scene->producer==(orca?"OrcaSlicer":"BambuStudio"));
+        CHECK(candidate.load_config==(orca&&version=="99.0.0"));
+    }
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("Prusa project follows original geometry fallback", "[libslicer_api][project-orca-parity]") {
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();
+    const auto source=project_candidate_fixture(before,false,{},"PrusaSlicer-2.9.0");
+    auto model=project_model_xml(source);replace_project_text(model,"<metadata name=\"BambuStudio:3mfVersion\">1</metadata>","");
+    rewrite_project_fixture(source,{{"3D/3dmodel.model",model}},{"Metadata/project_settings.config"});
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});
+    for(const auto& d:candidate.diagnostics)INFO(d.code<<": "<<d.message);
+    REQUIRE(candidate.success);CHECK(candidate.scene->producer=="PrusaSlicer");CHECK_FALSE(candidate.load_config);
+    CHECK(candidate.replace_document);CHECK(candidate.required_decisions.empty());CHECK_FALSE(candidate.scene->objects.empty());
+    CHECK(library->active_config_snapshot()->values()==before.values());std::filesystem::remove(source);
+}
+
+TEST_CASE("legacy multi plate frames use native integer dimensions and loaded printer", "[libslicer_api][project-orca-parity]") {
+    const bool legacy=GENERATE(false,true);CAPTURE(legacy);
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();
+    const auto source=project_candidate_fixture(before,true,{{"printable_area","0x0,190.9x0,190.9x170.9,0x170.9"},{"printable_height","210"}},legacy?"BambuStudio-1.0.0":"BambuStudio-2.0.0");
+    auto model=project_model_xml(source);
+    // New printer's native width is int(190.9)=190. Its plate 2 frame starts at
+    // 228, irrespective of the previous printer's 220 mm bed or the legacy
+    // temporary int(220+1.25)=221 frame. The test point intersects only plate 2.
+    replace_project_text(model,"50 50 0\"","300 50 0\"");
+    const std::string plates=R"(<config><plate><metadata key="plater_id" value="1"/></plate><plate><metadata key="plater_id" value="2"/></plate></config>)";
+    rewrite_project_fixture(source,{{"3D/3dmodel.model",model},{"Metadata/model_settings.config",plates}});
+    libslicer::ProjectReadRequest request{source.string(),libslicer::ProjectReadMode::Project};
+    libslicer::ProjectBedContext bed;bed.maximum_x=220;bed.maximum_y=220;bed.native_plate_size=std::array<int,3>{220,220,220};request.bed=bed;
+    const auto candidate=library->read_project(request);for(const auto& d:candidate.diagnostics)INFO(d.code<<": "<<d.message);
+    REQUIRE(candidate.success);REQUIRE(candidate.scene->plates.size()==2);REQUIRE(candidate.scene->objects.size()==1);
+    CHECK(candidate.scene->plates[1].origin_mm[0]==Catch::Approx(legacy?264.:228.));
+    CHECK(candidate.scene->plates[1].native_size_mm[0]==(legacy?220:190));
+    const auto& instance=candidate.scene->objects.front().instances.front();CHECK(instance.plate_id=="plate-2");
+    const auto bounds=project_world_bounds(*candidate.scene);
+    CHECK(bounds[0]==Catch::Approx(legacy?336.:300.).margin(1e-5));
+    CHECK(bounds[3]-bounds[0]==Catch::Approx(10.));
+    CHECK(candidate.configuration.snapshot().value("printable_area")=="0x0,190.9x0,190.9x170.9,0x170.9");
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("small loaded beds consume the previous axes before integer plate sizing", "[libslicer_api][project-orca-parity]") {
+    const bool offset=GENERATE(false,true);CAPTURE(offset);
+    auto library=project_test_library();
+    const auto source=project_candidate_fixture(*library->active_config_snapshot(),true,
+        {{"printable_area",offset?"100x0,105.5x0,105.5x5.5,100x5.5":"0x0,5.5x0,5.5x5.5,0x5.5"},{"printable_height","210"}});
+    // Original reset leaves the old AD5X axes at 0.1*220=22. set_shape
+    // calculates new bounds before updating axes to 0.1*210=21.
+    const int native_width=offset?83:22;const double x=native_width*1.2+(offset?101:1);
+    auto model=project_model_xml(source);replace_project_text(model,"50 50 0\"",std::to_string(x)+" 1 0\"");
+    const std::string plates=R"(<config><plate><metadata key="plater_id" value="1"/></plate><plate><metadata key="plater_id" value="2"/></plate></config>)";
+    rewrite_project_fixture(source,{{"3D/3dmodel.model",model},{"Metadata/model_settings.config",plates}});
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});
+    for(const auto& d:candidate.diagnostics)INFO(d.code<<": "<<d.message);
+    REQUIRE(candidate.success);REQUIRE(candidate.scene->plates.size()==2);
+    CHECK(candidate.scene->plates[1].native_size_mm[0]==native_width);
+    CHECK(candidate.scene->plates[1].origin_mm[0]==Catch::Approx(native_width*1.2));
+    CHECK(candidate.scene->objects.front().instances.front().plate_id=="plate-2");
+    CHECK(project_world_bounds(*candidate.scene)[0]==Catch::Approx(x).margin(1e-5));
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("throwing cancellation callbacks return structured read failures", "[libslicer_api][project-orca-parity]") {
+    auto library=project_test_library();const auto before=*library->active_config_snapshot();
+    const auto source=project_candidate_fixture(before,false);libslicer::SliceCallbacks callbacks;
+    callbacks.is_cancelled=[]()->bool {throw 7;};
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project},callbacks);
+    CHECK_FALSE(candidate.success);CHECK_FALSE(candidate.cancelled);CHECK_FALSE(candidate.scene);CHECK_FALSE(candidate.configuration.valid());
+    REQUIRE(candidate.diagnostics.size()==1);CHECK(candidate.diagnostics.front().code=="project.read_failed");
+    CHECK(library->active_config_snapshot()->values()==before.values());std::filesystem::remove(source);
+}
+
+TEST_CASE("project reset changes an embedded printer before consuming the bed snapshot", "[libslicer_api][project-orca-parity]") {
+    auto library=project_test_library();const auto original=*library->active_config_snapshot();
+    const std::string child="Project reset child";const std::string parent="Flashforge AD5X 0.4 nozzle";
+    const auto embedded=project_candidate_fixture(original,false,{
+        {"printer_settings_id",child},{"printer_model",child},
+        {"printable_area","0x0,100x0,100x100,0x100"},{"printable_height","100"},
+        {"inherits_group","\"\";\"\";\""+parent+"\""},
+        {"different_settings_to_system","\"\";\"\";\"printable_area;printable_height;printer_model\""}});
+    const nlohmann::json preset={{"name",child},{"printer_settings_id",child},{"inherits",parent},
+        {"printer_model",child},{"printable_area","0x0,100x0,100x100,0x100"},{"printable_height","100"},
+        {"type","machine"},{"version","2.0.0.0"},{"from","project"}};
+    rewrite_project_fixture(embedded,{{"Metadata/machine_settings_1.config",preset.dump()}});
+    const auto prepared=library->read_project({embedded.string(),libslicer::ProjectReadMode::Project});
+    for(const auto& d:prepared.diagnostics)INFO(d.code<<": "<<d.message);
+    REQUIRE(prepared.success);REQUIRE(prepared.configuration.snapshot().value("printer_settings_id")==child);
+    REQUIRE(library->install_configuration(prepared.configuration,library->configuration_revision()).success);
+    REQUIRE(library->active_config_snapshot()->value("printable_area")=="0x0,100x0,100x100,0x100");
+    const auto source=project_candidate_fixture(*library->active_config_snapshot(),false,{},"CAD-1.0");
+    rewrite_project_fixture(source,{}, {"Metadata/project_settings.config"});
+    libslicer::ProjectBedContext bed;bed.maximum_x=bed.maximum_y=100;bed.native_plate_size=std::array<int,3>{100,100,100};bed.axes_length_mm=10;
+    for(const auto mode:{libslicer::ProjectReadMode::Geometry,libslicer::ProjectReadMode::Project}) {
+        libslicer::ProjectReadRequest request{source.string(),mode};request.bed=bed;
+        const auto candidate=library->read_project(request);for(const auto& d:candidate.diagnostics)INFO(d.code<<": "<<d.message);
+        REQUIRE(candidate.success);CHECK_FALSE(candidate.load_config);
+        const auto bounds=project_world_bounds(*candidate.scene);const double expected=mode==libslicer::ProjectReadMode::Project?105:45;
+        CHECK(bounds[0]==Catch::Approx(expected));CHECK(bounds[1]==Catch::Approx(expected));
+        if(mode==libslicer::ProjectReadMode::Project) {
+            CHECK(candidate.configuration.snapshot().value("printer_settings_id")==parent);
+            CHECK(candidate.scene->plates.front().native_size_mm[0]==220);
+        }
+    }
+    CHECK(library->active_config_snapshot()->value("printer_settings_id")==child);
+    std::filesystem::remove(source);std::filesystem::remove(embedded);
+}
+
+TEST_CASE("native preset preparation failures keep configuration edits atomic", "[libslicer_api][project-candidate]") {
+    auto library=project_test_library();REQUIRE(library->resize_active_filament_slots(2).success);
+    const auto before=*library->active_config_snapshot();const auto revision=library->configuration_revision();
+    const auto failed=library->apply_active_config_patch({{"filament_start_gcode",""}});
+    CHECK_FALSE(failed.success);CHECK_FALSE(failed.diagnostics.empty());CHECK(failed.changed_items.empty());
+    CHECK(library->configuration_revision()==revision);CHECK(library->active_config_snapshot()->values()==before.values());
+    const auto selected=library->active_config()->selection;
+    libslicer::ConfigSelection selection{selected.machine_model_id,selected.machine_variant_id,selected.process_preset_id,selected.filament_preset_ids,selected.filament_physical_tools};
+    const auto activation=library->activate_config(selection,{{"filament_start_gcode",""}});
+    CHECK_FALSE(activation.success);CHECK_FALSE(activation.diagnostics.empty());
+    CHECK(library->configuration_revision()==revision);CHECK(library->active_config_snapshot()->values()==before.values());
+    const auto valid=library->apply_active_config_patch({{"filament_start_gcode","\"\";\"\""}});
+    CHECK(valid.success);CHECK(library->configuration_revision()==revision+1);
+}
+
+TEST_CASE("unchanged native beds preserve captured plate dimensions", "[libslicer_api][project-orca-parity]") {
+    auto library=project_test_library();
+    REQUIRE(library->apply_active_config_patch({{"printable_area","0x0,5.5x0,5.5x5.5,0x5.5"},{"printable_height","210"}}).success);
+    const bool ancillary_change=GENERATE(false,true);
+    const auto source=project_candidate_fixture(*library->active_config_snapshot(),false,
+        {{"bed_exclude_area",ancillary_change?"0x0,1x0,1x1,0x1":""},
+         {"different_settings_to_system","\"\";\"\";\"printable_area;printable_height;bed_exclude_area\""}});
+    libslicer::ProjectBedContext bed;bed.maximum_x=bed.maximum_y=5.5;
+    // A previous change from a 220 mm printer consumed axes22. Native cached
+    // plate width is22 although the axes have now updated to21 for height210.
+    bed.native_plate_size=std::array<int,3>{22,22,210};bed.axes_length_mm=21;
+    libslicer::ProjectReadRequest request{source.string(),libslicer::ProjectReadMode::Project};request.bed=bed;
+    const auto result=library->read_project(request);for(const auto& d:result.diagnostics)INFO(d.code<<": "<<d.message);
+    REQUIRE(result.success);CHECK(result.load_config);REQUIRE_FALSE(result.scene->plates.empty());
+    CHECK(result.scene->plates.front().native_size_mm==std::array<int,3>{22,22,210});
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("zero native print height remains editable across project entry points", "[libslicer_api][project-orca-parity][project-followup]") {
+    auto library=project_test_library();const auto initial=*library->active_config_snapshot();
+    const auto source=project_candidate_fixture(initial,false,{{"printable_height","0"},
+        {"different_settings_to_system","\"\";\"\";\"printable_height\""}});
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});
+    for(const auto& d:candidate.diagnostics)INFO(d.code<<": "<<d.message);
+    REQUIRE(candidate.success);REQUIRE(candidate.configuration.valid());
+    CHECK(candidate.configuration.snapshot().value("printable_height")=="0");
+    CHECK(candidate.configuration.machine().variant.printable_height==0);
+    REQUIRE_FALSE(candidate.scene->objects.empty());
+    REQUIRE(library->install_configuration(candidate.configuration,library->configuration_revision()).success);
+    CHECK(library->active_config_snapshot()->value("printable_height")=="0");
+    REQUIRE(library->set_active_config_value("layer_height","0.16").success);
+    CHECK(library->active_config_snapshot()->value("printable_height")=="0");
+    CHECK(library->read_project({source.string(),libslicer::ProjectReadMode::Geometry}).success);
+    REQUIRE(library->set_active_config_value("printable_height","180").success);
+    const auto revision=library->configuration_revision();
+    const auto legacy=library->import_project({source.string()});
+    for(const auto& d:legacy.diagnostics)INFO(d.message);
+    REQUIRE(legacy.success);CHECK(library->configuration_revision()==revision+1);
+    CHECK(library->active_config_snapshot()->value("printable_height")=="0");
+    CHECK_FALSE(library->set_active_config_value("printable_height","-1").success);
+    CHECK(library->active_config_snapshot()->value("printable_height")=="0");
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("mapped geometry discards source palette installation and supports remapping", "[libslicer_api][project-candidate][project-followup]") {
+    auto library=project_test_library();const auto target=*library->active_config_snapshot();
+    const auto revision=library->configuration_revision();
+    const auto source=project_candidate_fixture(target,false);
+    const std::string settings=R"(<config><object id="1"><metadata key="extruder" value="3"/><part id="1" subtype="normal_part"><metadata key="extruder" value="3"/></part></object></config>)";
+    rewrite_project_fixture(source,{{"Metadata/model_settings.config",settings}});
+    const auto expanded=library->read_project({source.string(),libslicer::ProjectReadMode::Geometry});
+    REQUIRE(expanded.success);REQUIRE(expanded.configuration_changed);
+    REQUIRE(expanded.configuration.valid());REQUIRE(expanded.scene->source_filaments.size()==3);
+    const auto mapped=library->remap_project_materials(expanded,{1,1,1},target);
+    REQUIRE(mapped.success);CHECK_FALSE(mapped.configuration_changed);CHECK_FALSE(mapped.configuration.valid());
+    CHECK(mapped.configuration_revision==expanded.configuration_revision);
+    REQUIRE(mapped.scene->source_filaments.size()==1);
+    CHECK(mapped.scene->source_filaments.front().preset_id==library->active_config()->filament_slots.front().preset_id);
+    CHECK(mapped.scene->source_filaments.front().color.red==library->active_config()->filament_slots.front().color.red);
+    CHECK(mapped.scene->objects.front().default_filament_slot==1);
+    // Native single-volume loading removes the redundant volume binding.
+    CHECK(mapped.scene->objects.front().parts.front().default_filament_slot==0);
+    CHECK_FALSE(mapped.scene->objects.front().parts.front().explicit_filament_binding);
+    CHECK(mapped.filament_color_cursor==0);CHECK(expanded.filament_color_cursor==2);
+    const auto invalid=library->remap_project_materials(expanded,{1,1},target);
+    CHECK_FALSE(invalid.success);CHECK_FALSE(invalid.scene);CHECK_FALSE(invalid.configuration.valid());
+    libslicer::SliceCallbacks cancelled;cancelled.is_cancelled=[] { return true; };
+    const auto aborted=library->remap_project_materials(expanded,{1,1,1},target,cancelled);
+    CHECK(aborted.cancelled);CHECK_FALSE(aborted.scene);CHECK_FALSE(aborted.configuration.valid());
+    CHECK(library->configuration_revision()==revision);CHECK(library->active_config_snapshot()->values()==target.values());
+    REQUIRE(library->resize_active_filament_slots(2).success);
+    const auto next_target=*library->active_config_snapshot();
+    const auto again=library->remap_project_materials(mapped,{2},next_target);
+    REQUIRE(again.success);REQUIRE(again.scene->source_filaments.size()==2);
+    CHECK(again.scene->objects.front().default_filament_slot==2);
+    CHECK(again.scene->objects.front().parts.front().default_filament_slot==0);
+    CHECK_FALSE(again.scene->objects.front().parts.front().explicit_filament_binding);
+    CHECK_FALSE(again.configuration_changed);CHECK_FALSE(again.configuration.valid());
+    CHECK(library->configuration_revision()==revision+1);
+    CHECK(library->active_config_snapshot()->values()==next_target.values());
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("model project gcode bytes do not activate a native slice result", "[libslicer_api][project-orca-parity][project-followup]") {
+    auto library=project_test_library();const auto source=project_candidate_fixture(*library->active_config_snapshot(),false);
+    const std::string plates=R"(<config><plate><metadata key="plater_id" value="1"/><metadata key="gcode_file" value="Metadata/plate_1.gcode"/></plate></config>)";
+    const std::string gcode="G90\nM83\n;LAYER_CHANGE\n;Z:0.2\nG1 Z0.2\nG1 X10 Y10 F1200\n;TYPE:Outer wall\nG1 X30 Y10 E1\n";
+    rewrite_project_fixture(source,{{"Metadata/model_settings.config",plates},{"Metadata/plate_1.gcode",gcode}});
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});
+    REQUIRE(candidate.success);REQUIRE_FALSE(candidate.scene->objects.empty());
+    REQUIRE(candidate.scene->plates.size()==1);const auto& plate=candidate.scene->plates.front();
+    CHECK(plate.gcode==gcode);CHECK_FALSE(plate.slice_result_valid);CHECK_FALSE(plate.preview);
+    CHECK_FALSE(candidate.scene->preview_only);CHECK(candidate.scene->kind!=libslicer::ProjectContainerKind::GCodeJob);
+    std::filesystem::remove(source);CHECK(plate.gcode==gcode);
+}
+
+TEST_CASE("empty model job selects the first valid plate", "[libslicer_api][project-orca-parity][project-followup]") {
+    auto library=project_test_library();const auto source=project_candidate_fixture(*library->active_config_snapshot(),false);
+    auto model=project_model_xml(source);const auto begin=model.find("<resources>");const auto end=model.find("</build>")+8;
+    model.replace(begin,end-begin,"<resources/><build/>");
+    const std::string plates=R"(<config><plate><metadata key="plater_id" value="1"/></plate><plate><metadata key="plater_id" value="2"/><metadata key="gcode_file" value="Metadata/plate_2.gcode"/></plate></config>)";
+    rewrite_project_fixture(source,{{"3D/3dmodel.model",model},{"Metadata/model_settings.config",plates},{"Metadata/plate_2.gcode","G90\n"}});
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Project});
+    REQUIRE(candidate.success);REQUIRE(candidate.scene->plates.size()==2);
+    CHECK_FALSE(candidate.scene->plates[0].slice_result_valid);CHECK(candidate.scene->plates[1].slice_result_valid);
+    CHECK(candidate.scene->active_plate_index==1);CHECK(candidate.scene->preview_only);
+    CHECK(candidate.scene->kind==libslicer::ProjectContainerKind::GCodeJob);
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("five project roles preserve their explicit SDK semantics", "[libslicer_api][project-orca-parity][project-followup]") {
+    auto library=project_test_library();const auto source=project_candidate_fixture(*library->active_config_snapshot(),false);
+    auto model=project_model_xml(source);const auto begin=model.find("<object id=\"1\"");const auto end=model.find("</object>",begin)+9;
+    const auto original=model.substr(begin,end-begin);std::string resources;
+    const std::array<const char*,5> types={"normal_part","negative_part","modifier_part","support_enforcer","support_blocker"};
+    std::string settings="<config><object id=\"10\">";
+    for(int i=1;i<=5;++i) {
+        auto part=original;replace_project_text(part,"id=\"1\"","id=\""+std::to_string(i)+"\"");resources+=part;
+        settings+="<part id=\""+std::to_string(i)+"\" subtype=\""+types[i-1]+"\"><metadata key=\"name\" value=\"role-"+types[i-1]+"\"/></part>";
+    }
+    resources+="<object id=\"10\" type=\"model\"><components>";
+    for(int i=1;i<=5;++i)resources+="<component objectid=\""+std::to_string(i)+"\"/>";
+    resources+="</components></object>";settings+="</object></config>";
+    model.replace(begin,end-begin,resources);replace_project_text(model,"<item objectid=\"1\"","<item objectid=\"10\"");
+    rewrite_project_fixture(source,{{"3D/3dmodel.model",model},{"Metadata/model_settings.config",settings}});
+    const auto candidate=library->read_project({source.string(),libslicer::ProjectReadMode::Geometry});
+    REQUIRE(candidate.success);REQUIRE(candidate.scene->objects.size()==1);
+    const std::map<std::string,libslicer::ProjectPartRole> expected={
+        {"role-normal_part",libslicer::ProjectPartRole::Model},
+        {"role-negative_part",libslicer::ProjectPartRole::NegativeVolume},
+        {"role-modifier_part",libslicer::ProjectPartRole::ParameterModifier},
+        {"role-support_enforcer",libslicer::ProjectPartRole::SupportEnforcer},
+        {"role-support_blocker",libslicer::ProjectPartRole::SupportBlocker}};
+    REQUIRE(candidate.scene->objects.front().parts.size()==expected.size());
+    std::set<libslicer::ProjectPartRole> actual;
+    for(const auto& p:candidate.scene->objects.front().parts) {
+        CAPTURE(p.name);REQUIRE(expected.count(p.name)==1);CHECK(p.role==expected.at(p.name));actual.insert(p.role);
+    }
+    CHECK(actual==std::set<libslicer::ProjectPartRole>{libslicer::ProjectPartRole::Model,libslicer::ProjectPartRole::NegativeVolume,
+        libslicer::ProjectPartRole::ParameterModifier,libslicer::ProjectPartRole::SupportEnforcer,libslicer::ProjectPartRole::SupportBlocker});
+    std::filesystem::remove(source);
+}
+
+TEST_CASE("explicit geometry mapping preserves an installed nonzero color cursor", "[libslicer_api][project-followup]") {
+    auto library=project_test_library();const auto source=project_candidate_fixture(*library->active_config_snapshot(),false);
+    const std::string settings=R"(<config><object id="1"><metadata key="extruder" value="3"/></object></config>)";
+    rewrite_project_fixture(source,{{"Metadata/model_settings.config",settings}});
+    libslicer::ProjectReadRequest request{source.string(),libslicer::ProjectReadMode::Geometry};request.filament_color_cursor=7;
+    const auto expanded=library->read_project(request);REQUIRE(expanded.success);REQUIRE(expanded.filament_color_cursor==9);
+    REQUIRE(library->install_configuration(expanded.configuration,library->configuration_revision()).success);
+    const auto target=*library->active_config_snapshot();const auto revision=library->configuration_revision();
+    request.filament_color_cursor=100;
+    const auto input=library->read_project(request);REQUIRE(input.success);REQUIRE(input.filament_color_cursor==100);
+    const auto result=library->remap_project_materials(input,{1,1,1},target);
+    REQUIRE(result.success);CHECK(result.filament_color_cursor==9);CHECK_FALSE(result.configuration_changed);
+    CHECK_FALSE(result.configuration.valid());CHECK(result.configuration_revision==input.configuration_revision);
+    CHECK(library->configuration_revision()==revision);CHECK(library->active_config_snapshot()->values()==target.values());
+    request.filament_color_cursor.reset();CHECK(library->read_project(request).filament_color_cursor==9);
+    std::filesystem::remove(source);
 }

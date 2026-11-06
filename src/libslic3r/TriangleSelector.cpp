@@ -6,6 +6,8 @@
 #include <boost/log/trivial.hpp>
 #include <cstddef>
 #include <functional>
+#include <limits>
+#include <stdexcept>
 #include <tbb/parallel_for.h>
 
 #ifndef NDEBUG
@@ -1775,14 +1777,9 @@ void TriangleSelector::deserialize(const TriangleSplittingData &data,
                                    EnforcerBlockerType          to_delete_filament,
                                    EnforcerBlockerType          replace_filament)
 {
+    data.validate(m_mesh.its.indices.size());
     if (needs_reset)
         reset(); // dump any current state
-    for (auto [triangle_id, ibit] : data.triangles_to_split) {
-        if (triangle_id >= int(m_triangles.size())) {
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "array bound:error:triangle_id >= int(m_triangles.size())";
-            return;
-        }
-    }
     // Reserve number of triangles as if each triangle was saved with 4 bits.
     // With MMU painting this estimate may be somehow low, but better than nothing.
     m_triangles.reserve(std::max(m_mesh.its.indices.size(), data.bitstream.size() / 4));
@@ -1892,18 +1889,65 @@ void TriangleSelector::deserialize(const TriangleSplittingData &data,
     }
 }
 
-void TriangleSelector::TriangleSplittingData::update_used_states(const size_t bitstream_start_idx) {
-    assert(bitstream_start_idx < this->bitstream.size());
-    assert(!this->bitstream.empty() && this->bitstream.size() != bitstream_start_idx);
-    assert((this->bitstream.size() - bitstream_start_idx) % 4 == 0);
+void TriangleSelector::TriangleSplittingData::validate(size_t triangle_count, EnforcerBlockerType maximum_state) const
+{
+    if (triangles_to_split.empty() != bitstream.empty())
+        throw std::invalid_argument("Facet roots/bitstream mismatch");
+    if (bitstream.size() % 4)
+        throw std::invalid_argument("Facet bitstream is not nibble aligned");
+    size_t consumed = 0;
+    int previous_triangle = -1;
+    for (size_t ri = 0; ri < triangles_to_split.size(); ++ri) {
+        const auto& root = triangles_to_split[ri];
+        if (root.triangle_idx <= previous_triangle || size_t(root.triangle_idx) >= triangle_count || root.bitstream_start_idx < 0)
+            throw std::invalid_argument("Invalid facet root");
+        previous_triangle = root.triangle_idx;
+        size_t offset = size_t(root.bitstream_start_idx);
+        const auto next = ri + 1 < triangles_to_split.size() ? triangles_to_split[ri + 1].bitstream_start_idx : -1;
+        if (ri + 1 < triangles_to_split.size() && next < 0)
+            throw std::invalid_argument("Invalid facet root");
+        const size_t end = ri + 1 < triangles_to_split.size() ? size_t(next) : bitstream.size();
+        if (offset != consumed || end > bitstream.size() || end <= offset)
+            throw std::invalid_argument("Facet root streams overlap or contain gaps");
+        const auto nibble = [&]() {
+            if (offset > end || end - offset < 4)
+                throw std::invalid_argument("Truncated facet subtree");
+            int code = 0;
+            for (int bit = 0; bit < 4; ++bit) code |= int(bitstream[offset++]) << bit;
+            return code;
+        };
+        size_t pending = 1;
+        while (pending) {
+            const int code = nibble(), split = code & 3;
+            --pending;
+            if (split) {
+                const int side = code >> 2;
+                if ((split == 3 && side != 0) || (split < 3 && side > 2))
+                    throw std::invalid_argument("Invalid facet split side");
+                pending += size_t(split + 1);
+            } else {
+                const int state = (code & 12) == 12 ? nibble() + 3 : code >> 2;
+                if (state > int(maximum_state))
+                    throw std::invalid_argument("Facet state outside supported range");
+            }
+        }
+        if (offset != end) throw std::invalid_argument("Trailing facet subtree data");
+        consumed = offset;
+    }
+}
 
+void TriangleSelector::TriangleSplittingData::update_used_states(const size_t bitstream_start_idx) {
+    if (bitstream_start_idx > this->bitstream.size() ||
+        (this->bitstream.size() - bitstream_start_idx) % 4 != 0)
+        throw std::invalid_argument("Malformed facet painting bitstream");
     if (this->bitstream.empty() || this->bitstream.size() == bitstream_start_idx)
         return;
 
     size_t nibble_idx = bitstream_start_idx;
 
     auto read_next_nibble = [&data_bitstream = std::as_const(this->bitstream), &nibble_idx]() -> uint8_t {
-        assert(nibble_idx + 3 < data_bitstream.size());
+        if (nibble_idx > data_bitstream.size() || data_bitstream.size() - nibble_idx < 4)
+            throw std::invalid_argument("Truncated facet painting state");
         uint8_t code = 0;
         for (size_t bit_idx = 0; bit_idx < 4; ++bit_idx)
             code |= data_bitstream[nibble_idx++] << bit_idx;
@@ -1917,9 +1961,8 @@ void TriangleSelector::TriangleSplittingData::update_used_states(const size_t bi
             continue;
 
         const uint8_t facet_state = (code & 0b1100) == 0b1100 ? read_next_nibble() + 3 : code >> 2;
-        assert(facet_state < this->used_states.size());
         if (facet_state >= this->used_states.size())
-            continue;
+            throw std::invalid_argument("Invalid facet painting state");
 
         this->used_states[facet_state] = true;
     }
@@ -1927,6 +1970,9 @@ void TriangleSelector::TriangleSplittingData::update_used_states(const size_t bi
 
 // Lightweight variant of deserialization, which only tests whether a face of test_state exists.
 bool TriangleSelector::has_facets(const TriangleSplittingData &data, const EnforcerBlockerType test_state) {
+    // This lightweight consumer has no mesh; actual mesh bounds are checked
+    // when deserializing. Forest validation still precedes every bit read.
+    data.validate(std::numeric_limits<size_t>::max());
     // Depth-first queue of a number of unvisited children.
     // Kept outside of the loop to avoid re-allocating inside the loop.
     std::vector<int> parents_children;

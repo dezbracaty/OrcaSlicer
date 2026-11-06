@@ -192,7 +192,9 @@ enum class SliceVolumeRole
 {
     ModelPart,
     SupportEnforcer,
-    SupportBlocker
+    SupportBlocker,
+    NegativeVolume,
+    ParameterModifier
 };
 
 struct SliceVolumeInput
@@ -202,6 +204,12 @@ struct SliceVolumeInput
     int default_filament_slot{1};
     SliceFacetLabels facet_labels;
     SliceVolumeRole role{SliceVolumeRole::ModelPart};
+    std::string project_semantics;
+    std::string surface_annotations;
+    bool inherit_object_filament{false};
+    // Native volume-local to object-local transform. Keep facet topology local,
+    // including mirrored and nonuniformly scaled parts.
+    std::array<double, 16> local_transform{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
 };
 
 // Geometry-only plane cutting contract. The mesh is expressed in model-local
@@ -290,6 +298,8 @@ struct SliceObjectInput
         0.0, 0.0, 0.0, 1.0};
     std::vector<SliceVolumeInput> volumes;
     std::vector<SliceFiberMaskInput> fiber_masks;
+    std::string project_semantics;
+    int default_filament_slot{0};
 };
 
 enum class OutputArtifactOwnership
@@ -310,6 +320,9 @@ struct OutputArtifact
 
 struct SliceRequest
 {
+    // Project/default material and plate semantics are immutable request inputs.
+    std::string project_semantics;
+    int default_filament_slot{1};
     // Each support mesh is associated with exactly one printable object.
     std::vector<SliceObjectInput> objects;
     ConfigSnapshot config;
@@ -489,6 +502,157 @@ struct ProjectImportResult
     explicit operator bool() const noexcept { return success; }
 };
 
+using ProjectSettings = std::vector<std::pair<std::string, std::string>>;
+enum class ProjectReadMode { Geometry, Project };
+enum class ProjectContainerKind { Model, Project, GCodeJob };
+enum class ProjectPartRole { Model, NegativeVolume, ParameterModifier, SupportEnforcer, SupportBlocker };
+enum class ProjectDecisionKind {
+    LegacyInfillRotation, ConvertMeters, ConvertInches,
+    MultipartObject, ScaleOversizedInstance
+};
+enum class ProjectDecisionAnswer { Yes, No, Cancel };
+struct ProjectDecision {
+    ProjectDecisionKind kind;
+    std::size_t object_index{std::size_t(-1)}, instance_index{std::size_t(-1)};
+    std::string message;
+};
+// Called synchronously on the read thread. Do not reenter this Library or its
+// owning executor while waiting for a GUI answer. The caller owns cancellation
+// and wakeup of any such wait; external cancellation is checked before/after it.
+using ProjectDecisionCallback = std::function<ProjectDecisionAnswer(const ProjectDecision&)>;
+// Snapshot before this operation. Project mode performs the native logical
+// reset first; if reset changes the bed, its geometry/dimensions are rebuilt
+// from the reset printer using this snapshot's axes length.
+struct ProjectBedContext {
+    double minimum_x{0}, minimum_y{0}, maximum_x{0}, maximum_y{0};
+    bool current_plate_empty{true};
+    // Native Bed3D position; Project reset selects plate zero.
+    PrintableAreaPoint shape_position_mm{0,0};
+    // Transformed per-instance convex hulls, in native world millimetres.
+    std::vector<std::vector<PrintableAreaPoint>> occupied_hulls;
+    // Captured native PartPlateList dimensions, if the caller has an existing
+    // GUI bed. Otherwise derived with Bed3D's axes/bounds and int conversion.
+    std::optional<std::array<int,3>> native_plate_size;
+    std::optional<float> axes_length_mm;
+};
+struct ProjectDiagnostic {
+    std::string severity, code, context, message;
+};
+struct ProjectMesh {
+    std::vector<ProjectImportVertex> vertices;
+    std::vector<ProjectImportTriangle> triangles;
+};
+struct ProjectLayerRange {
+    double minimum_z{0}, maximum_z{0};
+    ProjectSettings settings;
+};
+struct ProjectBrimPoint { float x{0}, y{0}, z{0}, head_front_radius{0}; };
+struct ProjectCustomGCode {
+    double print_z{0}; int type{0}; int filament_slot{0};
+    std::string color, extra;
+};
+struct ProjectPart {
+    std::string id, name;
+    ProjectPartRole role{ProjectPartRole::Model};
+    std::array<double,16> local_transform{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+    int default_filament_slot{0};
+    bool explicit_filament_binding{false};
+    std::shared_ptr<const ProjectMesh> mesh;
+    ProjectSettings settings;
+    SliceFacetLabels material_facets, support_facets, seam_facets, fuzzy_skin_facets;
+};
+struct ProjectInstance {
+    std::string id, name, plate_id;
+    std::array<double,16> transform{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+    bool printable{true};
+};
+struct ProjectObject {
+    std::string id, name;
+    int default_filament_slot{0};
+    ProjectSettings settings;
+    std::vector<ProjectLayerRange> layer_ranges;
+    std::vector<double> layer_height_profile;
+    std::vector<ProjectBrimPoint> brim_points;
+    std::vector<ProjectPart> parts;
+    std::vector<ProjectInstance> instances;
+};
+struct ProjectPlate {
+    std::string id, name;
+    int native_plate_index{0};
+    bool locked{false};
+    ProjectSettings settings;
+    int custom_gcode_mode{0};
+    std::vector<ProjectCustomGCode> custom_gcodes;
+    std::array<double,3> origin_mm{0,0,0};
+    std::array<int,3> native_size_mm{0,0,0};
+    // Original no-model job validity is independent of a drawable preview.
+    // Model projects keep G-code bytes as attachments with this flag false.
+    bool slice_result_valid{false};
+    std::string gcode;
+    ToolpathPreviewPtr preview;
+};
+struct ProjectMachine { MachineModelOption model; MachineVariantOption variant; bool project_local{false}; };
+struct ProjectScene {
+    ProjectContainerKind kind{ProjectContainerKind::Model};
+    ProjectReadMode mode{ProjectReadMode::Geometry};
+    std::string producer, version;
+    std::vector<ProjectObject> objects;
+    std::vector<ProjectPlate> plates;
+    std::vector<FilamentSlotInfo> source_filaments;
+    std::size_t active_plate_index{0};
+    bool preview_only{false};
+};
+class LIBSLICER_API ConfigurationState final {
+public:
+    ConfigurationState();
+    bool valid() const noexcept;
+    const ActiveConfigView& view() const;
+    const ProjectMachine& machine() const;
+    ConfigSnapshot snapshot() const;
+private:
+    class Impl;
+    std::shared_ptr<Impl> impl_;
+    std::uint64_t captured_revision_{0};
+    std::size_t filament_color_cursor_{0};
+    std::weak_ptr<const void> capture_origin_;
+    friend class Library;
+};
+struct ProjectReadRequest {
+    std::string path;
+    ProjectReadMode mode{ProjectReadMode::Geometry};
+    // Transitional source compatibility. Unknown settings never need consent;
+    // the legacy true value supplies Yes only if no typed callback is supplied.
+    bool accept_legacy_infill_rotation_fix{false};
+    bool accept_unknown_settings{false};
+    std::optional<ConfigurationState> configuration;
+    std::optional<ProjectBedContext> bed;
+    std::optional<std::size_t> filament_color_cursor;
+};
+struct ProjectReadResult {
+    bool success{false}, cancelled{false};
+    std::shared_ptr<const ProjectScene> scene;
+    ConfigurationState configuration;
+    std::vector<ProjectDiagnostic> diagnostics;
+    std::vector<std::string> required_decisions;
+    std::vector<std::string> ignored_settings;
+    // Document lifecycle follows the entry, configuration follows load_files.
+    bool replace_document{false}, load_config{false}, configuration_changed{false};
+    std::uint64_t configuration_revision{0};
+    std::size_t filament_color_cursor{0};
+    explicit operator bool() const noexcept { return success; }
+};
+struct ConfigurationInstallResult {
+    bool success{false};
+    std::uint64_t revision{0};
+    ConfigurationState previous;
+    std::vector<ConfigDiagnostic> diagnostics;
+    explicit operator bool() const noexcept { return success; }
+};
+LIBSLICER_API std::string encode_project_object_semantics(const ProjectObject&);
+LIBSLICER_API std::string encode_project_part_semantics(const ProjectPart&);
+LIBSLICER_API std::string encode_project_part_annotations(const ProjectPart&);
+LIBSLICER_API std::string encode_project_plate_semantics(const ProjectPlate&);
+
 class LIBSLICER_API Library final
 {
 public:
@@ -532,6 +696,18 @@ public:
                                           const SliceCallbacks& callbacks = {}) const;
     ProjectImportResult import_project(const ProjectImportRequest& request,
                                        const SliceCallbacks& callbacks = {}) const;
+    ProjectReadResult read_project(const ProjectReadRequest&, const SliceCallbacks& = {}) const;
+    ProjectReadResult read_project(const ProjectReadRequest&, const SliceCallbacks&,
+        const ProjectDecisionCallback&) const;
+    // Explicit mapping returns geometry in target_config's material domain.
+    // It never returns the source read's configuration-install candidate.
+    ProjectReadResult remap_project_materials(const ProjectReadResult&,
+        const std::vector<unsigned>& source_to_target_one_based,
+        const ConfigSnapshot& target_config, const SliceCallbacks& = {}) const;
+    std::optional<ProjectMachine> active_project_machine() const;
+    std::uint64_t configuration_revision() const noexcept;
+    ConfigurationState capture_configuration() const;
+    ConfigurationInstallResult install_configuration(const ConfigurationState&, std::uint64_t expected_revision);
 
 private:
     Library();

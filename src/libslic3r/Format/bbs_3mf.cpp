@@ -1136,7 +1136,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         std::vector<std::string> m_sub_model_paths;
         std::vector<ObjectImporter*> m_object_importers;
 
-        std::map<int, ModelVolume*> m_shared_meshes;
+        // Core resource IDs are local to their model part. Only the legacy
+        // mesh_shared metadata uses an archive-wide integer alias.
+        std::map<Id, ModelVolume*> m_shared_meshes;
+        std::map<int, ModelVolume*> m_legacy_shared_meshes;
 
         //BBS: plater related structures
         bool m_is_bbl_3mf { false };
@@ -4927,6 +4930,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             Transform3d volume_matrix_to_object = Transform3d::Identity();
             bool        has_transform 		    = false;
             int         shared_mesh_id          = object_id.second;
+            bool        explicit_shared_mesh    = false;
             if (volume_data)
             {
                 int found_count = 0;
@@ -4940,6 +4944,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     else if (metadata.key == MESH_SHARED_KEY){
                         //add the shared mesh logic
                         shared_mesh_id = ::atoi(metadata.value.c_str());
+                        explicit_shared_mesh = shared_mesh_id != -1;
                         found_count++;
                         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": line %1%, shared_mesh_id %2%")%__LINE__%shared_mesh_id;
                     }
@@ -4956,16 +4961,16 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             ModelVolume* volume = nullptr;
             ModelVolume *shared_volume = nullptr;
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": line %1%, subobject_id %2%, shared_mesh_id %3%")%__LINE__ %sub_object->id %shared_mesh_id;
-            if (shared_mesh_id != -1) {
-                std::map<int, ModelVolume*>::iterator iter = m_shared_meshes.find(shared_mesh_id);
-                if (iter != m_shared_meshes.end()) {
+            if (explicit_shared_mesh) {
+                auto iter = m_legacy_shared_meshes.find(shared_mesh_id);
+                if (iter != m_legacy_shared_meshes.end()) {
                     shared_volume = iter->second;
                     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": line %1%, found shared mesh, id %2%, mesh %3%")%__LINE__%shared_mesh_id%shared_volume;
                 }
             }
             else {
                 //for some cases, object point to this shared mesh already loaded, treat that one as the root
-                std::map<int, ModelVolume*>::iterator iter = m_shared_meshes.find(sub_object->id);
+                auto iter = m_shared_meshes.find(object_id);
                 if (iter != m_shared_meshes.end()) {
                     shared_volume = iter->second;
                     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": line %1%, already loaded copy-share mesh before, id %2%, mesh %3%")%__LINE__%sub_object->id%shared_volume;
@@ -5022,33 +5027,36 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
                 volume = object.add_volume(std::move(triangle_mesh));
 
-                if (shared_mesh_id != -1)
+                if (explicit_shared_mesh)
                     //for some cases the shared mesh is in other plate and not loaded in cli slicing
                     //we need to use the first one in the same plate instead
-                    m_shared_meshes[shared_mesh_id] = volume;
+                    m_legacy_shared_meshes[shared_mesh_id] = volume;
                 else
-                    m_shared_meshes[sub_object->id] = volume;
+                    m_legacy_shared_meshes.emplace(sub_object->id, volume);
             }
             else {
                 //create volume to use shared mesh
                 volume = object.add_volume_with_shared_mesh(*shared_volume);
                 BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": line %1%, create volume using shared_mesh %2%")%__LINE__%shared_volume;
             }
+            m_shared_meshes.emplace(object_id, volume);
             // stores the volume matrix taken from the metadata, if present
             if (has_transform)
                 volume->source.transform = Slic3r::Geometry::Transformation(volume_matrix_to_object);
 
             volume->calculate_convex_hull();
 
-            //set transform from 3mf
-            Slic3r::Geometry::Transformation comp_transformatino(sub_comp.transform);
-            volume->set_transformation(comp_transformatino * volume->get_transformation());
             if (shared_volume) {
                 const TriangleMesh& trangle_mesh = volume->mesh();
                 Vec3d shift = trangle_mesh.get_init_shift();
                 if (!shift.isApprox(Vec3d::Zero()))
                     volume->translate(shift);
             }
+            // The centered shared mesh has the same local offset as the first
+            // volume. Restore it before applying the component matrix, so a
+            // rotated component translates by R*center rather than center.
+            Slic3r::Geometry::Transformation comp_transformatino(sub_comp.transform);
+            volume->set_transformation(comp_transformatino * volume->get_transformation());
 
             // recreate custom supports, seam and mmu segmentation from previously loaded attribute
             {

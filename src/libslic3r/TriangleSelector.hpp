@@ -282,6 +282,10 @@ public:
         // Update used states based on the bitstream. It just iterated over the bitstream from the bitstream_start_idx till the end.
         void update_used_states(size_t bitstream_start_idx);
 
+        // Validate the serialized forest before any consumer decodes it.
+        // maximum_state applies to stored states, before deletion/remapping.
+        void validate(size_t triangle_count, EnforcerBlockerType maximum_state = EnforcerBlockerType::ExtruderMax) const;
+
     private:
         friend class cereal::access;
         template<class Archive> void serialize(Archive &ar) { ar(triangles_to_split, bitstream, used_states); }
