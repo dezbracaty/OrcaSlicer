@@ -1546,6 +1546,9 @@ TEST_CASE("fiber width reaches both path roles and preview independently of resi
 
 TEST_CASE("ordinary multi-tool printing uses configured clearance without fiber", "[libslicer_api][machine-gcode][slice]")
 {
+    const bool tower = GENERATE(false, true);
+    const auto tower_type = GENERATE(std::string("type1"), std::string("type2"));
+    CAPTURE(tower, tower_type);
     libslicer::LibraryOptions options;
     options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
     options.vendors = {"Flashforge"};
@@ -1561,7 +1564,8 @@ TEST_CASE("ordinary multi-tool printing uses configured clearance without fiber"
     REQUIRE(created.config->apply_patch({
         {"toolchange_z_lift", "7.5"}, {"part_cooling_fan_index", "4"},
         {"filament_colour", "#FFFFFF;#000000;#FF0000;#0000FF"},
-        {"enable_prime_tower", "0"}, {"change_filament_gcode", ""},
+        {"enable_prime_tower", tower ? "1" : "0"}, {"wipe_tower_type", tower_type},
+        {"wipe_tower_x", "40"}, {"wipe_tower_y", "40"}, {"change_filament_gcode", ""},
         {"filament_start_gcode", ";;;"}, {"filament_end_gcode", ";;;"},
         {"outer_wall_filament_id", "1"}, {"inner_wall_filament_id", "1"},
         {"sparse_infill_filament_id", "2"}, {"internal_solid_filament_id", "2"}, {"gcode_comments", "1"}}).success);
@@ -1573,6 +1577,11 @@ TEST_CASE("ordinary multi-tool printing uses configured clearance without fiber"
     for (const auto &d : sliced.diagnostics) diagnostics << d.message << "\n";
     INFO(diagnostics.str());
     REQUIRE(sliced.success);
+    REQUIRE(sliced.preview);
+    CHECK(std::any_of(sliced.preview->segments.begin(), sliced.preview->segments.end(), [](const auto& segment) {
+        return segment.extrusion_role == libslicer::ToolpathExtrusionRole::WipeTower &&
+            segment.motion == libslicer::ToolpathMotionKind::Extrusion;
+    }) == tower);
     std::ifstream input(sliced.output.path);
     std::string line;
     double z = 0, layer_z = 0;
@@ -1581,8 +1590,19 @@ TEST_CASE("ordinary multi-tool printing uses configured clearance without fiber"
     while (std::getline(input, line)) {
         if (line.rfind(";Z:", 0) == 0) layer_z = std::stod(line.substr(3));
         REQUIRE(line.rfind(";FIBER_BEGIN", 0) != 0);
-        if (line.rfind("G1 Z", 0) == 0) {
-            const double next_z = std::stod(line.substr(4));
+        // Type1 may retain Orca's spiral Z-hop (G2/G3) before the physical switch.
+        std::istringstream words(line.substr(0, line.find(';')));
+        std::string command;
+        words >> command;
+        bool has_z = false;
+        double next_z = z;
+        if (command == "G0" || command == "G1" || command == "G2" || command == "G3")
+            for (std::string word; words >> word;)
+                if (word.size() > 1 && word[0] == 'Z') {
+                    has_z = true;
+                    next_z = std::stod(word.substr(1));
+                }
+        if (has_z) {
             if (line.find("toolchange clearance") != std::string::npos) {
                 REQUIRE_FALSE(restore.has_value());
                 restore = std::max(z, layer_z);
@@ -1599,6 +1619,131 @@ TEST_CASE("ordinary multi-tool printing uses configured clearance without fiber"
     CHECK(protected_changes > 1);
     CHECK_FALSE(restore.has_value());
     std::filesystem::remove(sliced.output.path);
+}
+
+TEST_CASE("A500 wipe towers preserve deposition while protecting physical tool changes",
+          "[libslicer_api][machine-gcode][wipe-tower-clearance]")
+{
+    const auto tower_type = GENERATE(std::string("type1"), std::string("type2"));
+    CAPTURE(tower_type);
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    REQUIRE(library->activate_config(selection, {
+        {"toolchange_z_lift", "0"}, {"enable_prime_tower", "1"},
+        {"wipe_tower_type", tower_type}, {"wipe_tower_wall_type", "rectangle"},
+        {"wipe_tower_x", "40"}, {"wipe_tower_y", "40"},
+        {"curr_bed_type", "Engineering Plate"}, {"enable_support", "0"},
+        {"enable_arc_fitting", "0"}, {"gcode_comments", "1"},
+        {"generate_reinforced_perimeters", "1"},
+        {"generate_reinforced_infills", "0"},
+        {"outer_wall_filament_id", "1"}, {"inner_wall_filament_id", "1"},
+        {"sparse_infill_filament_id", "1"}, {"internal_solid_filament_id", "1"}
+    }).success);
+
+    // Rejected edits are atomic, including revision and presentation changes.
+    const auto before = *library->active_config_snapshot();
+    const auto revision = library->active_config()->revision;
+    const auto rejected = library->set_active_config_value("toolchange_z_lift", "-1");
+    CHECK_FALSE(rejected.success);
+    CHECK(rejected.changed_items.empty());
+    CHECK(library->active_config_snapshot()->values() == before.values());
+    CHECK(library->active_config()->revision == revision);
+
+    std::vector<std::string> baseline_deposition;
+    std::vector<int> baseline_changes;
+    for (const int clearance : {0, 10}) {
+        REQUIRE(library->set_active_config_value("toolchange_z_lift", std::to_string(clearance)).success);
+        libslicer::SliceRequest request;
+        request.config = *library->active_config_snapshot();
+        request.objects.push_back(fiber_infill_block());
+        const auto result = library->slice(request);
+        for (const auto& d : result.diagnostics) INFO(d.code << ": " << d.message);
+        REQUIRE(result.success);
+        REQUIRE(result.preview);
+        size_t tower_segments = 0;
+        for (const auto& segment : result.preview->segments)
+            if (segment.extrusion_role == libslicer::ToolpathExtrusionRole::WipeTower &&
+                segment.motion == libslicer::ToolpathMotionKind::Extrusion) {
+                ++tower_segments;
+                CHECK(segment.tool_id == 0);
+            }
+        REQUIRE(tower_segments > 0);
+        std::ifstream input(result.output.path);
+        std::string line, role;
+        int tool = -1;
+        bool body = false;
+        double x = 0, y = 0, z = 0, feed = 0;
+        std::optional<double> restore_z;
+        size_t lifts = 0, protected_changes = 0;
+        std::vector<std::string> deposition;
+        std::vector<int> changes;
+        while (std::getline(input, line)) {
+            if (line == ";LAYER_CHANGE") body = true;
+            if (line.rfind(";TYPE:", 0) == 0) role = line.substr(6);
+            std::istringstream words(line.substr(0, line.find(';')));
+            std::string command;
+            words >> command;
+            if (command == "T0" || command == "T1") {
+                const int next = command[1] - '0';
+                if (body && next != tool) {
+                    changes.push_back(next);
+                    CHECK(restore_z.has_value() == (clearance > 0));
+                    if (restore_z) ++protected_changes;
+                }
+                tool = next;
+            }
+            if (command != "G0" && command != "G1") continue;
+            const double old_x = x, old_y = y, old_z = z;
+            double e = 0;
+            for (std::string word; words >> word;) {
+                if (word.size() < 2) continue;
+                const double value = std::stod(word.substr(1));
+                if (word[0] == 'X') x = value;
+                if (word[0] == 'Y') y = value;
+                if (word[0] == 'Z') z = value;
+                if (word[0] == 'E') e = value;
+                if (word[0] == 'F') feed = value;
+            }
+            if (line.find("; toolchange clearance") != std::string::npos) {
+                REQUIRE_FALSE(restore_z.has_value());
+                restore_z = old_z;
+                CHECK(z - old_z == Catch::Approx(clearance).margin(0.001));
+                ++lifts;
+            } else if (line.find("; restore Z after toolchange") != std::string::npos) {
+                REQUIRE(restore_z.has_value());
+                CHECK(z == Catch::Approx(*restore_z).margin(0.001));
+                restore_z.reset();
+            } else if (restore_z) {
+                // Only the firmware Tx and temperature commands may intervene.
+                FAIL("Motion before temporary tool-change clearance was restored: " << line);
+            }
+            if (e > 0 && (x != old_x || y != old_y))
+                deposition.push_back(std::to_string(tool) + ":" + role + ":" +
+                    std::to_string(x) + ":" + std::to_string(y) + ":" + std::to_string(z) + ":" +
+                    std::to_string(e) + ":" + std::to_string(feed));
+        }
+        CHECK_FALSE(restore_z.has_value());
+        REQUIRE(changes.size() > 1);
+        CHECK(lifts == protected_changes);
+        if (clearance == 0) {
+            baseline_deposition = std::move(deposition);
+            baseline_changes = std::move(changes);
+        } else {
+            CHECK(deposition == baseline_deposition);
+            CHECK(changes == baseline_changes);
+            CHECK(protected_changes == changes.size());
+        }
+        std::filesystem::remove(result.output.path);
+    }
 }
 
 TEST_CASE("machine output settings migrate only missing known preset values", "[libslicer_api][machine-gcode][3mf]")

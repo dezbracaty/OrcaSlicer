@@ -4359,7 +4359,7 @@ void PrintConfigDef::init_fff_params()
     def = this->add("toolchange_z_lift", coFloat);
     def->label = L("Tool change clearance lift");
     def->tooltip = L("Additional Z clearance during a physical tool change. Zero preserves existing behavior. "
-                     "Not supported with prime towers, belt printers, manual tool changes or custom filament-change scripts.");
+                     "Not supported with belt printers, manual tool changes or custom filament-change scripts.");
     def->category = L("Machine G-code");
     def->sidetext = L("mm");
     def->min = 0;
@@ -10900,8 +10900,8 @@ std::map<std::string, std::string> validate_machine_gcode_config(const PrintConf
     if (!std::isfinite(lift) || lift < 0)
         errors.emplace("toolchange_z_lift", "Tool change clearance lift must be finite and non-negative.");
     else if (lift > 0) {
-        if (cfg.enable_prime_tower || cfg.printer_structure == psBelt || cfg.manual_filament_change)
-            errors.emplace("toolchange_z_lift", "Tool change clearance lift does not support prime towers, belt printers or manual tool changes.");
+        if (cfg.printer_structure == psBelt || cfg.manual_filament_change)
+            errors.emplace("toolchange_z_lift", "Tool change clearance lift does not support belt printers or manual tool changes.");
         const auto has_commands = [](const std::string &script) {
             std::istringstream stream(script);
             for (std::string line; std::getline(stream, line);) {

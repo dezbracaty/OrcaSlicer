@@ -1776,9 +1776,12 @@ TEST_CASE("machine output configuration rejects unsupported combinations", "[mac
         CHECK_FALSE(validate_machine_gcode_config(config).empty());
         config.toolchange_z_lift.value = 10;
         config.enable_prime_tower.value = true;
-        CHECK_FALSE(validate_machine_gcode_config(config).empty());
+        CHECK(validate_machine_gcode_config(config).empty());
         config.enable_prime_tower.value = false;
         config.printer_structure.value = psBelt;
+        CHECK_FALSE(validate_machine_gcode_config(config).empty());
+        config.printer_structure.value = psCoreXY;
+        config.manual_filament_change.value = true;
         CHECK_FALSE(validate_machine_gcode_config(config).empty());
     }
 }

@@ -994,6 +994,16 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
             need_travel_after_change_filament_gcode = true;
         }
 
+        // Type1 owns the Tx insertion here (Type2 delegates to set_extruder).
+        // Keep its existing end/change/start template and E-state ownership;
+        // only protect the real physical switch with a temporary Z offset.
+        const bool toolchange_clearance = !tcr.prime_only && new_filament_id >= 0 &&
+            gcodegen.writer().toolchange_requires_z_lift(unsigned(new_filament_id));
+        const double toolchange_restore_z = gcodegen.writer().get_position().z();
+        if (toolchange_clearance)
+            toolchange_gcode_str += gcodegen.writer().travel_to_z_for_toolchange(
+                toolchange_restore_z + gcodegen.config().toolchange_z_lift.value,
+                gcodegen.config().printable_height.value);
         std::string toolchange_command;
         if (tcr.priming || (new_filament_id >= 0 && gcodegen.writer().need_toolchange(new_filament_id)))
             toolchange_command = gcodegen.writer().toolchange(new_filament_id);
@@ -1002,6 +1012,10 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         else {
             // We have informed the m_writer about the current extruder_id, we can ignore the generated G-code.
         }
+
+        if (toolchange_clearance)
+            toolchange_gcode_str += gcodegen.writer().travel_to_z_for_toolchange(
+                toolchange_restore_z, gcodegen.config().printable_height.value);
 
         if (need_travel_after_change_filament_gcode) {
             // move to start_pos for wiping after toolchange
