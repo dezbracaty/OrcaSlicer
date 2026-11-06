@@ -55,6 +55,8 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_test(NAME OrcaPlaterSource COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/check_plater_source.py")
+    add_test(NAME OrcaProjectImportSource COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/check_project_import_source.py")
     add_test(NAME FiberEntryComparisonChecker COMMAND "${Python3_EXECUTABLE}" -m unittest discover
         -s "${CMAKE_CURRENT_SOURCE_DIR}" -p test_compare_legacy_landing.py)
     set_tests_properties(FiberEntryComparisonChecker PROPERTIES LABELS "fiber_entry_comparison" TIMEOUT 20)

@@ -1,0 +1,8 @@
+{
+  "revision": "3c8c667dbd402eb52e24fcc69aea3a1b5c5c72a1",
+  "path": "src/slic3r/GUI/Plater.cpp",
+  "start": "                    if (en_3mf_file_type == En3mfType::From_Prusa) {",
+  "end_exclusive": "                    // ORCA: legacy feature-filament default migration",
+  "sha256_normalized_body": "9b4cd9106d6f4e1822ba17f890e0a01ed97d762429aae494924985234d437bc9",
+  "scope": "Compatibility branch only; model/config/plate postprocessing additionally require native comparisons and review."
+}

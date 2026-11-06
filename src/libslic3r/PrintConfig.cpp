@@ -8576,6 +8576,32 @@ void PrintConfigDef::init_sla_params()
     def->set_default_value(new ConfigOptionEnum<SLAMaterialSpeed>(slamsFast));
 }
 
+bool PrintConfigDef::is_obsolete_key(const std::string& key)
+{
+    static const std::set<std::string> ignore = {
+        // Retired whole-path filters: discretized edges are not bend geometry.
+        "fiber_minimum_segment_length", "fiber_maximum_turn_angle",
+        // Local tangent connections replace parallel preparation offsets.
+        "fiber_contour_rounding_max_reserve",
+        "acceleration", "scale", "rotate", "duplicate", "duplicate_grid",
+        "bed_size",
+        "print_center", "g0", "wipe_tower_per_color_wipe",
+        "support_sharp_tails","support_remove_small_overhangs", "support_with_sheath",
+        "tree_support_collision_resolution", "tree_support_with_infill",
+        "max_volumetric_speed", "max_print_speed",
+        "support_closing_radius",
+        "remove_freq_sweep", "remove_bed_leveling", "remove_extrusion_calibration",
+        "support_transition_line_width", "support_transition_speed", "bed_temperature", "bed_temperature_initial_layer",
+        "can_switch_nozzle_type", "can_add_auxiliary_fan", "extra_flush_volume", "spaghetti_detector", "adaptive_layer_height",
+        "z_hop_type", "z_lift_type", "bed_temperature_difference","long_retraction_when_cut",
+        "retraction_distance_when_cut",
+        "internal_bridge_support_thickness", "top_area_threshold", "reduce_wall_solid_infill","filament_load_time","filament_unload_time",
+        "smooth_coefficient", "overhang_totally_speed", "silent_mode",
+        "overhang_speed_classic", "filament_prime_volume",
+    };
+    return ignore.find(key) != ignore.end();
+}
+
 void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &value)
 {
     //BBS: handle legacy options
@@ -8801,29 +8827,9 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
     }
 
     // Ignore the following obsolete configuration keys:
-    static std::set<std::string> ignore = {
-        // Retired whole-path filters: discretized edges are not bend geometry.
-        "fiber_minimum_segment_length", "fiber_maximum_turn_angle",
-        // Local tangent connections replace parallel preparation offsets.
-        "fiber_contour_rounding_max_reserve",
-        "acceleration", "scale", "rotate", "duplicate", "duplicate_grid",
-        "bed_size",
-        "print_center", "g0", "wipe_tower_per_color_wipe", 
-        "support_sharp_tails","support_remove_small_overhangs", "support_with_sheath",
-        "tree_support_collision_resolution", "tree_support_with_infill",
-        "max_volumetric_speed", "max_print_speed",
-        "support_closing_radius",
-        "remove_freq_sweep", "remove_bed_leveling", "remove_extrusion_calibration",
-        "support_transition_line_width", "support_transition_speed", "bed_temperature", "bed_temperature_initial_layer",
-        "can_switch_nozzle_type", "can_add_auxiliary_fan", "extra_flush_volume", "spaghetti_detector", "adaptive_layer_height",
-        "z_hop_type", "z_lift_type", "bed_temperature_difference","long_retraction_when_cut",
-        "retraction_distance_when_cut",
-        "internal_bridge_support_thickness", "top_area_threshold", "reduce_wall_solid_infill","filament_load_time","filament_unload_time",
-        "smooth_coefficient", "overhang_totally_speed", "silent_mode",
-        "overhang_speed_classic", "filament_prime_volume",
-    };
 
-    if (ignore.find(opt_key) != ignore.end()) {
+
+    if (is_obsolete_key(opt_key)) {
         opt_key = "";
         return;
     }

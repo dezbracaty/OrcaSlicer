@@ -574,6 +574,7 @@ class PrintConfigDef : public ConfigDef
 public:
     PrintConfigDef();
 
+    static bool is_obsolete_key(const std::string& key);
     static void handle_legacy(t_config_option_key &opt_key, std::string &value);
     static void handle_legacy_composite(DynamicPrintConfig &config);
 

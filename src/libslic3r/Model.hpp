@@ -888,7 +888,9 @@ public:
 
     // BBS: quick access for volume extruders, 1 based
     mutable std::vector<int> mmuseg_extruders;
-    mutable Timestamp        mmuseg_ts;
+    // Zero is an invalid cache timestamp; annotation timestamps start at one.
+    // Fresh and explicitly cloned volumes must scan painting before reuse.
+    mutable Timestamp        mmuseg_ts { 0 };
 
     // Is set only when volume is Embossed Text type
     // Contain information how to re-create volume

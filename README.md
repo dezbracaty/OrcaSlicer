@@ -205,6 +205,77 @@ resource root explicitly, as in the example. `find_package` also exposes
 - Each `SliceObjectInput` supplies either a model path or in-memory volumes.
   Transforms are row-major affine matrices in millimetres. Preserve volume
   roles and facet labels when transferring imported project geometry.
+- `read_project` prepares a read-only scene and configuration candidate. Its
+  Geometry entry uses the original Orca `LoadModel` strategy; Project uses
+  `LoadModel | LoadConfig | CheckVersion | LoadAuxiliary`. Producer/version
+  fallback and original model postprocessing are kept in the library. Unknown
+  settings, recognized extensions, and editable invalid parameter values are
+  not additional whole-file acceptance gates. Invalid values remain diagnosed;
+  `slice` validates them before native layer generation.
+- The producer/version tree is pinned to GUI commit
+  `3c8c667dbd402eb52e24fcc69aea3a1b5c5c72a1`. The original fragment and
+  `check_project_import_source.py` check only explicit GUI substitutions in
+  that tree. Native model comparisons and review additionally cover the other
+  stages; this is not a claim of a complete original-GUI runtime A/B.
+- `ProjectReadResult::replace_document` follows the entry independently of
+  `load_config`: opening a project may fall back to geometry and still replace
+  the previous document. Geometry import may produce `configuration_changed`
+  through the original logical filament-slot expansion, without remapping the
+  source material IDs. `remap_project_materials` remains an explicit, separate
+  capability for existing callers; it is not a required import stage. A mapped
+  result uses the target snapshot's material domain and no longer carries the
+  source expansion's install candidate or advances its color cursor. Target
+  material descriptions have no fabricated compatible-preset catalog.
+- The explicit three-argument `read_project(request, callbacks, decisions)`
+  overload accepts the original Yes/No decisions. No preserves and continues;
+  Cancel discards the candidate. Missing answers return `required_decisions`
+  with no scene/configuration. The callback runs synchronously on the read
+  thread and must not reenter its Library or owning Backend executor. The caller
+  must wake any GUI wait on cancellation. Exceptions become read diagnostics.
+  The old unknown-settings bool is ignored; the old legacy-fix true supplies
+  Yes only when no typed callback was provided. New integrations use the typed
+  callback. Neither the callback nor configuration installation publishes UI.
+- An optional captured `ConfigurationState` must belong to the same Library,
+  current immutable state and revision. Supply current bed bounds, native int
+  plate dimensions, native shape position and per-instance world convex hulls
+  in `ProjectBedContext`
+  for nonempty scenes. This is the pre-operation snapshot: Project reset
+  rebuilds changed bed geometry from the reset printer and preserves cached
+  dimensions when native bed inputs did not change. Omitted bed occupancy
+  means an empty SDK scene. The
+  fixed 16-color cursor is captured separately from material count and advances
+  only on installation; failed/cancelled reads do not advance it. This and
+  deferred document replacement are deliberate read-only preparation adaptations.
+- Install a changed candidate with
+  `install_configuration(state, result.configuration_revision)` at the
+  application's document commit. Retain `previous` for rollback: restoring it
+  restores configuration and color cursor while incrementing the revision.
+  Candidate preparation never changes the Library's active configuration or
+  the application's document, settings, selection or history.
+- Scenes preserve indexed meshes, five roles, overrides, layer profiles,
+  four facet annotations, brim points, instances and per-plate custom G-code.
+  Matrices are row-major in millimetres: plate origin plus instance transform
+  times volume-local transform reconstructs native world coordinates. Native
+  integer plate dimensions and legacy migration frames are explicit. Codecs
+  serialize only additional print semantics; topology and material ownership
+  remain separate. Legacy `import_project` keeps its previous contract.
+- Native `printable_height=0` remains a valid unbounded-height setting; it is
+  preserved by project reads and configuration editing, with original native
+  plate-assignment behavior.
+- Only the original no-model job branch activates `slice_result_valid`,
+  independently of a drawable preview. A model project's embedded G-code is
+  retained as attachment bytes with no activated slice result or preview.
+  Embedded job bytes are owned by `ProjectPlate::gcode`; optional preview data
+  survives native temporary-file cleanup and has no temporary `source_path`.
+  Export embedded G-code from the owned bytes. `preview_only` and
+  `active_plate_index` describe the original no-model/first-valid-job outcome;
+  an empty scene alone is not proof that an editable model was loaded.
+- Corrupt legacy alpha files missing required rotation/pattern fields return a
+  read error instead of dereferencing the original GUI's unchecked null option.
+  This is an explicit invalid-input hardening difference, not a geometry fallback.
+- The added slice-input fields change the public C++ ABI. Rebuild and deploy
+  a matching SDK and application together; old SDK binaries cannot consume
+  these new headers.
 - An explicit output path is `CallerOwned` and is never removed by the library.
   An omitted path produces a `LibraryTemporary` artifact: the consumer must
   retain it while needed and remove it when no preview needs it. The ownership
