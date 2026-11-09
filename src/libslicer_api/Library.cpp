@@ -4,6 +4,7 @@
 #include "OrcaCalibrationInternal.hpp"
 
 #include <libslic3r/PresetBundle.hpp>
+#include <libslic3r/ParameterUtils.hpp>
 #include <libslic3r/Model.hpp>
 #include <libslic3r/BuildVolume.hpp>
 #include <libslic3r/ClipperUtils.hpp>
@@ -2420,14 +2421,72 @@ PlaneCutResult cut_mesh_with_plane(const PlaneCutRequest& request)
     return result;
 }
 
+namespace {
+struct ProcessPresetBaselines {
+    Slic3r::Preset selected;
+    std::optional<Slic3r::Preset> parent;
+};
+
+std::shared_ptr<const ProcessPresetBaselines> capture_process_baselines(
+    const Slic3r::PresetCollection& prints)
+{
+    const auto snapshot = [](const Slic3r::Preset& preset) {
+        Slic3r::Preset copy(Slic3r::Preset::TYPE_PRINT, preset.name);
+        copy.config = preset.config;
+        return copy;
+    };
+    auto baselines = std::make_shared<ProcessPresetBaselines>(
+        ProcessPresetBaselines{snapshot(prints.get_selected_preset()), std::nullopt});
+    if (const auto* parent = prints.get_selected_preset_parent())
+        baselines->parent = snapshot(*parent);
+    return baselines;
+}
+
+ProcessPresetComparison compare_process_preset(const Slic3r::DynamicPrintConfig& config,
+    const ProcessPresetBaselines& baselines)
+{
+    const auto& process_keys = Slic3r::Preset::print_options();
+    Slic3r::Preset edited(Slic3r::Preset::TYPE_PRINT, baselines.selected.name);
+    for (const auto& key : process_keys)
+        if (const auto* value = config.option(key))
+            edited.config.set_key_value(key, value->clone());
+    const auto dirty = Slic3r::PresetCollection::dirty_options(&edited, &baselines.selected, true);
+    ProcessPresetComparison result;
+    result.has_comparison_parent = baselines.parent.has_value();
+    std::set<std::string> parent_differences;
+    if (baselines.parent) {
+        const auto differences = Slic3r::PresetCollection::dirty_options(&edited, &*baselines.parent, true);
+        parent_differences.insert(differences.begin(), differences.end());
+    }
+    std::set<std::string> highlighted;
+    for (const auto& key : dirty) {
+        if (baselines.parent && !parent_differences.count(key))
+            continue;
+        const auto field = key.substr(0, key.find('#'));
+        if (std::find(process_keys.begin(), process_keys.end(), field) != process_keys.end())
+            highlighted.insert(field);
+    }
+    result.highlighted_keys.assign(highlighted.begin(), highlighted.end());
+    return result;
+}
+}
+
 class ConfigurationState::Impl {
 public:
+    struct ImportedProcess {
+        std::vector<std::string> difference_keys;
+        std::string embedded_preset_id;
+        bool selected{true};
+    };
+
     std::unique_ptr<Config> config;
     ResolvedSelection selection;
     std::vector<PresetOption> compatible_processes, compatible_filaments;
     std::shared_ptr<Slic3r::PresetBundle> bundle;
     ProjectMachine machine;
     ActiveConfigView prepared_view;
+    std::optional<ImportedProcess> imported_process;
+    std::shared_ptr<const ProcessPresetBaselines> process_baselines;
     std::string resource_directory;
     Impl() = default;
     Impl(const Impl& other) :
@@ -2435,7 +2494,9 @@ public:
         selection(other.selection), compatible_processes(other.compatible_processes),
         compatible_filaments(other.compatible_filaments),
         bundle(other.bundle ? std::make_shared<Slic3r::PresetBundle>(*other.bundle) : nullptr),
-        machine(other.machine), prepared_view(other.prepared_view), resource_directory(other.resource_directory) {}
+        machine(other.machine), prepared_view(other.prepared_view),
+        imported_process(other.imported_process), process_baselines(other.process_baselines),
+        resource_directory(other.resource_directory) {}
 };
 ConfigurationState::ConfigurationState() = default;
 bool ConfigurationState::valid() const noexcept { return impl_ && bool(impl_->config); }
@@ -2462,6 +2523,8 @@ public:
     std::shared_ptr<const void> capture_origin=std::make_shared<const char>(0);
     void apply_installed_machine_capabilities(ProjectMachine& machine, const ResolvedSelection& selection) const;
     void prepare(const std::shared_ptr<ConfigurationState::Impl>& state);
+    ConfigCreateResult resolve_config(const ConfigSelection& selection,
+        std::shared_ptr<const ProcessPresetBaselines>* baselines = nullptr) const;
 };
 
 
@@ -2731,6 +2794,22 @@ void mark_full_config_authoritative(Slic3r::DynamicPrintConfig& config) {
     dirty.back()=Slic3r::escape_strings_cstyle(Slic3r::Preset::printer_options());
     config.set_key_value("different_settings_to_system",new Slic3r::ConfigOptionStrings(std::move(dirty)));
 }
+
+std::vector<std::string> imported_process_difference_keys(const Slic3r::DynamicPrintConfig& config)
+{
+    const auto* differences = config.opt<Slic3r::ConfigOptionStrings>("different_settings_to_system");
+    std::vector<std::string> keys;
+    if (!differences || differences->values.empty() ||
+        !Slic3r::unescape_strings_cstyle(differences->values.front(), keys))
+        return {};
+    const auto& process_keys = Slic3r::Preset::print_options();
+    keys.erase(std::remove_if(keys.begin(), keys.end(), [&](const auto& key) {
+        return !config.has(key) || std::find(process_keys.begin(), process_keys.end(), key) == process_keys.end();
+    }), keys.end());
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+}
 }
 std::string encode_project_object_semantics(const ProjectObject& object) {
     auto ranges=ProjectJson::array(), brim=ProjectJson::array();
@@ -2738,13 +2817,153 @@ std::string encode_project_object_semantics(const ProjectObject& object) {
     for(const auto& b:object.brim_points)brim.push_back({{"x",b.x},{"y",b.y},{"z",b.z},{"head_front_radius",b.head_front_radius}});
     return ProjectJson{{"version",1},{"scope","object"},{"settings",settings_json(object.settings)},{"layer_ranges",ranges},{"layer_height_profile",object.layer_height_profile},{"brim_points",brim}}.dump();
 }
+
+Config Config::for_project_object(const ConfigSnapshot& base, std::string_view plate_semantics,
+                                  std::string_view object_semantics)
+{
+    if (!base.valid())
+        throw std::invalid_argument("Object setting baseline is unavailable");
+    auto baseline = dynamic_config(base);
+    baseline.apply(effective_plate_settings(semantic_json(plate_semantics, "plate")));
+    auto config = for_overrides(Config(serialized_values(baseline)).snapshot(), ConfigScope::ModelObject);
+    const auto source = semantic_settings(semantic_json(object_semantics, "object"));
+    config.load_native_settings(serialized_values(source));
+    return config;
+}
+
+SettingsResult edit_project_object_setting(const ConfigSnapshot& base,
+    std::string_view plate_semantics, std::string& object_semantics,
+    std::string_view key, std::optional<std::string_view> value)
+{
+    try {
+        auto config = Config::for_project_object(base, plate_semantics, object_semantics);
+        auto result = value ? config.set(key, *value) : config.reset(key);
+        if (!result)
+            return result;
+
+        // Orca ConfigManipulation::update_print_fff_config restores the
+        // default style if the chosen support type cannot use it.
+        bool corrected_style = false;
+        if (key == "support_style" || key == "support_type" || key == "enable_support") {
+            const auto items = config.settings();
+            const auto style = std::find_if(items.begin(), items.end(),
+                [](const SettingItem& item) { return item.key == "support_style"; });
+            if (style != items.end() && style->enabled &&
+                std::none_of(style->enum_items.begin(), style->enum_items.end(),
+                    [&](const EnumItem& option) { return option.value == style->value; })) {
+                auto corrected = config.set("support_style",
+                    Slic3r::ConfigOptionEnum<Slic3r::SupportMaterialStyle>(Slic3r::smsDefault).serialize());
+                if (!corrected)
+                    return corrected;
+                corrected_style = true;
+                for (auto& item : corrected.changed_items) {
+                    const auto previous = std::find_if(result.changed_items.begin(), result.changed_items.end(),
+                        [&](const SettingItem& entry) { return entry.key == item.key; });
+                    if (previous == result.changed_items.end())
+                        result.changed_items.push_back(std::move(item));
+                    else
+                        *previous = std::move(item);
+                }
+                if (!value && key == "support_style")
+                    result.diagnostics.push_back({"support_style",
+                        "The inherited support style is incompatible with the model's support type. The default style is used."});
+            }
+        }
+
+        static const auto empty = ProjectJson::parse(encode_project_object_semantics({}));
+        auto document = semantic_json(object_semantics, "object");
+        if (document.empty())
+            document = empty;
+        auto& settings = document["settings"];
+        const auto previous = settings;
+        const auto snapshot = config.snapshot();
+        if (value)
+            settings[std::string(key)] = snapshot.value(key).value();
+        else if (settings.is_object())
+            settings.erase(std::string(key));
+        if (corrected_style)
+            settings["support_style"] = snapshot.value("support_style").value();
+        if (settings != previous)
+            object_semantics = document == empty ? std::string{} : document.dump();
+        return result;
+    } catch (const std::exception& error) {
+        SettingsResult result;
+        result.diagnostics.push_back({std::string(key), error.what()});
+        return result;
+    }
+}
+
 std::string encode_project_part_semantics(const ProjectPart& part) {return ProjectJson{{"version",1},{"scope","part"},{"settings",settings_json(part.settings)}}.dump();}
+
+Config Config::for_project_part(const ConfigSnapshot& base, std::string_view plate_semantics,
+    std::string_view object_semantics, std::string_view part_semantics)
+{
+    if (!base.valid())
+        throw std::invalid_argument("Part setting baseline is unavailable");
+    auto baseline = dynamic_config(base);
+    baseline.apply(effective_plate_settings(semantic_json(plate_semantics, "plate")));
+    baseline.apply(semantic_settings(semantic_json(object_semantics, "object")));
+    auto config = for_overrides(Config(serialized_values(baseline)).snapshot(), ConfigScope::ModelPart);
+    config.load_native_settings(serialized_values(semantic_settings(semantic_json(part_semantics, "part"))));
+    return config;
+}
+
+SettingsResult edit_project_part_setting(const ConfigSnapshot& base, std::string_view plate_semantics,
+    std::string_view object_semantics, std::string& part_semantics, std::string_view key,
+    std::optional<std::string_view> value)
+{
+    try {
+        auto config = Config::for_project_part(base, plate_semantics, object_semantics, part_semantics);
+        auto result = value ? config.set(key, *value) : config.reset(key);
+        if (!result)
+            return result;
+        auto document = semantic_json(part_semantics, "part");
+        if (document.empty())
+            document = ProjectJson::parse(encode_project_part_semantics({}));
+        auto& settings = document["settings"];
+        if (value) {
+            const auto normalized = config.snapshot().value(key).value();
+            const auto existing = settings.find(std::string(key));
+            if (existing != settings.end() && *existing == normalized)
+                return result;
+            settings[std::string(key)] = normalized;
+        } else if (!settings.is_object() || !settings.erase(std::string(key))) {
+            return result;
+        }
+        part_semantics = document.dump();
+        return result;
+    } catch (const std::exception& error) {
+        SettingsResult result;
+        result.diagnostics.push_back({std::string(key), error.what()});
+        return result;
+    }
+}
+
 std::string encode_project_part_annotations(const ProjectPart& part) {
     return ProjectJson{{"version",1},{"scope","part_annotations"},{"support_facets",facets_json(part.support_facets)},{"seam_facets",facets_json(part.seam_facets)},{"fuzzy_skin_facets",facets_json(part.fuzzy_skin_facets)}}.dump();
 }
 std::string encode_project_plate_semantics(const ProjectPlate& plate) {
     auto code=ProjectJson::array();for(const auto& c:plate.custom_gcodes)code.push_back({{"print_z",c.print_z},{"type",c.type},{"filament_slot",c.filament_slot},{"color",c.color},{"extra",c.extra}});
     return ProjectJson{{"version",1},{"scope","plate"},{"native_plate_index",plate.native_plate_index},{"settings",settings_json(plate.settings,false)},{"custom_gcode_mode",plate.custom_gcode_mode},{"custom_gcodes",code}}.dump();
+}
+
+std::string clear_expired_support_filaments(
+    std::string_view payload, std::string_view scope, std::size_t count)
+{
+    if (scope != "object" && scope != "part")
+        throw std::invalid_argument("Support filament cleanup requires object or part semantics");
+    auto document = semantic_json(payload, std::string(scope).c_str());
+    if (document.empty()) return std::string(payload);
+    const auto settings = semantic_settings(document);
+    bool changed = false;
+    for (const char* key : {"support_filament", "support_interface_filament"}) {
+        const auto* slot = settings.option<Slic3r::ConfigOptionInt>(key);
+        if (slot && slot->value > 0 && std::size_t(slot->value) > count) {
+            document["settings"].erase(key);
+            changed = true;
+        }
+    }
+    return changed ? document.dump() : std::string(payload);
 }
 
 std::string synchronize_project_plate_materials(std::string_view payload,
@@ -2803,10 +3022,47 @@ std::string synchronize_project_plate_materials(std::string_view payload,
         settings.erase("filament_map");
         settings.erase("filament_map_mode");
     }
-    // Only mapping keys are rewritten; retain every other JSON field verbatim.
+    // Only write affected fields so unrelated authored settings stay verbatim.
     for (const char* key : {"filament_map", "filament_map_mode"}) {
         j["settings"].erase(key);
         if (const auto* value = settings.option(key)) j["settings"][key] = value->serialize();
+    }
+    // Port of PartPlate::update_first_layer_print_sequence. Keep every
+    // surviving slot in its original print order.
+    const auto resize_order = [count](std::vector<int>& order) {
+        if (order.size() > count) {
+            order.erase(std::remove_if(order.begin(), order.end(), [count](int slot) {
+                return slot > 0 && std::size_t(slot) > count;
+            }), order.end());
+        }
+        while (order.size() < count) order.push_back(int(order.size() + 1));
+    };
+    if (const auto* first = settings.option<Slic3r::ConfigOptionInts>("first_layer_print_sequence");
+        first && !first->values.empty() && first->values.front() != 0 && first->size() != count) {
+        auto order = first->values;
+        resize_order(order);
+        j["settings"]["first_layer_print_sequence"] = Slic3r::ConfigOptionInts(std::move(order)).serialize();
+    }
+    if (const auto* other = settings.option<Slic3r::ConfigOptionInts>("other_layers_print_sequence")) {
+        const auto* segments = settings.option<Slic3r::ConfigOptionInt>("other_layers_print_sequence_nums");
+        if (segments && segments->value > 0 &&
+            other->size() % std::size_t(segments->value) == 0 &&
+            other->size() / std::size_t(segments->value) >= 3) {
+            auto sequences = Slic3r::get_other_layers_print_sequence(segments->value, other->values);
+            bool changed = false;
+            for (auto& [layer_range, order] : sequences) {
+                if (order.size() == count) continue;
+                resize_order(order);
+                changed = true;
+            }
+            if (changed) {
+                int segment_count = 0;
+                std::vector<int> values;
+                Slic3r::get_other_layers_print_sequence(sequences, segment_count, values);
+                j["settings"]["other_layers_print_sequence"] = Slic3r::ConfigOptionInts(std::move(values)).serialize();
+                j["settings"]["other_layers_print_sequence_nums"] = std::to_string(segment_count);
+            }
+        }
     }
     return j.dump();
 }
@@ -2841,6 +3097,10 @@ void Library::Impl::prepare(const std::shared_ptr<ConfigurationState::Impl>& sta
         state->bundle->load_config_model("GPlatform active project.3mf",full);
         state->selection.printer_preset_id=state->bundle->printers.get_selected_preset_name();
         state->selection.process_preset_id=state->bundle->prints.get_selected_preset_name();
+        if (state->imported_process && state->imported_process->selected) {
+            const auto& preset = state->bundle->prints.get_selected_preset();
+            state->imported_process->embedded_preset_id = preset.is_project_embedded ? preset.name : std::string{};
+        }
         state->selection.filament_preset_ids=state->bundle->filament_presets;
         state->compatible_processes=compatible_presets(state->bundle->prints,state->selection.process_preset_id);
         state->compatible_filaments=compatible_presets(state->bundle->filaments,state->selection.filament_preset_ids.empty()?"":state->selection.filament_preset_ids.front());
@@ -3013,12 +3273,18 @@ const std::vector<BuildPlateOption>& Library::build_plate_options() const noexce
 
 ConfigCreateResult Library::create_config(const ConfigSelection& selection) const
 {
+    return impl_->resolve_config(selection);
+}
+
+ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selection,
+    std::shared_ptr<const ProcessPresetBaselines>* baselines) const
+{
     ConfigCreateResult result;
     try {
-        const bool editing_project = impl_->active->bundle &&
-            selection.machine_model_id == impl_->active->selection.machine_model_id && selection.machine_variant_id == impl_->active->selection.machine_variant_id;
-        const Slic3r::PresetBundle* source_presets = editing_project ? impl_->active->bundle.get() : nullptr;
-        for (const auto& presets : impl_->vendor_presets) {
+        const bool editing_project = active->bundle &&
+            selection.machine_model_id == active->selection.machine_model_id && selection.machine_variant_id == active->selection.machine_variant_id;
+        const Slic3r::PresetBundle* source_presets = editing_project ? active->bundle.get() : nullptr;
+        for (const auto& presets : vendor_presets) {
             if (editing_project) break;
             if (presets->printers.find_system_preset_by_model_and_variant(
                     selection.machine_model_id, selection.machine_variant_id) != nullptr) {
@@ -3034,19 +3300,19 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
         const Slic3r::Preset* printer = selected.printers.find_system_preset_by_model_and_variant(
             selection.machine_model_id, selection.machine_variant_id);
 
-        std::string printer_name = printer ? printer->name : (editing_project ? impl_->active->selection.printer_preset_id : std::string{});
+        std::string printer_name = printer ? printer->name : (editing_project ? active->selection.printer_preset_id : std::string{});
         if (printer_name.empty()) throw std::invalid_argument("Machine has no printer preset");
         const bool same_active_machine =
-            selection.machine_model_id == impl_->active->selection.machine_model_id &&
-            selection.machine_variant_id == impl_->active->selection.machine_variant_id &&
-            !impl_->active->selection.printer_preset_id.empty() &&
+            selection.machine_model_id == active->selection.machine_model_id &&
+            selection.machine_variant_id == active->selection.machine_variant_id &&
+            !active->selection.printer_preset_id.empty() &&
             selected.printers.find_preset(
-                impl_->active->selection.printer_preset_id, false) != nullptr;
+                active->selection.printer_preset_id, false) != nullptr;
         if (same_active_machine) {
             // A project import may leave the selected preset edited with
             // custom values. Keep it while changing process or filament
             // choices for the same physical machine.
-            printer_name = impl_->active->selection.printer_preset_id;
+            printer_name = active->selection.printer_preset_id;
         }
         const bool keep_edited_printer = same_active_machine &&
             selected.printers.get_selected_preset_name() == printer_name;
@@ -3080,7 +3346,7 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
             throw std::runtime_error("Selected machine has no compatible process preset");
         }
         const bool keep_edited_process = keep_edited_printer &&
-            process_name == impl_->active->selection.process_preset_id &&
+            process_name == active->selection.process_preset_id &&
             selected.prints.get_selected_preset_name() == process_name;
         if (!keep_edited_process) {
             selected.prints.select_preset_by_name(process_name, true);
@@ -3138,7 +3404,7 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
                 throw std::runtime_error("Selected machine has no compatible filament preset");
         }
         const bool keep_edited_filament = keep_edited_process &&
-            filament_names == impl_->active->selection.filament_preset_ids &&
+            filament_names == active->selection.filament_preset_ids &&
             selected.filaments.get_selected_preset_name() == filament_names.front();
         if (!keep_edited_filament) {
             selected.filaments.select_preset_by_name(filament_names.front(), true);
@@ -3160,9 +3426,9 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
         auto full_config = selected.full_config();
         auto physical_tools = selection.filament_physical_tools;
         const auto tools = tool_config(full_config);
-        if (physical_tools.empty() && same_active_machine && impl_->active->config &&
-            result.selection.filament_preset_ids.size() == impl_->active->selection.filament_preset_ids.size()) {
-            const auto previous = dynamic_config(impl_->active->config->snapshot());
+        if (physical_tools.empty() && same_active_machine && active->config &&
+            result.selection.filament_preset_ids.size() == active->selection.filament_preset_ids.size()) {
+            const auto previous = dynamic_config(active->config->snapshot());
             const auto previous_tools = filament_tool_map(&previous, result.selection.filament_preset_ids.size());
             physical_tools.assign(previous_tools.begin(), previous_tools.end());
         }
@@ -3194,7 +3460,25 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
             Slic3r::validate_material_tool_bindings(tool_config(full_config));
         const auto resolved_tools = filament_tool_map(&full_config, result.selection.filament_preset_ids.size());
         result.selection.filament_physical_tools.assign(resolved_tools.begin(), resolved_tools.end());
+        if (!same_active_machine && tools.filament_slots_bound_to_physical_tools.value) {
+            // A fixed-slot printer can seed a new project palette from its tool colors.
+            const auto* tool_colors = active_printer.config.option<Slic3r::ConfigOptionStrings>("extruder_colour");
+            if (tool_colors && tool_colors->values.size() == tools.nozzle_diameter.size() &&
+                std::none_of(tool_colors->values.begin(), tool_colors->values.end(),
+                             [](const std::string& color) { return color.empty(); })) {
+                auto& colors = full_config.option<Slic3r::ConfigOptionStrings>("filament_colour")->values;
+                const auto& mapping = full_config.option<Slic3r::ConfigOptionInts>("filament_map")->values;
+                colors.clear();
+                for (int logical_tool : mapping)
+                    colors.push_back(tool_colors->values.at(logical_tool - 1));
+            }
+        }
         result.config = std::unique_ptr<Config>(new Config(serialized_values(full_config)));
+        if (baselines && (!active->process_baselines ||
+            result.selection.machine_model_id != active->selection.machine_model_id ||
+            result.selection.machine_variant_id != active->selection.machine_variant_id ||
+            result.selection.process_preset_id != active->selection.process_preset_id))
+            *baselines = capture_process_baselines(selected.prints);
         result.success = true;
     } catch (const std::exception& error) {
         result.diagnostics.push_back({"selection", error.what()});
@@ -3207,10 +3491,13 @@ ConfigActivationResult Library::activate_config(
     const std::vector<std::pair<std::string, std::string>>& patch)
 {
     ConfigActivationResult result;
-    const std::vector<std::string> previous_colors = impl_->active->config
+    const bool same_printer = selection.machine_model_id == impl_->active->selection.machine_model_id &&
+        selection.machine_variant_id == impl_->active->selection.machine_variant_id;
+    const std::vector<std::string> previous_colors = same_printer && impl_->active->config
         ? config_vector_values(*impl_->active->config, "filament_colour")
         : std::vector<std::string>{};
-    auto created = create_config(selection);
+    std::shared_ptr<const ProcessPresetBaselines> process_baselines;
+    auto created = impl_->resolve_config(selection, &process_baselines);
     if (!created) {
         result.diagnostics = std::move(created.diagnostics);
         return result;
@@ -3251,7 +3538,30 @@ ConfigActivationResult Library::activate_config(
                 return result;
             }
         }
-        const SettingsResult patched = created.config->apply_patch(patch);
+        // Orca keeps these values in the printer's remembered project state.
+        // They have no public setting rows, so restore them through the native
+        // option types instead of the editable-setting catalog.
+        std::vector<std::pair<std::string, std::string>> editable_patch;
+        auto project = dynamic_config(created.config->snapshot());
+        bool restored_project = false;
+        for (const auto& [key, value] : patch) {
+            if (key != "filament_multi_colour" && key != "filament_colour_type" &&
+                key != "flush_volumes_matrix" && key != "flush_volumes_vector" &&
+                key != "flush_multiplier") {
+                editable_patch.emplace_back(key, value);
+                continue;
+            }
+            try {
+                project.set_deserialize_strict(key, value);
+                restored_project = true;
+            } catch (const std::exception& error) {
+                result.diagnostics.push_back({key, error.what()});
+                return result;
+            }
+        }
+        if (restored_project)
+            created.config = std::unique_ptr<Config>(new Config(serialized_values(project)));
+        const SettingsResult patched = created.config->apply_patch(editable_patch);
         if (!patched) {
             result.diagnostics = patched.diagnostics;
             return result;
@@ -3275,14 +3585,23 @@ ConfigActivationResult Library::activate_config(
     }
 
     auto next_state = std::make_shared<ConfigurationState::Impl>(*impl_->active);
+    if (process_baselines)
+        next_state->process_baselines = std::move(process_baselines);
     next_state->config = std::move(created.config);
     next_state->selection = std::move(created.selection);
     next_state->compatible_processes = std::move(created.compatible_processes);
     next_state->compatible_filaments = std::move(created.compatible_filaments);
     const bool same_context = next_state->bundle && next_state->selection.machine_model_id == impl_->active->selection.machine_model_id && next_state->selection.machine_variant_id == impl_->active->selection.machine_variant_id;
     if (!same_context) {
+        next_state->imported_process.reset();
         next_state->bundle.reset();next_state->machine.project_local=false;
         for(const auto& seed:impl_->vendor_presets)if(seed->printers.find_system_preset_by_model_and_variant(next_state->selection.machine_model_id,next_state->selection.machine_variant_id)){next_state->bundle=std::make_shared<Slic3r::PresetBundle>(*seed);break;}
+    }
+    else if (auto& imported = next_state->imported_process;
+             imported && next_state->selection.process_preset_id != impl_->active->selection.process_preset_id) {
+        const auto* preset = next_state->bundle->prints.find_preset(next_state->selection.process_preset_id, false);
+        imported->selected = preset && preset->is_project_embedded &&
+            preset->name == imported->embedded_preset_id;
     }
     try {
         impl_->prepare(next_state);
@@ -3308,9 +3627,13 @@ std::optional<ActiveConfigView> Library::active_config() const
     view.compatible_processes = impl_->active->compatible_processes;
     view.compatible_filaments = impl_->active->compatible_filaments;
     view.settings = impl_->active->config->settings();
+    if (const auto& imported = impl_->active->imported_process; imported && imported->selected)
+        view.imported_process_difference_keys = imported->difference_keys;
     view.selection.filament_physical_tools.clear();
 
     const Slic3r::DynamicPrintConfig config = dynamic_config(impl_->active->config->snapshot());
+    if (impl_->active->process_baselines)
+        view.process_preset_comparison = compare_process_preset(config, *impl_->active->process_baselines);
     view.filament_slots=project_filament_slots(config,view.selection.filament_preset_ids.size());
     for (std::size_t index = 0; index < view.filament_slots.size(); ++index) {
         auto& slot=view.filament_slots[index];
@@ -4580,7 +4903,10 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
         // document replacement itself is performed by the caller at commit.
         const auto entry_config=bundle.full_config();
         const auto entry_bed_model=project_bed_model(bundle,entry_config);
-        if (result.replace_document) bundle.reset_project_embedded_presets();
+        if (result.replace_document) {
+            bundle.reset_project_embedded_presets();
+            state->imported_process.reset();
+        }
         auto current=bundle.full_config();
         const auto sync_nozzle_count=[&] {
             const auto& printer=bundle.printers.get_edited_preset();
@@ -4836,7 +5162,13 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
             std::optional<ConfigOptionFloats> tower_x,tower_y;
             if (const auto* value=config.opt<ConfigOptionFloats>("wipe_tower_x")) tower_x=*value;
             if (const auto* value=config.opt<ConfigOptionFloats>("wipe_tower_y")) tower_y=*value;
+            auto imported_keys = imported_process_difference_keys(config);
             bundle.load_config_model(fs::u8path(request.path).filename().string(),std::move(config),version);
+            if (result.replace_document && !imported_keys.empty()) {
+                const auto& preset = bundle.prints.get_selected_preset();
+                state->imported_process = ConfigurationState::Impl::ImportedProcess{
+                    std::move(imported_keys), preset.is_project_embedded ? preset.name : std::string{}};
+            }
             sync_nozzle_count();
             auto& project=bundle.project_config;
             if (tower_x) *project.opt<ConfigOptionFloats>("wipe_tower_x")=*tower_x;
@@ -5071,6 +5403,8 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
         // geometry-only palette expansion or a project-entry reset fallback.
         result.configuration_changed=result.replace_document || expanded_filaments;
         if (result.configuration_changed) {
+            if (result.replace_document || !state->process_baselines)
+                state->process_baselines = capture_process_baselines(bundle.prints);
             state->config=std::unique_ptr<Config>(new Config(serialized_values(resolved)));
             state->machine=machine;
             state->machine.project_local=true;
@@ -5502,6 +5836,7 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                     auto next=std::make_shared<ConfigurationState::Impl>();
                     next->resource_directory=impl_->resource_directory;
                     next->bundle=std::make_shared<Slic3r::PresetBundle>(std::move(candidate_bundle));
+                    next->process_baselines = capture_process_baselines(next->bundle->prints);
                     next->config=std::move(active);
                     next->machine=describe_project_machine(dynamic_config(next->config->snapshot()));
                     next->machine.project_local=false;

@@ -280,7 +280,7 @@
   "internal_solid_infill_speed": "120",
   "outer_wall_speed": "120",
   "raft_first_layer_density": "100%",
-  "fiber_width": "0.98",
+  "fiber_width": "1",
   "seam_position": "back",
   "skirt_distance": "3",
   "skirt_speed": "60",

@@ -6,49 +6,504 @@
     "instantiation": "true",
     "printer_model": "P3",
     "printer_variant": "0.4",
-    "printer_technology": "FFF",
-    "printer_structure": "corexy",
+    "adaptive_bed_mesh_margin": "0",
+    "auxiliary_fan": "0",
+    "bbl_use_printhost": "0",
+    "bed_custom_model": "",
+    "bed_custom_texture": "",
+    "bed_exclude_area": [
+        "0x0"
+    ],
+    "bed_mesh_max": "99999,99999",
+    "bed_mesh_min": "-99999,-99999",
+    "bed_mesh_probe_distance": "50,50",
+    "bed_temperature_formula": "by_first_filament",
+    "before_layer_change_gcode": ";BEFORE_LAYER_CHANGE\n;[layer_z]\n{if layer_num == 0}\n;P3 wait after automatic initial dock selection\nM109 S{nozzle_temperature_initial_layer[initial_tool]}\n{endif}\n",
+    "best_object_pos": "0.5,0.5",
+    "change_extrusion_role_gcode": "",
+    "change_filament_gcode": ";P3_TOOLCHANGE_BEGIN\nM400\nT{next_extruder}\nM109 S{new_filament_temp}\nG90\nM83\n{if toolchange_z > 0}\n;P3_RETURN_XYZ\nG1 Z{min(position[2] + 5, 315)} F600\nG1 X{position[0]} Y{position[1]} F9000\nG1 Z{position[2]} F600\n{if filament_process_type[next_extruder] != \"continuous_fiber\" and new_retract_length_toolchange > 0}\nG1 E{new_retract_length_toolchange} F{deretraction_speed[next_extruder] * 60}\n{endif}\n{e_retracted[next_extruder] = 0}\n{endif}\n;P3_TOOLCHANGE_END\n",
+    "cooling_tube_length": "5",
+    "cooling_tube_retraction": "91.5",
+    "default_bed_type": "",
+    "default_filament_profile": [
+        "CFSYS TPU 95A",
+        "CFSYS TPU 95A",
+        "CFSYS TPU 95A",
+        "Generic PLA @P3",
+        "CFSYS PA-CF",
+        "CFSYS CCF"
+    ],
+    "default_nozzle_volume_type": [
+        "Standard",
+        "Standard",
+        "Standard",
+        "Standard",
+        "Standard",
+        "Standard"
+    ],
+    "default_print_profile": "0.20mm Standard @P3",
+    "deretraction_speed": [
+        "30",
+        "30",
+        "30",
+        "30",
+        "30",
+        "30"
+    ],
+    "disable_m73": "0",
+    "emit_machine_limits_to_gcode": "1",
+    "enable_filament_ramming": "1",
+    "enable_long_retraction_when_cut": "0",
+    "enable_power_loss_recovery": "printer_configuration",
+    "extra_loading_move": "-2",
+    "extruder_clearance_height_to_lid": "140",
+    "extruder_clearance_height_to_rod": "36",
+    "extruder_clearance_radius": "65",
+    "extruder_colour": [
+        "#FCE94F",
+        "#FCE94F",
+        "#FCE94F",
+        "#FCE94F",
+        "#FCE94F",
+        "#FCE94F"
+    ],
+    "extruder_offset": [
+        "0x0",
+        "0x0",
+        "0x0",
+        "0x0",
+        "0x0",
+        "0x0"
+    ],
+    "extruder_printable_area": [],
+    "extruder_printable_height": [
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+    ],
+    "extruder_type": [
+        "Direct Drive",
+        "Direct Drive",
+        "Direct Drive",
+        "Direct Drive",
+        "Direct Drive",
+        "Direct Drive"
+    ],
+    "extruder_variant_list": [
+        "Direct Drive Standard",
+        "Direct Drive Standard",
+        "Direct Drive Standard",
+        "Direct Drive Standard",
+        "Direct Drive Standard",
+        "Direct Drive Standard"
+    ],
+    "fan_kickstart": "0",
+    "fan_speedup_overhangs": "1",
+    "fan_speedup_time": "0",
+    "file_start_gcode": "",
+    "flashforge_serial_number": "",
     "gcode_flavor": "klipper",
-    "printable_area": ["40x50", "337x50", "337x285", "40x285"],
+    "grab_length": [
+        "0"
+    ],
+    "head_wrap_detect_zone": [],
+    "high_current_on_filament_swap": "0",
+    "host_type": "octoprint",
+    "input_shaping_damp_x": "0.1",
+    "input_shaping_damp_y": "0.1",
+    "input_shaping_emit": "0",
+    "input_shaping_freq_x": "0",
+    "input_shaping_freq_y": "0",
+    "input_shaping_type": "Default",
+    "layer_change_gcode": ";AFTER_LAYER_CHANGE\n;[layer_z]",
+    "long_retractions_when_cut": [
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+    ],
+    "machine_end_gcode": "M400\nTURN_OFF_HEATERS\nM107\n",
+    "machine_load_filament_time": "10",
+    "machine_max_acceleration_e": [
+        "5000",
+        "5000"
+    ],
+    "machine_max_acceleration_extruding": [
+        "20000",
+        "20000"
+    ],
+    "machine_max_acceleration_retracting": [
+        "5000",
+        "5000"
+    ],
+    "machine_max_acceleration_travel": [
+        "20000",
+        "20000"
+    ],
+    "machine_max_acceleration_x": [
+        "20000",
+        "20000"
+    ],
+    "machine_max_acceleration_y": [
+        "20000",
+        "20000"
+    ],
+    "machine_max_acceleration_z": [
+        "500",
+        "200"
+    ],
+    "machine_max_jerk_e": [
+        "2.5",
+        "2.5"
+    ],
+    "machine_max_jerk_x": [
+        "9",
+        "9"
+    ],
+    "machine_max_jerk_y": [
+        "9",
+        "9"
+    ],
+    "machine_max_jerk_z": [
+        "0.2",
+        "0.4"
+    ],
+    "machine_max_junction_deviation": [
+        "0.01"
+    ],
+    "machine_max_speed_e": [
+        "25",
+        "25"
+    ],
+    "machine_max_speed_x": [
+        "500",
+        "200"
+    ],
+    "machine_max_speed_y": [
+        "500",
+        "200"
+    ],
+    "machine_max_speed_z": [
+        "12",
+        "12"
+    ],
+    "machine_min_extruding_rate": [
+        "0",
+        "0"
+    ],
+    "machine_min_travel_rate": [
+        "0",
+        "0"
+    ],
+    "machine_pause_gcode": "PAUSE",
+    "machine_start_gcode": ";P3 shared extruder/heater; tool state must already be confirmed by the operator\nG90\nM83\nG28\nT[initial_tool]\nM109 S{nozzle_temperature_initial_layer[initial_tool]}\nG92 E0\n",
+    "machine_tool_change_time": "15",
+    "machine_unload_filament_time": "50",
+    "manual_filament_change": "0",
+    "master_extruder_id": "1",
+    "max_layer_height": [
+        "0.32",
+        "0.32",
+        "0.32",
+        "0.32",
+        "0.32",
+        "0.32"
+    ],
+    "max_resonance_avoidance_speed": "120",
+    "min_layer_height": [
+        "0.08",
+        "0.08",
+        "0.08",
+        "0.08",
+        "0.08",
+        "0.08"
+    ],
+    "min_resonance_avoidance_speed": "70",
+    "nozzle_diameter": [
+        "0.4",
+        "0.4",
+        "0.4",
+        "0.4",
+        "0.4",
+        "0.4"
+    ],
+    "nozzle_flush_dataset": [
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+    ],
+    "nozzle_height": "2.5",
+    "nozzle_hrc": "0",
+    "nozzle_type": [
+        "undefine",
+        "undefine",
+        "undefine",
+        "undefine",
+        "undefine",
+        "undefine"
+    ],
+    "nozzle_volume": [
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+    ],
+    "parallel_printheads_bed_exclude_areas": [],
+    "parallel_printheads_count": "1",
+    "parking_pos_retraction": "92",
+    "part_cooling_fan_min_pwm": "0",
+    "pellet_modded_printer": "0",
+    "physical_extruder_map": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5"
+    ],
+    "preferred_orientation": "0",
+    "printable_area": [
+        "0x0",
+        "380x0",
+        "380x330",
+        "0x330"
+    ],
     "printable_height": "310",
-    "printer_notes": "P3 test profile from P3机器切片对接参数摘要.md. T0..T5 identify docks, sharing one extruder motor and heater. XY40..337/Y50..285 and Z0..310 are candidate print bounds, not accepted machine dimensions. Zero nozzle offsets are placeholders pending calibration. Confirm clean persistent tool state manually after first use or errors; never auto-confirm it from G-code. Bed heater and mesh are unverified and omitted. PLA 210 C; current frequency profile is only verified up to 220 C. Retraction, priming, nozzle offsets and the tool return path still require machine acceptance.",
-    "nozzle_diameter": ["0.4", "0.4", "0.4", "0.4", "0.4", "0.4"],
-    "min_layer_height": ["0.08", "0.08", "0.08", "0.08", "0.08", "0.08"],
-    "max_layer_height": ["0.32", "0.32", "0.32", "0.32", "0.32", "0.32"],
-    "extruder_offset": ["0x0", "0x0", "0x0", "0x0", "0x0", "0x0"],
-    "extruder_colour": ["#F28E2B", "#4E79A7", "#59A14F", "#B07AA1", "#EDC948", "#E15759"],
+    "printer_agent": "",
+    "printer_extruder_id": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6"
+    ],
+    "printer_extruder_variant": [
+        "Direct Drive Standard",
+        "Direct Drive Standard",
+        "Direct Drive Standard",
+        "Direct Drive Standard",
+        "Direct Drive Standard",
+        "Direct Drive Standard"
+    ],
+    "printer_notes": "",
+    "printer_structure": "undefine",
+    "printer_technology": "FFF",
+    "printhost_authorization_type": "key",
+    "printhost_ssl_ignore_revoke": "0",
+    "printing_by_object_gcode": "",
+    "purge_in_prime_tower": "0",
+    "resonance_avoidance": "0",
+    "retract_before_wipe": [
+        "70%",
+        "70%",
+        "70%",
+        "70%",
+        "70%",
+        "70%"
+    ],
+    "retract_length_toolchange": [
+        "0.6",
+        "0.6",
+        "0.6",
+        "0.6",
+        "0.6",
+        "0.6"
+    ],
+    "retract_lift_above": [
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+    ],
+    "retract_lift_below": [
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+    ],
+    "retract_lift_enforce": [
+        "All Surfaces",
+        "All Surfaces",
+        "All Surfaces",
+        "All Surfaces",
+        "All Surfaces",
+        "All Surfaces"
+    ],
+    "retract_restart_extra": [
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+    ],
+    "retract_restart_extra_toolchange": [
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0"
+    ],
+    "retract_when_changing_layer": [
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "1"
+    ],
+    "retraction_distances_when_cut": [
+        "18",
+        "18",
+        "18",
+        "18",
+        "18",
+        "18"
+    ],
+    "retraction_length": [
+        "0.6",
+        "0.6",
+        "0.6",
+        "0.6",
+        "0.6",
+        "0"
+    ],
+    "retraction_minimum_travel": [
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "1"
+    ],
+    "retraction_speed": [
+        "30",
+        "30",
+        "30",
+        "30",
+        "30",
+        "30"
+    ],
+    "scan_first_layer": "0",
+    "silent_mode": "0",
     "single_extruder_multi_material": "0",
+    "support_air_filtration": "1",
+    "support_chamber_temp_control": "1",
+    "support_multi_bed_types": "0",
+    "support_object_skip_flush": "0",
+    "support_parallel_printheads": "0",
+    "template_custom_gcode": "",
+    "thumbnails": "48x48/PNG,300x300/PNG",
+    "thumbnails_format": "PNG",
+    "time_cost": "0",
+    "time_lapse_gcode": "",
+    "tool_change_on_wipe_tower": "0",
+    "travel_slope": [
+        "3",
+        "3",
+        "3",
+        "3",
+        "3",
+        "3"
+    ],
+    "upward_compatible_machine": [],
+    "use_3mf": "0",
+    "use_firmware_retraction": "0",
+    "use_relative_e_distances": "1",
+    "wipe": [
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "1"
+    ],
+    "wipe_distance": [
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "1"
+    ],
     "wipe_tower_type": "type2",
-    "filament_slots_bound_to_physical_tools": "1",
-    "physical_extruder_map": ["0", "1", "2", "3", "4", "5"],
-    "toolhead_process_capabilities": ["thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber", "thermoplastic+continuous_fiber"],
-    "toolhead_fiber_protocol_id": ["", "", "", "", "", "p3-shared-e-v1"],
+    "wrapping_detection_gcode": "",
+    "wrapping_detection_layers": "20",
+    "wrapping_exclude_area": [],
+    "z_hop": [
+        "0.4",
+        "0.4",
+        "0.4",
+        "0.4",
+        "0.4",
+        "0.4"
+    ],
+    "z_hop_types": [
+        "Normal Lift",
+        "Normal Lift",
+        "Normal Lift",
+        "Normal Lift",
+        "Normal Lift",
+        "Normal Lift"
+    ],
+    "z_offset": "0",
     "fiber_cut_gcode": "M400\nS0\nM400\n",
     "fiber_cut_to_contact_length": "20.55",
-    "toolhead_fiber_e_units_per_mm": ["1", "1", "1", "1", "1", "1"],
-    "toolhead_filament_capacity": ["1", "1", "1", "1", "1", "1"],
-    "physical_tool_sides": ["unknown", "unknown", "unknown", "unknown", "unknown", "unknown"],
-    "retraction_length": ["0.4", "0.4", "0.4", "0.4", "0.4", "0.4"],
-    "retraction_speed": ["30", "30", "30", "30", "30", "30"],
-    "deretraction_speed": ["30", "30", "30", "30", "30", "30"],
-    "retract_length_toolchange": ["0.4", "0.4", "0.4", "0.4", "0.4", "0.4"],
-    "retract_restart_extra_toolchange": ["0", "0", "0", "0", "0", "0"],
-    "z_hop": ["0.4", "0.4", "0.4", "0.4", "0.4", "0.4"],
-    "toolchange_z_lift": "0",
-    "machine_max_speed_x": ["850", "850"],
-    "machine_max_speed_y": ["850", "850"],
-    "machine_max_speed_z": ["20", "20"],
-    "machine_max_acceleration_x": ["10000", "10000"],
-    "machine_max_acceleration_y": ["10000", "10000"],
-    "machine_max_acceleration_z": ["100", "100"],
-    "machine_max_acceleration_extruding": ["10000", "10000"],
-    "machine_max_acceleration_travel": ["10000", "10000"],
-    "emit_machine_limits_to_gcode": "0",
-    "change_filament_gcode": ";P3_TOOLCHANGE_BEGIN\nM400\nT{next_extruder}\nM109 S{new_filament_temp}\nG90\nM83\n{if toolchange_z > 0}\n;P3_RETURN_XYZ\nG1 Z{min(position[2] + 5, 315)} F600\nG1 X{position[0]} Y{position[1]} F9000\nG1 Z{position[2]} F600\n{if filament_process_type[next_extruder] != \"continuous_fiber\" and new_retract_length_toolchange > 0}\nG1 E{new_retract_length_toolchange} F{deretraction_speed[next_extruder] * 60}\n{endif}\n{e_retracted[next_extruder] = 0}\n{endif}\n;P3_TOOLCHANGE_END\n",
-    "machine_start_gcode": ";P3 shared extruder/heater; tool state must already be confirmed by the operator\nG90\nM83\nG28\nT[initial_tool]\nM109 S{nozzle_temperature_initial_layer[initial_tool]}\nG92 E0\n",
-    "machine_end_gcode": "M400\nTURN_OFF_HEATERS\nM107\n",
-    "before_layer_change_gcode": ";BEFORE_LAYER_CHANGE\n;[layer_z]\n{if layer_num == 0}\n;P3 wait after automatic initial dock selection\nM109 S{nozzle_temperature_initial_layer[initial_tool]}\n{endif}\n",
-    "layer_change_gcode": ";AFTER_LAYER_CHANGE\n;[layer_z]",
-    "default_print_profile": "0.20mm Standard @P3",
-    "default_filament_profile": ["CFSYS TPU 95A", "CFSYS TPU 95A", "CFSYS TPU 95A", "Generic PLA @P3", "CFSYS PA-CF", "CFSYS CCF"]
+    "toolhead_fiber_e_units_per_mm": [
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "1"
+    ],
+    "toolhead_fiber_protocol_id": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        "p3-shared-e-v1"
+    ],
+    "toolhead_process_capabilities": [
+        "thermoplastic+continuous_fiber",
+        "thermoplastic+continuous_fiber",
+        "thermoplastic+continuous_fiber",
+        "thermoplastic+continuous_fiber",
+        "thermoplastic+continuous_fiber",
+        "thermoplastic+continuous_fiber"
+    ],
+    "toolhead_filament_capacity": [
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "1"
+    ],
+    "filament_slots_bound_to_physical_tools": "1",
+    "physical_tool_sides": [
+        "unknown",
+        "unknown",
+        "unknown",
+        "unknown",
+        "unknown",
+        "unknown"
+    ]
 }

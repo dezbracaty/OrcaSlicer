@@ -1059,7 +1059,7 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("Physical fiber width shared by continuous fiber contours and infill. Specify a positive width in millimeters.");
     def->sidetext = "mm";
     def->min = 0.000001;
-    def->set_default_value(new ConfigOptionFloat(0.8));
+    def->set_default_value(new ConfigOptionFloat(1.0));
 
     def = this->add("fiber_layer_height_ratio", coInt);
     def->label = L("Continuous fiber layer interval");

@@ -18,7 +18,7 @@ enum class SettingLevel { Simple, Advanced, Expert, Developer };
 
 enum class SettingGroup { Process, Filament, Printer };
 
-enum class ConfigScope { Full, FiberMask };
+enum class ConfigScope { Full, FiberMask, ModelObject, ModelPart };
 
 struct EnumItem
 {
@@ -102,6 +102,11 @@ public:
     // Edit a scoped patch over an immutable baseline. Unedited values inherit;
     // setting a value explicitly records it even when it equals the baseline.
     static Config for_overrides(const ConfigSnapshot& base, ConfigScope scope);
+    // Resolve the same plate baseline and sparse object settings used at slice time.
+    static Config for_project_object(const ConfigSnapshot& base,
+        std::string_view plate_semantics, std::string_view object_semantics);
+    static Config for_project_part(const ConfigSnapshot& base, std::string_view plate_semantics,
+        std::string_view object_semantics, std::string_view part_semantics);
     // Replace the patch atomically. The JSON object uses serialized string values
     // and remains compatible with existing App mask documents.
     SettingsResult load_overrides(std::string_view payload);
@@ -132,6 +137,7 @@ public:
 private:
     Config();
     explicit Config(std::vector<std::pair<std::string, std::string>> baseline);
+    void load_native_settings(const std::vector<std::pair<std::string, std::string>>& values);
 
     class Impl;
     std::unique_ptr<Impl> impl_;

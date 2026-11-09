@@ -59,6 +59,37 @@ SettingLevel public_level(Slic3r::ConfigOptionMode mode)
 
 std::set<std::string> key_set(const std::vector<std::string>& keys) { return {keys.begin(), keys.end()}; }
 
+bool in_scope(ConfigScope scope, std::string_view key)
+{
+    if (scope == ConfigScope::FiberMask)
+        return Slic3r::is_fiber_mask_parameter(key);
+    if (scope != ConfigScope::ModelObject && scope != ConfigScope::ModelPart)
+        return true;
+
+    // Orca TabPrintModel intersects both scopes with the process preset keys.
+    static const auto part_keys = [] {
+        const auto region = key_set(Slic3r::PrintRegionConfig().keys());
+        std::set<std::string, std::less<>> editable;
+        for (const auto& key : Slic3r::Preset::print_options())
+            if (key != "extruder" && region.count(key))
+                editable.insert(key);
+        return editable;
+    }();
+    if (scope == ConfigScope::ModelPart)
+        return part_keys.find(key) != part_keys.end();
+
+    static const auto object_keys = [] {
+        auto keys = key_set(Slic3r::PrintObjectConfig().keys());
+        auto editable = part_keys;
+        for (const auto& key : Slic3r::Preset::print_options()) {
+            if (key != "extruder" && keys.count(key))
+                editable.insert(key);
+        }
+        return editable;
+    }();
+    return object_keys.find(key) != object_keys.end();
+}
+
 bool is_scalar_numeric(SettingType type)
 {
     return type == SettingType::Integer || type == SettingType::Float || type == SettingType::Percent ||
@@ -196,6 +227,24 @@ bool key_is(std::string_view key, std::initializer_list<std::string_view> candid
 void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintConfig& config,
                                 ConfigScope scope = ConfigScope::Full)
 {
+    if (scope == ConfigScope::ModelObject || scope == ConfigScope::ModelPart) {
+        // Orca ConfigManipulation::toggle_print_fff_options.
+        if (key_is(item.key, {"sparse_infill_pattern", "infill_direction", "sparse_infill_rotate_template"}))
+            item.enabled = config.opt_float("sparse_infill_density") > 0;
+        else if (key_is(item.key, {"support_type", "support_style", "support_on_build_plate_only",
+                                  "support_top_z_distance"}))
+            item.enabled = boolean_value(config, "enable_support");
+        if (item.key == "support_style") {
+            const auto& values = Slic3r::ConfigOptionEnum<Slic3r::SupportMaterialStyle>::get_enum_values();
+            const bool tree = Slic3r::is_tree(config.opt_enum<Slic3r::SupportType>("support_type"));
+            item.enum_items.erase(std::remove_if(item.enum_items.begin(), item.enum_items.end(),
+                [&](const EnumItem& option) {
+                    const int style = values.at(option.value);
+                    const bool normal = style == Slic3r::smsGrid || style == Slic3r::smsSnug;
+                    return style != Slic3r::smsDefault && (tree ? normal : !normal);
+                }), item.enum_items.end());
+        }
+    }
     if (item.key == "wipe_tower_position_mode") {
         const auto* mode = config.option<Slic3r::ConfigOptionEnumsGeneric>(item.key);
         if (mode && mode->values.size() == 1)
@@ -355,6 +404,19 @@ Config Config::for_overrides(const ConfigSnapshot& base, ConfigScope scope)
     result.impl_->override_scope = scope;
     return result;
 }
+
+void Config::load_native_settings(
+    const std::vector<std::pair<std::string, std::string>>& values)
+{
+    // Imported Orca settings already passed native deserialization. Apply the
+    // editable subset as-is, and apply editor validation only to new edits.
+    for (const auto& [key, value] : values) {
+        if (!in_scope(impl_->override_scope.value(), key) || !catalog().find(key))
+            continue;
+        impl_->current.set_deserialize_strict(key, value);
+        impl_->overridden_keys.insert(key);
+    }
+}
 Config::Config(const Config& other) : impl_(std::make_unique<Impl>(*other.impl_)) {}
 Config::Config(Config&&) noexcept = default;
 Config& Config::operator=(const Config& other)
@@ -378,7 +440,7 @@ std::vector<SettingItem> Config::settings(ConfigScope scope) const
     std::vector<SettingItem> result;
     result.reserve(catalog().items.size());
     for (const SettingItem& definition : catalog().items) {
-        if (scope == ConfigScope::FiberMask && !Slic3r::is_fiber_mask_parameter(definition.key))
+        if (!in_scope(scope, definition.key))
             continue;
         const auto* option = impl_->current.option(definition.key);
         if (option == nullptr) {
@@ -415,7 +477,7 @@ std::optional<SettingItem> current_item(const Slic3r::DynamicPrintConfig& config
                                         const Slic3r::DynamicPrintConfig& defaults,
                                         std::string_view key, ConfigScope scope = ConfigScope::Full)
 {
-    if (scope == ConfigScope::FiberMask && !Slic3r::is_fiber_mask_parameter(key))
+    if (!in_scope(scope, key))
         return std::nullopt;
     const SettingItem* definition = catalog().find(key);
     const auto* option            = definition == nullptr ? nullptr : config.option(definition->key);
@@ -437,13 +499,16 @@ void append_presentation_changes(std::vector<std::string>& changed_keys,
                                  ConfigScope scope = ConfigScope::Full)
 {
     for (const SettingItem& definition : catalog().items) {
-        if (scope == ConfigScope::FiberMask && !Slic3r::is_fiber_mask_parameter(definition.key))
+        if (!in_scope(scope, definition.key))
             continue;
         SettingItem previous = definition;
         SettingItem current  = definition;
         apply_dynamic_presentation(previous, before, scope);
         apply_dynamic_presentation(current, after, scope);
-        if ((previous.enabled != current.enabled || previous.visible != current.visible) &&
+        const bool choices_changed = !std::equal(previous.enum_items.begin(), previous.enum_items.end(),
+            current.enum_items.begin(), current.enum_items.end(),
+            [](const EnumItem& a, const EnumItem& b) { return a.value == b.value; });
+        if ((previous.enabled != current.enabled || previous.visible != current.visible || choices_changed) &&
             std::find(changed_keys.begin(), changed_keys.end(), definition.key) == changed_keys.end()) {
             changed_keys.push_back(definition.key);
         }
@@ -478,8 +543,10 @@ SettingsResult Config::apply_patch(ConfigScope scope,
     try {
         for (const auto& [key, serialized_value] : patch) {
             last_key = key;
-            if (scope == ConfigScope::FiberMask && !Slic3r::is_fiber_mask_parameter(key))
-                return failure(key, "Configuration option cannot be overridden by a fiber mask");
+            if (!in_scope(scope, key))
+                return failure(key, scope == ConfigScope::FiberMask
+                    ? "Configuration option cannot be overridden by a fiber mask"
+                    : "Configuration option cannot be overridden by a model object");
             const SettingItem* definition = catalog().find(key);
             if (definition == nullptr) {
                 return failure(key, "Unknown configuration option");
@@ -576,8 +643,10 @@ SettingsResult Config::reset(std::string_view key)
 {
     const std::string owned_key(key);
     const auto scope = impl_->override_scope.value_or(ConfigScope::Full);
-    if (scope == ConfigScope::FiberMask && !Slic3r::is_fiber_mask_parameter(key))
-        return failure(owned_key, "Configuration option cannot be overridden by a fiber mask");
+    if (!in_scope(scope, key))
+        return failure(owned_key, scope == ConfigScope::FiberMask
+            ? "Configuration option cannot be overridden by a fiber mask"
+            : "Configuration option cannot be overridden by a model object");
     const SettingItem* definition = catalog().find(owned_key);
     if (definition == nullptr || impl_->defaults.option(owned_key) == nullptr) {
         return failure(owned_key, "Unknown configuration option");

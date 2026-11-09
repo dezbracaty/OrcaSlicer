@@ -138,6 +138,13 @@ struct FilamentSlotInfo
     std::vector<PresetOption> compatible_presets;
 };
 
+struct ProcessPresetComparison
+{
+    std::vector<std::string> highlighted_keys;
+    // Orca may use the selected preset itself as the comparable reference.
+    bool has_comparison_parent{false};
+};
+
 struct ActiveConfigView
 {
     std::uint64_t revision{0};
@@ -146,6 +153,10 @@ struct ActiveConfigView
     std::vector<PresetOption> compatible_filaments;
     std::vector<SettingItem> settings;
     std::vector<FilamentSlotInfo> filament_slots;
+    // The active project's process difference list after Orca import migrations.
+    // Import provenance is independent of the live preset comparison.
+    std::vector<std::string> imported_process_difference_keys;
+    ProcessPresetComparison process_preset_comparison;
 
     bool valid() const noexcept { return revision != 0; }
 };
@@ -649,9 +660,19 @@ struct ConfigurationInstallResult {
     explicit operator bool() const noexcept { return success; }
 };
 LIBSLICER_API std::string encode_project_object_semantics(const ProjectObject&);
+// Edit one object setting atomically. A missing value restores inheritance.
+LIBSLICER_API SettingsResult edit_project_object_setting(const ConfigSnapshot& base,
+    std::string_view plate_semantics, std::string& object_semantics,
+    std::string_view key, std::optional<std::string_view> value);
 LIBSLICER_API std::string encode_project_part_semantics(const ProjectPart&);
+LIBSLICER_API SettingsResult edit_project_part_setting(const ConfigSnapshot& base,
+    std::string_view plate_semantics, std::string_view object_semantics,
+    std::string& part_semantics, std::string_view key, std::optional<std::string_view> value);
 LIBSLICER_API std::string encode_project_part_annotations(const ProjectPart&);
 LIBSLICER_API std::string encode_project_plate_semantics(const ProjectPlate&);
+// Apply Orca's object-list cleanup for support slots beyond the new palette.
+LIBSLICER_API std::string clear_expired_support_filaments(
+    std::string_view semantics, std::string_view scope, std::size_t filament_count);
 // Call only when the machine/material domain changes, before publishing the
 // new configuration to consumers. Preserves unrelated semantics and applicable
 // manual bindings; stale bindings inherit target_config. Does not repair slice
@@ -659,7 +680,6 @@ LIBSLICER_API std::string encode_project_plate_semantics(const ProjectPlate&);
 LIBSLICER_API std::string synchronize_project_plate_materials(
     std::string_view semantics, const ConfigSnapshot& target_config,
     std::vector<ConfigDiagnostic>* diagnostics = nullptr);
-
 class LIBSLICER_API Library final
 {
 public:
