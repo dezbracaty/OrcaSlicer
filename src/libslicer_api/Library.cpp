@@ -4,6 +4,7 @@
 #include "OrcaCalibrationInternal.hpp"
 
 #include <libslic3r/PresetBundle.hpp>
+#include <libslic3r/AppConfig.hpp>
 #include <libslic3r/ParameterUtils.hpp>
 #include <libslic3r/Model.hpp>
 #include <libslic3r/BuildVolume.hpp>
@@ -34,6 +35,8 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <tuple>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -2515,6 +2518,9 @@ class Library::Impl
 public:
     std::string resource_directory;
     std::vector<std::unique_ptr<Slic3r::PresetBundle>> vendor_presets;
+    fs::path user_preset_directory;
+    void load_user_presets(Slic3r::PresetBundle&, std::string_view vendor) const;
+    std::string vendor_for(std::string_view model, std::string_view variant) const;
     std::vector<MachineModelOption> machines;
     std::vector<BuildPlateOption> build_plates;
     std::shared_ptr<ConfigurationState::Impl> active = std::make_shared<ConfigurationState::Impl>();
@@ -2522,9 +2528,11 @@ public:
     std::size_t filament_color_cursor{0};
     std::shared_ptr<const void> capture_origin=std::make_shared<const char>(0);
     void apply_installed_machine_capabilities(ProjectMachine& machine, const ResolvedSelection& selection) const;
-    void prepare(const std::shared_ptr<ConfigurationState::Impl>& state);
+    void prepare(const std::shared_ptr<ConfigurationState::Impl>& state, bool import_full_config = true);
+    void prepare_preset_edit(const std::shared_ptr<ConfigurationState::Impl>& state);
     ConfigCreateResult resolve_config(const ConfigSelection& selection,
-        std::shared_ptr<const ProcessPresetBaselines>* baselines = nullptr) const;
+        std::shared_ptr<const ProcessPresetBaselines>* baselines = nullptr,
+        std::shared_ptr<Slic3r::PresetBundle>* switch_bundle = nullptr) const;
 };
 
 
@@ -2967,7 +2975,7 @@ std::string clear_expired_support_filaments(
 }
 
 std::string synchronize_project_plate_materials(std::string_view payload,
-    const ConfigSnapshot& target, std::vector<ConfigDiagnostic>* diagnostics) {
+    const ConfigSnapshot& target, std::vector<ConfigDiagnostic>* diagnostics, bool update_print_sequence) {
     if (!target.valid()) throw std::invalid_argument("Plate material synchronization requires a configuration");
     auto j = semantic_json(payload, "plate");
     if (j.empty()) return std::string(payload);
@@ -3027,6 +3035,7 @@ std::string synchronize_project_plate_materials(std::string_view payload,
         j["settings"].erase(key);
         if (const auto* value = settings.option(key)) j["settings"][key] = value->serialize();
     }
+    if (!update_print_sequence) return j.dump();
     // Port of PartPlate::update_first_layer_print_sequence. Keep every
     // surviving slot in its original print order.
     const auto resize_order = [count](std::vector<int>& order) {
@@ -3088,13 +3097,15 @@ void Library::Impl::apply_installed_machine_capabilities(ProjectMachine& machine
         break;
     }
 }
-void Library::Impl::prepare(const std::shared_ptr<ConfigurationState::Impl>& state) {
+void Library::Impl::prepare(const std::shared_ptr<ConfigurationState::Impl>& state, bool import_full_config) {
     state->resource_directory=resource_directory;
     if (!state->config) return;
     auto full=dynamic_config(state->config->snapshot());
     if(state->bundle) {
-        mark_full_config_authoritative(full);
-        state->bundle->load_config_model("GPlatform active project.3mf",full);
+        if (import_full_config) {
+            mark_full_config_authoritative(full);
+            state->bundle->load_config_model("GPlatform active project.3mf",full);
+        }
         state->selection.printer_preset_id=state->bundle->printers.get_selected_preset_name();
         state->selection.process_preset_id=state->bundle->prints.get_selected_preset_name();
         if (state->imported_process && state->imported_process->selected) {
@@ -3112,6 +3123,48 @@ void Library::Impl::prepare(const std::shared_ptr<ConfigurationState::Impl>& sta
     apply_installed_machine_capabilities(state->machine,state->selection);
     Library viewer;viewer.impl_->resource_directory=resource_directory;viewer.impl_->active=state;viewer.impl_->active_revision=1;
     state->prepared_view=*viewer.active_config();state->prepared_view.revision=0;
+}
+
+void Library::Impl::prepare_preset_edit(const std::shared_ptr<ConfigurationState::Impl>& state)
+{
+    if (!state->bundle) {
+        prepare(state);
+        return;
+    }
+    const auto before = dynamic_config(active->config->snapshot());
+    const auto edited = dynamic_config(state->config->snapshot());
+    const auto changed = edited.diff(before);
+    const auto& material_keys = Slic3r::Preset::filament_options();
+    if (std::any_of(changed.begin(), changed.end(), [&material_keys](const auto& key) {
+            return std::find(material_keys.begin(), material_keys.end(), key) != material_keys.end();
+        })) {
+        // A flat material vector may change a non-current slot. Keep Orca's
+        // whole split, including that slot's newly selected preset.
+        prepare(state);
+        return;
+    }
+    auto bundle = state->bundle;
+    // Use Orca to split the flat settings back into their owning presets.
+    // Keep the selected presets and apply only the edited fields. Reloading
+    // the whole project here also marks unrelated imported presets dirty.
+    state->bundle = std::make_shared<Slic3r::PresetBundle>(*bundle);
+    auto split = edited;
+    mark_full_config_authoritative(split);
+    state->bundle->load_config_model("GPlatform active project.3mf", std::move(split));
+    for (const auto& [destination, source, keys] : {
+         std::tuple<Slic3r::PresetCollection*, const Slic3r::PresetCollection*, const std::vector<std::string>*>{
+             &bundle->printers, &state->bundle->printers, &Slic3r::Preset::printer_options()},
+         {&bundle->prints, &state->bundle->prints, &Slic3r::Preset::print_options()}}) {
+        std::vector<std::string> own_changes;
+        for (const auto& key : changed)
+            if (std::find(keys->begin(), keys->end(), key) != keys->end()) own_changes.push_back(key);
+        if (own_changes.empty()) continue;
+        destination->get_edited_preset().config.apply_only(source->get_edited_preset().config, own_changes, true);
+        destination->update_dirty();
+    }
+    bundle->project_config = std::move(state->bundle->project_config);
+    state->bundle = std::move(bundle);
+    prepare(state, false);
 }
 
 const char* version() noexcept
@@ -3134,6 +3187,8 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
         const fs::path data_directory = fs::temp_directory_path() / "libslicer";
         fs::create_directories(data_directory);
         Slic3r::set_data_dir(data_directory.string());
+        if (!options.user_preset_directory.empty())
+            library->impl_->user_preset_directory = fs::absolute(options.user_preset_directory);
         const fs::path working_directory = data_directory / "work";
         fs::create_directories(working_directory);
         Slic3r::set_temporary_dir(working_directory.string());
@@ -3277,12 +3332,15 @@ ConfigCreateResult Library::create_config(const ConfigSelection& selection) cons
 }
 
 ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selection,
-    std::shared_ptr<const ProcessPresetBaselines>* baselines) const
+    std::shared_ptr<const ProcessPresetBaselines>* baselines,
+    std::shared_ptr<Slic3r::PresetBundle>* switch_bundle) const
 {
     ConfigCreateResult result;
     try {
-        const bool editing_project = active->bundle &&
-            selection.machine_model_id == active->selection.machine_model_id && selection.machine_variant_id == active->selection.machine_variant_id;
+        const bool editing_project = !switch_bundle && active->bundle &&
+            selection.machine_model_id == active->selection.machine_model_id &&
+            selection.machine_variant_id == active->selection.machine_variant_id &&
+            (selection.printer_preset_id.empty() || selection.printer_preset_id == active->selection.printer_preset_id);
         const Slic3r::PresetBundle* source_presets = editing_project ? active->bundle.get() : nullptr;
         for (const auto& presets : vendor_presets) {
             if (editing_project) break;
@@ -3297,12 +3355,21 @@ ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selectio
             return result;
         }
         auto selected = *source_presets;
+        if (!editing_project)
+            load_user_presets(selected, vendor_for(selection.machine_model_id, selection.machine_variant_id));
         const Slic3r::Preset* printer = selected.printers.find_system_preset_by_model_and_variant(
             selection.machine_model_id, selection.machine_variant_id);
 
         std::string printer_name = printer ? printer->name : (editing_project ? active->selection.printer_preset_id : std::string{});
+        if (!selection.printer_preset_id.empty()) {
+            const auto* requested = selected.printers.find_preset(selection.printer_preset_id, false);
+            if (!requested || requested->config.opt_string("printer_model") != selection.machine_model_id ||
+                requested->config.opt_string("printer_variant") != selection.machine_variant_id)
+                throw std::invalid_argument("Unknown printer preset: " + selection.printer_preset_id);
+            printer_name = requested->name;
+        }
         if (printer_name.empty()) throw std::invalid_argument("Machine has no printer preset");
-        const bool same_active_machine =
+        const bool same_active_machine = editing_project &&
             selection.machine_model_id == active->selection.machine_model_id &&
             selection.machine_variant_id == active->selection.machine_variant_id &&
             !active->selection.printer_preset_id.empty() &&
@@ -3323,6 +3390,22 @@ ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selectio
 
         const Slic3r::Preset& active_printer = selected.printers.get_edited_preset();
         std::string process_name = selection.process_preset_id;
+        std::vector<std::string> filament_names = selection.filament_preset_ids;
+        if (switch_bundle && (!process_name.empty() || !filament_names.empty())) {
+            Slic3r::AppConfig remembered;
+            remembered.set_printer_setting(printer_name, PRESET_PRINT_NAME, process_name);
+            if (!filament_names.empty()) {
+                remembered.set_printer_setting(printer_name, PRESET_FILAMENT_NAME, filament_names.front());
+                for (std::size_t slot = 1; slot < filament_names.size(); ++slot) {
+                    char key[32];
+                    std::snprintf(key, sizeof(key), "filament_%02zu", slot);
+                    remembered.set_printer_setting(printer_name, key, filament_names[slot]);
+                }
+            }
+            selected.update_selections(remembered);
+            process_name = selected.prints.get_selected_preset_name();
+            filament_names = selected.filament_presets;
+        }
         if (!process_name.empty()) {
             const Slic3r::Preset* requested = selected.prints.find_preset(process_name, false);
             if (requested == nullptr) {
@@ -3353,9 +3436,45 @@ ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selectio
         }
         selected.update_compatible(Slic3r::PresetSelectCompatibleType::Always);
 
-        std::vector<std::string> filament_names = selection.filament_preset_ids;
+        auto remembered_tools = selection.filament_physical_tools;
+        const auto printer_tools = tool_config(active_printer.config);
+        if (switch_bundle && std::any_of(remembered_tools.begin(), remembered_tools.end(), [&](unsigned owner) {
+                const auto& map = printer_tools.physical_extruder_map.values;
+                return owner >= printer_tools.nozzle_diameter.size() ||
+                    std::count(map.begin(), map.end(), int(owner)) != 1;
+            })) {
+            // These owners were saved for a different hardware layout.
+            // Fall back to the target's normal physical-tool assignment.
+            remembered_tools.clear();
+            if (!printer_tools.toolhead_filament_capacity.values.empty() &&
+                filament_names.size() > printer_tools.nozzle_diameter.size())
+                filament_names.resize(printer_tools.nozzle_diameter.size());
+        }
         if (!filament_names.empty()) {
-            for (const std::string& filament_name : filament_names) {
+            const auto& tools = printer_tools;
+            for (std::size_t slot = 0; slot < filament_names.size(); ++slot) {
+                std::string& filament_name = filament_names[slot];
+                if (switch_bundle && Slic3r::has_fiber_tool(tools)) {
+                    const auto physical = slot < remembered_tools.size() ? remembered_tools[slot] : slot;
+                    const auto accepts = [&](const Slic3r::Preset& preset) {
+                        return preset.is_visible && preset.is_compatible &&
+                            Slic3r::tool_accepts_process(tools, unsigned(physical), preset_process(preset));
+                    };
+                    const auto* current = selected.filaments.find_preset(filament_name, false);
+                    if (!current || !accepts(*current)) {
+                        const auto* defaults = active_printer.config.option<Slic3r::ConfigOptionStrings>("default_filament_profile");
+                        const auto* preferred = defaults && physical < defaults->size()
+                            ? selected.filaments.find_preset(defaults->values[physical], false) : nullptr;
+                        if (preferred && accepts(*preferred))
+                            filament_name = preferred->name;
+                        else {
+                            const auto replacement = std::find_if(selected.filaments.begin(), selected.filaments.end(), accepts);
+                            if (replacement == selected.filaments.end())
+                                throw std::invalid_argument("No compatible material for physical tool " + std::to_string(physical));
+                            filament_name = replacement->name;
+                        }
+                    }
+                }
                 const Slic3r::Preset* requested = selected.filaments.find_preset(filament_name, false);
                 if (requested == nullptr) {
                     result.diagnostics.push_back({"filament", "Unknown filament preset: " + filament_name});
@@ -3424,8 +3543,14 @@ ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selectio
                                                                                                         result.selection.filament_preset_ids.front());
 
         auto full_config = selected.full_config();
-        auto physical_tools = selection.filament_physical_tools;
+        auto physical_tools = std::move(remembered_tools);
         const auto tools = tool_config(full_config);
+        if (switch_bundle && !physical_tools.empty() &&
+            physical_tools.size() != result.selection.filament_preset_ids.size()) {
+            physical_tools.resize(std::min(physical_tools.size(), result.selection.filament_preset_ids.size()));
+            for (std::size_t slot = physical_tools.size(); slot < result.selection.filament_preset_ids.size(); ++slot)
+                physical_tools.push_back(unsigned(std::min(slot, tools.nozzle_diameter.size() - 1)));
+        }
         if (physical_tools.empty() && same_active_machine && active->config &&
             result.selection.filament_preset_ids.size() == active->selection.filament_preset_ids.size()) {
             const auto previous = dynamic_config(active->config->snapshot());
@@ -3479,9 +3604,294 @@ ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selectio
             result.selection.machine_variant_id != active->selection.machine_variant_id ||
             result.selection.process_preset_id != active->selection.process_preset_id))
             *baselines = capture_process_baselines(selected.prints);
+        if (switch_bundle) *switch_bundle = std::make_shared<Slic3r::PresetBundle>(std::move(selected));
         result.success = true;
     } catch (const std::exception& error) {
         result.diagnostics.push_back({"selection", error.what()});
+    }
+    return result;
+}
+
+void Library::Impl::load_user_presets(Slic3r::PresetBundle& bundle, std::string_view vendor) const
+{
+    if (user_preset_directory.empty() || vendor.empty()) return;
+    const auto directory = user_preset_directory / std::string(vendor);
+    Slic3r::PresetsConfigSubstitutions substitutions;
+    for (const auto& [collection, section] : {
+        std::pair<Slic3r::PresetCollection*, const char*>{&bundle.printers, PRESET_PRINTER_NAME},
+        {&bundle.prints, PRESET_PRINT_NAME}, {&bundle.filaments, PRESET_FILAMENT_NAME}}) {
+        if (fs::is_directory(directory / section))
+            collection->load_presets(directory.string(), section, substitutions,
+                Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
+    }
+}
+
+std::string Library::Impl::vendor_for(std::string_view model, std::string_view variant) const
+{
+    for (const auto& machine : machines) {
+        if (machine.id == model && std::any_of(machine.variants.begin(), machine.variants.end(),
+                [variant](const auto& item) { return item.id == variant; }))
+            return machine.vendor_id;
+    }
+    return {};
+}
+
+std::vector<PresetOption> Library::printer_presets(std::string_view model, std::string_view variant) const
+{
+    for (const auto& seed : impl_->vendor_presets) {
+        const auto* system = seed->printers.find_system_preset_by_model_and_variant(
+            std::string(model), std::string(variant));
+        if (!system) continue;
+        std::vector<PresetOption> presets{{system->name, system->name, true}};
+        const auto vendor = impl_->vendor_for(model, variant);
+        if (impl_->user_preset_directory.empty() || vendor.empty() ||
+            !fs::is_directory(impl_->user_preset_directory / vendor / PRESET_PRINTER_NAME))
+            return presets;
+        auto bundle = *seed;
+        impl_->load_user_presets(bundle, vendor);
+        for (const auto& preset : bundle.printers)
+            if (preset.is_user() && preset.is_visible && preset.config.opt_string("printer_model") == model &&
+                preset.config.opt_string("printer_variant") == variant)
+                presets.push_back({preset.name, preset.name, false});
+        return presets;
+    }
+    return {};
+}
+
+namespace {
+using SwitchPreset = PrinterSwitchPreset;
+using SwitchAction = PrinterSwitchAction;
+constexpr std::array switch_preset_order{SwitchPreset::Printer, SwitchPreset::Process, SwitchPreset::Filament};
+
+Slic3r::PresetCollection& switch_collection(Slic3r::PresetBundle& bundle, SwitchPreset type)
+{
+    if (type == SwitchPreset::Printer) return bundle.printers;
+    if (type == SwitchPreset::Process) return bundle.prints;
+    return bundle.filaments;
+}
+
+std::string switch_option_value(const Slic3r::DynamicPrintConfig& config, const std::string& key)
+{
+    const auto index = key.find('#');
+    const auto* option = config.option(key.substr(0, index));
+    if (!option) return {};
+    if (index == std::string::npos) return option->serialize();
+    const auto* vector = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(option);
+    if (!vector) return {};
+    const auto values = vector->vserialize();
+    const auto slot = std::stoul(key.substr(index + 1));
+    return slot < values.size() ? values[slot] : std::string{};
+}
+
+std::vector<PrinterSwitchReview::Preset> switch_differences(
+    Slic3r::PresetBundle& source, Slic3r::PresetBundle& destination)
+{
+    const auto old_printer = source.printers.get_edited_preset_with_vendor_profile();
+    const auto new_printer = destination.printers.get_edited_preset_with_vendor_profile();
+    const auto& old_variants = old_printer.preset.config.option<Slic3r::ConfigOptionStrings>(
+        "printer_extruder_variant")->values;
+    const auto& new_variants = new_printer.preset.config.option<Slic3r::ConfigOptionStrings>(
+        "printer_extruder_variant")->values;
+    const bool different_variant = old_variants != new_variants;
+    const bool same_technology = old_printer.preset.printer_technology() == new_printer.preset.printer_technology();
+
+    std::vector<PrinterSwitchReview::Preset> result;
+    for (const auto type : switch_preset_order) {
+        auto& presets = switch_collection(source, type);
+        if (!presets.current_is_dirty()) continue;
+        const auto& edited = presets.get_edited_preset();
+        const auto& selected = presets.get_selected_preset();
+        const bool compatible = type != SwitchPreset::Printer && same_technology &&
+            Slic3r::is_compatible_with_printer(presets.get_edited_preset_with_vendor_profile(), new_printer);
+        PrinterSwitchReview::Preset review{
+            type, edited.name, type != SwitchPreset::Printer && same_technology,
+            !compatible, !edited.can_overwrite() || edited.is_project_embedded, {}};
+        if (type == SwitchPreset::Printer) {
+            const auto old_count = selected.config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter")->size();
+            const auto edited_count = edited.config.option<Slic3r::ConfigOptionFloats>("nozzle_diameter")->size();
+            if (old_count != edited_count)
+                review.changes.push_back({"extruders_count", std::to_string(old_count), std::to_string(edited_count), false});
+        }
+        const auto& target_config = switch_collection(destination, type).get_edited_preset().config;
+        for (const auto& key : presets.current_dirty_options(type != SwitchPreset::Process)) {
+            const auto index = key.find('#');
+            const auto base = key.substr(0, index);
+            const auto* def = Slic3r::print_config_def.get(base);
+            if (!def || (def->label.empty() && def->full_label.empty())) continue;
+            bool transferable = review.transfer_allowed;
+            if (transferable && different_variant && index != std::string::npos) {
+                const auto* target_vector = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(target_config.option(base));
+                transferable = edited.config.has(base) && target_vector &&
+                    std::stoul(key.substr(index + 1)) < target_vector->size();
+            }
+            auto before = switch_option_value(selected.config, key);
+            auto after = switch_option_value(edited.config, key);
+            if (before != after)
+                review.changes.push_back({key, std::move(before), std::move(after), transferable});
+        }
+        if (!review.changes.empty())
+            result.push_back(std::move(review));
+    }
+    return result;
+}
+} // namespace
+
+PrinterSwitchReview Library::review_printer_switch(const ConfigSelection& selection) const
+{
+    PrinterSwitchReview result;
+    result.revision = impl_->active_revision;
+    std::shared_ptr<Slic3r::PresetBundle> target;
+    auto resolved = impl_->resolve_config(selection, nullptr, &target);
+    if (!resolved) {
+        result.diagnostics = std::move(resolved.diagnostics);
+        return result;
+    }
+    if (resolved.selection.printer_preset_id != impl_->active->selection.printer_preset_id) {
+        try {
+            if (auto source = impl_->active->bundle)
+                result.presets = switch_differences(*source, *target);
+        } catch (const std::exception& error) {
+            result.diagnostics.push_back({"printer_switch", error.what()});
+        }
+    }
+    return result;
+}
+
+PrinterSwitchResult Library::prepare_printer_switch(
+    const ConfigSelection& selection, std::uint64_t expected_revision,
+    const std::vector<PrinterSwitchDecision>& decisions,
+    const std::vector<std::pair<std::string, std::string>>& remembered_project_settings)
+{
+    PrinterSwitchResult result;
+    try {
+        if (expected_revision != impl_->active_revision)
+            throw std::runtime_error("The configuration changed before the printer switch");
+
+        std::shared_ptr<Slic3r::PresetBundle> target;
+        auto resolved = impl_->resolve_config(selection, nullptr, &target);
+        if (!resolved) {
+            result.diagnostics = std::move(resolved.diagnostics);
+            return result;
+        }
+        auto source = impl_->active->bundle;
+        const auto changes = source && resolved.selection.printer_preset_id != impl_->active->selection.printer_preset_id
+            ? switch_differences(*source, *target) : std::vector<PrinterSwitchReview::Preset>{};
+        if (changes.size() != decisions.size())
+            throw std::invalid_argument("The printer switch decisions are incomplete");
+
+        const auto source_vendor = impl_->vendor_for(
+            impl_->active->selection.machine_model_id, impl_->active->selection.machine_variant_id);
+        const auto user_directory = impl_->user_preset_directory / source_vendor;
+        auto saved = impl_->active->selection;
+        std::vector<std::pair<SwitchPreset, std::string>> to_save;
+        const auto baselines = capture_process_baselines(target->prints);
+
+        for (std::size_t i = 0; i < changes.size(); ++i) {
+            const auto& change = changes[i];
+            const auto& decision = decisions[i];
+            if (decision.type != change.type)
+                throw std::invalid_argument("Unexpected preset decision");
+            auto& from = switch_collection(*source, change.type);
+            if (decision.action == SwitchAction::Cancel && change.cancel_switch)
+                throw std::invalid_argument("Printer switch cancelled");
+            if (decision.action == SwitchAction::Transfer) {
+                if (!change.transfer_allowed)
+                    throw std::invalid_argument("This preset cannot be transferred");
+                auto& to = switch_collection(*target, change.type);
+                std::vector<std::string> keys;
+                for (const auto& item : change.changes)
+                    if (item.transferable) keys.push_back(item.key);
+                to.get_edited_preset().config.apply_only(from.get_edited_preset().config, keys);
+                to.update_dirty();
+            }
+            if (decision.action == SwitchAction::Save) {
+                if (source_vendor.empty())
+                    throw std::runtime_error("The project printer has no installed base for a user preset");
+                if (impl_->user_preset_directory.empty())
+                    throw std::runtime_error("A writable user preset directory is required");
+                const auto& name = change.save_as ? decision.save_name : change.name;
+                if (name.empty() || name.front() == ' ' || name.back() == ' ' ||
+                    name.find_first_of("<>:\"/\\|?*\r\n\t") != std::string::npos ||
+                    name == "." || name == ".." || name == "Default Printer" ||
+                    name == "Default Setting" || name == Slic3r::PresetBundle::ORCA_DEFAULT_FILAMENT_PLACEHOLDER ||
+                    from.get_preset_name_by_alias(name) != name)
+                    throw std::invalid_argument("Invalid preset name");
+                if (const auto* collision = from.find_preset(name, false); collision &&
+                    (change.save_as || !collision->can_overwrite()))
+                    throw std::invalid_argument("A preset with this name already exists");
+                to_save.emplace_back(change.type, name);
+            }
+        }
+
+        const auto resolved_full = dynamic_config(resolved.config->snapshot());
+        const auto* map = resolved_full.option<Slic3r::ConfigOptionInts>("filament_map");
+        auto& project = target->project_config;
+        const auto bed = target->printers.get_edited_preset().get_default_bed_type(target.get());
+        project.set_key_value("curr_bed_type", new Slic3r::ConfigOptionEnum<Slic3r::BedType>(bed));
+        const std::vector<std::string> purge_keys{"flush_volumes_matrix", "flush_volumes_vector", "flush_multiplier"};
+        project.apply_only(resolved_full, purge_keys);
+        project.apply_only(resolved_full, {"filament_colour", "filament_multi_colour", "filament_colour_type"});
+        for (const auto& [key, value] : remembered_project_settings) {
+            if (key != "curr_bed_type" && key != "filament_colour" && key != "filament_multi_colour" &&
+                key != "filament_colour_type" && key != "flush_volumes_matrix" &&
+                key != "flush_volumes_vector" && key != "flush_multiplier")
+                throw std::invalid_argument("Unexpected remembered printer setting: " + key);
+            project.set_deserialize_strict(key, value);
+        }
+        const auto heads = project.option<Slic3r::ConfigOptionFloats>("flush_multiplier")->size();
+        const auto matrix = project.option<Slic3r::ConfigOptionFloats>("flush_volumes_matrix")->size();
+        const auto slots = heads ? std::size_t(std::sqrt(double(matrix) / heads)) : 0;
+        const auto vector_size = project.option<Slic3r::ConfigOptionFloats>("flush_volumes_vector")->size();
+        if (slots == 0 || matrix != slots * slots * heads || vector_size % 2 != 0)
+            project.apply_only(resolved_full, purge_keys);
+        target->update_multi_material_filament_presets();
+        auto full = target->full_config(true, map ? std::optional(map->values) : std::nullopt);
+
+        auto candidate = std::make_shared<ConfigurationState::Impl>();
+        candidate->config = std::unique_ptr<Config>(new Config(serialized_values(full)));
+        const auto count = target->filament_presets.size();
+        auto normalized = normalize_filament_colors(*candidate->config, count, {});
+        if (!normalized) {
+            result.diagnostics = std::move(normalized.diagnostics);
+            return result;
+        }
+        result.diagnostics = candidate->config->validate();
+        auto cardinality = filament_cardinality_diagnostics(*candidate->config, count);
+        result.diagnostics.insert(result.diagnostics.end(), cardinality.begin(), cardinality.end());
+        if (!result.diagnostics.empty()) return result;
+        candidate->selection = std::move(resolved.selection);
+        candidate->process_baselines = baselines;
+        candidate->bundle = std::move(target);
+        impl_->prepare(candidate, false);
+
+        if (!to_save.empty()) {
+            fs::create_directories(user_directory);
+            auto save_bundle = *source;
+            for (const auto& [type, name] : to_save) {
+                auto& collection = switch_collection(save_bundle, type);
+                const char* section = type == SwitchPreset::Printer ? PRESET_PRINTER_NAME
+                    : type == SwitchPreset::Process ? PRESET_PRINT_NAME : PRESET_FILAMENT_NAME;
+                collection.update_user_presets_directory(user_directory.string(), section);
+                const auto path = collection.path_for_preset(collection.get_edited_preset());
+                if (name == collection.get_edited_preset().name && !collection.get_edited_preset().is_project_embedded &&
+                    fs::is_regular_file(path))
+                    collection.get_selected_preset().file = path;
+                save_bundle.save_changes_for_preset(name, collection.type(), {});
+                const auto& preset = collection.get_selected_preset();
+                if (preset.name != name || !preset.is_user() || !fs::is_regular_file(preset.file))
+                    throw std::runtime_error("Could not save user preset: " + name);
+                if (type == SwitchPreset::Printer) saved.printer_preset_id = name;
+                else if (type == SwitchPreset::Process) saved.process_preset_id = name;
+                else if (!saved.filament_preset_ids.empty()) saved.filament_preset_ids.front() = name;
+                result.saved_source = saved;
+            }
+        }
+        result.configuration.impl_ = std::move(candidate);
+        result.configuration.captured_revision_ = expected_revision;
+        result.configuration.capture_origin_ = impl_->capture_origin;
+        result.configuration.filament_color_cursor_ = impl_->filament_color_cursor;
+    } catch (const std::exception& error) {
+        result.diagnostics.push_back({"printer_switch", error.what()});
     }
     return result;
 }
@@ -3595,7 +4005,15 @@ ConfigActivationResult Library::activate_config(
     if (!same_context) {
         next_state->imported_process.reset();
         next_state->bundle.reset();next_state->machine.project_local=false;
-        for(const auto& seed:impl_->vendor_presets)if(seed->printers.find_system_preset_by_model_and_variant(next_state->selection.machine_model_id,next_state->selection.machine_variant_id)){next_state->bundle=std::make_shared<Slic3r::PresetBundle>(*seed);break;}
+        for (const auto& seed : impl_->vendor_presets) {
+            if (!seed->printers.find_system_preset_by_model_and_variant(
+                    next_state->selection.machine_model_id, next_state->selection.machine_variant_id))
+                continue;
+            next_state->bundle = std::make_shared<Slic3r::PresetBundle>(*seed);
+            impl_->load_user_presets(*next_state->bundle, impl_->vendor_for(
+                next_state->selection.machine_model_id, next_state->selection.machine_variant_id));
+            break;
+        }
     }
     else if (auto& imported = next_state->imported_process;
              imported && next_state->selection.process_preset_id != impl_->active->selection.process_preset_id) {
@@ -3710,7 +4128,7 @@ SettingsResult Library::apply_active_config_patch(
     auto next_state = std::make_shared<ConfigurationState::Impl>(*impl_->active);
     next_state->config = std::make_unique<Config>(std::move(candidate));
     try {
-        impl_->prepare(next_state);
+        impl_->prepare_preset_edit(next_state);
     } catch(const std::exception& error) {
         // Native preset splitting may reject structurally incomplete vectors.
         // Return an ordinary failed edit; never publish a partial candidate.
@@ -3761,7 +4179,7 @@ SettingsResult Library::reset_active_config_value(std::string_view key)
     auto next_state = std::make_shared<ConfigurationState::Impl>(*impl_->active);
     next_state->config = std::make_unique<Config>(std::move(candidate));
     try {
-        impl_->prepare(next_state);
+        impl_->prepare_preset_edit(next_state);
     } catch(const std::exception& error) {
         // Native preset splitting may reject structurally incomplete vectors.
         // Return an ordinary failed edit; never publish a partial candidate.

@@ -81,6 +81,7 @@ struct ConfigSelection
     std::vector<std::string> filament_preset_ids;
     // Optional physical tool IDs, one per material. Never inferred from material type.
     std::vector<unsigned> filament_physical_tools;
+    std::string printer_preset_id;
 };
 
 struct ResolvedSelection
@@ -99,6 +100,8 @@ struct LibraryOptions
     // Tests and SDK embedding may provide an explicit libslicer resource root.
     std::string resource_directory;
     std::vector<std::string> vendors;
+    // Optional writable root for Orca user presets, separate from slice work files.
+    std::string user_preset_directory;
 };
 
 struct ConfigCreateResult
@@ -168,6 +171,39 @@ struct ConfigActivationResult
     std::vector<ConfigDiagnostic> diagnostics;
 
     explicit operator bool() const noexcept { return success; }
+};
+
+enum class PrinterSwitchPreset { Printer, Process, Filament };
+enum class PrinterSwitchAction { Save, Transfer, Discard, Cancel };
+
+struct PrinterSwitchChange
+{
+    std::string key;
+    std::string before;
+    std::string after;
+    bool transferable{false};
+};
+
+struct PrinterSwitchReview
+{
+    struct Preset {
+        PrinterSwitchPreset type;
+        std::string name;
+        bool transfer_allowed;
+        bool cancel_switch;
+        bool save_as;
+        std::vector<PrinterSwitchChange> changes;
+    };
+    std::uint64_t revision{0};
+    std::vector<Preset> presets;
+    std::vector<ConfigDiagnostic> diagnostics;
+};
+
+struct PrinterSwitchDecision
+{
+    PrinterSwitchPreset type;
+    PrinterSwitchAction action;
+    std::string save_name;
 };
 
 struct SliceVertex
@@ -659,6 +695,12 @@ struct ConfigurationInstallResult {
     std::vector<ConfigDiagnostic> diagnostics;
     explicit operator bool() const noexcept { return success; }
 };
+struct PrinterSwitchResult {
+    ConfigurationState configuration;
+    std::optional<ResolvedSelection> saved_source;
+    std::vector<ConfigDiagnostic> diagnostics;
+    explicit operator bool() const noexcept { return configuration.valid(); }
+};
 LIBSLICER_API std::string encode_project_object_semantics(const ProjectObject&);
 // Edit one object setting atomically. A missing value restores inheritance.
 LIBSLICER_API SettingsResult edit_project_object_setting(const ConfigSnapshot& base,
@@ -679,7 +721,7 @@ LIBSLICER_API std::string clear_expired_support_filaments(
 // requests or user edits. Malformed semantics/invalid snapshots throw.
 LIBSLICER_API std::string synchronize_project_plate_materials(
     std::string_view semantics, const ConfigSnapshot& target_config,
-    std::vector<ConfigDiagnostic>* diagnostics = nullptr);
+    std::vector<ConfigDiagnostic>* diagnostics = nullptr, bool update_print_sequence = false);
 class LIBSLICER_API Library final
 {
 public:
@@ -695,10 +737,16 @@ public:
     const std::string& resource_directory() const noexcept;
     const std::vector<MachineModelOption>& machine_models() const noexcept;
     const std::vector<BuildPlateOption>& build_plate_options() const noexcept;
+    std::vector<PresetOption> printer_presets(std::string_view model, std::string_view variant) const;
     ConfigCreateResult create_config(const ConfigSelection& selection) const;
     ConfigActivationResult activate_config(
         const ConfigSelection& selection,
         const std::vector<std::pair<std::string, std::string>>& patch = {});
+    PrinterSwitchReview review_printer_switch(const ConfigSelection& target) const;
+    PrinterSwitchResult prepare_printer_switch(
+        const ConfigSelection& target, std::uint64_t expected_revision,
+        const std::vector<PrinterSwitchDecision>& decisions,
+        const std::vector<std::pair<std::string, std::string>>& remembered_project_settings = {});
     std::optional<ActiveConfigView> active_config() const;
     std::optional<ConfigSnapshot> active_config_snapshot() const;
     SettingsResult apply_active_config_patch(
