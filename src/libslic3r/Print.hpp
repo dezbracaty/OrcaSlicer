@@ -25,6 +25,7 @@
 #include <atomic>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <set>
 
 #include "calib.hpp"
@@ -1110,6 +1111,7 @@ public:
 
     // Wipe tower support.
     bool                        has_wipe_tower() const;
+    std::optional<Vec2d>        find_wipe_tower_position(const std::function<bool()>& stop) const;
     const WipeTowerData&        wipe_tower_data(size_t filaments_cnt = 0) const;
     const ToolOrdering& 		tool_ordering() const { return m_tool_ordering; }
 

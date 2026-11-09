@@ -1451,6 +1451,19 @@ bool store_gcode_3mf(const std::string& output_path,
     // Print configuration and generated calibration G-code must stay intact.
     auto package_config = config;
     normalize_filament_identity(package_config);
+    if (model.curr_plate_index > 0) {
+        const auto index = std::size_t(model.curr_plate_index);
+        for (const char* key : {"wipe_tower_x", "wipe_tower_y"}) {
+            auto* coordinate = package_config.option<Slic3r::ConfigOptionFloats>(key);
+            const double value = coordinate->get_at(index);
+            coordinate->values.assign(1, value);
+        }
+        auto& modes = package_config.option<Slic3r::ConfigOptionEnumsGeneric>("wipe_tower_position_mode")->values;
+        if (!modes.empty()) {
+            const int mode = index < modes.size() ? modes[index] : modes.front();
+            modes.assign(1, mode);
+        }
+    }
     Slic3r::PlateData plate;
     plate.plate_index = 0;
     for (std::size_t object_index = 0; object_index < model.objects.size(); ++object_index) {
@@ -2576,14 +2589,45 @@ Slic3r::DynamicPrintConfig effective_plate_settings(const ProjectJson& j) {
         settings.erase("filament_map_mode");
     return settings;
 }
+
+// Original Orca PartPlateList::MAX_PLATES_COUNT.
+constexpr std::size_t native_plate_limit = 36;
+
+void restore_project_tower_modes(Slic3r::DynamicPrintConfig& raw, std::size_t plate_count)
+{
+    using namespace Slic3r;
+    const auto* x = raw.option<ConfigOptionFloats>("wipe_tower_x");
+    const auto* y = raw.option<ConfigOptionFloats>("wipe_tower_y");
+    const bool legacy_coordinates = !raw.has("wipe_tower_position_mode") &&
+        ((x && !x->values.empty()) || (y && !y->values.empty()));
+    const std::size_t count = std::max({std::size_t(1), plate_count, x ? x->size() : 0, y ? y->size() : 0});
+    auto& modes = raw.option<ConfigOptionEnumsGeneric>("wipe_tower_position_mode", true)->values;
+    if (legacy_coordinates)
+        modes.assign(count, int(WipeTowerPositionMode::Manual));
+    else if (modes.size() < count) {
+        const int fallback = modes.empty() ? int(WipeTowerPositionMode::Auto) : modes.front();
+        modes.resize(count, fallback);
+    }
+}
+
 void apply_plate_semantics(Slic3r::Model& model, Slic3r::DynamicPrintConfig& config, const std::string& payload) {
     const auto j=semantic_json(payload,"plate"); if (j.empty()) return;
-    config.apply(effective_plate_settings(j));
+    const auto settings = effective_plate_settings(j);
+    config.apply(settings);
     const int mode=j.at("custom_gcode_mode");
     if (mode<0||mode>int(Slic3r::CustomGCode::Mode::MultiExtruder)) throw std::invalid_argument("Invalid custom G-code mode");
     const int index=j.value("native_plate_index",0);
     if(index<0)throw std::invalid_argument("Invalid native plate index");
     model.curr_plate_index=index;
+    if (!settings.has("wipe_tower_position_mode") && (settings.has("wipe_tower_x") || settings.has("wipe_tower_y"))) {
+        auto& modes = config.option<Slic3r::ConfigOptionEnumsGeneric>("wipe_tower_position_mode", true)->values;
+        const std::size_t plate = std::size_t(index);
+        const std::size_t target = plate < native_plate_limit || plate < modes.size() ? plate : 0;
+        const int fallback = modes.empty() ? int(Slic3r::WipeTowerPositionMode::Auto) : modes.front();
+        if (modes.size() <= target)
+            modes.resize(target + 1, fallback);
+        modes[target] = int(Slic3r::WipeTowerPositionMode::Manual);
+    }
     auto& code=model.plates_custom_gcodes[index]; code.mode=static_cast<Slic3r::CustomGCode::Mode>(mode);
     for (const auto& c : j.at("custom_gcodes")) {
         const double z=c.at("print_z");const int type=c.at("type"),slot=c.at("filament_slot");
@@ -3172,22 +3216,25 @@ ConfigActivationResult Library::activate_config(
         return result;
     }
 
-    if (impl_->active->config && selection.machine_model_id == impl_->active->selection.machine_model_id &&
-        selection.machine_variant_id == impl_->active->selection.machine_variant_id &&
-        selection.process_preset_id == impl_->active->selection.process_preset_id) {
+    if (impl_->active->config &&
+        created.selection.machine_model_id == impl_->active->selection.machine_model_id &&
+        created.selection.machine_variant_id == impl_->active->selection.machine_variant_id) {
         const auto previous = dynamic_config(impl_->active->config->snapshot());
         auto candidate = dynamic_config(created.config->snapshot());
-        for (const auto* keys : {&Slic3r::Preset::print_options(), &Slic3r::Preset::printer_options()})
-            for (const auto& key : *keys)
-                if (const auto* value = previous.option(key)) candidate.set_key_value(key, value->clone());
-        const auto& old_ids = impl_->active->selection.filament_preset_ids;
-        const auto& new_ids = created.selection.filament_preset_ids;
-        for (const auto& key : Slic3r::Preset::filament_options()) {
-            const auto* old_value = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(previous.option(key));
-            auto* new_value = dynamic_cast<Slic3r::ConfigOptionVectorBase*>(candidate.option(key));
-            if (!old_value || !new_value || old_value->size() != old_ids.size() || new_value->size() != new_ids.size()) continue;
-            for (size_t slot = 0; slot < std::min(old_ids.size(), new_ids.size()); ++slot)
-                if (old_ids[slot] == new_ids[slot]) new_value->set_at(old_value, slot, slot);
+        candidate.apply_only(previous, {"wipe_tower_position_mode", "wipe_tower_x", "wipe_tower_y"});
+        if (selection.process_preset_id == impl_->active->selection.process_preset_id) {
+            for (const auto* keys : {&Slic3r::Preset::print_options(), &Slic3r::Preset::printer_options()})
+                for (const auto& key : *keys)
+                    if (const auto* value = previous.option(key)) candidate.set_key_value(key, value->clone());
+            const auto& old_ids = impl_->active->selection.filament_preset_ids;
+            const auto& new_ids = created.selection.filament_preset_ids;
+            for (const auto& key : Slic3r::Preset::filament_options()) {
+                const auto* old_value = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(previous.option(key));
+                auto* new_value = dynamic_cast<Slic3r::ConfigOptionVectorBase*>(candidate.option(key));
+                if (!old_value || !new_value || old_value->size() != old_ids.size() || new_value->size() != new_ids.size()) continue;
+                for (size_t slot = 0; slot < std::min(old_ids.size(), new_ids.size()); ++slot)
+                    if (old_ids[slot] == new_ids[slot]) new_value->set_at(old_value, slot, slot);
+            }
         }
         created.config = std::unique_ptr<Config>(new Config(serialized_values(candidate)));
     }
@@ -3998,6 +4045,37 @@ SliceResult Library::slice_impl(const SliceRequest& request,
             config.opt_enum<Slic3r::PrintSequence>("print_sequence") == Slic3r::PrintSequence::ByLayer &&
             !print.config().enable_prime_tower.value && print.extruders(true).size() > 1)
             print.apply(plate_model, config);
+        bool tower_placement_failed = false;
+        const std::size_t native_plate_index = print.get_plate_index();
+        const auto& modes = print.config().wipe_tower_position_mode;
+        const bool auto_tower = modes.values.empty() ||
+            modes.get_at(native_plate_index) == int(Slic3r::WipeTowerPositionMode::Auto);
+        if (auto_tower && print.has_wipe_tower() &&
+            print.config().print_sequence.value == Slic3r::PrintSequence::ByLayer) {
+            if (const auto position = print.find_wipe_tower_position(callbacks.is_cancelled)) {
+                auto* tower_x = config.option<Slic3r::ConfigOptionFloats>("wipe_tower_x", true);
+                auto* tower_y = config.option<Slic3r::ConfigOptionFloats>("wipe_tower_y", true);
+                if (tower_x->get_at(native_plate_index) != position->x() || tower_y->get_at(native_plate_index) != position->y()) {
+                    // Orca PartPlateList caps new plate indices at 36. Do not
+                    // grow the coordinate vectors for an arbitrary SDK index.
+                    if (native_plate_index >= native_plate_limit &&
+                        native_plate_index >= std::min(tower_x->size(), tower_y->size())) {
+                        result.diagnostics.push_back({"validation", "Invalid native plate index for automatic tower placement",
+                                                      false, "wipe_tower_position_mode"});
+                        return result;
+                    }
+                    const Slic3r::ConfigOptionFloat x(position->x()), y(position->y());
+                    tower_x->set_at(&x, native_plate_index, 0);
+                    tower_y->set_at(&y, native_plate_index, 0);
+                    print.apply(plate_model, config);
+                }
+            } else if (cancellation_requested(callbacks)) {
+                result.cancelled = true;
+                return result;
+            } else {
+                tower_placement_failed = true;
+            }
+        }
         if (calibration) print.set_calib_params(calibration->impl_->params);
         validate_effective_mask_regions(print, mask_volume_ids);
 
@@ -4011,6 +4089,11 @@ SliceResult Library::slice_impl(const SliceRequest& request,
             result.diagnostics.push_back(
                 {"validation", validation_error.string, false,
                  validation_error.opt_key});
+            return result;
+        }
+        if (tower_placement_failed) {
+            result.diagnostics.push_back({"validation", "No free position for the prime tower on this plate",
+                                          false, "wipe_tower_position_mode"});
             return result;
         }
         if (cancellation_requested(callbacks)) {
@@ -4723,6 +4806,7 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
             if (!changed.empty()) diagnostic("project.preset_substitutions","Native Orca migrated embedded presets",{},"info");
         }
         if (load_config && !loaded.empty()) {
+            restore_project_tower_modes(loaded, plates.size());
             DynamicPrintConfig config; config.apply(FullPrintConfig::defaults()); config+=std::move(loaded);
             for (const auto& problem:config.validate()) diagnostic("project.invalid_configuration",problem.second,problem.first);
             Preset::normalize(config);
@@ -5383,6 +5467,7 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
                                 ". Select an updated machine preset to enable its configured behavior.", true});
                         }
                     }
+                    restore_project_tower_modes(config, plate_data.size());
                     Slic3r::DynamicPrintConfig resolved_config;
                     resolved_config.apply(Slic3r::FullPrintConfig::defaults());
                     resolved_config.apply(config);

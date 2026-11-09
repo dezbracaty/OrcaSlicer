@@ -85,6 +85,11 @@ enum class WipeTowerType {
     Type2,
 };
 
+enum class WipeTowerPositionMode {
+    Auto,
+    Manual,
+};
+
 enum PrintHostType {
     htPrusaLink, htPrusaConnect, htOctoPrint, htDuet, htFlashAir, htAstroBox, htRepetier, htMKS, htESP3D, htCrealityPrint, htObico, htFlashforge, htSimplyPrint, htElegooLink, ht3DPrinterOS, htMoonraker
 };
@@ -1681,6 +1686,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     // BBS: change wipe_tower_x and wipe_tower_y data type to floats to add partplate logic
     ((ConfigOptionFloats,             wipe_tower_x))
     ((ConfigOptionFloats,             wipe_tower_y))
+    ((ConfigOptionEnumsGeneric,       wipe_tower_position_mode))
     ((ConfigOptionFloat,              prime_tower_width))
     ((ConfigOptionFloat,              wipe_tower_per_color_wipe))
     ((ConfigOptionFloat,              wipe_tower_rotation_angle))

@@ -218,6 +218,11 @@ static t_config_enum_values s_keys_map_WipeTowerType {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(WipeTowerType)
 
+static const t_config_enum_values s_wipe_tower_position_modes {
+    { "auto",   int(WipeTowerPositionMode::Auto) },
+    { "manual", int(WipeTowerPositionMode::Manual) }
+};
+
 static t_config_enum_values s_keys_map_FuzzySkinMode {
     { "displacement",   int(FuzzySkinMode::Displacement) },
     { "extrusion",      int(FuzzySkinMode::Extrusion) },
@@ -680,6 +685,18 @@ PrintConfigDef::PrintConfigDef()
     def->category = L("Continuous fiber");
     def->printer_technology = ptFFF;
     def->set_default_value(new ConfigOptionBools{false});
+
+    def = this->add("wipe_tower_position_mode", coEnums);
+    def->label = L("Wipe tower position");
+    def->tooltip = L("Choose automatic placement or fixed X and Y coordinates for each plate.");
+    def->category = L("Wipe tower");
+    def->printer_technology = ptFFF;
+    def->mode = comAdvanced;
+    def->enum_keys_map = &s_wipe_tower_position_modes;
+    def->enum_values = { "auto", "manual" };
+    def->enum_labels = { L("Auto"), L("Manual") };
+    def->set_default_value(new ConfigOptionEnumsGeneric(&s_wipe_tower_position_modes, 1,
+        int(WipeTowerPositionMode::Auto)));
 }
 
 void PrintConfigDef::init_common_params()

@@ -79,7 +79,8 @@ public:
         // presented alongside process settings by the public three-group API.
         // Tower coordinates are per-plate project state as well. Callers must
         // be able to place the tower inside printers with an offset bed origin.
-        const std::set<std::string> process_project_keys{"curr_bed_type", "wipe_tower_x", "wipe_tower_y"};
+        const std::set<std::string> process_project_keys{
+            "curr_bed_type", "wipe_tower_x", "wipe_tower_y", "wipe_tower_position_mode"};
         // Per-slot colors are also project state (they are intentionally not
         // part of Preset::filament_options()), but must travel with a project
         // so facet labels continue to address the correct material colors.
@@ -195,6 +196,11 @@ bool key_is(std::string_view key, std::initializer_list<std::string_view> candid
 void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintConfig& config,
                                 ConfigScope scope = ConfigScope::Full)
 {
+    if (item.key == "wipe_tower_position_mode") {
+        const auto* mode = config.option<Slic3r::ConfigOptionEnumsGeneric>(item.key);
+        if (mode && mode->values.size() == 1)
+            item.type = SettingType::Enum;
+    }
     if (item.key == "filament_exclude_from_wipe_tower") {
         item.enabled = false;
         const auto* flags = config.option<Slic3r::ConfigOptionBools>(item.key);
@@ -467,6 +473,8 @@ SettingsResult Config::apply_patch(ConfigScope scope,
     const Slic3r::DynamicPrintConfig before = impl_->current;
     Slic3r::DynamicPrintConfig candidate = before;
     std::string last_key;
+    bool explicit_tower_mode = false;
+    std::size_t explicit_tower_plates = 0;
     try {
         for (const auto& [key, serialized_value] : patch) {
             last_key = key;
@@ -496,6 +504,16 @@ SettingsResult Config::apply_patch(ConfigScope scope,
             if (key == "fiber_infill_angle_sequence")
                 Slic3r::parse_fiber_infill_angle_sequence(serialized_value);
             candidate.set_deserialize_strict(key, serialized_value);
+            if (key == "wipe_tower_position_mode") {
+                explicit_tower_mode = true;
+                if (candidate.option<Slic3r::ConfigOptionEnumsGeneric>(key)->values.empty())
+                    return failure(key, "Choose an automatic or manual tower position");
+            } else if (key_is(key, {"wipe_tower_x", "wipe_tower_y"})) {
+                const std::size_t count = candidate.option<Slic3r::ConfigOptionFloats>(key)->size();
+                if (count == 0)
+                    return failure(key, "Enter a tower coordinate");
+                explicit_tower_plates = std::max(explicit_tower_plates, count);
+            }
             const auto* option_definition = Slic3r::print_config_def.get(key);
             const auto* option            = candidate.option(key);
             if (option_definition != nullptr && option != nullptr) {
@@ -514,6 +532,14 @@ SettingsResult Config::apply_patch(ConfigScope scope,
         }
     } catch (const std::exception& error) {
         return failure(last_key, error.what());
+    }
+
+    // An existing SDK caller can still set fixed coordinates without a mode.
+    if (!explicit_tower_mode && explicit_tower_plates > 0) {
+        auto& modes = candidate.option<Slic3r::ConfigOptionEnumsGeneric>("wipe_tower_position_mode", true)->values;
+        if (modes.size() < explicit_tower_plates)
+            modes.resize(explicit_tower_plates);
+        std::fill_n(modes.begin(), explicit_tower_plates, int(Slic3r::WipeTowerPositionMode::Manual));
     }
 
     if (const auto* flags = before.option<Slic3r::ConfigOptionBools>("filament_exclude_from_wipe_tower")) {

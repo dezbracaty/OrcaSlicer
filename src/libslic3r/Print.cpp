@@ -1,6 +1,8 @@
 #include "Config.hpp"
 #include "Exception.hpp"
 #include "Print.hpp"
+#include "Arrange.hpp"
+#include "Tesselate.hpp"
 #include "BoundingBox.hpp"
 #include "Brim.hpp"
 #include "ClipperUtils.hpp"
@@ -959,6 +961,26 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
     return single_object_exception;
 }
 
+static Polygon wipe_tower_rectangle(float x, float y, float width, float depth, double rotation)
+{
+    Polygon footprint;
+    footprint.points.emplace_back(scale_(x), scale_(y));
+    footprint.points.emplace_back(scale_(x + width), scale_(y));
+    footprint.points.emplace_back(scale_(x + width), scale_(y + depth));
+    footprint.points.emplace_back(scale_(x), scale_(y + depth));
+    footprint.rotate(rotation);
+    return footprint;
+}
+
+static Polygon instance_volume_hull(const PrintInstance& instance, const ModelVolume& volume)
+{
+    const ModelInstance& model_instance = *instance.model_instance;
+    auto hull = volume.get_convex_hull_2d(Geometry::assemble_transform(Vec3d::Zero(), model_instance.get_rotation(),
+        model_instance.get_scaling_factor(), model_instance.get_mirror()));
+    hull.translate(instance.shift - instance.print_object->center_offset());
+    return hull;
+}
+
 //BBS
 static StringObjectException layered_print_cleareance_valid(const Print &print, StringObjectException *warning)
 {
@@ -986,9 +1008,7 @@ static StringObjectException layered_print_cleareance_valid(const Print &print, 
         for (const ModelVolume *v : inst->print_object->model_object()->volumes) {
             if (!v->is_model_part()) continue;
             
-            auto volume_hull = v->get_convex_hull_2d(Geometry::assemble_transform(Vec3d::Zero(), inst->model_instance->get_rotation(),
-                                                                                  inst->model_instance->get_scaling_factor(), inst->model_instance->get_mirror()));
-            volume_hull.translate(inst->shift - inst->print_object->center_offset());
+            auto volume_hull = instance_volume_hull(*inst, *v);
 
             if (!intersection(exclude_polys, volume_hull).empty()) {
                 // return {inst->model_instance->get_object()->name + L(" is too close to exclusion area, there may be collisions when printing.") + "\n",
@@ -1047,13 +1067,7 @@ static StringObjectException layered_print_cleareance_valid(const Print &print, 
     Polygons convex_hulls_temp;
     if (print.has_wipe_tower()) {
         if (!print.is_step_done(psWipeTower)) {
-            Polygon wipe_tower_convex_hull;
-            wipe_tower_convex_hull.points.emplace_back(scale_(x), scale_(y));
-            wipe_tower_convex_hull.points.emplace_back(scale_(x + width), scale_(y));
-            wipe_tower_convex_hull.points.emplace_back(scale_(x + width), scale_(y + depth));
-            wipe_tower_convex_hull.points.emplace_back(scale_(x), scale_(y + depth));
-            wipe_tower_convex_hull.rotate(a);
-            convex_hulls_temp.push_back(wipe_tower_convex_hull);
+            convex_hulls_temp.push_back(wipe_tower_rectangle(x, y, width, depth, a));
         } else {
             //here, wipe_tower_polygon is not always convex.
             Polygon wipe_tower_polygon;
@@ -1078,6 +1092,107 @@ static StringObjectException layered_print_cleareance_valid(const Print &print, 
         return {L("Prime Tower") + L(" is too close to clumping detection area, and collisions will be caused.\n")};
     }
     return {};
+}
+
+std::optional<Vec2d> Print::find_wipe_tower_position(const std::function<bool()>& stop) const
+{
+    const PrintConfig& cfg = config();
+    const auto& estimate = wipe_tower_data(extruders().size());
+    const float depth = estimate.depth;
+    const float nominal_width = cfg.prime_tower_width.value;
+    const float validation_width = cfg.wipe_tower_wall_type.value == wtwRib ? depth : nominal_width;
+    const float rotation = cfg.wipe_tower_rotation_angle.value;
+    const float margin = std::max(0.f, estimate.brim_width) + 1.f;
+    const auto& defaults = FullPrintConfig::defaults();
+    const Vec2d initial(defaults.wipe_tower_x.get_at(0), defaults.wipe_tower_y.get_at(0));
+    if (depth <= 0)
+        return initial;
+
+    const Polygon bed(get_bed_shape(cfg));
+    if (bed.points.size() < 3)
+        return std::nullopt;
+    Polygons allowed{bed};
+    for (const Pointfs& area : cfg.extruder_printable_area.values) {
+        if (area.size() < 3)
+            continue;
+        allowed = intersection(allowed, Polygon::new_scale(make_counter_clockwise(area)));
+        if (allowed.empty())
+            return std::nullopt;
+    }
+    const Vec3d origin = get_plate_origin();
+    const Point origin_xy(scale_(origin.x()), scale_(origin.y()));
+    Polygons keepouts = get_bed_excluded_area(cfg);
+    if (cfg.enable_wrapping_detection.value && cfg.wrapping_exclude_area.values.size() >= 3)
+        keepouts.push_back(Polygon::new_scale(make_counter_clockwise(cfg.wrapping_exclude_area.values)));
+
+    Polygons obstacles = keepouts;
+    for (const auto* instance : sort_object_instances_by_model_order(*this, true)) {
+        for (const auto* volume : instance->print_object->model_object()->volumes) {
+            if (volume->is_model_part()) {
+                auto hull = instance_volume_hull(*instance, *volume);
+                hull.translate(-origin_xy);
+                obstacles.push_back(std::move(hull));
+            }
+        }
+    }
+
+    const Polygon outline = wipe_tower_rectangle(-margin, -margin,
+        std::max(nominal_width, validation_width) + 2 * margin, depth + 2 * margin, Geometry::deg2rad(rotation));
+    const auto fits = [&](const Vec2d& position) {
+        Polygon occupied = outline;
+        occupied.translate(scale_(position.x()), scale_(position.y()));
+        Polygon preflight = wipe_tower_rectangle(float(position.x() + origin.x()), float(position.y() + origin.y()),
+            validation_width, depth, rotation);
+        preflight.translate(-origin_xy);
+        return diff(Polygons{occupied}, allowed).empty() && intersection(obstacles, occupied).empty() &&
+               intersection(keepouts, preflight).empty();
+    };
+    if (fits(initial))
+        return initial;
+
+    // Orca PartPlateList::set_default_wipe_tower_pos_for_plate uses these
+    // preferred locations and clamps them by the estimated tower size.
+    const BoundingBox bed_bounds = get_extents(allowed);
+    const BoundingBox tower_bounds = get_extents(outline);
+    const Point lower = bed_bounds.min - tower_bounds.min;
+    const Point upper = bed_bounds.max - tower_bounds.max;
+    if (lower.x() > upper.x() || lower.y() > upper.y())
+        return std::nullopt;
+    const Vec2d preferred(
+        unscale_(std::clamp<coord_t>(scale_(cfg.printer_structure.value == psI3 ? 0. : 165.), lower.x(), upper.x())),
+        unscale_(std::clamp<coord_t>(scale_(250.), lower.y(), upper.y())));
+    if (fits(preferred))
+        return preferred;
+
+    // Reuse Orca's arranger with only the tower movable. Triangulate the
+    // keep-outs because the arranger's fixed shapes must be convex.
+    arrangement::ArrangeParams params;
+    params.parallel = false;
+    params.do_final_align = false;
+    params.progressind = {};
+    params.stopcondition = stop;
+    for (const Polygon& obstacle : obstacles) {
+        if (obstacle.points.size() < 3)
+            continue;
+        const auto triangles = triangulate_expolygons_2d({ExPolygon(obstacle)});
+        for (std::size_t i = 0; i + 2 < triangles.size(); i += 3) {
+            arrangement::ArrangePolygon fixed;
+            fixed.poly.contour = Polygon{Point::new_scale(triangles[i]), Point::new_scale(triangles[i + 1]),
+                                         Point::new_scale(triangles[i + 2])};
+            params.excluded_regions.push_back(std::move(fixed));
+        }
+    }
+    for (const Polygon& area : allowed) {
+        if (stop && stop())
+            return std::nullopt;
+        arrangement::ArrangePolygons tower(1);
+        tower.front().poly.contour = outline;
+        arrangement::arrange(tower, area.points, params);
+        const Vec2d position = unscale(tower.front().translation);
+        if (tower.front().bed_idx == 0 && fits(position))
+            return position;
+    }
+    return std::nullopt;
 }
 
 FilamentCompatibilityType Print::check_multi_filaments_compatibility(
