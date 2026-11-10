@@ -28,56 +28,6 @@
 #include <string_view>
 #include <vector>
 
-TEST_CASE("Project object settings edit only explicit Orca overrides", "[project-object-settings]")
-{
-    auto base = libslicer::Config::defaults();
-    REQUIRE(base.set("fiber_infill_angle_sequence", "0"));
-    libslicer::ProjectPlate plate;
-    plate.settings = {{"wall_loops", "4"}};
-    const auto plate_semantics = libslicer::encode_project_plate_semantics(plate);
-    libslicer::ProjectObject object;
-    object.layer_height_profile = {0, 0.2, 1, 0.1};
-    object.settings = {{"curr_bed_type", "Textured PEI Plate"}};
-    auto semantics = libslicer::encode_project_object_semantics(object);
-    const auto original = semantics;
-    auto editor = libslicer::Config::for_project_object(base.snapshot(), plate_semantics, semantics);
-    REQUIRE(editor.snapshot().value("wall_loops") == std::optional<std::string>("4"));
-    REQUIRE(editor.overrides().empty());
-    REQUIRE_FALSE(libslicer::edit_project_object_setting(base.snapshot(), plate_semantics,
-        semantics, "wipe_tower_x", "40"));
-    REQUIRE_FALSE(libslicer::edit_project_object_setting(base.snapshot(), plate_semantics,
-        semantics, "fiber_infill_angle_sequence", "invalid"));
-    REQUIRE(semantics == original);
-
-    REQUIRE(libslicer::edit_project_object_setting(base.snapshot(), plate_semantics,
-        semantics, "fiber_infill_angle_sequence", "0"));
-    REQUIRE(base.set("fiber_infill_angle_sequence", "90"));
-    editor = libslicer::Config::for_project_object(base.snapshot(), plate_semantics, semantics);
-    REQUIRE(editor.snapshot().value("fiber_infill_angle_sequence") == std::optional<std::string>("0"));
-    REQUIRE(editor.overrides().size() == 1);
-    REQUIRE(libslicer::edit_project_object_setting(base.snapshot(), plate_semantics,
-        semantics, "fiber_infill_angle_sequence", std::nullopt));
-    REQUIRE(semantics == original);
-    editor = libslicer::Config::for_project_object(base.snapshot(), plate_semantics, semantics);
-    REQUIRE(editor.snapshot().value("fiber_infill_angle_sequence") == std::optional<std::string>("90"));
-
-    REQUIRE(base.set("enable_support", "1"));
-    REQUIRE(base.set("support_style", "snug"));
-    const auto support = libslicer::edit_project_object_setting(base.snapshot(), plate_semantics,
-        semantics, "support_type", "tree(auto)");
-    REQUIRE(support);
-    CHECK(std::none_of(support.changed_items.begin(), support.changed_items.end(),
-        [](const libslicer::SettingItem& item) { return item.key == "wall_loops"; }));
-    editor = libslicer::Config::for_project_object(base.snapshot(), plate_semantics, semantics);
-    REQUIRE(editor.snapshot().value("support_style") == std::optional<std::string>("default"));
-    const auto inherit = libslicer::edit_project_object_setting(base.snapshot(), plate_semantics,
-        semantics, "support_style", std::nullopt);
-    REQUIRE(inherit);
-    REQUIRE(inherit.diagnostics.size() == 1);
-    editor = libslicer::Config::for_project_object(base.snapshot(), plate_semantics, semantics);
-    REQUIRE(editor.snapshot().value("support_style") == std::optional<std::string>("default"));
-}
-
 namespace {
 // Real-model validation must use the same explicit mesh placement as the App.
 // Compatibility file input does not apply SliceObjectInput::transform.
@@ -535,10 +485,8 @@ TEST_CASE("P3 PLA TPU dock changes stay within extrusion limits with and without
 {
     const bool tower = GENERATE(false, true);
     const bool infill_only = GENERATE(false, true);
-    const auto tower_type = GENERATE("type1", "type2");
     INFO("enable_prime_tower=" << tower);
     INFO("single object with TPU infill=" << infill_only);
-    INFO("wipe_tower_type=" << tower_type);
     libslicer::LibraryOptions options;
     options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
     options.vendors = {"P3"};
@@ -558,7 +506,7 @@ TEST_CASE("P3 PLA TPU dock changes stay within extrusion limits with and without
     CHECK(created.config->snapshot().value("single_extruder_multi_material") == "0");
     REQUIRE(created.config->apply_patch({
         {"filament_colour", "#F28E2B;#4E79A7;#59A14F;#B07AA1;#EDC948;#E15759"},
-        {"enable_prime_tower", tower ? "1" : "0"}, {"wipe_tower_type", tower_type},
+        {"enable_prime_tower", tower ? "1" : "0"}, {"wipe_tower_type", "type2"},
         {"wipe_tower_x", "60"}, {"wipe_tower_y", "60"}, {"prime_tower_width", "60"},
         {"wipe_tower_wall_type", "rectangle"}, {"enable_arc_fitting", "0"},
         {"enable_support", "0"}, {"generate_reinforced_perimeters", "0"},
@@ -604,9 +552,7 @@ TEST_CASE("P3 PLA TPU dock changes stay within extrusion limits with and without
     const std::string gcode((std::istreambuf_iterator<char>(input)), {});
     CHECK(require_p3_heat_before_extrusion(gcode) == std::set<unsigned>{0, 3});
     require_p3_retraction_lengths(gcode);
-    const bool has_tower = gcode.find(";TYPE:Prime tower") != std::string::npos ||
-        gcode.find("; FEATURE: Prime tower") != std::string::npos;
-    CHECK(has_tower == tower);
+    CHECK((gcode.find(";TYPE:Prime tower") != std::string::npos) == tower);
     CHECK(gcode.find("; CP TOOLCHANGE LOAD") == std::string::npos);
     CHECK(gcode.find("; Retract(unload)") == std::string::npos);
     CHECK(gcode.find("; Cooling park") == std::string::npos);
@@ -893,10 +839,6 @@ TEST_CASE("P3 can select CCF on any tool without changing material ownership", "
     CHECK(initial.view.selection.filament_preset_ids == std::vector<std::string>{
         "CFSYS TPU 95A", "CFSYS TPU 95A", "CFSYS TPU 95A",
         "Generic PLA @P3", "CFSYS PA-CF", "CFSYS CCF"});
-    CHECK(library->active_config_snapshot()->value("filament_colour") ==
-        "#F28E2B;#4E79A7;#59A14F;#B07AA1;#EDC948;#E15759");
-    CHECK(library->active_config_snapshot()->value("enable_prime_tower") == "1");
-    CHECK(library->active_config_snapshot()->value("wipe_tower_type") == "type1");
     CHECK(library->active_config_snapshot()->value("filament_process_type") ==
         "thermoplastic;thermoplastic;thermoplastic;thermoplastic;thermoplastic;continuous_fiber");
     // CCF is a 0.4 mm composite feedstock; its deposited fiber_width is a
@@ -5381,8 +5323,7 @@ TEST_CASE("wipe tower exclusions preserve model tools and prime a single ordinar
     const unsigned ordinary_materials = GENERATE(1u, 2u);
     const unsigned shell_layers = GENERATE(0u, 1u);
     const bool machine_hooks = GENERATE(false, true);
-    const bool use_tpu = GENERATE(false, true);
-    CAPTURE(tower_type, ordinary_materials, shell_layers, machine_hooks, use_tpu);
+    CAPTURE(tower_type, ordinary_materials, shell_layers, machine_hooks);
     libslicer::LibraryOptions options;
     options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
     options.vendors = {"P3"};
@@ -5393,7 +5334,6 @@ TEST_CASE("wipe tower exclusions preserve model tools and prime a single ordinar
     selection.machine_variant_id = "0.4";
     selection.process_preset_id = "0.20mm Standard @P3";
     selection.filament_preset_ids.assign(6, "Generic PLA @P3");
-    if (use_tpu) selection.filament_preset_ids[0] = "CFSYS TPU 95A";
     selection.filament_preset_ids[5] = "CFSYS CCF";
     auto created = library->create_config(selection);
     REQUIRE(created.success);

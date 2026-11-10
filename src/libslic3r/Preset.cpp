@@ -1637,7 +1637,7 @@ std::string PresetCollection::canonical_preset_name(const std::string &name, con
 void PresetCollection::load_presets(
     const std::string &dir_path, const std::string &subdir,
     PresetsConfigSubstitutions& substitutions, ForwardCompatibilitySubstitutionRule substitution_rule,
-    std::function<void(Preset&)> preset_loaded_fn, const PresetOrigin &load_origin)
+    std::function<void(Preset&)> preset_loaded_fn, const PresetOrigin &load_origin, bool read_only)
 {
     // Don't use boost::filesystem::canonical() on Windows, it is broken in regard to reparse points,
     // see https://github.com/prusa3d/PrusaSlicer/issues/732
@@ -1646,7 +1646,7 @@ void PresetCollection::load_presets(
 
     // Load custom roots first
     if (fs::exists(dir / "base")) {
-        load_presets(dir.string(), "base", substitutions, substitution_rule, nullptr, resolved_origin);
+        load_presets(dir.string(), "base", substitutions, substitution_rule, nullptr, resolved_origin, read_only);
     }
 
     //BBS: add config related logs
@@ -1654,10 +1654,17 @@ void PresetCollection::load_presets(
     //BBS do not parse folder if not exists
     m_dir_path = dir.string();
     if (!fs::exists(dir)) {
-        fs::create_directory(dir);
+        if (!read_only) fs::create_directory(dir);
         return;
     }
 
+    const auto remove_invalid_preset = [read_only](const Preset& preset) {
+        if (read_only) return;
+        fs::path file_path(preset.file);
+        fs::remove(file_path);
+        file_path.replace_extension(".info");
+        fs::remove(file_path);
+    };
     std::string errors_cummulative;
     // Store the loaded presets into a new vector, otherwise the binary search for already existing presets would be broken.
     // (see the "Preset already present, not loading" message).
@@ -1703,12 +1710,7 @@ void PresetCollection::load_presets(
                     if (! config_substitutions.empty())
                         substitutions.push_back({ preset.name, m_type, PresetConfigSubstitutions::Source::UserFile, preset.file, std::move(config_substitutions) });
                     if (!reason.empty()) {
-                        fs::path file_path(preset.file);
-                        if (fs::exists(file_path))
-                            fs::remove(file_path);
-                        file_path.replace_extension(".info");
-                        if (fs::exists(file_path))
-                            fs::remove(file_path);
+                        remove_invalid_preset(preset);
                         BOOST_LOG_TRIVIAL(error) << boost::format("parse config %1% failed")%preset.file;
                         ++m_errors;
                         continue;
@@ -1778,7 +1780,7 @@ void PresetCollection::load_presets(
                             size_t at_pos = name.find('@');
                             if (at_pos != std::string::npos && at_pos + 1 < name.length()) {
                                 compatible_printers->values.push_back(name.substr(at_pos + 1));
-                                preset.save(nullptr);
+                                if (!read_only) preset.save(nullptr);
                                 BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " added compatible_printers for preset: " << name;
                             }
                         }
@@ -1795,23 +1797,15 @@ void PresetCollection::load_presets(
                 } catch (const std::ifstream::failure &err) {
                     ++m_errors;
                     BOOST_LOG_TRIVIAL(error) << boost::format("The user-config cannot be loaded: %1%. Reason: %2%")%preset.file %err.what();
-                    fs::path file_path(preset.file);
-                    if (fs::exists(file_path))
-                        fs::remove(file_path);
-                    file_path.replace_extension(".info");
-                    if (fs::exists(file_path))
-                        fs::remove(file_path);
+                    remove_invalid_preset(preset);
+                    if (read_only) continue;
                     //throw Slic3r::RuntimeError(std::string("The selected preset cannot be loaded: ") + preset.file + "\n\tReason: " + err.what());
                 } catch (const std::runtime_error &err) {
                     ++m_errors;
                     BOOST_LOG_TRIVIAL(error) << boost::format("Failed loading the user-config file: %1%. Reason: %2%")%preset.file %err.what();
                     //throw Slic3r::RuntimeError(std::string("Failed loading the preset file: ") + preset.file + "\n\tReason: " + err.what());
-                    fs::path file_path(preset.file);
-                    if (fs::exists(file_path))
-                        fs::remove(file_path);
-                    file_path.replace_extension(".info");
-                    if (fs::exists(file_path))
-                        fs::remove(file_path);
+                    remove_invalid_preset(preset);
+                    if (read_only) continue;
                 }
 
                 if (preset_loaded_fn != nullptr)

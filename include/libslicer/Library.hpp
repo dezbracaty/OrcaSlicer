@@ -141,13 +141,6 @@ struct FilamentSlotInfo
     std::vector<PresetOption> compatible_presets;
 };
 
-struct ProcessPresetComparison
-{
-    std::vector<std::string> highlighted_keys;
-    // Orca may use the selected preset itself as the comparable reference.
-    bool has_comparison_parent{false};
-};
-
 struct ActiveConfigView
 {
     std::uint64_t revision{0};
@@ -156,11 +149,6 @@ struct ActiveConfigView
     std::vector<PresetOption> compatible_filaments;
     std::vector<SettingItem> settings;
     std::vector<FilamentSlotInfo> filament_slots;
-    // The active project's process difference list after Orca import migrations.
-    // Import provenance is independent of the live preset comparison.
-    std::vector<std::string> imported_process_difference_keys;
-    ProcessPresetComparison process_preset_comparison;
-
     bool valid() const noexcept { return revision != 0; }
 };
 
@@ -174,7 +162,7 @@ struct ConfigActivationResult
 };
 
 enum class PrinterSwitchPreset { Printer, Process, Filament };
-enum class PrinterSwitchAction { Save, Transfer, Discard, Cancel };
+enum class PrinterSwitchAction { Transfer, Discard, Cancel };
 
 struct PrinterSwitchChange
 {
@@ -203,7 +191,14 @@ struct PrinterSwitchDecision
 {
     PrinterSwitchPreset type;
     PrinterSwitchAction action;
-    std::string save_name;
+};
+
+struct PrinterSwitchSaveResult
+{
+    ActiveConfigView view;
+    std::vector<ConfigDiagnostic> diagnostics;
+    std::string overwrite_warning;
+    explicit operator bool() const noexcept { return view.valid(); }
 };
 
 struct SliceVertex
@@ -697,23 +692,15 @@ struct ConfigurationInstallResult {
 };
 struct PrinterSwitchResult {
     ConfigurationState configuration;
-    std::optional<ResolvedSelection> saved_source;
     std::vector<ConfigDiagnostic> diagnostics;
     explicit operator bool() const noexcept { return configuration.valid(); }
 };
 LIBSLICER_API std::string encode_project_object_semantics(const ProjectObject&);
-// Edit one object setting atomically. A missing value restores inheritance.
-LIBSLICER_API SettingsResult edit_project_object_setting(const ConfigSnapshot& base,
-    std::string_view plate_semantics, std::string& object_semantics,
-    std::string_view key, std::optional<std::string_view> value);
 LIBSLICER_API std::string encode_project_part_semantics(const ProjectPart&);
-LIBSLICER_API SettingsResult edit_project_part_setting(const ConfigSnapshot& base,
-    std::string_view plate_semantics, std::string_view object_semantics,
-    std::string& part_semantics, std::string_view key, std::optional<std::string_view> value);
 LIBSLICER_API std::string encode_project_part_annotations(const ProjectPart&);
 LIBSLICER_API std::string encode_project_plate_semantics(const ProjectPlate&);
 // Apply Orca's object-list cleanup for support slots beyond the new palette.
-LIBSLICER_API std::string clear_expired_support_filaments(
+LIBSLICER_API std::string synchronize_project_model_materials(
     std::string_view semantics, std::string_view scope, std::size_t filament_count);
 // Call only when the machine/material domain changes, before publishing the
 // new configuration to consumers. Preserves unrelated semantics and applicable
@@ -721,7 +708,8 @@ LIBSLICER_API std::string clear_expired_support_filaments(
 // requests or user edits. Malformed semantics/invalid snapshots throw.
 LIBSLICER_API std::string synchronize_project_plate_materials(
     std::string_view semantics, const ConfigSnapshot& target_config,
-    std::vector<ConfigDiagnostic>* diagnostics = nullptr, bool update_print_sequence = false);
+    std::vector<ConfigDiagnostic>* diagnostics = nullptr, bool update_print_sequence = false,
+    bool reset_single_tool_mapping = false);
 class LIBSLICER_API Library final
 {
 public:
@@ -742,7 +730,10 @@ public:
     ConfigActivationResult activate_config(
         const ConfigSelection& selection,
         const std::vector<std::pair<std::string, std::string>>& patch = {});
-    PrinterSwitchReview review_printer_switch(const ConfigSelection& target) const;
+    PrinterSwitchReview review_printer_switch(const ConfigSelection& target, bool after_save = false) const;
+    PrinterSwitchSaveResult save_printer_switch_preset(
+        std::uint64_t expected_revision, PrinterSwitchPreset type, std::string_view save_name,
+        bool validate_only = false);
     PrinterSwitchResult prepare_printer_switch(
         const ConfigSelection& target, std::uint64_t expected_revision,
         const std::vector<PrinterSwitchDecision>& decisions,

@@ -2863,8 +2863,7 @@ WipeTower::ToolChangeResult WipeTower::tool_change_new(size_t new_tool, bool sol
             }
         }
 
-        // Priming may have no nozzle-change path to retrace.
-        if (!prime_only && nozzle_change_line_count > 0 && m_is_multi_extruder && is_tpu_filament(new_tool)) {
+        if (m_is_multi_extruder && is_tpu_filament(new_tool)) {
             float dy = m_layer_info->extra_spacing * m_nozzle_change_perimeter_width;
             if (m_layer_info->extra_spacing < m_tpu_fixed_spacing) {
                 dy = m_tpu_fixed_spacing * m_nozzle_change_perimeter_width;
