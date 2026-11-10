@@ -699,6 +699,9 @@ LIBSLICER_API std::string encode_project_object_semantics(const ProjectObject&);
 LIBSLICER_API std::string encode_project_part_semantics(const ProjectPart&);
 LIBSLICER_API std::string encode_project_part_annotations(const ProjectPart&);
 LIBSLICER_API std::string encode_project_plate_semantics(const ProjectPlate&);
+LIBSLICER_API SettingsResult edit_project_override(const ConfigSnapshot& base,
+    std::string_view plate, std::string& target, std::optional<std::string_view> parent_object,
+    std::string_view key, std::optional<std::string_view> value);
 // Apply Orca's object-list cleanup for support slots beyond the new palette.
 LIBSLICER_API std::string synchronize_project_model_materials(
     std::string_view semantics, std::string_view scope, std::size_t filament_count);

@@ -2755,6 +2755,59 @@ std::string encode_project_object_semantics(const ProjectObject& object) {
 
 std::string encode_project_part_semantics(const ProjectPart& part) {return ProjectJson{{"version",1},{"scope","part"},{"settings",settings_json(part.settings)}}.dump();}
 
+Config Config::for_project_overrides(const ConfigSnapshot& base, std::string_view plate,
+    std::string_view target, std::optional<std::string_view> parent_object)
+{
+    if (!base.valid())
+        throw std::invalid_argument("Model setting baseline is unavailable");
+    auto baseline = dynamic_config(base);
+    baseline.apply(effective_plate_settings(semantic_json(plate, "plate")));
+    if (parent_object)
+        baseline.apply(semantic_settings(semantic_json(*parent_object, "object")));
+    auto config = for_overrides(Config(serialized_values(baseline)).snapshot(),
+        parent_object ? ConfigScope::ModelPart : ConfigScope::ModelObject);
+    config.load_native_overrides(serialized_values(
+        semantic_settings(semantic_json(target, parent_object ? "part" : "object"))));
+    return config;
+}
+
+SettingsResult edit_project_override(const ConfigSnapshot& base, std::string_view plate,
+    std::string& target, std::optional<std::string_view> parent_object,
+    std::string_view key, std::optional<std::string_view> value)
+{
+    try {
+        auto config = Config::for_project_overrides(base, plate, target, parent_object);
+        auto result = value ? config.set(key, *value) : config.reset(key);
+        if (!result)
+            return result;
+
+        auto document = semantic_json(target, parent_object ? "part" : "object");
+        if (document.empty()) {
+            if (!value)
+                return result;
+            document = ProjectJson::parse(parent_object
+                ? encode_project_part_semantics({}) : encode_project_object_semantics({}));
+        }
+        const std::string name(key);
+        if (value) {
+            const auto normalized = config.snapshot().value(key).value();
+            const auto& settings = document["settings"];
+            const auto previous = settings.find(name);
+            if (previous != settings.end() && *previous == normalized)
+                return result;
+            document["settings"][name] = normalized;
+        } else {
+            const auto settings = document.find("settings");
+            if (settings == document.end() || !settings->erase(name))
+                return result;
+        }
+        target = document.dump();
+        return result;
+    } catch (const std::exception& error) {
+        return settings_failure(std::string(key), error.what());
+    }
+}
+
 std::string encode_project_part_annotations(const ProjectPart& part) {
     return ProjectJson{{"version",1},{"scope","part_annotations"},{"support_facets",facets_json(part.support_facets)},{"seam_facets",facets_json(part.seam_facets)},{"fuzzy_skin_facets",facets_json(part.fuzzy_skin_facets)}}.dump();
 }
@@ -3741,6 +3794,25 @@ PrinterSwitchResult Library::prepare_printer_switch(
         const std::vector<std::string> purge_keys{"flush_volumes_matrix", "flush_volumes_vector", "flush_multiplier"};
         project.apply_only(resolved_full, purge_keys);
         project.apply_only(resolved_full, {"filament_colour", "filament_multi_colour", "filament_colour_type"});
+        // A fixed-slot machine's palette initializes its project slot colors.
+        // Remembered project colors are restored below.
+        const auto* tool_colors = resolved_full.option<Slic3r::ConfigOptionStrings>("extruder_colour");
+        const auto* nozzles = resolved_full.option<Slic3r::ConfigOptionFloats>("nozzle_diameter");
+        const bool seed_palette = fixed_physical_filament_slots(resolved_full) && map && tool_colors && nozzles &&
+            tool_colors->size() == nozzles->size() &&
+            map->size() == resolved.selection.filament_preset_ids.size() &&
+            std::all_of(map->values.begin(), map->values.end(), [&](int tool) {
+                return tool > 0 && std::size_t(tool) <= tool_colors->size() &&
+                    !tool_colors->values[tool - 1].empty();
+            });
+        if (seed_palette) {
+            auto& colors = project.option<Slic3r::ConfigOptionStrings>("filament_colour")->values;
+            colors.clear();
+            for (int tool : map->values)
+                colors.push_back(tool_colors->values[tool - 1]);
+            project.option<Slic3r::ConfigOptionStrings>("filament_colour_type")->values.assign(colors.size(), "1");
+        }
+        bool restored_multi_color = false;
         for (const auto& [key, value] : remembered_project_settings) {
             if (key != "curr_bed_type" && key != "filament_colour" && key != "filament_multi_colour" &&
                 key != "filament_colour_type" && key != "flush_volumes_matrix" &&
@@ -3756,7 +3828,12 @@ PrinterSwitchResult Library::prepare_printer_switch(
                 continue;
             }
             project.apply_only(field, {key});
+            if (key == "filament_multi_colour")
+                restored_multi_color = true;
         }
+        if (seed_palette && !restored_multi_color)
+            project.option<Slic3r::ConfigOptionStrings>("filament_multi_colour")->values =
+                project.option<Slic3r::ConfigOptionStrings>("filament_colour")->values;
         const auto heads = project.option<Slic3r::ConfigOptionFloats>("flush_multiplier")->size();
         const auto matrix = project.option<Slic3r::ConfigOptionFloats>("flush_volumes_matrix")->size();
         const auto slots = heads ? std::size_t(std::sqrt(double(matrix) / heads)) : 0;
