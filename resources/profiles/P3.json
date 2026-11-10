@@ -36,12 +36,14 @@
         {"name": "CFSYS PA", "sub_path": "filament/CFSYS PA.json"},
         {"name": "CFSYS PA-CF", "sub_path": "filament/CFSYS PA-CF.json"},
         {"name": "CFSYS TPU 95A", "sub_path": "../CFSYS/filament/CFSYS TPU 95A.json"},
+        {"name": "CFSYS TPU 95A @P3", "sub_path": "filament/CFSYS TPU 95A @P3.json"},
         {"name": "CFSYS PET-CF", "sub_path": "filament/CFSYS PET-CF.json"},
         {"name": "CFSYS PET-GF", "sub_path": "filament/CFSYS PET-GF.json"},
         {"name": "CFSYS PPS-CF", "sub_path": "filament/CFSYS PPS-CF.json"},
         {"name": "CFSYS S-Multi", "sub_path": "filament/CFSYS S-Multi.json"},
         {"name": "CFSYS CIRON", "sub_path": "filament/CFSYS CIRON.json"},
         {"name": "CFSYS CCF", "sub_path": "../CFSYS/filament/CFSYS CCF.json"},
-        {"name": "Generic PLA @P3", "sub_path": "filament/Generic PLA @P3.json"}
+        {"name": "Generic PLA @P3", "sub_path": "filament/Generic PLA @P3.json"},
+        {"name": "Generic PLA 200C @P3", "sub_path": "filament/Generic PLA 200C @P3.json"}
     ]
 }

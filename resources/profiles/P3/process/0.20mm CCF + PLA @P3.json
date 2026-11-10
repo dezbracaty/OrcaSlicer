@@ -33,7 +33,6 @@
     "fiber_infill_min_speed": "10",
     "fiber_contour_feed_ratio": "1",
     "fiber_infill_feed_ratio": "1",
-    "fiber_prefeed_extra_length": "0.05",
     "fiber_prefeed_speed": "10",
     "fiber_z_hop_height": "2",
     "fiber_landing_length": "0.2",

@@ -26,9 +26,9 @@
     "cooling_tube_retraction": "91.5",
     "default_bed_type": "",
     "default_filament_profile": [
-        "CFSYS TPU 95A",
-        "CFSYS TPU 95A",
-        "CFSYS TPU 95A",
+        "Generic PLA 200C @P3",
+        "Generic PLA 200C @P3",
+        "Generic PLA 200C @P3",
         "Generic PLA @P3",
         "CFSYS PA-CF",
         "CFSYS CCF"
@@ -464,7 +464,7 @@
     ],
     "z_offset": "0",
     "fiber_cut_gcode": "M400\nS0\nM400\n",
-    "fiber_cut_to_contact_length": "20.55",
+    "fiber_cut_to_contact_length": "56",
     "toolhead_fiber_e_units_per_mm": [
         "1",
         "1",
