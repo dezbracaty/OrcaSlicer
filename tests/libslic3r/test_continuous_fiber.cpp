@@ -5694,6 +5694,48 @@ TEST_CASE("open ring excessive clipping never leaves ghost cut windows", "[Conti
     for(size_t i=0;i<original.size();++i)CHECK(plan.validation.assignments[i].prepared==original[i].prepared);
 }
 
+TEST_CASE("short hole rings only deposit as a certified connected path", "[ContinuousFiber][OpenRingConnection]")
+{
+    auto config=open_ring_config();
+    config.contour_count=2;
+    config.contour_include_holes=true;
+    config.cut_to_contact_length_mm=56;
+    auto region=rectangle(0,0,50,50);
+    auto hole=rectangle(19,19,31,31).contour;
+    hole.make_clockwise();
+    region.holes.push_back(std::move(hole));
+    const ExPolygons domain{region};
+    auto disabled=config;
+    disabled.connect_adjacent_rings=false;
+    const auto original=open_ring_plan(disabled,domain);
+    REQUIRE(original.validation.accepted_count()==2);
+    const bool blocked=GENERATE(false,true);
+    if (blocked) config.connection_tail_trim_widths=1000;
+    auto plan=open_ring_plan(config,domain);
+    REQUIRE(plan.validation.accepted_count()==2);
+    REQUIRE(std::count_if(plan.validation.assignments.begin(),plan.validation.assignments.end(),
+        [](const auto& source){return source.chain_only;})==2);
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config);
+    REQUIRE(plan.audit_lineage());
+    REQUIRE(plan.validation.audit_open_chains());
+    if (blocked) {
+        CHECK(plan.validation.chain_executions.empty());
+        CHECK(plan.validation.accepted_count()==2);
+        CHECK(diff_ex(plan.validation.resin_exclusion,original.validation.resin_exclusion).empty());
+        CHECK(diff_ex(original.validation.resin_exclusion,plan.validation.resin_exclusion).empty());
+    } else {
+        REQUIRE(plan.validation.chain_executions.size()==2);
+        REQUIRE(plan.validation.accepted_count()==4);
+        const auto& chain=plan.validation.chain_executions.back();
+        REQUIRE(chain.sources.size()==2);
+        CHECK(open_ring_bridges(chain)==1);
+        CHECK(chain.sources.front().original_mm<56);
+        CHECK(chain.prepared->requested_passive_length_mm==56);
+        CHECK(chain.prepared->start_procedure.prefeed_length_mm==56);
+        check_open_ring_sources(plan);
+    }
+}
+
 TEST_CASE("open ring planning tail crosses bridge once and finish uses terminal forward source", "[ContinuousFiber][OpenRingConnection]")
 {
     auto config=open_ring_config();config.finish_overlap_length_mm=3;
