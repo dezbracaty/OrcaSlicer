@@ -1,0 +1,10 @@
+{
+    "type": "filament",
+    "name": "Generic PLA 200C @P3",
+    "from": "system",
+    "setting_id": "P3FPLA200",
+    "filament_id": "P3PLA",
+    "instantiation": "true",
+    "inherits": "Generic PLA @P3",
+    "nozzle_temperature_initial_layer": ["200"]
+}

@@ -13,37 +13,70 @@
         "0"
     ],
     "chamber_temperature": [
-        "0"
+        "60"
     ],
     "default_filament_colour": [
         "#77FF77"
     ],
     "fan_cooling_layer_time": [
-        "4"
+        "5"
     ],
     "fan_max_speed": [
-        "60"
+        "30"
     ],
     "fan_min_speed": [
-        "0"
+        "10"
+    ],
+    "filament_cost": [
+        "94.99"
+    ],
+    "filament_density": [
+        "1.06"
+    ],
+    "filament_flow_ratio": [
+        "0.96"
+    ],
+    "filament_loading_speed": [
+        "28"
+    ],
+    "filament_loading_speed_start": [
+        "3"
     ],
     "filament_max_volumetric_speed": [
         "8"
     ],
+    "filament_vendor": [
+        "Bambu Lab"
+    ],
+    "full_fan_speed_layer": [
+        "2"
+    ],
+    "hot_plate_temp": [
+        "60"
+    ],
+    "hot_plate_temp_initial_layer": [
+        "60"
+    ],
     "nozzle_temperature_initial_layer": [
-        "280"
+        "310"
     ],
     "nozzle_temperature": [
-        "270"
+        "300"
+    ],
+    "overhang_fan_speed": [
+        "40"
     ],
     "enable_pressure_advance": [
-        "1"
+        "0"
     ],
     "pressure_advance": [
-        "0.026"
+        "0.02"
     ],
     "reduce_fan_stop_start_freq": [
-        "1"
+        "0"
+    ],
+    "required_nozzle_HRC": [
+        "40"
     ],
     "slow_down_layer_time": [
         "2"
@@ -52,10 +85,22 @@
         "10"
     ],
     "support_material_interface_fan_speed": [
-        "100"
+        "-1"
+    ],
+    "complete_print_exhaust_fan_speed": [
+        "70"
+    ],
+    "during_print_exhaust_fan_speed": [
+        "70"
+    ],
+    "supertack_plate_temp": [
+        "0"
+    ],
+    "supertack_plate_temp_initial_layer": [
+        "0"
     ],
     "temperature_vitrification": [
-        "108"
+        "180"
     ],
     "compatible_printers": [
       "P3 0.4 nozzle",

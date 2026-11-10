@@ -32,6 +32,7 @@ enum class FiberRejectionReason : uint8_t {
     DuplicateSegment,
     OutsideDomain,
     ProcessBudgetTooShort,
+    ChainRequired,
     FinalizedPathOutsideDomain,
     IntervalMappingFailure,
     FinishUnavailable,
@@ -64,6 +65,8 @@ struct FiberFragmentAssignment {
     std::optional<FiberPathPurpose> display_purpose;
     std::vector<ContourArc> source_arcs;
     std::vector<ContourBend> source_bends;
+    // A complete geometric source that may only deposit as part of a certified chain.
+    bool chain_only {false};
 };
 
 struct FiberChainSourceSlice {
