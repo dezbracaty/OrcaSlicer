@@ -139,6 +139,7 @@ struct FilamentSlotInfo
     std::string physical_tool_side;
     double nozzle_diameter_mm{0.0};
     std::vector<PresetOption> compatible_presets;
+    bool preset_modified{false};
 };
 
 struct ActiveConfigView
@@ -149,6 +150,8 @@ struct ActiveConfigView
     std::vector<PresetOption> compatible_filaments;
     std::vector<SettingItem> settings;
     std::vector<FilamentSlotInfo> filament_slots;
+    std::vector<std::string> modified_process_keys;
+    bool printer_preset_modified{false};
     bool valid() const noexcept { return revision != 0; }
 };
 
@@ -736,7 +739,7 @@ public:
     PrinterSwitchReview review_printer_switch(const ConfigSelection& target, bool after_save = false) const;
     PrinterSwitchSaveResult save_printer_switch_preset(
         std::uint64_t expected_revision, PrinterSwitchPreset type, std::string_view save_name,
-        bool validate_only = false);
+        bool validate_only = false, std::string_view source_preset_id = {});
     PrinterSwitchResult prepare_printer_switch(
         const ConfigSelection& target, std::uint64_t expected_revision,
         const std::vector<PrinterSwitchDecision>& decisions,
@@ -747,6 +750,11 @@ public:
         const std::vector<std::pair<std::string, std::string>>& patch);
     SettingsResult set_active_config_value(std::string_view key, std::string_view value);
     SettingsResult reset_active_config_value(std::string_view key);
+    // Discard edits to the selected native preset. Filament requires an explicit
+    // zero-based slot; all references to that preset are restored together.
+    // Project palette/mapping and edits to other presets are preserved.
+    ConfigActivationResult restore_active_preset(SettingGroup group,
+        std::optional<std::size_t> filament_slot = std::nullopt);
     ConfigActivationResult set_active_filament_preset(
         std::size_t slot_index, std::string_view preset_id);
     ConfigActivationResult resize_active_filament_slots(std::size_t slot_count);

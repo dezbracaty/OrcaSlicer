@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -816,6 +817,233 @@ TEST_CASE("P3 waits after initial selection and later dock changes", "[libslicer
     }
 }
 
+TEST_CASE("native preset rollback preserves other presets and P3 project state", "[libslicer_api][preset-restore]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    REQUIRE(library->activate_config(selection).success);
+    const auto baseline = *library->active_config_snapshot();
+    REQUIRE(library->set_active_config_value("outer_wall_speed", "97").success);
+    REQUIRE(library->set_active_config_value("machine_start_gcode", "; restore-test\n").success);
+    REQUIRE(library->set_active_filament_color(0, {20, 40, 60, 255}).success);
+    const auto colors = library->active_config_snapshot()->value("filament_colour");
+    const auto edited_start = library->active_config_snapshot()->value("machine_start_gcode");
+    auto reset = library->restore_active_preset(libslicer::SettingGroup::Process);
+    for (const auto& issue : reset.diagnostics) INFO(issue.key << ": " << issue.message);
+    REQUIRE(reset.success);
+    CHECK(library->active_config_snapshot()->value("outer_wall_speed") == baseline.value("outer_wall_speed"));
+    CHECK(library->active_config_snapshot()->value("machine_start_gcode") == edited_start);
+    reset = library->restore_active_preset(libslicer::SettingGroup::Printer);
+    for (const auto& issue : reset.diagnostics) INFO(issue.key << ": " << issue.message);
+    REQUIRE(reset.success);
+    CHECK(library->active_config_snapshot()->value("machine_start_gcode") == baseline.value("machine_start_gcode"));
+
+    const auto flows = [](const libslicer::ConfigSnapshot& snapshot) {
+        std::vector<double> result;
+        std::istringstream input(snapshot.value("filament_max_volumetric_speed").value());
+        std::string value;
+        while (std::getline(input, value, ',')) result.push_back(std::stod(value));
+        return result;
+    };
+    REQUIRE(library->set_active_config_value("outer_wall_speed", "93").success);
+    REQUIRE(library->set_active_config_value("filament_max_volumetric_speed", "9,9,9,9,9,9").success);
+    const auto before = library->active_config()->selection.filament_preset_ids;
+    const auto original = flows(baseline);
+    const std::size_t target = GENERATE(0u, 1u, 4u, 5u);
+    reset = library->restore_active_preset(libslicer::SettingGroup::Filament, target);
+    for (const auto& issue : reset.diagnostics) INFO(issue.key << ": " << issue.message);
+    REQUIRE(reset.success);
+    const auto after = flows(*library->active_config_snapshot());
+    REQUIRE(after.size() == 6);
+    for (std::size_t slot = 0; slot < after.size(); ++slot)
+        CHECK(after[slot] == (before[slot] == before[target] ? original[slot] : 9));
+    CHECK(library->active_config_snapshot()->value("outer_wall_speed") == "93");
+    // A second edit must not overwrite the saved embedded preset baseline.
+    REQUIRE(library->set_active_config_value("filament_max_volumetric_speed", "8,8,8,8,8,8").success);
+    for (std::size_t slot = 0; slot < 6; ++slot) {
+        reset = library->restore_active_preset(libslicer::SettingGroup::Filament, slot);
+        for (const auto& issue : reset.diagnostics) INFO(issue.key << ": " << issue.message);
+        REQUIRE(reset.success);
+    }
+    CHECK(flows(*library->active_config_snapshot()) == original);
+    CHECK(library->active_config_snapshot()->value("filament_colour") == colors);
+    CHECK(library->active_config_snapshot()->value("filament_map") == baseline.value("filament_map"));
+    CHECK(library->active_config()->filament_slots.size() == 6);
+    const auto revision = library->configuration_revision();
+    REQUIRE(library->restore_active_preset(libslicer::SettingGroup::Filament, 0).success);
+    CHECK(library->configuration_revision() == revision);
+    CHECK_FALSE(library->restore_active_preset(libslicer::SettingGroup::Filament).success);
+    CHECK_FALSE(library->restore_active_preset(libslicer::SettingGroup::Filament, 6).success);
+    CHECK_FALSE(library->restore_active_preset(libslicer::SettingGroup::Process, 0).success);
+    CHECK_FALSE(library->restore_active_preset(static_cast<libslicer::SettingGroup>(99)).success);
+    CHECK(library->configuration_revision() == revision);
+}
+
+TEST_CASE("native rollback restores the saved user preset and clears dirty review", "[libslicer_api][preset-restore]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("libslicer-preset-rollback-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    options.user_preset_directory = directory.string();
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    REQUIRE(library->activate_config(selection).success);
+    const auto factory = library->active_config_snapshot()->value("outer_wall_speed");
+    REQUIRE(library->set_active_config_value("outer_wall_speed", "87").success);
+    auto saved = library->save_printer_switch_preset(library->configuration_revision(),
+        libslicer::PrinterSwitchPreset::Process, "Native Rollback Test");
+    for (const auto& issue : saved.diagnostics) INFO(issue.message);
+    REQUIRE(bool(saved));
+    REQUIRE(library->set_active_config_value("outer_wall_speed", "91").success);
+    auto review = library->review_printer_switch(selection, true);
+    REQUIRE(std::any_of(review.presets.begin(), review.presets.end(), [](const auto& preset) {
+        return preset.type == libslicer::PrinterSwitchPreset::Process;
+    }));
+    const auto restored = library->restore_active_preset(libslicer::SettingGroup::Process);
+    for (const auto& issue : restored.diagnostics) INFO(issue.message);
+    REQUIRE(restored.success);
+    CHECK(library->active_config_snapshot()->value("outer_wall_speed") == "87");
+    CHECK(library->active_config_snapshot()->value("outer_wall_speed") != factory);
+    CHECK(library->active_config()->selection.process_preset_id == "Native Rollback Test");
+    review = library->review_printer_switch(selection, true);
+    CHECK(std::none_of(review.presets.begin(), review.presets.end(), [](const auto& preset) {
+        return preset.type == libslicer::PrinterSwitchPreset::Process;
+    }));
+    std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("secondary material rollback follows native save and switch decisions", "[libslicer_api][preset-restore]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("libslicer-secondary-save-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    options.user_preset_directory = directory.string();
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection target;
+    target.machine_model_id = "P3";
+    target.machine_variant_id = "0.4";
+    REQUIRE(library->activate_config(target).success);
+    const auto initial = *library->active_config_snapshot();
+    const auto first = library->active_config()->selection.filament_preset_ids.front();
+    REQUIRE(library->set_active_config_value("filament_max_volumetric_speed", "12,12,12,12,6,1").success);
+    const auto active = *library->active_config();
+    REQUIRE(active.filament_slots[4].preset_modified);
+    REQUIRE_FALSE(active.filament_slots[0].preset_modified);
+    const auto captured = library->capture_configuration();
+    CHECK(captured.view().filament_slots[4].preset_modified == active.filament_slots[4].preset_modified);
+    CHECK(captured.view().modified_process_keys == active.modified_process_keys);
+    const auto id = active.selection.filament_preset_ids[4];
+    const auto review = library->review_printer_switch(target, true);
+    REQUIRE(review.diagnostics.empty());
+    REQUIRE(review.presets.size() == 1);
+    REQUIRE(review.presets.front().name == id);
+    CHECK_FALSE(review.presets.front().transfer_allowed);
+    CHECK(review.presets.front().cancel_switch);
+    for (auto action : {libslicer::PrinterSwitchAction::Cancel, libslicer::PrinterSwitchAction::Transfer}) {
+        CHECK_FALSE(bool(library->prepare_printer_switch(target, library->configuration_revision(),
+            {{libslicer::PrinterSwitchPreset::Filament, action}})));
+        CHECK(library->active_config_snapshot()->values() == captured.snapshot().values());
+    }
+    const auto discarded = library->prepare_printer_switch(target, library->configuration_revision(),
+        {{libslicer::PrinterSwitchPreset::Filament, libslicer::PrinterSwitchAction::Discard}});
+    REQUIRE(bool(discarded));
+    CHECK_FALSE(discarded.configuration.view().filament_slots[4].preset_modified);
+    const auto revision = library->configuration_revision();
+    CHECK_FALSE(bool(library->save_printer_switch_preset(revision, libslicer::PrinterSwitchPreset::Filament,
+        "Invalid Source", false, "not referenced")));
+    CHECK(library->configuration_revision() == revision);
+    const auto saved = library->save_printer_switch_preset(revision, libslicer::PrinterSwitchPreset::Filament,
+        "Secondary PA-CF", false, id);
+    for (const auto& issue : saved.diagnostics) INFO(issue.message);
+    REQUIRE(bool(saved));
+    CHECK(saved.view.selection.filament_preset_ids.front() == first);
+    CHECK(saved.view.selection.filament_preset_ids[4] == "Secondary PA-CF");
+    for (std::size_t i : {0u, 1u, 2u, 3u, 5u})
+        CHECK(saved.view.selection.filament_preset_ids[i] == active.selection.filament_preset_ids[i]);
+    CHECK_FALSE(saved.view.filament_slots[4].preset_modified);
+    CHECK(library->review_printer_switch(target, true).presets.empty());
+    const auto saved_flow = library->active_config_snapshot()->value("filament_max_volumetric_speed");
+    REQUIRE(library->set_active_config_value("filament_max_volumetric_speed", "12,12,12,12,5,1").success);
+    REQUIRE(library->restore_active_preset(libslicer::SettingGroup::Filament, 4).success);
+    CHECK(library->active_config_snapshot()->value("filament_max_volumetric_speed") == saved_flow);
+    REQUIRE(library->install_configuration(captured, library->configuration_revision()).success);
+    CHECK(library->active_config()->filament_slots[4].preset_modified);
+    REQUIRE(library->restore_active_preset(libslicer::SettingGroup::Filament, 4).success);
+    CHECK(library->active_config_snapshot()->value("filament_max_volumetric_speed") == initial.value("filament_max_volumetric_speed"));
+    CHECK(library->active_config_snapshot()->value("filament_colour") == initial.value("filament_colour"));
+    CHECK(library->active_config_snapshot()->value("filament_map") == initial.value("filament_map"));
+    // Saving one secondary must retain an edited current material and another
+    // secondary. Shared embedded references produce one decision.
+    REQUIRE(library->set_active_config_value("filament_max_volumetric_speed", "9,9,9,12,6,7").success);
+    const auto multiple = *library->active_config();
+    const auto multiple_flow = library->active_config_snapshot()->value("filament_max_volumetric_speed");
+    const auto multiple_review = library->review_printer_switch(target, true);
+    std::ostringstream review_details;
+    for (const auto& preset : multiple_review.presets) {
+        review_details << int(preset.type) << " " << preset.name << '\n';
+        for (const auto& change : preset.changes) review_details << change.key << " " << change.before << " -> " << change.after << '\n';
+    }
+    INFO(review_details.str());
+    REQUIRE(multiple.selection.filament_preset_ids[1] == multiple.selection.filament_preset_ids[2]);
+    REQUIRE(multiple.selection.filament_preset_ids[0] != multiple.selection.filament_preset_ids[1]);
+    REQUIRE(multiple_review.presets.size() == 4);
+    CHECK(multiple_review.presets.front().name == multiple.selection.filament_preset_ids.front());
+    CHECK(multiple_review.presets.front().transfer_allowed);
+    const auto save_secondary = library->save_printer_switch_preset(library->configuration_revision(),
+        libslicer::PrinterSwitchPreset::Filament, "Secondary Mixed PA-CF", false,
+        multiple.selection.filament_preset_ids[4]);
+    for (const auto& issue : save_secondary.diagnostics) INFO(issue.message);
+    REQUIRE(bool(save_secondary));
+    CHECK(library->active_config_snapshot()->value("filament_max_volumetric_speed") == multiple_flow);
+    CHECK(save_secondary.view.selection.filament_preset_ids.front() == multiple.selection.filament_preset_ids.front());
+    CHECK(save_secondary.view.filament_slots.front().preset_modified);
+    CHECK(save_secondary.view.filament_slots[5].preset_modified);
+    CHECK_FALSE(save_secondary.view.filament_slots[4].preset_modified);
+    CHECK(library->review_printer_switch(target, true).presets.size() == 3);
+    // Explicitly overwriting another referenced user preset merges its references
+    // under native identity; every reference must receive the saved values.
+    const auto overwritten = library->save_printer_switch_preset(library->configuration_revision(),
+        libslicer::PrinterSwitchPreset::Filament, "Secondary Mixed PA-CF", false,
+        multiple.selection.filament_preset_ids[5]);
+    for (const auto& issue : overwritten.diagnostics) INFO(issue.message);
+    REQUIRE(bool(overwritten));
+    CHECK(library->active_config_snapshot()->value("filament_max_volumetric_speed") == "9,9,9,12,7,7");
+    CHECK(overwritten.view.selection.filament_preset_ids[4] == overwritten.view.selection.filament_preset_ids[5]);
+    CHECK_FALSE(overwritten.view.filament_slots[4].preset_modified);
+    CHECK_FALSE(overwritten.view.filament_slots[5].preset_modified);
+    CHECK(overwritten.view.selection.filament_preset_ids.front() == multiple.selection.filament_preset_ids.front());
+    CHECK(overwritten.view.filament_slots.front().preset_modified);
+    // Also cover overwriting the current preset from a different secondary.
+    REQUIRE(bool(library->save_printer_switch_preset(library->configuration_revision(),
+        libslicer::PrinterSwitchPreset::Filament, "Secondary Mixed PA-CF", false,
+        multiple.selection.filament_preset_ids.front())));
+    const auto current_name = library->active_config()->selection.filament_preset_ids.front();
+    REQUIRE(library->set_active_config_value("filament_max_volumetric_speed", "9,10,10,12,9,9").success);
+    const auto edited_secondary = library->active_config()->selection.filament_preset_ids[1];
+    const auto overwrite_current = library->save_printer_switch_preset(library->configuration_revision(),
+        libslicer::PrinterSwitchPreset::Filament, current_name, false, edited_secondary);
+    for (const auto& issue : overwrite_current.diagnostics) INFO(issue.message);
+    REQUIRE(bool(overwrite_current));
+    CHECK(overwrite_current.view.selection.filament_preset_ids.front() == current_name);
+    CHECK(library->active_config_snapshot()->value("filament_max_volumetric_speed") == "10,10,10,12,10,10");
+    for (const auto& material : overwrite_current.view.filament_slots) CHECK_FALSE(material.preset_modified);
+    std::filesystem::remove_all(directory);
+}
+
 TEST_CASE("P3 can select CCF on any tool without changing material ownership", "[libslicer_api][p3][tool-materials]")
 {
     const unsigned fiber_tool = GENERATE(0u, 1u, 2u, 3u, 4u, 5u);
@@ -837,7 +1065,7 @@ TEST_CASE("P3 can select CCF on any tool without changing material ownership", "
             [](const auto& preset) { return preset.id == "CFSYS CCF"; }));
     }
     CHECK(initial.view.selection.filament_preset_ids == std::vector<std::string>{
-        "CFSYS TPU 95A", "CFSYS TPU 95A", "CFSYS TPU 95A",
+        "Generic PLA 200C @P3", "Generic PLA 200C @P3", "Generic PLA 200C @P3",
         "Generic PLA @P3", "CFSYS PA-CF", "CFSYS CCF"});
     CHECK(library->active_config_snapshot()->value("filament_process_type") ==
         "thermoplastic;thermoplastic;thermoplastic;thermoplastic;thermoplastic;continuous_fiber");
@@ -5588,6 +5816,42 @@ std::unique_ptr<libslicer::Library> project_test_library() {
     const auto activated=library->activate_config(selection);for(const auto& d:activated.diagnostics)INFO(d.message);REQUIRE(activated.success);return library;
 }
 }
+TEST_CASE("native rollback retains an imported project preset baseline", "[libslicer_api][preset-restore]")
+{
+    auto library = project_test_library();
+    const auto source = project_candidate_fixture(*library->active_config_snapshot(), false, {
+        {"print_settings_id", "Imported rollback process"}, {"inherits_group", ""}, {"outer_wall_speed", "83"},
+        {"filament_settings_id", "Imported rollback material"}, {"filament_max_volumetric_speed", "13.5"}});
+    REQUIRE(library->restore_active_preset(libslicer::SettingGroup::Process).success);
+    const auto context = library->capture_configuration();
+    const auto revision = library->configuration_revision();
+    REQUIRE(library->restore_active_preset(libslicer::SettingGroup::Process).success);
+    CHECK(library->configuration_revision() == revision);
+    libslicer::ProjectReadRequest request{source.string(), libslicer::ProjectReadMode::Project};
+    request.configuration = context;
+    const auto candidate = library->read_project(request);
+    for (const auto& issue : candidate.diagnostics) INFO(issue.message);
+    REQUIRE(candidate.success);
+    REQUIRE(library->install_configuration(candidate.configuration, library->configuration_revision()).success);
+    REQUIRE(library->active_config_snapshot()->value("outer_wall_speed") == "83");
+    REQUIRE(library->active_config_snapshot()->value("filament_max_volumetric_speed") == "13.5");
+    REQUIRE(library->set_active_config_value("filament_max_volumetric_speed", "9").success);
+    auto material = library->restore_active_preset(libslicer::SettingGroup::Filament, 0);
+    for (const auto& issue : material.diagnostics) INFO(issue.message);
+    REQUIRE(material.success);
+    CHECK(library->active_config_snapshot()->value("filament_max_volumetric_speed") == "13.5");
+    REQUIRE(library->set_active_config_value("filament_max_volumetric_speed", "8").success);
+    REQUIRE(library->set_active_config_value("outer_wall_speed", "92").success);
+    const auto restored = library->restore_active_preset(libslicer::SettingGroup::Process);
+    for (const auto& issue : restored.diagnostics) INFO(issue.message);
+    REQUIRE(restored.success);
+    CHECK(library->active_config_snapshot()->value("outer_wall_speed") == "83");
+    CHECK(library->active_config_snapshot()->value("filament_max_volumetric_speed") == "8");
+    REQUIRE(library->restore_active_preset(libslicer::SettingGroup::Filament, 0).success);
+    CHECK(library->active_config_snapshot()->value("filament_max_volumetric_speed") == "13.5");
+    std::filesystem::remove(source);
+}
+
 TEST_CASE("installed material capacity is independent of the current palette", "[libslicer_api][configuration-machine-capacity]") {
     auto library=project_test_library();
     const auto& models=library->machine_models();
