@@ -5584,6 +5584,42 @@ TEST_CASE("open ring chain retains one forward arc and one local seam per source
     for(auto* entity:output)delete entity;
 }
 
+TEST_CASE("open ring search connects a safe passage when the nearest concave gate fails",
+    "[ContinuousFiber][OpenRingConnection][OpenRingGateSearch]")
+{
+    std::ifstream input(std::string(TEST_DATA_DIR)+"/continuous_fiber/open_ring_concave_gate.json");
+    REQUIRE(input.good());nlohmann::json fixture;input>>fixture;
+    ExPolygon region;
+    for (size_t i=0;i<fixture.at("rings").size();++i) {
+        Polygon ring;
+        for (const auto& point:fixture.at("rings")[i])
+            ring.points.emplace_back(scale_(point[0].get<double>()),scale_(point[1].get<double>()));
+        if (i==0) region.contour=std::move(ring);else region.holes.push_back(std::move(ring));
+    }
+    const double translation=GENERATE(0.0,137.1234);
+    region.translate(scale_(translation),scale_(-translation));
+    auto config=open_ring_config();config.contour_count=2;
+    config.contour_flow=Flow(fixture.at("width_mm").get<float>(),fixture.at("height_mm").get<float>(),.4f);
+    config.contour_boundary_clearance_mm=fixture.at("boundary_clearance_mm");
+    config.cut_to_contact_length_mm=fixture.at("cut_to_contact_mm");
+    const ExPolygons domain{region};auto plan=open_ring_plan(config,domain);
+    INFO(rejection_details(plan.validation));REQUIRE(plan.validation.accepted_count()==2);
+    const auto frozen=plan.validation.assignments;
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    for (const auto& decision:plan.chain_decisions) INFO(decision.reason);
+    REQUIRE(plan.validation.chain_executions.size()==1);
+    const auto& chain=plan.validation.chain_executions.front();
+    REQUIRE(chain.sources.size()==2);CHECK(open_ring_bridges(chain)==1);
+    CHECK(chain.sources.front().tail_mm==Catch::Approx(1.2));
+    CHECK(chain.sources.back().head_mm==Catch::Approx(.8));
+    REQUIRE(chain.prepared);CHECK(plan.validation.audit_open_chains());
+    CHECK(chain.prepared->requested_passive_length_mm==56);
+    CHECK(std::count_if(chain.prepared->actions.begin(),chain.prepared->actions.end(),
+        [](const auto& action){return action.type==FiberActionType::Cut;})==1);
+    for (size_t i=0;i<frozen.size();++i) CHECK(plan.validation.assignments[i].prepared==frozen[i].prepared);
+    REQUIRE(plan.chain_decisions.size()==1);CHECK(plan.chain_decisions.front().published);
+}
+
 TEST_CASE("execution connection audit retains independent obstacles whenever a connected route exists",
     "[ContinuousFiber][OpenRingConnection][ConnectionAudit]")
 {
@@ -5736,6 +5772,34 @@ TEST_CASE("short hole rings only deposit as a certified connected path", "[Conti
     }
 }
 
+TEST_CASE("three short hole rings satisfy the cutter budget only as a complete chain",
+    "[ContinuousFiber][OpenRingConnection][OpenRingGateSearch]")
+{
+    auto config=open_ring_config();config.cut_to_contact_length_mm=56;config.contour_include_holes=true;
+    auto region=rectangle(0,0,50,50);auto hole=rectangle(23,23,27,27).contour;
+    hole.make_clockwise();region.holes.push_back(std::move(hole));
+    const ExPolygons domain{region};auto plan=open_ring_plan(config,domain);
+    REQUIRE(plan.validation.assignments.size()==6);
+    REQUIRE(plan.validation.accepted_count()==3);
+    std::vector<double> short_lengths;
+    for (const auto& source:plan.validation.assignments) if (source.chain_only) {
+        const double length=source.source_end_mm-source.source_begin_mm;
+        CHECK(length<56);short_lengths.push_back(length);
+    }
+    REQUIRE(short_lengths.size()==3);
+    // Even with a bridge, the first two hole rings cannot yet supply a 56mm tail.
+    CHECK(short_lengths[0]+short_lengths[1]+5<56);
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+    REQUIRE(plan.validation.chain_executions.size()==2);
+    const auto& chain=plan.validation.chain_executions.back();
+    REQUIRE(chain.sources.size()==3);CHECK(open_ring_bridges(chain)==2);
+    CHECK(chain.sources.front().original_mm<56);
+    CHECK(plan.validation.accepted_count()==6);check_open_ring_sources(plan);
+    REQUIRE(chain.prepared);CHECK(chain.prepared->requested_passive_length_mm==56);
+    CHECK(std::count_if(chain.prepared->actions.begin(),chain.prepared->actions.end(),
+        [](const auto& action){return action.type==FiberActionType::Cut;})==1);
+}
+
 TEST_CASE("open ring planning tail crosses bridge once and finish uses terminal forward source", "[ContinuousFiber][OpenRingConnection]")
 {
     auto config=open_ring_config();config.finish_overlap_length_mm=3;
@@ -5863,7 +5927,16 @@ TEST_CASE("open chain stability clips the original marked region at its true ret
     // region around the chosen seam. They do not claim the square was radius-treated.
     ContourBend bend;bend.begin_mm=head.seam_mm-.5;bend.end_mm=head.seam_mm+.5;
     source.source_bends={bend};config.concentric_corner_stabilization_length_mm=.1;
-    SECTION("Infill first retained fragment starts inside bend and has zero prefix") {
+    SECTION("a blocked local seam is retried outside its marked bend") {
+        FiberPathValidator::plan_open_ring_chains(frozen,domain,config,true);
+        REQUIRE(frozen.validation.chain_executions.size()==1);
+        const auto& replacement=frozen.validation.chain_executions.front().sources.front();
+        CHECK(replacement.seam_mm!=Catch::Approx(head.seam_mm));
+        CHECK(frozen.validation.audit_open_chains());
+    }
+    SECTION("every retained start is inside a bend and has zero prefix") {
+        source.source_bends.front().begin_mm=0;
+        source.source_bends.front().end_mm=head.original_mm;
         FiberPathValidator::plan_open_ring_chains(frozen,domain,config,true);
         CHECK(frozen.validation.chain_executions.empty());
         REQUIRE_FALSE(frozen.chain_decisions.empty());

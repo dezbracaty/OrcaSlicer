@@ -1288,23 +1288,40 @@ double projection_fraction(const Vec2d& point,const Linef& line)
 }
 
 // This is finite-segment proximity. Parallel contacts are joined into their
-// complete continuous contact interval before choosing its midpoint.
-ChainGate nearest_ring_gate(const FrozenRingView& parent,const FrozenRingView& child)
+// complete continuous contact interval before selecting candidate seams.
+std::vector<ChainGate> ring_gate_candidates(const FrozenRingView& parent,const FrozenRingView& child,
+    const ContinuousFiberConfig& config,std::optional<double> inherited_seam={})
 {
-    size_t hit=0;Vec2d point;
-    const double initial=AABBTreeLines::squared_distance_to_indexed_lines(
-        child.segments,child.index,parent.segments.front().a,hit,point);
-    if (initial<0) throw std::invalid_argument("empty_source_segment_index");
-    double distance=std::sqrt(initial);
     std::vector<ContactInterval> contacts;
-    const auto accept=[&](ContactInterval value) {
-        if (value.distance<distance-gate_numeric_tie_mm) {distance=value.distance;contacts.clear();}
-        if (value.distance<=distance+gate_numeric_tie_mm) contacts.push_back(value);
-    };
-    for (size_t i=0;i<parent.segments.size();++i) {
+    const double tolerance=ContourRoundingOptions{}.geometry_tolerance_mm;
+    if (inherited_seam) {
+        // The incoming seam on an intermediate ring is frozen. Search child
+        // contacts without moving it or introducing a second cut in that ring.
+        const Vec2d p=parent.position(parent.wrap(*inherited_seam));
+        for (size_t j=0;j<child.segments.size();++j) {
+            const auto& q=child.segments[j];
+            const double t=projection_fraction(p,q);
+            const double station=child.stations[j]+t*(child.stations[j+1]-child.stations[j]);
+            contacts.push_back({*inherited_seam,*inherited_seam,station,station,
+                (p-q.a-t*(q.b-q.a)).norm()});
+        }
+    } else for (size_t i=0;i<parent.segments.size();++i) {
         const auto& p=parent.segments[i];
+        size_t hit=0;Vec2d point;
+        const Vec2d midpoint=0.5*(p.a+p.b);
+        const double initial=AABBTreeLines::squared_distance_to_indexed_lines(
+            child.segments,child.index,midpoint,hit,point);
+        if (initial<0) throw std::invalid_argument("empty_source_segment_index");
+        // Find local finite-segment contacts, rather than discarding every
+        // passage except the globally shortest (possibly unusable) one.
+        double distance=std::sqrt(initial)+0.5*(p.b-p.a).norm();
+        std::vector<ContactInterval> local;
+        const auto accept=[&](ContactInterval value) {
+            if (value.distance<distance-tolerance) {distance=value.distance;local.clear();}
+            if (value.distance<=distance+tolerance) local.push_back(value);
+        };
         AABBTreeIndirect::Tree<2,double>::BoundingBox box(p.a,p.a);box.extend(p.b);
-        box.min().array()-=distance+gate_numeric_tie_mm;box.max().array()+=distance+gate_numeric_tie_mm;
+        box.min().array()-=distance+tolerance;box.max().array()+=distance+tolerance;
         AABBTreeIndirect::traverse(child.index,[&](const auto& node){return box.intersects(node.bbox);},
             [&](const auto& node) {
                 const size_t j=node.idx;const auto& q=child.segments[j];
@@ -1327,14 +1344,11 @@ ChainGate nearest_ring_gate(const FrozenRingView& parent,const FrozenRingView& c
                             child.stations[j]+projection_fraction(pb,q)*lq,std::abs(cross2(t,q.a-p.a))});
                     }
                 }
-                const auto& pp=parent.check_view.points;
-                const auto& qp=child.check_view.points;
-                if (Geometry::segments_intersect(pp[i].head<2>(),pp[i+1].head<2>(),qp[j].head<2>(),qp[j+1].head<2>())) distance=0;
                 return true;
             });
+        for (const auto& contact:local)
+            if (contact.distance<=distance+tolerance) contacts.push_back(contact);
     }
-    contacts.erase(std::remove_if(contacts.begin(),contacts.end(),[&](const auto& c){
-        return c.distance>distance+gate_numeric_tie_mm;}),contacts.end());
     std::sort(contacts.begin(),contacts.end(),[](const auto& a,const auto& b){
         return std::tie(a.p0,a.p1,a.q0,a.q1)<std::tie(b.p0,b.p1,b.q0,b.q1);});
     std::vector<ContactInterval> merged;
@@ -1355,38 +1369,39 @@ ChainGate nearest_ring_gate(const FrozenRingView& parent,const FrozenRingView& c
         const auto first=merged.front(),last=merged.back();
         const double shift=std::round((last.q1-first.q0)/child.length)*child.length;
         if (std::abs(last.q1-first.q0-shift)<=gate_numeric_tie_mm) {
-            merged.back()={last.p0,first.p1+parent.length,last.q0,first.q1+shift,distance};merged.erase(merged.begin());
+            merged.back()={last.p0,first.p1+parent.length,last.q0,first.q1+shift,std::min(last.distance,first.distance)};merged.erase(merged.begin());
         }
     }
     if (merged.empty()) throw std::invalid_argument("finite_nearest_contact_unavailable");
-    std::pair<double,double> station{std::numeric_limits<double>::infinity(),0};
-    for (const auto& contact:merged) station=std::min(station,std::make_pair(
-        parent.wrap(0.5*(contact.p0+contact.p1)),child.wrap(0.5*(contact.q0+contact.q1))));
-    // The AABB/chord search selects candidates; publish exact points on the circles.
-    const Point3 p=parent.at(station.first),q=child.at(station.second);
-    return {station.first,station.second,unscale<double>((p-q).cast<double>().norm()),p,q};
-}
-
-ChainGate inherited_ring_gate(const FrozenRingView& parent,const FrozenRingView& child,double seam)
-{
-    const Point3 p=parent.at(parent.wrap(seam));const Vec2d query=parent.position(parent.wrap(seam));
-    size_t hit=0;Vec2d nearest;
-    const double squared=AABBTreeLines::squared_distance_to_indexed_lines(child.segments,child.index,query,hit,nearest);
-    if (squared<0) throw std::invalid_argument("empty_source_segment_index");
-    const double distance=std::sqrt(squared);
-    double station=std::numeric_limits<double>::infinity();
-    const auto matches=AABBTreeLines::all_lines_in_radius(child.segments,child.index,query,
-        (distance+gate_numeric_tie_mm)*(distance+gate_numeric_tie_mm));
-    for (const size_t i:matches) {
-        const double t=projection_fraction(query,child.segments[i]);
-        const Vec2d q=child.segments[i].a+t*(child.segments[i].b-child.segments[i].a);
-        if ((q-query).norm()<=distance+gate_numeric_tie_mm)
-            station=std::min(station,child.wrap(child.stations[i]+t*(child.stations[i+1]-child.stations[i])));
+    std::vector<ChainGate> result;
+    const auto add=[&](double p,double q) {
+        p=parent.wrap(p);q=child.wrap(q);
+        const Point3 a=parent.at(p),b=child.at(q);
+        result.push_back({p,q,unscale<double>((a-b).cast<double>().norm()),a,b});
+    };
+    for (const auto& contact:merged) {
+        add(0.5*(contact.p0+contact.p1),0.5*(contact.q0+contact.q1));
+        // Also place the cut window within a parallel passage when its midpoint
+        // would trim the parent or start the child beyond that passage.
+        const double dp=contact.p1-contact.p0,dq=contact.q1-contact.q0;
+        const double tail=config.connection_tail_trim_widths*parent.source->centerline->width;
+        const double head=config.connection_head_trim_widths*child.source->centerline->width;
+        if (!inherited_seam && dp>tail && std::abs(dq)>head) {
+            double lo=tail/dp,hi=1.0;
+            if (dq>0) hi=1-head/dq;
+            else lo=std::max(lo,head/-dq);
+            if (lo<=hi) {
+                const double t=0.5*(lo+hi);
+                add(contact.p0+t*dp,contact.q0+t*dq);
+            }
+        }
     }
-    if (!std::isfinite(station)) throw std::invalid_argument("fixed_seam_projection_unavailable");
-    station=Geometry::project_with_arcs_mm(child.source->centerline->polyline,p);
-    const Point3 q=child.at(station);
-    return {seam,station,unscale<double>((p-q).cast<double>().norm()),p,q};
+    std::sort(result.begin(),result.end(),[](const auto& a,const auto& b){
+        return std::tie(a.parent_station,a.child_station)<std::tie(b.parent_station,b.child_station);});
+    result.erase(std::unique(result.begin(),result.end(),[](const auto& a,const auto& b){
+        return a.parent==b.parent && a.child==b.child;
+    }),result.end());
+    return result;
 }
 
 struct RingChainDraft {std::vector<size_t> sources;std::vector<double> seams;std::vector<size_t> links;};
@@ -1831,13 +1846,58 @@ void plan_ring_connections(FiberContourPlanResult& plan,const ExPolygons& allowe
             fiber_material_offset(allowed_domain,-config.contour_boundary_clearance_mm),-0.5*width)).first;
         return found->second;
     };
+    // Only a finalized complete chain may publish consumed sources. Keep its
+    // immutable execution instead of finalizing the winning draft twice.
+    std::vector<std::optional<FiberChainExecution>> prepared_drafts(sources.size());
+    const auto prepare_chain=[&](const RingChainDraft& draft,OpenChainGeometry geometry) {
+        const auto& root=*sources[draft.sources.front()].source;
+        FiberChainExecution chain;
+        if (draft.sources.size()==1) {
+            chain.centerline=*root.centerline;chain.prepared=root.prepared;
+        } else {
+            normalize_open_chain(geometry,safe_domain(root.centerline->width));
+            if (!open_chain_stability(geometry.bends,config.concentric_corner_stabilization_length_mm))
+                throw std::invalid_argument("normalized_open_chain_bend_stabilization_too_short");
+            chain.centerline=ExtrusionPath(geometry.path,*root.centerline);
+            const auto& terminal=sources[draft.sources.back()];
+            FiberFinishRoute finish;finish.strategy=FiberFinishStrategy::LoopOverlap;finish.source=terminal.source->id;
+            finish.requested_length_mm=config.finish_overlap_length_mm;
+            if (!std::isfinite(finish.requested_length_mm) || finish.requested_length_mm<0 || finish.requested_length_mm>terminal.length)
+                throw std::invalid_argument("terminal_source_cannot_supply_requested_finish");
+            if (finish.requested_length_mm>0) {
+                OpenChainGeometry route;
+                const double head=config.connection_head_trim_widths*terminal.source->centerline->width;
+                const double first=std::min(head,finish.requested_length_mm);
+                if (first>0) append_frozen_span(route,terminal,draft.sources.back(),draft.seams.back(),first,false);
+                if (finish.requested_length_mm>first) append_frozen_span(route,terminal,draft.sources.back(),
+                    draft.seams.back()+first,finish.requested_length_mm-first,false);
+                finish.geometry=std::move(route.path);chain.finish_pieces=std::move(route.pieces);
+            }
+            const auto prepared=FiberPathFinalizer::finalize(chain.centerline,allowed_domain,config,root.id,finish,
+                geometry.arcs,&safe_domain(chain.centerline.width),geometry.pieces,chain.finish_pieces);
+            if (!prepared.prepared) throw std::invalid_argument(std::string("open_chain_finalization_")+
+                fiber_rejection_reason_name(finalization_reason(prepared.failure))+": "+prepared.detail);
+            chain.prepared=prepared.prepared;
+        }
+        chain.sources=std::move(geometry.sources);chain.pieces=std::move(geometry.pieces);
+        if (draft.sources.size()>1) for (const auto& route:actual_chain_deposition(*chain.prepared)) {
+            const ExtrusionPath actual(route,chain.centerline);
+            const auto reason=validate_path_geometry(actual);
+            if (actual.is_closed() || reason!=FiberRejectionReason::None)
+                throw std::invalid_argument(std::string("open_chain_actual_")+fiber_rejection_reason_name(reason));
+        }
+        return chain;
+    };
     for (const size_t root:roots) {
         if (used[root]) continue;
         used[root]=true;
-        while (true) {
-            const auto& current=*drafts[root];const size_t parent_index=current.sources.back();
+        // A prefix need not satisfy the complete CUT budget: three short
+        // rings can be printable together even when the first two are not.
+        // Finalize at a chain end and backtrack rejected candidate seams.
+        const auto extend=[&](auto&& self)->bool {
+            const auto current=*drafts[root];const size_t parent_index=current.sources.back();
             const auto& parent=sources[parent_index];const bool inherited=current.sources.size()>1;
-            struct Choice {size_t child,decision;ChainGate gate;};std::vector<Choice> choices;
+            struct Choice {size_t child,decision;ChainGate gate;double bridge_length;};std::vector<Choice> choices;
             for (const auto& edge:children[parent_index]) {
                 auto& decision=plan.chain_decisions[edge.second];
                 if (used[edge.first]) {decision.reason="source_already_visited";continue;}
@@ -1851,34 +1911,52 @@ void plan_ring_connections(FiberContourPlanResult& plan,const ExPolygons& allowe
                     decision.reason="incompatible_actual_process";continue;
                 }
                 try {
-                    const auto gate=inherited?inherited_ring_gate(parent,child,current.seams.back()):nearest_ring_gate(parent,child);
-                    decision.inherited_seam=inherited;decision.parent_contact=gate.parent;decision.child_contact=gate.child;
-                    decision.parent_station_mm=parent.canonical(gate.parent_station);decision.child_station_mm=child.canonical(gate.child_station);
-                    decision.gap_mm=gate.distance;choices.push_back({edge.first,edge.second,gate});
+                    const auto gates=ring_gate_candidates(parent,child,config,
+                        inherited?std::optional<double>(current.seams.back()):std::nullopt);
+                    for (const auto& gate:gates) {
+                        const auto a=parent.at(parent.wrap(gate.parent_station-
+                            config.connection_tail_trim_widths*p.centerline->width));
+                        const auto b=child.at(child.wrap(gate.child_station+
+                            config.connection_head_trim_widths*c.centerline->width));
+                        choices.push_back({edge.first,edge.second,gate,unscale<double>((a-b).cast<double>().norm())});
+                    }
                 } catch (const FiberExecutionError&) { throw; }
     catch (const CanceledException&) { throw; }
     catch (const std::exception& error) {decision.reason=error.what();}
             }
             std::sort(choices.begin(),choices.end(),[&](const auto& a,const auto& b){
-                return std::make_tuple(a.gate.distance,sources[a.child].source->id,a.gate.parent_station,a.gate.child_station)<
-                    std::make_tuple(b.gate.distance,sources[b.child].source->id,b.gate.parent_station,b.gate.child_station);});
-            bool extended=false;
+                return std::make_tuple(a.bridge_length,sources[a.child].source->id,a.gate.parent_station,a.gate.child_station)<
+                    std::make_tuple(b.bridge_length,sources[b.child].source->id,b.gate.parent_station,b.gate.child_station);});
+            const auto domain=offset_ex(safe_domain(parent.source->centerline->width),
+                float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
             for (size_t choice_index=0;choice_index<choices.size();++choice_index) {
                 const auto& choice=choices[choice_index];auto& decision=plan.chain_decisions[choice.decision];
+                const auto& child=sources[choice.child];
+                decision.inherited_seam=inherited;decision.parent_contact=choice.gate.parent;decision.child_contact=choice.gate.child;
+                decision.parent_station_mm=parent.canonical(choice.gate.parent_station);decision.child_station_mm=child.canonical(choice.gate.child_station);
+                decision.gap_mm=choice.gate.distance;
                 RingChainDraft trial=current;
                 if (!inherited) trial.seams.front()=choice.gate.parent_station;
                 trial.sources.push_back(choice.child);trial.seams.push_back(choice.gate.child_station);
                 trial.links.push_back(transition_offset+choice.decision+1);
+                bool reserved=false;
                 try {
-                    const auto geometry=build_open_chain(trial,sources,config);
-                    decision.bridge_begin=geometry.bridges.back().first;decision.bridge_end=geometry.bridges.back().second;
+                    // Reject an unsafe bridge before constructing and auditing
+                    // thousands of unchanged source edges for this candidate.
+                    const auto a=parent.at(parent.wrap(choice.gate.parent_station-
+                        config.connection_tail_trim_widths*parent.source->centerline->width));
+                    const auto b=child.at(child.wrap(choice.gate.child_station+
+                        config.connection_head_trim_widths*child.source->centerline->width));
+                    decision.bridge_begin=a;decision.bridge_end=b;
+                    if (!diff_pl(Polylines{Polyline{Points{Point{a.x(),a.y()},Point{b.x(),b.y()}}}},domain).empty())
+                        throw std::invalid_argument("open_chain_outside_configured_material_clearance");
+                    auto geometry=build_open_chain(trial,sources,config);
                     ExtrusionPath path(geometry.path,*sources[root].source->centerline);
                     const auto reason=validate_path_geometry(path);
                     if (path.is_closed() || reason!=FiberRejectionReason::None)
                         throw std::invalid_argument(std::string("open_chain_")+fiber_rejection_reason_name(reason));
                     if (!chain_only && intersects_other_chains(geometry.path,drafts,sources,config,root,choice.child))
                         throw std::invalid_argument("open_chain_intersects_another_source");
-                    const auto domain=offset_ex(safe_domain(path.width),float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
                     if (!diff_pl(Polylines{check_view(geometry.path)},domain).empty())
                         throw std::invalid_argument("open_chain_outside_configured_material_clearance");
                     if (config.enforce_policy_boundary && config.policy_boundary && !config.policy_boundary->forbidden_core.empty() &&
@@ -1887,17 +1965,42 @@ void plan_ring_connections(FiberContourPlanResult& plan,const ExPolygons& allowe
                         throw std::invalid_argument("open_chain_crosses_policy_boundary");
                     if (!open_chain_stability(geometry.bends,config.concentric_corner_stabilization_length_mm))
                         throw std::invalid_argument("open_chain_bend_stabilization_too_short");
-                    drafts[root]=std::move(trial);drafts[choice.child].reset();used[choice.child]=true;
-                    decision.planned=true;decision.reason="planned";extended=true;
-                    for (size_t j=choice_index+1;j<choices.size();++j)
-                        plan.chain_decisions[choices[j].decision].reason="one_successor_separate_root";
-                    break;
+                    drafts[root]=std::move(trial);drafts[choice.child].reset();used[choice.child]=true;reserved=true;
+                    decision.planned=true;decision.reason="planned";
+                    if (self(self)) {
+                        for (size_t j=choice_index+1;j<choices.size();++j)
+                            if (choices[j].decision!=choice.decision)
+                                plan.chain_decisions[choices[j].decision].reason="one_successor_separate_root";
+                        return true;
+                    }
                 } catch (const FiberExecutionError&) { throw; }
-    catch (const CanceledException&) { throw; }
-    catch (const std::exception& error) {decision.reason=error.what();}
+                catch (const CanceledException&) { throw; }
+                catch (const std::exception& error) {decision.reason=error.what();}
+                if (reserved) {
+                    // A failed suffix owns no published geometry or source.
+                    // Restore the child before trying the next gate.
+                    drafts[root]=current;
+                    drafts[choice.child]=RingChainDraft{{choice.child},{0},{}};
+                    used[choice.child]=false;decision.planned=false;
+                }
             }
-            if (!extended) break;
-        }
+            if (current.sources.size()<2) return false;
+            try {
+                auto prepared=prepare_chain(current,build_open_chain(current,sources,config));
+                if (!chain_only) for (const auto& route:actual_chain_deposition(*prepared.prepared))
+                    if (intersects_other_chains(route,drafts,sources,config,root,sources.size()))
+                        throw std::invalid_argument("open_chain_actual_domain_crossing");
+                prepared_drafts[root]=std::move(prepared);
+                return true;
+            } catch (const FiberExecutionError&) { throw; }
+            catch (const CanceledException&) { throw; }
+            catch (const std::exception& error) {
+                for (const size_t link:current.links)
+                    plan.chain_decisions.at(link-transition_offset-1).reason=error.what();
+            }
+            return false;
+        };
+        extend(extend);
     }
     if (std::none_of(drafts.begin(),drafts.end(),[](const auto& draft){return draft && draft->sources.size()>1;})) return;
     FiberValidationResult publish;publish.assignments=original.assignments;publish.output_role=original.output_role;
@@ -1913,50 +2016,16 @@ void plan_ring_connections(FiberContourPlanResult& plan,const ExPolygons& allowe
             const auto da=nodes.at(sources[a].source->id.parent)->depth,db=nodes.at(sources[b].source->id.parent)->depth;
             return std::make_pair(da,sources[a].source->id)<std::make_pair(db,sources[b].source->id);});
         for (const size_t index:order) {
-            const auto& draft=*drafts[index];const auto& root=*sources[index].source;
-            auto geometry=build_open_chain(draft,sources,config);FiberChainExecution chain;
-            if (draft.sources.size()==1) {
-                chain.centerline=*root.centerline;chain.prepared=root.prepared;
-            } else {
-                normalize_open_chain(geometry,safe_domain(root.centerline->width));
-                if (!open_chain_stability(geometry.bends,config.concentric_corner_stabilization_length_mm))
-                    throw std::invalid_argument("normalized_open_chain_bend_stabilization_too_short");
-                chain.centerline=ExtrusionPath(geometry.path,*root.centerline);
-                const auto& terminal=sources[draft.sources.back()];
-                FiberFinishRoute finish;finish.strategy=FiberFinishStrategy::LoopOverlap;finish.source=terminal.source->id;
-                finish.requested_length_mm=config.finish_overlap_length_mm;
-                if (!std::isfinite(finish.requested_length_mm) || finish.requested_length_mm<0 || finish.requested_length_mm>terminal.length)
-                    throw std::invalid_argument("terminal_source_cannot_supply_requested_finish");
-                if (finish.requested_length_mm>0) {
-                    OpenChainGeometry route;
-                    const double head=config.connection_head_trim_widths*terminal.source->centerline->width;
-                    const double first=std::min(head,finish.requested_length_mm);
-                    if (first>0) append_frozen_span(route,terminal,draft.sources.back(),draft.seams.back(),first,false);
-                    if (finish.requested_length_mm>first) append_frozen_span(route,terminal,draft.sources.back(),
-                        draft.seams.back()+first,finish.requested_length_mm-first,false);
-                    finish.geometry=std::move(route.path);chain.finish_pieces=std::move(route.pieces);
-                }
-                const auto prepared=FiberPathFinalizer::finalize(chain.centerline,allowed_domain,config,root.id,finish,
-                    geometry.arcs,&safe_domain(chain.centerline.width),geometry.pieces,chain.finish_pieces);
-                if (!prepared.prepared) throw std::invalid_argument(std::string("open_chain_finalization_")+
-                    fiber_rejection_reason_name(finalization_reason(prepared.failure))+": "+prepared.detail);
-                chain.prepared=prepared.prepared;
-                if (chain_only) for (size_t index : draft.sources) {
-                    auto& assignment=publish.assignments.at(size_t(sources[index].source-original.assignments.data()));
-                    assignment.kind=FiberAssignmentKind::AcceptedFiber;
-                    assignment.reason=FiberRejectionReason::None;
-                    assignment.detail.clear();
-                }
+            const auto& draft=*drafts[index];
+            auto chain=prepared_drafts[index]?std::move(*prepared_drafts[index]):
+                prepare_chain(draft,build_open_chain(draft,sources,config));
+            if (chain_only && draft.sources.size()>1) for (size_t source_index : draft.sources) {
+                auto& assignment=publish.assignments.at(size_t(sources[source_index].source-original.assignments.data()));
+                assignment.kind=FiberAssignmentKind::AcceptedFiber;
+                assignment.reason=FiberRejectionReason::None;
+                assignment.detail.clear();
             }
-            chain.sources=std::move(geometry.sources);chain.pieces=std::move(geometry.pieces);
-            // Every placement is audited below in its own canonical frame.
             actual_variants.push_back(actual_chain_deposition(*chain.prepared));connected.push_back(draft.sources.size()>1);
-            if (connected.back())for(const auto& route:actual_variants.back()) {
-                const ExtrusionPath actual(route,chain.centerline);
-                const auto reason=validate_path_geometry(actual);
-                if (actual.is_closed() || reason!=FiberRejectionReason::None)
-                    throw std::invalid_argument(std::string("open_chain_actual_")+fiber_rejection_reason_name(reason));
-            }
             publish.chain_executions.push_back(std::move(chain));
         }
         // Recheck every changed execution against all actual prepared paths,
