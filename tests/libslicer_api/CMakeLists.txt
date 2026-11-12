@@ -117,7 +117,7 @@ if(FIBER_GEOMETRY_PYTHON)
     set_tests_properties(FiberBracketResinGeometry PROPERTIES LABELS "fiber_resin" TIMEOUT 240 FIXTURES_REQUIRED bracket_resin)
 endif()
 
-foreach(_mode IN ITEMS contour_only infill_only no_fiber sparse_resin resin_off zero_radius concentric_resin)
+foreach(_mode IN ITEMS contour_only infill_only no_fiber sparse_resin resin_off zero_radius concentric_resin concentric_resin_arcs)
     add_test(NAME FiberBracket_${_mode} COMMAND fiber_4xiao_acceptance --resin-model
         "${CMAKE_SOURCE_DIR}/tests/data/continuous_fiber/bracket1"
         "${CMAKE_CURRENT_BINARY_DIR}/bracket-${_mode}"
@@ -140,10 +140,15 @@ foreach(_model IN LISTS FIBER_RING_MODELS)
     else()
         set(_layers 212)
     endif()
-    add_test(NAME FiberSharedRing_${_model} COMMAND fiber_4xiao_acceptance --ring-model
-        "${FIBER_TEST_MODELS_DIR}/${_model}.stl" ${_layers}
-        "${CMAKE_CURRENT_BINARY_DIR}/shared-ring/${_model}")
-    set_tests_properties(FiberSharedRing_${_model} PROPERTIES LABELS "fiber_shared_ring" TIMEOUT 1800 RUN_SERIAL TRUE)
+    # The same functional cases and timing consistency checks have separate
+    # budgets. Do not make many normal full slices share one timeout.
+    foreach(_matrix IN ITEMS S0 S5 benchmark)
+        add_test(NAME FiberSharedRing_${_model}_${_matrix} COMMAND fiber_4xiao_acceptance --ring-model
+            "${FIBER_TEST_MODELS_DIR}/${_model}.stl" ${_layers}
+            "${CMAKE_CURRENT_BINARY_DIR}/shared-ring/${_model}/${_matrix}" ${_matrix})
+        set_tests_properties(FiberSharedRing_${_model}_${_matrix} PROPERTIES
+            LABELS "fiber_shared_ring;fiber_shared_ring_${_matrix}" TIMEOUT 1800 RUN_SERIAL TRUE)
+    endforeach()
 endforeach()
 add_test(NAME FiberSharedRingPositive COMMAND fiber_4xiao_acceptance --ring-positive
     "${CMAKE_CURRENT_BINARY_DIR}/shared-ring/positive")

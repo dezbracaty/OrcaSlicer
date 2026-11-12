@@ -11,6 +11,9 @@
 
 namespace Slic3r {
 
+// Existing command-grid normalization bound, shared with contour query bounds.
+inline constexpr double fiber_normalization_error_mm = 0.002;
+
 class ExtrusionPath;
 // Error-bounded short-edge and collinear normalization. Preserves
 // endpoints/seam; this geometry becomes the source for length and coverage.
@@ -71,7 +74,11 @@ public:
         const std::vector<ContourArc>& arcs = {},
         const ExPolygons* planned_centerline_domain = nullptr,
         const std::vector<FiberExecutionPiece>& pieces = {},
-        const std::vector<FiberExecutionPiece>& finish_pieces = {});
+        const std::vector<FiberExecutionPiece>& finish_pieces = {},
+        // Optional offset_ex(*planned_centerline_domain, +geometry_tolerance).
+        // The synchronous caller owns this exact derived query domain. It does
+        // not replace the original planning or material-allocation domains.
+        const ExPolygons* expanded_centerline_domain = nullptr);
 };
 
 } // namespace Slic3r

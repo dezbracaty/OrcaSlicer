@@ -1810,7 +1810,8 @@ static void execute_surface_fill_job(
     const FillExecutionContext& context,
     SurfaceFill                 surface_fill,
     ExtrusionEntitiesPtr&       destination,
-    const FillExecutionPolicy&  policy)
+    const FillExecutionPolicy&  policy,
+    std::shared_ptr<const ExPolygons> resin_protected_core = {})
 {
     if (surface_fill.params.density <= 0) return;
     Layer& layer = context.layer;
@@ -1986,7 +1987,37 @@ static void execute_surface_fill_job(
         }
 
         const size_t micro_fill_begin = destination.size();
-        f->fill_surface_extrusion(&surface_fill.surface, params, destination);
+        if (resin_protected_core && !resin_protected_core->empty() && params.extrusion_role == erResinInfill) {
+            // Native fill envelopes allow bead overlap with a neighboring wall.
+            // Fiber residuals instead have an explicit material boundary. Keep
+            // the original pattern/Flow, then let the same native GapFill see
+            // the actual main entities that remain after that boundary check.
+            FillParams main_params = params;
+            main_params.enable_gap_fill = false;
+            ExtrusionEntityCollection generated;
+            f->fill_surface_extrusion(&surface_fill.surface, main_params, generated.entities);
+            for (auto*& entity : generated.entities) {
+                auto* collection = dynamic_cast<ExtrusionEntityCollection*>(entity);
+                if (!collection) throw RuntimeError("Unexpected native resin fill entity");
+                ContinuousFiberFillStrategy::constrain_resin_paths(collection->entities, *resin_protected_core);
+                const size_t gap_begin = collection->entities.size();
+                if (params.enable_gap_fill)
+                    f->_create_gap_fill(&surface_fill.surface, params, collection);
+                ContinuousFiberFillStrategy::constrain_resin_paths(collection->entities, *resin_protected_core, gap_begin);
+                auto guarded = std::make_unique<ExtrusionResinCollection>(std::move(*collection), resin_protected_core);
+                delete collection;
+                entity = guarded.release();
+            }
+            destination.reserve(destination.size() + generated.entities.size());
+            for (auto* entity : generated.entities) {
+                auto* collection = static_cast<ExtrusionEntityCollection*>(entity);
+                if (collection->empty()) delete collection;
+                else destination.push_back(entity);
+            }
+            generated.entities.clear();
+        } else {
+            f->fill_surface_extrusion(&surface_fill.surface, params, destination);
+        }
         // A merged fill job can contain regions with different reinforcement
         // flags. Keep every such layer unchanged, even for its ordinary paths.
         const bool non_reinforced_layer = std::none_of(layer.regions().begin(), layer.regions().end(),
@@ -2249,10 +2280,10 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     };
     const bool concentric=config.concentric_infill();
     FiberValidationResult contour_result;
+    if (collect_debug)
+        record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
+                       "original_contour_domain_before_candidate_generation");
     if ((config.contour_enabled && config.contour_count > 0) || concentric) {
-        if (collect_debug)
-            record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
-                           "original_contour_domain_before_candidate_generation");
         const auto ring_config=concentric?fiber_ring_reference_config(config):config;
         const size_t display_depths=config.contour_enabled?size_t(config.contour_count):0;
         const double extra_spacing=concentric && config.infill_density<100?
@@ -2347,6 +2378,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     FiberCoverageRecord coverage;
     coverage.source = domain_id;
     coverage.source_domain = original_area;
+    coverage.resin_overlap_mm = config.resin_overlap_mm;
     coverage.accepted_contour_exclusion = contour_result.resin_exclusion;
     coverage.accepted_infill_exclusion = infill_result.resin_exclusion;
     if (concentric) {
@@ -2601,6 +2633,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
                     record.source = {this->object()->id().id, this->id(), contributor.id.region_id, contributor.id.surface_id};
                     record.source_domain = contributor.effective_domain;
                     const auto& source = m_regions[contributor.id.region_id]->region().config();
+                    record.resin_overlap_mm = source.fiber_resin_overlap.value;
                     (source.fiber_resin_fill_density.value > 0 ? record.resin_domain : record.intentional_void) =
                         contributor.effective_domain;
                     transaction.coverage.add(std::move(record));
@@ -2619,12 +2652,14 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
             bbox,
             resolution
         };
+        const auto protected_core = std::make_shared<const ExPolygons>(transaction.coverage.resin_protected_core());
         for (SurfaceFill& resin_fill : resin_fills)
             execute_surface_fill_job(
                 resin_execution_context,
                 resin_fill,
                 transaction.resin_destination(resin_fill.region_id),
-                ordinary_fill_policy);
+                ordinary_fill_policy,
+                protected_core);
     } else {
         for (SurfaceFill& surface_fill : surface_fills)
             execute_surface_fill_job(

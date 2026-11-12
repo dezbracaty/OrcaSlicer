@@ -18,6 +18,79 @@
 
 namespace Slic3r {
 
+namespace continuous_fiber_detail {
+
+std::optional<HoleQueryBand> hole_query_band(const ExPolygons& frontier, double width_mm, double radius_mm)
+{
+    if (frontier.empty() || !std::isfinite(width_mm) || width_mm <= 0 ||
+        !std::isfinite(radius_mm) || radius_mm < 0) return std::nullopt;
+    const ContourRoundingOptions tolerance;
+    const double g = tolerance.geometry_tolerance_mm, q = tolerance.chord_tolerance_mm;
+    const long double units = scale_(1.0);
+    // Sum reaches rather than assuming offsets cancel. Round offsets use the
+    // same arc tolerance as fiber_region_offset; miter offsets use the actual
+    // float delta consumed by offset_ex. Each operation rounds outward a grid.
+    const auto round_reach = [&](double delta) {
+        return std::ceil(units * (std::abs((long double)delta) + .25L*q)) + 1;
+    };
+    const auto miter_reach = [&](double delta) {
+        return std::ceil(DefaultMiterLimit * std::abs((long double)float(scale_(delta)))) + 1;
+    };
+    long double halo = round_reach(.5*width_mm); // frontier -> candidate
+    if (radius_mm > 0) {
+        halo += std::ceil(units*(4.L*radius_mm + g)) + 1; // shaping box
+        halo += miter_reach(g); // rounded shape output allowance
+    }
+    halo += std::ceil(units*fiber_normalization_error_mm) + 1;
+    halo += round_reach(.5*width_mm); // remaining material -> centerline
+    halo += round_reach(.5*width_mm); // intra-candidate reallocation
+    halo += miter_reach(g); // zero-radius cleanup (conservatively also rounded)
+    halo += miter_reach(radius_mm > 0 ? g : .5*g); // partition
+    halo += miter_reach(.5*g); // remaining partition
+    halo += miter_reach(g) + miter_reach(q); // Finalizer centerline -> arc query
+    // These planning diffs/offsets do not use ApplySafetyOffset::Yes. Full
+    // business-domain clips and their safety offsets remain outside this query.
+    const long double limit = std::min((long double)std::numeric_limits<coord_t>::max(),
+                                      (long double)ClipperLib::hiRange);
+    if (!std::isfinite(halo) || halo >= limit) return std::nullopt;
+    const auto bounds = get_extents(frontier);
+    for (size_t axis = 0; axis < 2; ++axis)
+        if ((long double)bounds.min[axis]-halo <= -limit ||
+            (long double)bounds.max[axis]+halo >= limit) return std::nullopt;
+    return HoleQueryBand{coord_t((long double)bounds.min.y()-halo), coord_t((long double)bounds.max.y()+halo)};
+}
+
+static bool intersects_band(const Polygon& polygon, const HoleQueryBand& band)
+{
+    if (polygon.points.empty()) return false;
+    const auto bounds = get_extents(polygon);
+    return bounds.min.y() <= band.max_y && bounds.max.y() >= band.min_y;
+}
+
+ExPolygons hole_query_material(const ExPolygons& material, const HoleQueryBand& band)
+{
+    ExPolygons selected;
+    for (const auto& region : material) if (intersects_band(region.contour, band)) {
+        // Never cut the outer contour or a hole. A surrounding hole must also
+        // survive even when all its vertices lie outside the queried band.
+        ExPolygon copy(region.contour);
+        for (const auto& hole : region.holes)
+            if (intersects_band(hole, band)) copy.holes.push_back(hole);
+        selected.push_back(std::move(copy));
+    }
+    return selected;
+}
+
+ExPolygons hole_query_occupancy(const ExPolygons& footprint, const HoleQueryBand& band)
+{
+    ExPolygons selected;
+    for (const auto& region : footprint)
+        if (intersects_band(region.contour, band)) selected.push_back(region);
+    return selected;
+}
+
+} // namespace continuous_fiber_detail
+
 namespace {
 
 constexpr double interval_epsilon_mm = 1e-5;
@@ -573,6 +646,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
     const auto process_path = [&](const ExtrusionPath& input) {
         ExtrusionPath path(input);
         bool planar = true;
+        ExPolygons cleanup_domain;
         // Source shaping may ignore other boundaries, but simplification must
         // not create a shortcut outside the physical domain and then clip it
         // as an unavailable interval during allocation.
@@ -584,7 +658,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
             // Clean these before freezing source stations, with the existing
             // domain-preserving normalizer. Never simplify analytic arcs.
             if (!rounds_contours) {
-                const auto cleanup_domain=offset_ex(centerline_domain_for_width(path.width),
+                cleanup_domain=offset_ex(centerline_domain_for_width(path.width),
                     float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
                 path.polyline = normalize_fiber_geometry(path.polyline, &cleanup_domain);
             }
@@ -809,8 +883,18 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 FiberFinalizationResult finalized;
                 try {
                     const auto finish=make_independent_fiber_finish_route(*assignment.centerline,config,assignment.id);
+                    const ExPolygons* expanded_domain=nullptr;
+                    if (final_domain && final_domain==planned_centerline_domain) {
+                        if (!rounds_contours) expanded_domain=&cleanup_domain;
+                        else if (const auto found=partition_domains.find(path.width);found!=partition_domains.end())
+                            expanded_domain=&found->second;
+                    }
+                    // Reuse only this path's unchanged planning revision. A
+                    // remaining_domain has a different +g/2 partition; Finalizer
+                    // must derive its own +g query after occupancy changes.
                     finalized=FiberPathFinalizer::finalize(
-                        *assignment.centerline,allowed_domain,config,assignment.id,finish,arcs,final_domain);
+                        *assignment.centerline,allowed_domain,config,assignment.id,finish,arcs,final_domain,
+                        {},{},expanded_domain);
                 } catch (const FiberExecutionError&) { throw; }
     catch (const CanceledException&) { throw; }
     catch (const std::invalid_argument& error) {
@@ -1054,31 +1138,54 @@ FiberContourPlanResult plan_ring_stage(
     const ExPolygons physical_domain = fiber_material_offset(material, -0.5 * width);
     const ExPolygons physical_partition = fiber_material_offset(physical_domain,
         0.5 * ContourRoundingOptions{}.geometry_tolerance_mm);
+    std::vector<ExPolygons> roots;
+    roots.reserve(regions.size());
+    for (const auto& region : regions)
+        roots.push_back(fiber_material_offset(ExPolygons{region}, -clearance));
     size_t job = 0;
     for (const auto side : {FiberContourSide::Outer, FiberContourSide::Hole}) {
         if (side == FiberContourSide::Hole && !stage.include_holes) continue;
         std::vector<Branch> current;
         for (size_t region = 0; region < regions.size(); ++region) {
-            const auto root = fiber_material_offset(ExPolygons{regions[region]}, -clearance);
             if (side == FiberContourSide::Outer) {
-                current.push_back({root, {}, std::nullopt, region, 0});
+                current.push_back({roots[region], {}, std::nullopt, region, 0});
             } else for (size_t hole = 0; hole < regions[region].holes.size(); ++hole) {
                 Polygon boundary = regions[region].holes[hole]; boundary.make_counter_clockwise();
-                current.push_back({root, fiber_material_offset(ExPolygons{ExPolygon(boundary)}, clearance),
+                current.push_back({{}, fiber_material_offset(ExPolygons{ExPolygon(boundary)}, clearance),
                     std::nullopt, region, hole});
             }
         }
         for (size_t depth = 0; depth < stage.max_depth && !current.empty(); ++depth) {
             std::vector<Branch> next;
             for (const auto& branch : current) {
+                const auto band = side == FiberContourSide::Hole ?
+                    continuous_fiber_detail::hole_query_band(branch.hole_frontier, width, stage.bend_radius_mm) :
+                    std::nullopt;
+                const auto& complete_material = side == FiberContourSide::Hole ? roots[branch.region] : branch.material;
+                const auto selected_material = band ?
+                    continuous_fiber_detail::hole_query_material(complete_material, *band) : ExPolygons{};
+                const auto& branch_material = band ? selected_material : complete_material;
                 const bool provisional = !branch.provisional_footprint.empty();
                 const auto remaining_material = [&] {
-                    if (!provisional) return diff_ex(branch.material, result.physical_footprint);
-                    return diff_ex(branch.material, union_ex(result.physical_footprint, branch.provisional_footprint));
+                    // Keep the original union -> diff -> erosion order and
+                    // reselect after every committed sibling's coverage.
+                    ExPolygons remaining;
+                    if (!provisional) remaining=diff_ex(branch_material, band ?
+                        continuous_fiber_detail::hole_query_occupancy(result.physical_footprint, *band) :
+                        result.physical_footprint);
+                    else {
+                        const auto occupied = union_ex(result.physical_footprint, branch.provisional_footprint);
+                        remaining=diff_ex(branch_material, band ?
+                            continuous_fiber_detail::hole_query_occupancy(occupied, *band) : occupied);
+                    }
+                    // The diff may expose remote holes/components from a
+                    // selected occupancy component that spans the whole layer.
+                    return band ? continuous_fiber_detail::hole_query_material(remaining,*band) : std::move(remaining);
                 };
                 const ExPolygons remaining = remaining_material();
-                const auto candidates = ContinuousFiberFillStrategy::generate_contour_level(remaining, width,
+                auto candidates = ContinuousFiberFillStrategy::generate_contour_level(remaining, width,
                     side == FiberContourSide::Hole ? &branch.hole_frontier : nullptr);
+                if (band) candidates.centerline_domain=continuous_fiber_detail::hole_query_material(candidates.centerline_domain,*band);
                 // Hole paths may become open strands. Shape against their own
                 // frontier first; allocation then clips other holes and occupied
                 // material. Requiring a complete ring inside that clipped domain
@@ -1111,6 +1218,7 @@ FiberContourPlanResult plan_ring_stage(
                     if (coverage_changed) {
                         updated_available = fiber_material_offset(
                             remaining_material(), -0.5 * width);
+                        if (band) updated_available=continuous_fiber_detail::hole_query_material(updated_available,*band);
                         available = &updated_available;
                     }
                     FiberValidationResult accepted;
@@ -1168,7 +1276,7 @@ FiberContourPlanResult plan_ring_stage(
                         } else {
                             auto frontier=union_ex(enclosed,staged?provisional_footprint:accepted.physical_footprint);
                             if (spaced) frontier=fiber_material_offset(frontier,stage.extra_spacing_mm);
-                            next.push_back({branch.material,std::move(frontier),id,branch.region,branch.boundary,
+                            next.push_back({{},std::move(frontier),id,branch.region,branch.boundary,
                                 staged?union_ex(branch.provisional_footprint,provisional_footprint):ExPolygons{}});
                         }
                     } else {

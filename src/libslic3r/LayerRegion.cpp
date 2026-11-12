@@ -9,6 +9,7 @@
 #include "BoundingBox.hpp"
 #include "SVG.hpp"
 #include "Algorithm/RegionExpansion.hpp"
+#include "ContinuousFiber/ContinuousFiberFillStrategy.hpp"
 
 #include <string>
 #include <map>
@@ -1054,17 +1055,25 @@ void LayerRegion::export_region_fill_surfaces_to_svg_debug(const char *name) con
 
 void LayerRegion::simplify_entity_collection(ExtrusionEntityCollection* entity_collection)
 {
-    for (size_t i = 0; i < entity_collection->entities.size(); i++) {
-        if (ExtrusionEntityCollection* collection = dynamic_cast<ExtrusionEntityCollection*>(entity_collection->entities[i]))
-            this->simplify_entity_collection(collection);
-        else if (ExtrusionPath* path = dynamic_cast<ExtrusionPath*>(entity_collection->entities[i]))
-            this->simplify_path(path);
-        else if (ExtrusionMultiPath* multipath = dynamic_cast<ExtrusionMultiPath*>(entity_collection->entities[i]))
-            this->simplify_multi_path(multipath);
-        else if (ExtrusionLoop* loop = dynamic_cast<ExtrusionLoop*>(entity_collection->entities[i]))
-            this->simplify_loop(loop);
-        else
-            throw Slic3r::InvalidArgument("Invalid extrusion entity supplied to simplify_entity_collection()");
+    auto* resin = dynamic_cast<ExtrusionResinCollection*>(entity_collection);
+    auto originals = resin ? resin->backup_paths() : ExtrusionResinCollection::Backup{};
+    try {
+        for (size_t i = 0; i < entity_collection->entities.size(); i++) {
+            if (ExtrusionEntityCollection* collection = dynamic_cast<ExtrusionEntityCollection*>(entity_collection->entities[i]))
+                this->simplify_entity_collection(collection);
+            else if (ExtrusionPath* path = dynamic_cast<ExtrusionPath*>(entity_collection->entities[i]))
+                this->simplify_path(path);
+            else if (ExtrusionMultiPath* multipath = dynamic_cast<ExtrusionMultiPath*>(entity_collection->entities[i]))
+                this->simplify_multi_path(multipath);
+            else if (ExtrusionLoop* loop = dynamic_cast<ExtrusionLoop*>(entity_collection->entities[i]))
+                this->simplify_loop(loop);
+            else
+                throw Slic3r::InvalidArgument("Invalid extrusion entity supplied to simplify_entity_collection()");
+        }
+        if (resin) resin->accept_safe_simplification(originals);
+    } catch (...) {
+        ExtrusionResinCollection::restore(originals);
+        throw;
     }
 }
 

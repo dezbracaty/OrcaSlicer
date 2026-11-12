@@ -34,6 +34,7 @@ struct FiberCoverageRecord {
     ExPolygons intentional_void;
     ExPolygons outside_domain;
     std::optional<FiberCoverageEnvelope> execution_envelope;
+    double resin_overlap_mm {0.0};
 };
 
 enum class FiberCoverageAuditMode { MaterialIntegrity, Detailed };
@@ -61,6 +62,8 @@ class FiberCoverageLedger {
 public:
     void add(FiberCoverageRecord record);
     FiberCoverageAudit audit(FiberCoverageAuditMode mode = FiberCoverageAuditMode::MaterialIntegrity) const;
+    // Limit existing resin entities; does not create material sources or shrink F.
+    ExPolygons resin_protected_core() const;
     const std::vector<FiberCoverageRecord>& records() const { return m_records; }
 
 private:

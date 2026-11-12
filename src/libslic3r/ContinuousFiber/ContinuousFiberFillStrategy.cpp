@@ -4,6 +4,8 @@
 #include "../AABBTreeLines.hpp"
 #include "../Geometry.hpp"
 #include "../Geometry/ArcWelder.hpp"
+#include "../ExtrusionEntityCollection.hpp"
+#include "../GCodeWriter.hpp"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -14,6 +16,7 @@
 #include <functional>
 #include <variant>
 #include <queue>
+#include <tbb/parallel_for.h>
 #include <GccAna_Circ2d2TanRad.hxx>
 #include <GccEnt_QualifiedLin.hxx>
 #include <gp_Lin2d.hxx>
@@ -648,7 +651,25 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
     // An isolated wedge uses the analytic symmetric construction. For coupled
     // turns that construction is only a seed, not an acceptable stopping rule.
     if (group.count==1 && !result.values.empty()) return result;
-    for (int first:{1,-1}) for (int kind=0;kind<4;++kind) {
+    struct RetainedCandidate {
+        TangentSolution value;
+        std::optional<double> score;
+        bool from_callback;
+        std::string callback_message;
+    };
+    struct FamilyResult {
+        std::vector<RetainedCandidate> candidates;
+        bool optimizer_limit_reached=false, numerical_failure=false;
+        std::exception_ptr failure;
+    };
+    std::vector<FamilyResult> families(8);
+    // COBYLA uses a deterministic generator local to each optimize call.
+    // Searches only read the problem/domain; defer candidate acceptance so its
+    // deduplication and pruning order remains exactly first/kind/seed order.
+    tbb::parallel_for(size_t(0),families.size(),[&](size_t index) {
+      auto& run=families[index];
+      try {
+        const int first=index<4?1:-1,kind=int(index%4);
         ConnectionFamily family{first,kind<2?(kind==0?first:-first):first,kind<2?0:(kind==2?1:-1)};
         // Single-circle tangency, symmetric CCC retreat and the support
         // midpoint seed distinct contact poses without changing the radius.
@@ -658,8 +679,14 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
         for (size_t seed=0;seed<seeds.size();++seed) {
             if (std::find(seeds.begin(),seeds.begin()+seed,seeds[seed])!=seeds.begin()+seed) continue;
             auto x=seeds[seed];
-            Search search{&problem,family,&distances,options.chord_tolerance_mm*.5,&knots,add};
+            nlopt::opt* active_optimizer=nullptr;
+            Search search{&problem,family,&distances,options.chord_tolerance_mm*.5,&knots,
+                [&](TangentSolution value,std::optional<double> known_score) {
+                    const char* message=active_optimizer->get_errmsg();
+                    run.candidates.push_back({std::move(value),known_score,true,message?message:""});
+                }};
             nlopt::opt optimizer(nlopt::LN_COBYLA,2);
+            active_optimizer=&optimizer;
             optimizer.set_lower_bounds(std::vector<double>{0,0});
             optimizer.set_upper_bounds(upper);
             optimizer.set_min_objective(Search::objective,&search);
@@ -669,11 +696,28 @@ LocalSolutions solve_group(const std::vector<Vec2d>& p, CornerGroup group,
             optimizer.set_initial_step(step);
             optimizer.set_xtol_abs(1e-5); optimizer.set_maxeval(180);
             double score;
-            try { result.optimizer_limit_reached|=optimizer.optimize(x,score)==nlopt::MAXEVAL_REACHED; }
-            catch (const nlopt::roundoff_limited&) { result.numerical_failure=true; }
+            try { run.optimizer_limit_reached|=optimizer.optimize(x,score)==nlopt::MAXEVAL_REACHED; }
+            catch (const nlopt::roundoff_limited&) { run.numerical_failure=true; }
             double violation;
-            if (auto value=connection(problem,family,x,violation)) add(*value);
+            if (auto value=connection(problem,family,x,violation))
+                run.candidates.push_back({std::move(*value),std::nullopt,false,{}});
         }
+      } catch (...) { run.failure=std::current_exception(); }
+    });
+    for (auto& run:families) {
+        result.optimizer_limit_reached|=run.optimizer_limit_reached;
+        result.numerical_failure|=run.numerical_failure;
+        for (auto& candidate:run.candidates) {
+            if (!candidate.from_callback) add(std::move(candidate.value),candidate.score);
+            else try { add(std::move(candidate.value),candidate.score); }
+            catch (...) {
+                continuous_fiber_detail::rethrow_optimizer_callback_failure(
+                    std::current_exception(),candidate.callback_message);
+            }
+        }
+        // Worker failures are observed at their original logical position,
+        // after preceding callbacks, never in thread completion order.
+        if (run.failure) std::rethrow_exception(run.failure);
     }
     prune_candidates(result);
     return result;
@@ -715,6 +759,18 @@ std::vector<CornerGroup> conflict_windows(const std::vector<Vec2d>& p,
 } // namespace
 
 namespace continuous_fiber_detail {
+[[noreturn]] void rethrow_optimizer_callback_failure(const std::exception_ptr& error, const std::string& message)
+{
+    // Same translation as nlopt::opt's vector callback wrapper. The candidate
+    // checker itself does not invoke NLopt or user callbacks.
+    try { std::rethrow_exception(error); }
+    catch (const std::bad_alloc&) { throw; }
+    catch (const std::invalid_argument&) {
+        throw std::invalid_argument(message.empty()?"nlopt invalid argument":message);
+    }
+    catch (...) { throw std::runtime_error(message.empty()?"nlopt failure":message); }
+}
+
 CycleChoice compatible_cycle(const std::vector<LocalSolutions>& candidates,
     const std::vector<size_t>& fixed,const std::vector<std::vector<size_t>>& banned)
 {
@@ -1526,6 +1582,10 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_outer_contour(
         }
         // Try the analytically indicated side first. If that incomplete
         // heuristic finds no path, retry without pruning either direction.
+        // The ring, domain, options and default contact bounds are immutable
+        // for this call. Different window states can reuse the same complete
+        // local solution, including an empty result, without solving it again.
+        std::map<std::pair<size_t,size_t>,LocalSolutions> local_solutions;
         for (int pass=0;pass<2;++pass) {
             std::vector<OuterWindowState> pending{initial};
             std::set<OuterWindowState> seen{initial};
@@ -1540,16 +1600,21 @@ ContourRoundingResult ContinuousFiberFillStrategy::round_outer_contour(
                 size_t unresolved=groups.size();
                 for (size_t i=0;i<groups.size();++i) {
                     const CornerGroup group=groups[i];
-                    LocalSolutions local;
-                    if (group.count==1)
-                        if (auto exact=outer_corner_circle(p,group.first,options,distances)) local.values.push_back(*exact);
-                    if (local.values.empty()) local=solve_group(p,group,options,distances);
-                    if (local.values.empty() && unresolved==groups.size()) unresolved=i;
-                    std::stable_sort(local.values.begin(),local.values.end(),[&](const auto& a,const auto& b) {
-                        const double x=outer_removed_length(a,p,group),y=outer_removed_length(b,p,group);
-                        return std::abs(x-y)>1e-8?x<y:a.score<b.score;
-                    });
-                    pools.push_back(std::move(local));
+                    const auto key=std::make_pair(group.first,group.count);
+                    auto found=local_solutions.find(key);
+                    if (found==local_solutions.end()) {
+                        LocalSolutions local;
+                        if (group.count==1)
+                            if (auto exact=outer_corner_circle(p,group.first,options,distances)) local.values.push_back(*exact);
+                        if (local.values.empty()) local=solve_group(p,group,options,distances);
+                        std::stable_sort(local.values.begin(),local.values.end(),[&](const auto& a,const auto& b) {
+                            const double x=outer_removed_length(a,p,group),y=outer_removed_length(b,p,group);
+                            return std::abs(x-y)>1e-8?x<y:a.score<b.score;
+                        });
+                        found=local_solutions.emplace(key,std::move(local)).first;
+                    }
+                    if (found->second.values.empty() && unresolved==groups.size()) unresolved=i;
+                    pools.push_back(found->second);
                 }
                 if (unresolved==groups.size()) {
                     std::vector<TangentSolution> chosen(groups.size());
@@ -1769,6 +1834,269 @@ ExPolygons ContinuousFiberFillStrategy::build_resin_area(
     if (accepted_fiber_resin_exclusion.empty())
         return original_area;
     return diff_ex(original_area, accepted_fiber_resin_exclusion, ApplySafetyOffset::Yes);
+}
+
+namespace {
+bool simplified_resin_is_safe(const ExtrusionPath& path, const ExPolygons& core)
+{
+    if (path.polyline.points.size() < 2) return false;
+    const auto is_arc = [](const PathFittingData& fit) {
+        return fit.path_type == EMovePathType::Arc_move_cw || fit.path_type == EMovePathType::Arc_move_ccw;
+    };
+    const bool has_arcs = std::any_of(path.polyline.fitting_result.begin(), path.polyline.fitting_result.end(), is_arc);
+    Polyline line;
+    double padding = 0;
+    if (has_arcs) {
+        // Orca keeps approximate source points for wiping inside an arc span.
+        // The execution view contains its actual arc endpoints and metadata,
+        // while linear records retain every native point.
+        Polyline3 execution;
+        execution.points.push_back(path.polyline.points.front());
+        size_t source_end = 0;
+        const double quantum = GCodeFormatter::pow_10_inv[GCodeFormatter::XYZF_EXPORT_DIGITS];
+        for (const auto& fit : path.polyline.fitting_result) {
+            if (fit.start_point_index != source_end || fit.end_point_index <= source_end ||
+                fit.end_point_index >= path.polyline.points.size()) return false;
+            auto record = fit;
+            record.start_point_index = execution.points.size()-1;
+            if (is_arc(fit)) {
+                const auto delta = path.polyline.points[fit.end_point_index] - path.polyline.points[source_end];
+                // A short fitted arc can become a full circle when XYZ rounds
+                // both endpoints to the same command. Preserve the source then.
+                if (delta.head<2>().cwiseAbs().maxCoeff() <= scale_(quantum)) return false;
+                const Vec2d ij = fit.arc_data.center.cast<double>() -
+                    path.polyline.points[source_end].head<2>().cast<double>();
+                if (ij.cwiseAbs().maxCoeff() <= 0.5*scale_(quantum)) return false;
+                execution.points.push_back(path.polyline.points[fit.end_point_index]);
+            } else {
+                execution.points.insert(execution.points.end(), path.polyline.points.begin()+source_end+1,
+                    path.polyline.points.begin()+fit.end_point_index+1);
+            }
+            record.end_point_index = execution.points.size()-1;
+            execution.fitting_result.push_back(std::move(record));
+            source_end = fit.end_point_index;
+        }
+        if (source_end+1 != path.polyline.points.size()) return false;
+        try {
+            line = Geometry::sample_with_arcs(execution, EPSILON).to_polyline();
+        } catch (const std::invalid_argument&) {
+            return false; // An uncertifiable optimization keeps its safe source.
+        }
+        // Round caps are a conservative tube, so a changed arc tangent cannot
+        // rotate a wide butt end into fiber unnoticed. Reserve sampling and the
+        // native XY/IJ output grid; ambiguous endpoint collapse was rejected above.
+        padding = EPSILON + 3*std::sqrt(2.0)*quantum + 2*std::sqrt(2.0)*SCALING_FACTOR;
+    } else line = path.polyline.to_polyline();
+    const auto footprint = offset(line, float(scale_(0.5*path.width + padding)), ClipperLib::jtRound,
+        double(SCALED_EPSILON), path.is_closed() ? ClipperLib::etClosedLine :
+            has_arcs ? ClipperLib::etOpenRound : ClipperLib::etOpenButt);
+    const auto nearby = ClipperUtils::clip_clipper_polygons_with_subject_bbox(core,
+        get_extents(footprint).inflated(SCALED_EPSILON));
+    return intersection_ex(nearby, union_ex(footprint), ApplySafetyOffset::No).empty();
+}
+}
+
+ExtrusionResinCollection::ExtrusionResinCollection(ExtrusionEntityCollection&& source,
+    std::shared_ptr<const ExPolygons> core)
+    : ExtrusionEntityCollection(std::move(source)), m_protected_core(std::move(core))
+{
+    if (!m_protected_core || m_protected_core->empty())
+        throw std::invalid_argument("Constrained resin requires a material boundary");
+}
+
+ExtrusionResinCollection::Backup ExtrusionResinCollection::backup_paths() const
+{
+    Backup result;
+    const auto collect = [&](const auto& self, ExtrusionEntity* entity) -> void {
+        if (!entity) return; // The native dispatcher reports unsupported entities.
+        if (auto* collection = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
+            for (auto* child : collection->entities) self(self, child);
+        } else {
+            const auto add = [&](ExtrusionPath& path) {
+                if ((path.role()==erResinInfill || path.role()==erGapFill) && !path.is_force_no_extrusion())
+                    result.emplace_back(&path, path.polyline);
+            };
+            if (auto* path = dynamic_cast<ExtrusionPath*>(entity)) add(*path);
+            else if (auto* multi = dynamic_cast<ExtrusionMultiPath*>(entity)) for (auto& path : multi->paths) add(path);
+            else if (auto* loop = dynamic_cast<ExtrusionLoop*>(entity)) for (auto& path : loop->paths) add(path);
+        }
+    };
+    for (auto* entity : entities) collect(collect, entity);
+    return result;
+}
+
+void ExtrusionResinCollection::restore(Backup& originals) noexcept
+{
+    for (auto& item : originals) {
+        item.first->polyline.points.swap(item.second.points);
+        item.first->polyline.fitting_result.swap(item.second.fitting_result);
+    }
+}
+
+void ExtrusionResinCollection::accept_safe_simplification(Backup& originals) const
+{
+    std::vector<size_t> rejected;
+    rejected.reserve(originals.size());
+    for (size_t i=0; i<originals.size(); ++i) {
+        const auto& path = *originals[i].first;
+        if (path.polyline.fitting_result.empty() && path.polyline.points==originals[i].second.points) continue;
+        if (!simplified_resin_is_safe(path, *m_protected_core)) rejected.push_back(i);
+    }
+    // Validation is complete before the first swap. A later exception cannot
+    // swap an already restored safe path back to its rejected fitted candidate.
+    for (const auto i : rejected) {
+        originals[i].first->polyline.points.swap(originals[i].second.points);
+        originals[i].first->polyline.fitting_result.swap(originals[i].second.fitting_result);
+    }
+}
+
+void ContinuousFiberFillStrategy::constrain_resin_paths(
+    std::vector<ExtrusionEntity*>& entities, const ExPolygons& protected_core, size_t begin)
+{
+    if (protected_core.empty() || begin >= entities.size()) return;
+    BoundingBox bounds;
+    const auto eligible = [](const ExtrusionPath& path) {
+        return (path.role() == erResinInfill || path.role() == erGapFill) && !path.is_force_no_extrusion();
+    };
+    const auto visit = [&](const auto& self, const ExtrusionEntity& entity, const auto& action) -> void {
+        if (const auto* collection = dynamic_cast<const ExtrusionEntityCollection*>(&entity)) {
+            for (const auto* child : collection->entities) self(self, *child, action);
+        } else if (const auto* path = dynamic_cast<const ExtrusionPath*>(&entity)) action(*path);
+        else if (const auto* loop = dynamic_cast<const ExtrusionLoop*>(&entity)) {
+            for (const auto& path : loop->paths) action(path);
+        } else if (const auto* multi = dynamic_cast<const ExtrusionMultiPath*>(&entity)) {
+            for (const auto& path : multi->paths) action(path);
+        }
+    };
+    bool found_path = false;
+    for (size_t i = begin; i < entities.size(); ++i) visit(visit, *entities[i], [&](const ExtrusionPath& path) {
+        if (!eligible(path)) return;
+        if (!std::isfinite(path.width) || path.width <= 0 || path.z_contoured || !path.polyline.fitting_result.empty() ||
+            std::any_of(path.polyline.points.begin(), path.polyline.points.end(), [](const Point3& point) { return point.z() != 0; }))
+            throw std::logic_error("Resin boundary adapter requires native unsimplified LayerXY paths");
+        for (const auto& point : path.polyline.points) bounds.merge(point.to_point());
+        found_path |= path.polyline.points.size() > 1;
+    });
+    if (!found_path) return;
+    // This call owns immutable rings and their derived boxes. A ring outside
+    // the query box has zero winding there, including holes; touching or
+    // enclosing boxes must still reach the original native pruning helper.
+    struct QueryPolygons {
+        Polygons rings;
+        std::vector<BoundingBox> bounds;
+        explicit QueryPolygons(Polygons input) : rings(std::move(input)) {
+            bounds.reserve(rings.size());
+            for (const auto& ring : rings) bounds.push_back(get_extents(ring));
+        }
+        Polygons query(const BoundingBox& box) const {
+            Polygons result;
+            for (size_t i = 0; i < rings.size(); ++i) {
+                if (rings[i].empty() || !bounds[i].overlap(box)) continue;
+                auto ring = ClipperUtils::clip_clipper_polygon_with_subject_bbox(rings[i], box);
+                if (!ring.empty()) result.push_back(std::move(ring));
+            }
+            return result;
+        }
+    };
+    const QueryPolygons core(to_polygons(protected_core));
+    std::map<float, QueryPolygons> limits;
+    const auto forbidden = [&](float width) -> const QueryPolygons& {
+        auto result = limits.find(width);
+        if (result == limits.end()) {
+            const double grid_error = 0.5 * std::sqrt(2.0) *
+                GCodeFormatter::pow_10_inv[GCodeFormatter::XYZF_EXPORT_DIGITS];
+            const double radius = 0.5*width + grid_error + EPSILON + 2*std::sqrt(2.0)*SCALING_FACTOR;
+            auto query = bounds;
+            query.offset(scale_(radius + EPSILON));
+            // Outside this conservative query box, protected material cannot
+            // reach any segment of this native collection's centerlines.
+            auto nearby = intersection_ex(protected_core, ExPolygons{ExPolygon(query.polygon())}, ApplySafetyOffset::No);
+            result = limits.emplace(width, QueryPolygons(to_polygons(offset_ex(nearby, float(scale_(radius)),
+                ClipperLib::jtRound, double(SCALED_EPSILON))))).first;
+        }
+        return result->second;
+    };
+    const auto affected = [&](const ExtrusionPath& path) {
+        if (!eligible(path) || path.polyline.points.size() < 2) return false;
+        const auto line = path.polyline.to_polyline();
+        const auto nearby = forbidden(path.width).query(get_extents(line).inflated(SCALED_EPSILON));
+        if (intersection_pl(Polylines{line}, nearby).empty()) return false;
+        // The centerline Minkowski query also covers endpoint disks. Native
+        // extrusion has butt caps: a legal endpoint must not be shortened just
+        // because that conservative query touches protected material.
+        const auto footprint = offset(path.polyline.to_polyline(), float(scale_(0.5*path.width)),
+            ClipperLib::jtRound, double(SCALED_EPSILON),
+            path.is_closed() ? ClipperLib::etClosedLine : ClipperLib::etOpenButt);
+        const auto nearby_core = core.query(get_extents(footprint).inflated(SCALED_EPSILON));
+        return !intersection_ex(nearby_core, union_ex(footprint), ApplySafetyOffset::No).empty();
+    };
+    const auto clip = [&](const ExtrusionPath& path, ExtrusionEntityCollection& output) {
+        Polylines kept;
+        const auto& source = path.polyline.points;
+        BoundingBox path_bounds;
+        for (const auto& point : source) path_bounds.merge(point.to_point());
+        path_bounds.offset(SCALED_EPSILON);
+        const QueryPolygons path_limits(forbidden(path.width).query(path_bounds));
+        for (size_t i = 1; i < source.size(); ++i) {
+            const Point a = source[i-1].to_point(), b = source[i].to_point();
+            const Vec2d delta = (b-a).cast<double>();
+            const double squared = delta.squaredNorm();
+            if (squared == 0) continue;
+            std::vector<std::pair<double, Polyline>> pieces;
+            BoundingBox query;
+            query.merge(a);
+            query.merge(b);
+            query.offset(SCALED_EPSILON);
+            // Native perimeter clipping uses this same broad phase. It removes
+            // only vertices irrelevant to the subject box, preserving the
+            // original mask edges inside it and the segment's exact Boolean.
+            const auto local = path_limits.query(query);
+            for (auto& fragment : diff_pl(Polylines{Polyline(Points{a,b})}, local)) {
+                if (fragment.points.size() < 2) continue;
+                const auto parameter = [&](const Point& point) { return (point-a).cast<double>().dot(delta)/squared; };
+                double first = parameter(fragment.points.front()), last = parameter(fragment.points.back());
+                if (last < first) { fragment.reverse(); std::swap(first, last); }
+                if (last > first) pieces.emplace_back(first, std::move(fragment));
+            }
+            std::sort(pieces.begin(), pieces.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (auto& piece : pieces) {
+                auto& line = piece.second;
+                if (!kept.empty() && kept.back().last_point() == line.first_point()) kept.back().append(std::move(line));
+                else kept.push_back(std::move(line));
+            }
+        }
+        output.entities.reserve(output.entities.size() + kept.size());
+        for (auto& line : kept) output.entities.push_back(new ExtrusionPath(Polyline3(line), path));
+    };
+    const auto constrain = [&](const auto& self, std::vector<ExtrusionEntity*>& list, size_t first) -> void {
+        for (size_t i = first; i < list.size();) {
+            auto*& entity = list[i];
+            if (auto* collection = dynamic_cast<ExtrusionEntityCollection*>(entity)) self(self, collection->entities, 0);
+            else if (const auto* path = dynamic_cast<const ExtrusionPath*>(entity)) {
+                if (affected(*path)) {
+                    auto replacement = std::make_unique<ExtrusionEntityCollection>();replacement->no_sort = true;
+                    clip(*path, *replacement);delete entity;entity = replacement.release();
+                }
+            } else {
+                const ExtrusionPaths* paths = nullptr;
+                if (const auto* loop = dynamic_cast<const ExtrusionLoop*>(entity)) paths = &loop->paths;
+                else if (const auto* multi = dynamic_cast<const ExtrusionMultiPath*>(entity)) paths = &multi->paths;
+                if (paths && std::any_of(paths->begin(), paths->end(), affected)) {
+                    auto replacement = std::make_unique<ExtrusionEntityCollection>();replacement->no_sort = true;
+                    for (const auto& path : *paths) {
+                        if (affected(path)) clip(path, *replacement);
+                        else replacement->append(path);
+                    }
+                    // Broken loops must not reconnect clipped spans by extrusion.
+                    delete entity;entity = replacement.release();
+                }
+            }
+            if (const auto* collection = dynamic_cast<const ExtrusionEntityCollection*>(entity); collection && collection->empty()) {
+                delete entity;list.erase(list.begin()+i);
+            } else ++i;
+        }
+    };
+    constrain(constrain, entities, begin);
 }
 
 } // namespace Slic3r

@@ -590,8 +590,12 @@ TEST_CASE("P3 0.125 mm mixed preset shares layers between matrix and fiber", "[l
     CHECK(defaults.value("retraction_length") == "0.4,0.4,0.4,0.4,0.4,0.4");
     CHECK(defaults.value("retract_length_toolchange") == "0.4,0.4,0.4,0.4,0.4,0.4");
     CHECK(defaults.value("filament_diameter") == "1.75,1.75,1.75,1.75,1.75,0.4");
-    CHECK(defaults.value("nozzle_temperature_initial_layer") == "230,230,230,210,280,235");
-    CHECK(defaults.value("nozzle_temperature") == "230,230,230,210,270,235");
+    const auto initial_temperature = defaults.value("nozzle_temperature_initial_layer");
+    const auto normal_temperature = defaults.value("nozzle_temperature");
+    REQUIRE(initial_temperature);
+    REQUIRE(normal_temperature);
+    CHECK(*initial_temperature == "200,200,200,210,310,235");
+    CHECK(*normal_temperature == "200,200,200,200,300,235");
     REQUIRE(created.config->set("filament_colour", "#F28E2B;#4E79A7;#59A14F;#B07AA1;#EDC948;#E15759").success);
     if (!fiber)
         REQUIRE(created.config->set("generate_reinforced_perimeters", "0").success);
@@ -632,7 +636,7 @@ TEST_CASE("P3 0.125 mm mixed preset shares layers between matrix and fiber", "[l
     CHECK(layers == 16);
 }
 
-TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material", "[libslicer_api][p3][slice]")
+TEST_CASE("P3 preserves machine material parameters and exports each material", "[libslicer_api][p3][slice]")
 {
     const unsigned physical_tool = GENERATE(0u, 1u, 2u, 3u, 4u, 5u);
     INFO("physical_tool=" << physical_tool);
@@ -706,6 +710,14 @@ TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material
                 REQUIRE(std::getline(input, value, ','));
             return value;
         };
+        const std::map<std::string, std::string> p3_pa_cf = {
+            {"nozzle_temperature", "300"}, {"nozzle_temperature_initial_layer", "310"},
+            {"filament_flow_ratio", "0.96"}, {"filament_density", "1.06"},
+            {"fan_min_speed", "10"}, {"fan_max_speed", "30"},
+            {"hot_plate_temp", "60"}, {"hot_plate_temp_initial_layer", "60"},
+            {"chamber_temperature", "60"}, {"pressure_advance", "0.02"},
+            {"enable_pressure_advance", "0"}
+        };
         // Compare the actual loaded material, including inherited cooling and
         // flow settings, rather than just checking the catalog's JSON entries.
         for (const char* key : {"nozzle_temperature", "nozzle_temperature_initial_layer",
@@ -719,11 +731,15 @@ TEST_CASE("P3 shares Alpha500 thermoplastic parameters and exports each material
             const auto original_value = original.value(key);
             REQUIRE(actual_value);
             REQUIRE(original_value);
-            // P3 PLA has a machine-specific flow calibration; the remaining
-            // material parameters continue to match the Alpha500 definition.
-            const std::string expected_value = material == "CFSYS PLA" &&
+            // P3 keeps Alpha500's shared defaults except for its explicit
+            // machine-specific PLA flow and PA-CF material calibration.
+            std::string expected_value = material == "CFSYS PLA" &&
                     std::string(key) == "filament_flow_ratio"
                 ? "0.99" : original_value->substr(0, original_value->find(','));
+            if (material == "CFSYS PA-CF") {
+                if (const auto calibrated = p3_pa_cf.find(key); calibrated != p3_pa_cf.end())
+                    expected_value = calibrated->second;
+            }
             CHECK(material_value(*actual_value) == expected_value);
         }
 

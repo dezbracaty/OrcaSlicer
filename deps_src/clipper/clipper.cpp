@@ -527,16 +527,19 @@ bool FirstIsBottomPt(const OutPt* btmPt1, const OutPt* btmPt2)
 //------------------------------------------------------------------------------
 
 // Called by GetLowermostRec()
-OutPt* GetBottomPt(OutPt *pp)
+static OutPt* GetBottomPtWithUniqueness(OutPt *pp, bool *is_unique)
 {
+  const OutPt* const start = pp;
+  bool unique = true;
   OutPt* dups = nullptr;
   OutPt* p = pp->Next;
-  while (p != pp)
+  while (p != start)
   {
     if (p->Pt.y() > pp->Pt.y())
     {
       pp = p;
       dups = nullptr;
+      unique = true;
     }
     else if (p->Pt.y() == pp->Pt.y() && p->Pt.x() <= pp->Pt.x())
     {
@@ -544,13 +547,18 @@ OutPt* GetBottomPt(OutPt *pp)
       {
         dups = nullptr;
         pp = p;
+        unique = true;
       } else
       {
+        unique = false;
         if (p->Next != pp && p->Prev != pp) dups = p;
       }
     }
     p = p->Next;
   }
+  // The old loop revisited start -> pp after finding a better bottom point.
+  // That prefix contains no equal/better point. Keep its disambiguation anchor.
+  p = pp;
   if (dups)
   {
     //there appears to be at least 2 vertices at BottomPt so ...
@@ -561,8 +569,35 @@ OutPt* GetBottomPt(OutPt *pp)
       while (dups->Pt != pp->Pt) dups = dups->Next;
     }
   }
+  if (is_unique) *is_unique = unique;
   return pp;
 }
+
+OutPt* GetBottomPt(OutPt *pp)
+{
+  return GetBottomPtWithUniqueness(pp, nullptr);
+}
+
+#ifdef CLIPPER_VERIFY_INVARIANTS
+class ClipperInvariantError : public std::logic_error {
+public:
+  explicit ClipperInvariantError(const char *message) : std::logic_error(message) {}
+};
+
+static void VerifyBottomPointCache(const OutRec &record)
+{
+  if (!record.BottomPt) return;
+  if (!record.Pts || !record.BottomPtIsUnique || GetBottomPt(record.Pts) != record.BottomPt)
+    throw ClipperInvariantError("Clipper unique-bottom cache invariant failed");
+  size_t matches = 0;
+  const OutPt *p = record.Pts;
+  do {
+    if (p->Pt.x() == record.BottomPt->Pt.x() && p->Pt.y() == record.BottomPt->Pt.y()) ++matches;
+    p = p->Next;
+  } while (p != record.Pts);
+  if (matches != 1) throw ClipperInvariantError("Clipper unique-bottom cache invariant failed");
+}
+#endif
 
 //------------------------------------------------------------------------------
 
@@ -1121,13 +1156,22 @@ bool Clipper::ExecuteInternal()
       botY = topY;
     } while (!m_Scanbeam.empty() || !m_MinimaList.empty());
   }
-  catch(...) 
+  #ifdef CLIPPER_VERIFY_INVARIANTS
+  catch (const ClipperInvariantError&) { throw; }
+  #endif
+  catch(...)
   {
     succeeded = false;
   }
 
   if (succeeded)
   {
+    // Append caches are only valid during the scanbeam. Restore the original
+    // empty-cache state before orientation changes, joins and polygon splits.
+    for (OutRec &outRec : m_PolyOuts) {
+      outRec.BottomPt = nullptr;
+      outRec.BottomPtIsUnique = false;
+    }
 
     //fix orientations ...
     //FIXME Vojtech: Does it not invalidate the loop hierarchy maintained as OutRec::FirstLeft pointers?
@@ -1852,9 +1896,9 @@ OutRec* GetLowermostRec(OutRec *outRec1, OutRec *outRec2)
 {
   //work out which polygon fragment has the correct hole state ...
   if (!outRec1->BottomPt) 
-    outRec1->BottomPt = GetBottomPt(outRec1->Pts);
+    outRec1->BottomPt = GetBottomPtWithUniqueness(outRec1->Pts, &outRec1->BottomPtIsUnique);
   if (!outRec2->BottomPt) 
-    outRec2->BottomPt = GetBottomPt(outRec2->Pts);
+    outRec2->BottomPt = GetBottomPtWithUniqueness(outRec2->Pts, &outRec2->BottomPtIsUnique);
   OutPt *OutPt1 = outRec1->BottomPt;
   OutPt *OutPt2 = outRec2->BottomPt;
   if (OutPt1->Pt.y() > OutPt2->Pt.y()) return outRec1;
@@ -1894,6 +1938,11 @@ void Clipper::AppendPolygon(TEdge *e1, TEdge *e2)
   OutRec *outRec1 = &m_PolyOuts[e1->OutIdx];
   OutRec *outRec2 = &m_PolyOuts[e2->OutIdx];
 
+  #ifdef CLIPPER_VERIFY_INVARIANTS
+  VerifyBottomPointCache(*outRec1);
+  VerifyBottomPointCache(*outRec2);
+  #endif
+
   OutRec *holeStateRec;
   if (OutRec1RightOfOutRec2(outRec1, outRec2))
     holeStateRec = outRec2;
@@ -1901,6 +1950,15 @@ void Clipper::AppendPolygon(TEdge *e1, TEdge *e2)
     holeStateRec = outRec1;
   else 
     holeStateRec = GetLowermostRec(outRec1, outRec2);
+
+  OutPt *mergedBottom = nullptr;
+  if (outRec1->BottomPt && outRec2->BottomPt) {
+    const IntPoint &a = outRec1->BottomPt->Pt, &b = outRec2->BottomPt->Pt;
+    if ((a.y() > b.y() || (a.y() == b.y() && a.x() < b.x())) && outRec1->BottomPtIsUnique)
+      mergedBottom = outRec1->BottomPt;
+    else if ((b.y() > a.y() || (b.y() == a.y() && b.x() < a.x())) && outRec2->BottomPtIsUnique)
+      mergedBottom = outRec2->BottomPt;
+  }
 
   //get the start and ends of both output polygons and
   //join e2 poly onto e1 poly and delete pointers to e2 ...
@@ -1951,7 +2009,11 @@ void Clipper::AppendPolygon(TEdge *e1, TEdge *e2)
     }
   }
 
-  outRec1->BottomPt = 0;
+  outRec1->BottomPt = mergedBottom;
+  outRec1->BottomPtIsUnique = mergedBottom != nullptr;
+  #ifdef CLIPPER_VERIFY_INVARIANTS
+  VerifyBottomPointCache(*outRec1);
+  #endif
   if (holeStateRec == outRec2)
   {
     if (outRec2->FirstLeft != outRec1)
@@ -1960,6 +2022,7 @@ void Clipper::AppendPolygon(TEdge *e1, TEdge *e2)
   }
   outRec2->Pts = 0;
   outRec2->BottomPt = 0;
+  outRec2->BottomPtIsUnique = false;
   outRec2->FirstLeft = outRec1;
 
   int OKIdx = e1->OutIdx;
@@ -1993,6 +2056,7 @@ OutRec* Clipper::CreateOutRec()
   result.FirstLeft = 0;
   result.Pts = 0;
   result.BottomPt = 0;
+  result.BottomPtIsUnique = false;
   result.PolyNd = 0;
   result.Idx = (int)m_PolyOuts.size()-1;
   return &result;
@@ -2033,6 +2097,16 @@ OutPt* Clipper::AddOutPt(TEdge *e, const IntPoint &pt)
     newOp->Prev->Next = newOp;
     op->Prev = newOp;
     if (ToFront) outRec->Pts = newOp;
+    if (outRec->BottomPt) {
+      const IntPoint &bottom = outRec->BottomPt->Pt;
+      if (pt.y() > bottom.y() || (pt.y() == bottom.y() && pt.x() < bottom.x())) {
+        outRec->BottomPt = newOp;
+        outRec->BottomPtIsUnique = true;
+      } else if (!outRec->BottomPtIsUnique || (pt.y() == bottom.y() && pt.x() == bottom.x())) {
+        outRec->BottomPt = nullptr;
+        outRec->BottomPtIsUnique = false;
+      }
+    }
     return newOp;
   }
 }
@@ -2444,7 +2518,14 @@ bool Clipper::ProcessIntersections(const cInt topY)
     }
     else return false;
   }
-  catch(...) 
+  #ifdef CLIPPER_VERIFY_INVARIANTS
+  catch (const ClipperInvariantError&) {
+    m_SortedEdges = 0;
+    m_IntersectList.clear();
+    throw;
+  }
+  #endif
+  catch(...)
   {
     m_SortedEdges = 0;
     m_IntersectList.clear();
@@ -2459,22 +2540,60 @@ void Clipper::BuildIntersectList(const cInt topY)
 {
   if ( !m_ActiveEdges ) return;
 
-  //prepare for sorting ...
+  // Update every edge even when an inversion is found: the top-of-scanbeam
+  // stage reuses these exact coordinates. Most scanbeams need no sorting.
   TEdge* e = m_ActiveEdges;
-  m_SortedEdges = e;
+  TEdge* previous = nullptr;
+  bool ordered = true;
   while( e )
   {
-    e->PrevInSEL = e->PrevInAEL;
-    e->NextInSEL = e->NextInAEL;
     e->Curr.x() = TopX( *e, topY );
+    if (previous && previous->Curr.x() > e->Curr.x()) ordered = false;
+    previous = e;
     e = e->NextInAEL;
   }
 
+  #ifdef CLIPPER_VERIFY_INVARIANTS
+  // Frozen original bubble passes: remove exactly one tail element per pass.
+  // Check actual edge identities and intersection coordinates, including ties.
+  std::vector<TEdge*> referenceEdges;
+  for (TEdge *edge = m_ActiveEdges; edge; edge = edge->NextInAEL)
+    referenceEdges.push_back(edge);
+  std::vector<IntersectNode> referenceIntersections;
+  for (size_t end = referenceEdges.size(); end > 1; --end) {
+    bool modified = false;
+    for (size_t i = 0; i + 1 < end; ++i) {
+      TEdge *left = referenceEdges[i], *right = referenceEdges[i + 1];
+      if (left->Curr.x() > right->Curr.x()) {
+        IntPoint point;
+        IntersectPoint(*left, *right, point);
+        if (point.y() < topY) point = IntPoint2d(TopX(*left, topY), topY);
+        referenceIntersections.emplace_back(left, right, point);
+        std::swap(referenceEdges[i], referenceEdges[i + 1]);
+        modified = true;
+      }
+    }
+    if (!modified) break;
+  }
+  const size_t firstIntersection = m_IntersectList.size();
+  #endif
+
+  if (ordered) {
+    #ifdef CLIPPER_VERIFY_INVARIANTS
+    if (!referenceIntersections.empty())
+      throw ClipperInvariantError("Clipper ordered scanbeam has intersections");
+    #endif
+    m_SortedEdges = nullptr;
+    return;
+  }
+  // Reuse the original link-copy operation only when swaps are necessary.
+  CopyAELToSEL();
+
   //bubblesort ...
-  bool isModified;
+  TEdge *lastSwap;
   do
   {
-    isModified = false;
+    lastSwap = nullptr;
     e = m_SortedEdges;
     while( e->NextInSEL )
     {
@@ -2487,16 +2606,31 @@ void Clipper::BuildIntersectList(const cInt topY)
         if (Pt.y() < topY) Pt = IntPoint2d(TopX(*e, topY), topY);
         m_IntersectList.emplace_back(IntersectNode(e, eNext, Pt));
         SwapPositionsInSEL(e, eNext);
-        isModified = true;
+        // eNext is now the left node. Everything after the last such node
+        // is an ordered suffix that can never produce another intersection.
+        lastSwap = eNext;
       }
       else
         e = eNext;
     }
-    if( e->PrevInSEL ) e->PrevInSEL->NextInSEL = 0;
-    else break;
+    if (lastSwap) lastSwap->NextInSEL = nullptr;
   }
-  while ( isModified );
+  while (lastSwap);
   m_SortedEdges = 0; //important
+
+  #ifdef CLIPPER_VERIFY_INVARIANTS
+  if (m_IntersectList.size() - firstIntersection != referenceIntersections.size())
+    throw ClipperInvariantError("Clipper intersection event count changed");
+  for (size_t i = 0; i < referenceIntersections.size(); ++i) {
+    const auto &expected = referenceIntersections[i], &actual = m_IntersectList[firstIntersection + i];
+    if (expected.Edge1 != actual.Edge1 || expected.Edge2 != actual.Edge2 ||
+        expected.Pt.x() != actual.Pt.x() || expected.Pt.y() != actual.Pt.y()
+        #ifdef CLIPPERLIB_USE_XYZ
+        || expected.Pt.z() != actual.Pt.z()
+        #endif
+        ) throw ClipperInvariantError("Clipper intersection event order changed");
+  }
+  #endif
 }
 //------------------------------------------------------------------------------
 
@@ -2619,7 +2753,12 @@ void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
       } 
       else
       {
-        e->Curr.x() = TopX( *e, topY );
+        // BuildIntersectList already evaluated this same edge at topY.
+        // Intersections only reorder AEL; promotion uses the other branch.
+        #ifdef CLIPPER_VERIFY_INVARIANTS
+        if (e->Curr.x() != TopX(*e, topY))
+          throw ClipperInvariantError("Clipper scanbeam TopX reuse invariant failed");
+        #endif
         e->Curr.y() = topY;
 #ifdef CLIPPERLIB_USE_XYZ
         e->Curr.z() = topY == e->Top.y() ? e->Top.z() : (topY == e->Bot.y() ? e->Bot.z() : 0);

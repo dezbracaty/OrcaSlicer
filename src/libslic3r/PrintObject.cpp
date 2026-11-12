@@ -746,10 +746,28 @@ void PrintObject::infill(std::shared_ptr<FiberEarlyExecutionBatch> early)
         const auto& support_fill_octree = this->m_adaptive_fill_octrees.second;
 
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - start";
+        std::vector<std::pair<size_t,size_t>> layer_work;
+        if (early) {
+            layer_work.reserve(m_layers.size());
+            for (size_t layer_idx=0;layer_idx<m_layers.size();++layer_idx) {
+                m_print->throw_if_canceled();
+                size_t points=0;
+                for (const auto* region:m_layers[layer_idx]->regions())
+                    for (const auto& surface:region->fill_surfaces.surfaces)
+                        points+=count_points(surface.expolygon);
+                layer_work.emplace_back(points,layer_idx);
+            }
+            // Keep independent, expensive CCF layers from starting at the tail.
+            // This is a task permutation; logical layers and slots stay ordered.
+            std::stable_sort(layer_work.begin(),layer_work.end(),[](const auto& a,const auto& b) {
+                return a.first>b.first;
+            });
+        }
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this, early, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
-                for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+            [this, early, &layer_work, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
+                for (size_t work_idx = range.begin(); work_idx < range.end(); ++ work_idx) {
+                    const size_t layer_idx=layer_work.empty()?work_idx:layer_work[work_idx].second;
                     m_print->throw_if_canceled();
                     m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get());
                     if (early) m_print->compile_fiber_early_layer(*early,*m_layers[layer_idx],layer_idx);

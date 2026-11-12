@@ -3,7 +3,11 @@
 
 #include "ContinuousFiberConfig.hpp"
 #include "../ExPolygon.hpp"
+#include "../ExtrusionEntityCollection.hpp"
+#include <memory>
 #include <optional>
+#include <exception>
+#include <string>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -11,6 +15,23 @@
 #include <set>
 
 namespace Slic3r {
+
+class ExtrusionEntity;
+
+// Only the fork's resin jobs carry this LayerXY material constraint. Native
+// collections, including unrelated GapFill, keep their original behavior.
+class ExtrusionResinCollection final : public ExtrusionEntityCollection {
+public:
+    using Backup = std::vector<std::pair<ExtrusionPath*, Polyline3>>;
+    ExtrusionResinCollection(ExtrusionEntityCollection&& source, std::shared_ptr<const ExPolygons> core);
+    ExtrusionEntity* clone() const override { return new ExtrusionResinCollection(*this); }
+    ExtrusionEntity* clone_move() override { return new ExtrusionResinCollection(std::move(*this)); }
+    Backup backup_paths() const;
+    void accept_safe_simplification(Backup& originals) const;
+    static void restore(Backup& originals) noexcept;
+private:
+    std::shared_ptr<const ExPolygons> m_protected_core;
+};
 
 struct ContourRoundingOptions {
     // Exact centerline radius; zero disables rounding.
@@ -49,6 +70,8 @@ struct ContourRoundingResult {
 
 // Internal solver data shared with its exhaustive regression tests.
 namespace continuous_fiber_detail {
+// Deferred candidate checks must preserve NLopt's callback exception contract.
+[[noreturn]] void rethrow_optimizer_callback_failure(const std::exception_ptr& error, const std::string& message);
 struct CornerGroup { size_t first, count; };
 struct TangentSolution {
     std::vector<ContourArc> arcs;
@@ -177,6 +200,11 @@ public:
     static ExPolygons build_resin_area(
         const ExPolygons& original_area,
         const ExPolygons& accepted_fiber_resin_exclusion);
+
+    // Native linear entities, after Flow/variable-width conversion and before
+    // Layer simplification. Preserve the pattern, Flow and legal native paths.
+    static void constrain_resin_paths(std::vector<ExtrusionEntity*>& entities,
+        const ExPolygons& protected_core, size_t begin = 0);
 };
 
 } // namespace Slic3r

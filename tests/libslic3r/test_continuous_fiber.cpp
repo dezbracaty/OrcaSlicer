@@ -27,6 +27,8 @@
 #include <regex>
 #include <sstream>
 #include <nlohmann/json.hpp>
+#include <boost/uuid/detail/sha1.hpp>
+#include <tbb/global_control.h>
 
 using namespace Slic3r;
 
@@ -2086,8 +2088,23 @@ TEST_CASE("tangent rounding expands towards insufficient supports", "[Continuous
             }
             domain.push_back(std::move(area));
         }
+        ContourRoundingResult serial;
+        {
+            tbb::global_control one_thread(tbb::global_control::max_allowed_parallelism,1);
+            serial=ContinuousFiberFillStrategy::round_hole_contour(source,domain,{.1});
+        }
         const auto rounded=ContinuousFiberFillStrategy::round_hole_contour(source,domain,{.1});
+        REQUIRE(serial.path);
         REQUIRE(rounded.path);
+        CHECK(serial.path->points==rounded.path->points);
+        REQUIRE(serial.arcs.size()==rounded.arcs.size());
+        for(size_t i=0;i<serial.arcs.size();++i) {
+            CHECK(serial.arcs[i].center_mm==rounded.arcs[i].center_mm);
+            CHECK(serial.arcs[i].radius_mm==rounded.arcs[i].radius_mm);
+            CHECK(serial.arcs[i].sweep_radians==rounded.arcs[i].sweep_radians);
+            CHECK(serial.arcs[i].begin_mm==rounded.arcs[i].begin_mm);
+            CHECK(serial.arcs[i].end_distance_mm==rounded.arcs[i].end_distance_mm);
+        }
         CHECK(rounded.path->length()>source.length()*.9);
         CHECK(diff_pl(Polylines{rounded.path->to_polyline()},offset_ex(domain,float(scale_(.0001)))).empty());
         // Changing the cyclic seam cannot change which neighbouring corner is merged.
@@ -7909,6 +7926,314 @@ TEST_CASE("shared contour envelopes retain the original independent clipping pol
     CHECK(prepared.contour_to_infill_keepout==original_infill);
 }
 
+TEST_CASE("hole queries preserve full width and complete surrounding geometry", "[ContinuousFiber][HoleQuery]")
+{
+    using namespace continuous_fiber_detail;
+    const ExPolygons frontier{rectangle(20,20,40,40)};
+    const auto band=hole_query_band(frontier,1,.3);
+    REQUIRE(band);
+    auto material=rectangle_with_hole(-200,-200,200,200,20,20,40,40);
+    const auto add_hole=[&](ExPolygon hole) {hole.contour.make_clockwise();material.holes.push_back(hole.contour);};
+    add_hole(rectangle(150,25,170,35)); // distant X, SAME scanbeam events
+    add_hole(rectangle(60,-100,80,100)); // no vertex in band, surrounds Y
+    add_hole(rectangle(20,120,40,140)); // only this hole may be omitted
+    const auto selected=hole_query_material({material,rectangle(300,25,320,35),rectangle(300,125,320,135)},*band);
+    REQUIRE(selected.size()==2);
+    CHECK(selected.front().contour==material.contour);
+    REQUIRE(selected.front().holes.size()==3);
+    for(size_t i=0;i<3;++i) CHECK(selected.front().holes[i]==material.holes[i]);
+    CHECK(selected.back().contour==rectangle(300,25,320,35).contour);
+    // Occupancy retains ALL holes of a selected component, even remote ones.
+    const auto occupied=hole_query_occupancy({material,rectangle(300,125,320,135)},*band);
+    REQUIRE(occupied.size()==1);
+    CHECK(occupied.front()==material);
+    CHECK_FALSE(hole_query_band({},1,.3));
+    CHECK_FALSE(hole_query_band(frontier,0,.3));
+    CHECK_FALSE(hole_query_band(frontier,1,-.3));
+    CHECK_FALSE(hole_query_band(frontier,1,std::numeric_limits<double>::infinity()));
+    CHECK_FALSE(hole_query_band(frontier,std::numeric_limits<double>::max(),.3));
+    ExPolygons extreme=frontier;
+    extreme.front().contour.points.front().x()=std::numeric_limits<coord_t>::max();
+    CHECK_FALSE(hole_query_band(extreme,1,.3));
+}
+
+TEST_CASE("hole query domains preserve global clipping normalization and final commands", "[ContinuousFiber][HoleQuery]")
+{
+    using namespace continuous_fiber_detail;
+    const double radius=GENERATE(0.,.3,1.2);
+    const double clearance=GENERATE(0.,.2);
+    auto region=rectangle_with_hole(-20,-120,220,160,20,20,40,40);
+    auto remote=rectangle(150,20,170,40).contour;
+    // Tiny non-collinearity at distant X must remain in the same Y scanbeams.
+    remote.points.insert(remote.points.begin()+1,Point::new_scale(160,20.000001));
+    remote.make_clockwise();region.holes.push_back(remote);
+    for(double y:{-90.,90.}) {
+        auto hole=rectangle(20,y,40,y+20).contour;hole.make_clockwise();region.holes.push_back(hole);
+    }
+    const ExPolygons original{region};
+    const auto material=fiber_material_offset(original,-clearance);
+    const auto frontier=fiber_material_offset({rectangle(20,20,40,40)},clearance);
+    const auto band=hole_query_band(frontier,1,radius);
+    REQUIRE(band);
+    const auto selected=hole_query_material(material,*band);
+    REQUIRE(selected.front().holes.size()<material.front().holes.size());
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.2f,.4f);config.contour_bend_radius_mm=radius;
+    config.cut_to_contact_length_mm=2;config.finish_overlap_length_mm=2;
+    config.minimum_effective_length_mm=.5;config.z_hop_height_mm=0;
+    auto id=test_id();id.parent.purpose=FiberPathPurpose::Contour;
+    const auto shape=ContinuousFiberFillStrategy::generate_contour_level(material,1,&frontier);
+    REQUIRE(shape.paths.size()==1);
+    ExtrusionPath source(erContinuousFiberContour,.1,1.f,.2f);
+    source.polyline=shape.paths.front().geometry;
+    std::vector<ContourArc> arcs;
+    if(radius>0) {
+        const auto expanded=fiber_material_offset(frontier,.5);
+        auto box=get_extents(expanded);box.offset(scale_(4*radius+ContourRoundingOptions{}.geometry_tolerance_mm));
+        const auto rounded=ContinuousFiberFillStrategy::round_hole_contour(source.polyline,
+            diff_ex(ExPolygons{ExPolygon(box.polygon())},expanded),ContourRoundingOptions{radius});
+        REQUIRE(rounded.path);source.polyline=*rounded.path;arcs=rounded.arcs;
+    }
+    // Repeat after a committed footprint and an intra-candidate
+    // allocation. Boolean/erosion order is the production order in both paths.
+    for(bool committed:{false,true}) {
+        const ExPolygons footprint=committed ? ExPolygons{rectangle(10,18.9,50,19.4),rectangle(10,100,50,101)} : ExPolygons{};
+        auto full=fiber_material_offset(diff_ex(material,footprint),-.5);
+        const auto local_remaining=hole_query_material(diff_ex(selected,hole_query_occupancy(footprint,*band)),*band);
+        auto local=hole_query_material(fiber_material_offset(local_remaining,-.5),*band);
+        const double g=ContourRoundingOptions{}.geometry_tolerance_mm;
+        for(bool reallocate:{false,true}) {
+            if(reallocate) {
+                const ExPolygons accepted{rectangle(19.4,24,19.6,28),rectangle(0,100,10,101)};
+                full=diff_ex(full,fiber_material_offset(accepted,.5));
+                local=diff_ex(local,fiber_material_offset(hole_query_occupancy(accepted,*band),.5));
+            }
+            const float partition=float(scale_(reallocate?.5*g:(radius>0?g:.5*g)));
+            const auto line=Geometry::sample_with_arcs(source.polyline,ContourRoundingOptions{}.chord_tolerance_mm).to_polyline();
+            CHECK(intersection_pl(Polylines{line},offset_ex(full,partition))==
+                  intersection_pl(Polylines{line},offset_ex(local,partition)));
+            CHECK(diff_pl(Polylines{line},offset_ex(full,partition))==
+                  diff_pl(Polylines{line},offset_ex(local,partition)));
+            const auto full_cleanup=offset_ex(full,float(scale_(g)));
+            const auto local_cleanup=offset_ex(local,float(scale_(g)));
+            CHECK(normalize_fiber_geometry(source.polyline,&full_cleanup).points==
+                  normalize_fiber_geometry(source.polyline,&local_cleanup).points);
+            const auto a=finalize_independent(source,original,config,id,arcs,&full);
+            const auto b=finalize_independent(source,original,config,id,arcs,&local);
+            CHECK(a.failure==b.failure);
+            REQUIRE(bool(a.prepared)==bool(b.prepared));
+            if(!committed && !reallocate) {INFO(a.detail);REQUIRE(a.prepared);}
+            if(a.prepared) {
+                CHECK(a.prepared->physical_coverage==b.prepared->physical_coverage);
+                CHECK(a.prepared->resin_exclusion==b.prepared->resin_exclusion);
+                CHECK(a.prepared->contour_to_infill_keepout==b.prepared->contour_to_infill_keepout);
+                CHECK(b.prepared->allowed_domain==original);
+                const auto x=compile_fixture(a.prepared,0,0,0,1,"CUT");
+                const auto y=compile_fixture(b.prepared,0,0,0,1,"CUT");
+                CHECK(equal_fiber_commands(*x.commands,*y.commands));
+            }
+        }
+    }
+}
+
+TEST_CASE("zero radius hole cleanup makes the same short-edge decisions in a query band", "[ContinuousFiber][HoleQuery]")
+{
+    using namespace continuous_fiber_detail;
+    const ExPolygons frontier{rectangle(20,20,40,40)};
+    auto region=rectangle_with_hole(0,-100,200,150,20,20,40,40);
+    auto remote=rectangle(20,100,40,120).contour;remote.make_clockwise();region.holes.push_back(remote);
+    const ExPolygons material{region};const auto band=hole_query_band(frontier,1,0);REQUIRE(band);
+    const auto full=offset_ex(fiber_material_offset(material,-.5),float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
+    const auto local=offset_ex(fiber_material_offset(hole_query_material(material,*band),-.5),
+        float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
+    const auto source=path_from_points({{19.4,22},{19.40001,22.00001},{19.4,28},{19.4,32}},1);
+    const auto a=normalize_fiber_geometry(source.polyline,&full);
+    const auto b=normalize_fiber_geometry(source.polyline,&local);
+    CHECK(a.points.size()<source.polyline.points.size());
+    CHECK(a.points==b.points);
+}
+
+TEST_CASE("Finalizer can share an existing expanded planning domain without changing execution", "[ContinuousFiber][HoleQuery]")
+{
+    const double radius=GENERATE(0.,.3);
+    const ExPolygons domain{rectangle_with_hole(-2,-2,22,22,5,5,15,15)};
+    const auto planned=fiber_material_offset(domain,-.5);
+    const auto expanded=offset_ex(planned,float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm)));
+    auto source=path_from_points({{0,0},{20,0},{20,20},{0,20},{0,0}},1);
+    source.set_extrusion_role(erContinuousFiberContour);
+    std::vector<ContourArc> arcs;
+    if(radius>0) {
+        auto rounded=ContinuousFiberFillStrategy::round_outer_contour(source.polyline,planned,ContourRoundingOptions{radius});
+        REQUIRE(rounded.path);source.polyline=*rounded.path;arcs=rounded.arcs;
+    }
+    ContinuousFiberConfig config;config.contour_bend_radius_mm=radius;
+    config.cut_to_contact_length_mm=2;config.finish_overlap_length_mm=2;config.z_hop_height_mm=0;
+    auto id=test_id();id.parent.purpose=FiberPathPurpose::Contour;
+    const auto finish=make_independent_fiber_finish_route(source,config,id);
+    const auto original=FiberPathFinalizer::finalize(source,domain,config,id,finish,arcs,&planned);
+    const auto shared=FiberPathFinalizer::finalize(source,domain,config,id,finish,arcs,&planned,{},{},&expanded);
+    INFO(original.detail);REQUIRE(original.prepared);REQUIRE(shared.prepared);
+    CHECK(original.prepared->physical_coverage==shared.prepared->physical_coverage);
+    CHECK(original.prepared->resin_exclusion==shared.prepared->resin_exclusion);
+    CHECK(shared.prepared->allowed_domain==domain);
+    const auto a=compile_fixture(original.prepared,0,0,0,1,"CUT");
+    const auto b=compile_fixture(shared.prepared,0,0,0,1,"CUT");
+    CHECK(equal_fiber_commands(*a.commands,*b.commands));
+    const auto invalid=FiberPathFinalizer::finalize(source,domain,config,id,finish,arcs,nullptr,{},{},&expanded);
+    CHECK(invalid.failure==FiberFinalizationFailure::InvalidParameter);
+}
+
+TEST_CASE("deferred fiber optimizer callbacks preserve NLopt exception translation", "[ContinuousFiber][ContourRounding]")
+{
+    using continuous_fiber_detail::rethrow_optimizer_callback_failure;
+    const auto samples=std::make_exception_ptr(std::length_error("Contour arc exceeds sampling budget"));
+    CHECK_THROWS_WITH(rethrow_optimizer_callback_failure(samples,""),"nlopt failure");
+    try { rethrow_optimizer_callback_failure(samples,""); }
+    catch (const std::length_error&) { FAIL("A callback failure became a recoverable sampling rejection"); }
+    catch (const std::runtime_error&) {}
+    CHECK_THROWS_WITH(rethrow_optimizer_callback_failure(samples,"callback detail"),"callback detail");
+    const auto invalid=std::make_exception_ptr(std::invalid_argument("invalid pose"));
+    CHECK_THROWS_AS(rethrow_optimizer_callback_failure(invalid,""),std::invalid_argument);
+    CHECK_THROWS_WITH(rethrow_optimizer_callback_failure(invalid,""),"nlopt invalid argument");
+    CHECK_THROWS_WITH(rethrow_optimizer_callback_failure(invalid,"pose detail"),"pose detail");
+    CHECK_THROWS_AS(rethrow_optimizer_callback_failure(std::make_exception_ptr(std::bad_alloc()),""),std::bad_alloc);
+}
+
+TEST_CASE("hole allocation and connected descendants match the original whole-domain planner", "[ContinuousFiber][HoleQueryReference]")
+{
+    using Json=nlohmann::json;
+    const auto digest=[](const Json& value) {
+        const auto bytes=value.dump();boost::uuids::detail::sha1 hash;
+        hash.process_bytes(bytes.data(),bytes.size());unsigned int words[5];hash.get_digest(words);
+        return Json{{"count",value.size()},{"sha1",{words[0],words[1],words[2],words[3],words[4]}}};
+    };
+    const auto points=[&](const auto& line) {
+        Json out=Json::array();
+        for(const auto& p:line.points) {
+            Json row=Json::array();for(int i=0;i<p.size();++i)row.push_back(p[i]);out.push_back(std::move(row));
+        }
+        return digest(out);
+    };
+    const auto polygons=[&](const ExPolygons& regions) {
+        Json out=Json::array();
+        for(const auto& region:regions) {
+            Json holes=Json::array();for(const auto& hole:region.holes)holes.push_back(points(hole));
+            out.push_back({points(region.contour),holes});
+        }
+        return out;
+    };
+    const auto prepared=[&](const std::shared_ptr<const PreparedFiberPath>& path) -> Json {
+        if(!path)return nullptr;
+        Json spans=Json::array(),actions=Json::array();
+        for(const auto& span:path->spans) {
+            Json edges=Json::array();for(const auto& edge:span.edges)edges.push_back({edge.speed_mm_s,edge.feed_mm_per_xy_mm});
+            // Keep computed speeds/ratios numeric: opaque float hashes would
+            // turn harmless platform roundoff into an unexplained mismatch.
+            spans.push_back({int(span.kind),points(span.geometry),edges});
+        }
+        for(const auto& action:path->actions)actions.push_back({int(action.type),action.span_index});
+        return Json{{"spans",spans},{"actions",actions},{"entry",points(path->entry.geometry)},
+            {"coverage",polygons(path->physical_coverage)},{"resin",polygons(path->resin_exclusion)},
+            {"keepout",polygons(path->contour_to_infill_keepout)}};
+    };
+    const auto snapshot=[&](const FiberContourPlanResult& plan) {
+        Json out={{"nodes",Json::array()},{"assignments",Json::array()},{"chains",Json::array()}};
+        for(const auto& node:plan.nodes)out["nodes"].push_back({node.id.job_ordinal,node.depth,int(node.side),
+            node.region_id,node.boundary_id,node.parent?Json(node.parent->job_ordinal):Json(nullptr)});
+        for(const auto& a:plan.validation.assignments) {
+            Json arcs=Json::array();
+            for(const auto& arc:a.source_arcs)arcs.push_back({arc.center_mm.x(),arc.center_mm.y(),arc.radius_mm,
+                arc.sweep_radians,arc.begin_mm,arc.end_distance_mm});
+            out["assignments"].push_back({{"id",{a.id.parent.job_ordinal,a.id.fragment_ordinal}},
+                {"kind",int(a.kind)},{"reason",int(a.reason)}, {"begin",a.source_begin_mm},{"end",a.source_end_mm},
+                {"chain_only",a.chain_only},{"source",a.centerline?points(a.centerline->polyline):Json(nullptr)},
+                {"arcs",arcs},{"prepared",prepared(a.prepared)}});
+        }
+        for(const auto& chain:plan.validation.chain_executions) {
+            Json sources=Json::array();for(const auto& source:chain.sources)sources.push_back({
+                source.source.parent.job_ordinal,source.seam_mm,source.head_mm,source.tail_mm,
+                source.original_mm,source.retained_mm,source.retained_intervals});
+            out["chains"].push_back({{"sources",sources},{"prepared",prepared(chain.prepared)}});
+        }
+        out["coverage"]=polygons(plan.validation.physical_footprint);
+        return out;
+    };
+    Json actual=Json::array();
+    for(int mode=0;mode<4;++mode) {
+        CAPTURE(mode);
+        auto config=open_ring_config();config.contour_include_holes=true;
+        config.contour_bend_radius_mm=mode==3?0:.3;
+        config.contour_boundary_clearance_mm=.05;
+        auto region=rectangle(0,0,90,180);
+        for(double y:{20.,80.,140.}) {
+            auto hole=rectangle(20,y,40,y+20).contour;hole.make_clockwise();region.holes.push_back(hole);
+        }
+        if(mode==1) { // near-wall clipping plus shared occupancy of close holes
+            region=rectangle_with_hole(0,0,60,150,1,20,20,40);
+            auto hole=rectangle(20.8,20,40,40).contour;hole.make_clockwise();region.holes.push_back(hole);
+        } else if(mode==2) { // provisional short cycles must retain their original root
+            region=rectangle_with_hole(0,0,50,150,19,19,31,31);
+            auto remote=rectangle(19,110,31,122).contour;remote.make_clockwise();region.holes.push_back(remote);
+            config.cut_to_contact_length_mm=56;
+        }
+        const ExPolygons domain{region};
+        const auto run=[&]() {
+            auto plan=FiberPathValidator::plan_contours(domain,config,{7,11,2,0},true,
+                mode==3?1:fiber_contour_depth_limit,mode==3?.4:0);
+            REQUIRE(plan.audit_lineage());REQUIRE(plan.validation.audit_assignments().valid());
+            if(mode==2)CHECK(std::any_of(plan.validation.assignments.begin(),plan.validation.assignments.end(),
+                [](const auto& a){return a.chain_only;}));
+            Json record={{"before",snapshot(plan)}};
+            FiberPathValidator::plan_open_ring_chains(plan,domain,config,true);
+            REQUIRE(plan.audit_lineage());REQUIRE(plan.validation.audit_open_chains());
+            record["after"]=snapshot(plan);
+            return record;
+        };
+        auto record=run();
+        {
+            tbb::global_control one_thread(tbb::global_control::max_allowed_parallelism,1);
+            CHECK(run()==record);
+        }
+        actual.push_back(std::move(record));
+    }
+    // Captured from bf946c941824's unmodified plan_ring_stage, not from the
+    // optimized output. Keeps rejected source intervals as well as executions.
+    std::ifstream input(std::string(TEST_DATA_DIR)+"/continuous_fiber/hole_query_reference.json");
+    REQUIRE(input.good());Json expected;input>>expected;
+    std::string mismatch;
+    std::function<bool(const Json&,const Json&,const std::string&,bool)> equal;
+    equal=[&](const Json& a,const Json& b,const std::string& path,bool station) {
+        bool same=false;
+        if(a.is_number_float() || b.is_number_float()) {
+            if(a.is_number_float() && b.is_number_float()) {
+                const double x=a.get<double>(),y=b.get<double>();
+                // Source stations already use 1e-8 mm roundoff in Finalizer.
+                // Other computed scalars get only a small machine-roundoff
+                // allowance, never a geometry/grid tolerance.
+                const double tolerance=station?1e-8:64*std::numeric_limits<double>::epsilon()*
+                    std::max({1.,std::abs(x),std::abs(y)});
+                same=std::isfinite(x) && std::isfinite(y) && std::abs(x-y)<=tolerance;
+            }
+        } else if(a.is_object() && b.is_object() && a.size()==b.size()) {
+            for(auto it=a.begin();it!=a.end();++it) {
+                if(!b.contains(it.key())) {mismatch=path+"/"+it.key()+": missing reference key";return false;}
+                if(!equal(it.value(),b.at(it.key()),path+"/"+it.key(),
+                    station || it.key()=="begin" || it.key()=="end" || it.key()=="sources"))return false;
+            }
+            return true;
+        } else if(a.is_array() && b.is_array() && a.size()==b.size()) {
+            for(size_t i=0;i<a.size();++i)if(!equal(a[i],b[i],path+"/"+std::to_string(i),station))return false;
+            return true;
+        } else same=a==b;
+        if(!same)mismatch=path+": "+a.dump()+" != "+b.dump();
+        return same;
+    };
+    for(size_t i=0;i<actual.size();++i) {
+        CAPTURE(i);const bool matches=equal(actual[i],expected.at(i),std::to_string(i),false);
+        INFO(mismatch);CHECK(matches);
+    }
+}
+
 TEST_CASE("rounded intermediate masks cannot replace the actual fiber allocation", "[ContinuousFiber][FillPerformance]")
 {
     // This exact-grid counterexample prevents substituting G intersect A for
@@ -8132,4 +8457,279 @@ TEST_CASE("fiber zero-feed parsing retains phase ownership and ordinary separati
     GCodeProcessor ordinary;ordinary.apply_config(config);ordinary.initialize_result_moves();
     CHECK_NOTHROW(ordinary.process_buffer(prefix+"G1 X1 F600\n"));
     CHECK(std::none_of(ordinary.get_result().moves.begin(),ordinary.get_result().moves.end(),[](const auto& move){return move.deposition==ToolpathDeposition::ContinuousFiberPowered;}));
+}
+
+
+TEST_CASE("large-radius window reuse preserves the captured bounded-search result",
+    "[ContinuousFiber][ContourRounding][7xiao_outer]")
+{
+    std::ifstream stream(std::string(TEST_DATA_DIR)+"/continuous_fiber/7xiao_outer_radius06_window_search.json");
+    REQUIRE(stream.good());nlohmann::json fixture;stream>>fixture;
+    Polyline3 source;
+    for(const auto& point:fixture.at("source"))source.points.emplace_back(point[0].get<coord_t>(),point[1].get<coord_t>(),coord_t(0));
+    ExPolygons domain;
+    for(const auto& rings:fixture.at("domain")) {
+        ExPolygon region;
+        for(size_t i=0;i<rings.size();++i) {
+            Polygon ring;for(const auto& point:rings[i])ring.points.emplace_back(point[0].get<coord_t>(),point[1].get<coord_t>());
+            if(i==0)region.contour=std::move(ring);else region.holes.push_back(std::move(ring));
+        }
+        domain.push_back(std::move(region));
+    }
+    ContourRoundingOptions options{fixture.at("radius").get<double>(),fixture.at("chord_tolerance").get<double>(),
+        fixture.at("geometry_tolerance").get<double>()};
+    const auto result=ContinuousFiberFillStrategy::round_outer_contour(source,domain,options);
+    const auto& expected=fixture.at("expected");
+    REQUIRE(expected.at("path").is_null());CHECK_FALSE(result.path);
+    REQUIRE(expected.at("arcs").empty());CHECK(result.arcs.empty());
+    REQUIRE(expected.at("bends").empty());CHECK(result.bends.empty());
+    nlohmann::json issues=nlohmann::json::array();
+    for(const auto& issue:result.issues) {
+        nlohmann::json points=nlohmann::json::array();
+        for(const auto& point:issue.source.points)points.push_back({point.x(),point.y()});
+        issues.push_back({int(issue.reason),std::move(points)});
+    }
+    CHECK(issues==expected.at("issues"));
+}
+
+TEST_CASE("resin contact derives only from real union residuals and source policies",
+    "[ContinuousFiber][ResinBoundary]")
+{
+    FiberCoverageLedger ledger;
+    FiberCoverageRecord left;left.source_domain={rectangle(0,0,10,4)};
+    left.accepted_contour_exclusion=left.source_domain;left.resin_overlap_mm=.05;
+    ledger.add(std::move(left));
+    FiberCoverageRecord residual;residual.source_domain={rectangle(10,0,11,4)};
+    residual.resin_domain=residual.source_domain;ledger.add(std::move(residual));
+    FiberCoverageRecord right;right.source_domain={rectangle(11,0,21,4)};
+    right.accepted_infill_exclusion=right.source_domain;right.resin_overlap_mm=.1;
+    ledger.add(std::move(right));
+    const auto protected_core=ledger.resin_protected_core();
+    const auto contains=[&](double x,double y) {
+        return std::any_of(protected_core.begin(),protected_core.end(),[&](const auto& region) {
+            return region.contains(Point::new_scale(x,y),true);
+        });
+    };
+    CHECK(contains(9.94,2));CHECK_FALSE(contains(9.97,2));
+    CHECK_FALSE(contains(11.08,2));CHECK(contains(11.11,2));
+    CHECK(contains(.01,2)); // Object exterior is not a made-up residual seed.
+    CHECK(ledger.records().front().accepted_contour_exclusion.front().area()==rectangle(0,0,10,4).area());
+
+    FiberCoverageLedger touching;
+    for(int i=0;i<2;++i) {
+        FiberCoverageRecord record;record.source_domain={rectangle(i*10,0,(i+1)*10,3)};
+        record.accepted_infill_exclusion=record.source_domain;record.resin_overlap_mm=.1;
+        touching.add(std::move(record));
+    }
+    CHECK(diff_ex(ExPolygons{rectangle(0,0,20,3)},touching.resin_protected_core()).empty());
+}
+
+TEST_CASE("legal narrow resin pockets retain actual-width Arachne and gap paths",
+    "[ContinuousFiber][ResinBoundary]")
+{
+    const auto role=GENERATE(erResinInfill,erGapFill);
+    FiberCoverageLedger ledger;
+    FiberCoverageRecord record;record.source_domain={rectangle(0,0,40,3)};
+    record.accepted_contour_exclusion={rectangle(0,0,40,1),rectangle(0,1.35,40,3)};
+    record.resin_overlap_mm=.05;ledger.add(std::move(record));
+    auto path=straight_path(2,1.175,38,1.175,.44);path.set_extrusion_role(role);
+    ExtrusionEntityCollection clipped;clipped.append(path);
+    const auto* original=clipped.entities.front();
+    ContinuousFiberFillStrategy::constrain_resin_paths(clipped.entities,ledger.resin_protected_core());
+    CHECK(clipped.entities.front()==original);
+    REQUIRE(clipped.entities.size()==1);
+    const auto* kept=dynamic_cast<const ExtrusionPath*>(clipped.entities.front());REQUIRE(kept);
+    CHECK(kept->polyline.points==path.polyline.points);CHECK(kept->role()==role);
+    CHECK(kept->width==path.width);CHECK(kept->mm3_per_mm==path.mm3_per_mm);
+}
+
+
+TEST_CASE("native resin boundary spans retain source order and flow without crossing gaps",
+    "[ContinuousFiber][ResinBoundary]")
+{
+    auto path=path_from_points({{0,0},{10,0},{0,0},{0,10}},.42);
+    path.set_extrusion_role(erGapFill);path.set_reverse();
+    ExtrusionEntityCollection result;result.append(path);
+    const ExPolygons forbidden{rectangle(4,-1,6,1)};
+    ContinuousFiberFillStrategy::constrain_resin_paths(result.entities,forbidden);
+    REQUIRE(result.entities.size()==1);
+    const auto* ordered=dynamic_cast<const ExtrusionEntityCollection*>(result.entities.front());
+    REQUIRE(ordered);CHECK(ordered->no_sort);REQUIRE(ordered->entities.size()==3);
+    const auto* first=dynamic_cast<const ExtrusionPath*>(ordered->entities[0]);
+    const auto* second=dynamic_cast<const ExtrusionPath*>(ordered->entities[1]);
+    const auto* third=dynamic_cast<const ExtrusionPath*>(ordered->entities[2]);
+    REQUIRE(first);REQUIRE(second);REQUIRE(third);
+    CHECK(first->first_point()==Point::new_scale(0,0));
+    CHECK(unscale<double>(first->last_point().x())>3.78);CHECK(unscale<double>(first->last_point().x())<3.79);
+    CHECK(unscale<double>(second->first_point().x())>6.21);
+    CHECK(second->first_point()==second->last_point()); // Retain the real out-and-back source run.
+    CHECK(unscale<double>(third->first_point().x())<3.79);CHECK(third->last_point()==Point::new_scale(0,10));
+    for(const auto* entity:ordered->entities) {
+        const auto* part=dynamic_cast<const ExtrusionPath*>(entity);REQUIRE(part);
+        CHECK(part->role()==path.role());CHECK(part->width==path.width);CHECK(part->height==path.height);
+        CHECK(part->mm3_per_mm==path.mm3_per_mm);CHECK_FALSE(part->can_reverse());
+        Polygons footprint;part->polygons_covered_by_width(footprint,0);
+        CHECK(intersection_ex(union_ex(footprint),forbidden).empty());
+    }
+}
+
+TEST_CASE("native resin butt endpoints remain intact beside a fiber boundary",
+    "[ContinuousFiber][ResinBoundary]")
+{
+    auto path=straight_path(0,0,9.99,0,.42);path.set_extrusion_role(erResinInfill);
+    ExtrusionEntityCollection collection;collection.append(path);
+    const auto* original=collection.entities.front();
+    ContinuousFiberFillStrategy::constrain_resin_paths(collection.entities,{rectangle(10,-2,20,2)});
+    REQUIRE(collection.entities.size()==1);CHECK(collection.entities.front()==original);
+    const auto* kept=dynamic_cast<const ExtrusionPath*>(collection.entities.front());REQUIRE(kept);
+    CHECK(kept->polyline.points==path.polyline.points);
+}
+
+TEST_CASE("resin query pruning retains enclosing material and enclosing holes",
+    "[ContinuousFiber][ResinBoundary]")
+{
+    auto path=straight_path(-2,0,2,0,.42);path.set_extrusion_role(erResinInfill);
+    ExPolygon material=rectangle(-10,-10,10,10);
+    ExtrusionEntityCollection collection;collection.append(path);
+    const auto* original=collection.entities.front();
+    SECTION("an enclosing solid still removes an entirely forbidden path") {
+        ContinuousFiberFillStrategy::constrain_resin_paths(collection.entities,{material});
+        CHECK(collection.empty());
+    }
+    SECTION("an enclosing hole preserves a legal original path") {
+        Polygon hole=rectangle(-5,-5,5,5).contour;hole.reverse();
+        material.holes.push_back(std::move(hole));
+        ContinuousFiberFillStrategy::constrain_resin_paths(collection.entities,
+            {material,rectangle(100,100,110,110)});
+        REQUIRE(collection.entities.size()==1);CHECK(collection.entities.front()==original);
+        const auto* kept=dynamic_cast<const ExtrusionPath*>(collection.entities.front());REQUIRE(kept);
+        CHECK(kept->polyline.points==path.polyline.points);
+    }
+}
+
+TEST_CASE("native resin fitting keeps safe geometry and rolls back unsafe wide arc caps",
+    "[ContinuousFiber][ResinBoundary][ResinArcBoundary]")
+{
+    auto config=masked_print_config();config.set_deserialize_strict("enable_arc_fitting","1");
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,.2));object->add_instance();
+    Print print;print.set_plate_origin(Vec3d::Zero());print.is_BBL_printer()=false;print.apply(model,config);
+    REQUIRE_FALSE(print.objects().empty());auto* printed=print.get_object(size_t(0));
+    auto* layer=printed->add_layer(0,.2,.2,.1);auto* region=layer->add_region(&printed->printing_region(0));
+    auto path=path_from_points({{13.935600,-11.466980},{13.875904,-11.466980},{13.846055,-11.415281},
+        {13.875903,-11.363582},{13.935297,-11.363582}},.5054782629013062);
+    path.set_extrusion_role(erResinInfill);
+    const auto original=path.polyline;
+    const auto install=[&](std::unique_ptr<ExtrusionEntityCollection> collection) {
+        auto* pointer=collection.get();region->fills.entities.push_back(collection.release());return pointer;
+    };
+    const ExPolygons nearby{rectangle(13.98,-11.72,14.08,-11.60)};
+    Polygons footprint;path.polygons_covered_by_width(footprint,0);
+    CHECK(intersection_ex(union_ex(footprint),nearby).empty());
+    const auto has_arc=[](const ExtrusionPath& candidate) {
+        return std::any_of(candidate.polyline.fitting_result.begin(),candidate.polyline.fitting_result.end(),
+            [](const auto& fit){return fit.path_type==EMovePathType::Arc_move_cw || fit.path_type==EMovePathType::Arc_move_ccw;});
+    };
+    SECTION("the ordinary native collection still performs its original fitting") {
+        auto* plain=install(std::make_unique<ExtrusionEntityCollection>());plain->append(path);
+        region->simplify_infill_extrusion_entity();
+        CHECK(has_arc(*dynamic_cast<ExtrusionPath*>(plain->entities.front())));
+    }
+    SECTION("the constrained single path retains its safe source") {
+        ExtrusionEntityCollection base;base.append(path);
+        auto* guarded=install(std::make_unique<ExtrusionResinCollection>(std::move(base),std::make_shared<const ExPolygons>(nearby)));
+        region->simplify_infill_extrusion_entity();
+        auto* kept=dynamic_cast<ExtrusionPath*>(guarded->entities.front());REQUIRE(kept);
+        CHECK(kept->polyline.points==original.points);CHECK(kept->polyline.fitting_result.empty());
+        CHECK(kept->width==path.width);CHECK(kept->mm3_per_mm==path.mm3_per_mm);
+    }
+    SECTION("value paths in a native multi path keep the same material constraint") {
+        ExtrusionMultiPath multi;multi.paths.push_back(path);ExtrusionEntityCollection base;base.append(std::move(multi));
+        auto* guarded=install(std::make_unique<ExtrusionResinCollection>(std::move(base),std::make_shared<const ExPolygons>(nearby)));
+        region->simplify_infill_extrusion_entity();
+        auto* kept=dynamic_cast<ExtrusionMultiPath*>(guarded->entities.front());REQUIRE(kept);
+        CHECK(kept->paths.front().polyline.points==original.points);CHECK(kept->paths.front().polyline.fitting_result.empty());
+    }
+    SECTION("a legal native arc away from protected material remains an arc") {
+        ExtrusionEntityCollection base;base.append(path);
+        auto* guarded=install(std::make_unique<ExtrusionResinCollection>(std::move(base),
+            std::make_shared<const ExPolygons>(ExPolygons{rectangle(14.5,-12,15,-11)})));
+        region->simplify_infill_extrusion_entity();
+        CHECK(has_arc(*dynamic_cast<ExtrusionPath*>(guarded->entities.front())));
+    }
+    SECTION("copy and move clones retain boundary ownership and collection properties") {
+        auto core=std::make_shared<const ExPolygons>(nearby);std::weak_ptr<const ExPolygons> lifetime=core;
+        ExtrusionEntityCollection base;base.append(path);base.no_sort=true;base.set_reverse();
+        ExtrusionResinCollection guarded(std::move(base),core);core.reset();
+        std::unique_ptr<ExtrusionEntity> copied(guarded.clone());
+        std::unique_ptr<ExtrusionEntity> moved(copied->clone_move());
+        auto* kept=dynamic_cast<ExtrusionResinCollection*>(moved.get());REQUIRE(kept);
+        CHECK_FALSE(lifetime.expired());CHECK(kept->no_sort);CHECK_FALSE(kept->can_reverse());
+        region->fills.entities.push_back(moved.release());region->simplify_infill_extrusion_entity();
+        CHECK(dynamic_cast<ExtrusionPath*>(kept->entities.front())->polyline.points==original.points);
+    }
+    SECTION("native failure restores every backup before a retry") {
+        ExtrusionEntityCollection base;base.append(path);base.entities.push_back(nullptr);
+        auto* guarded=install(std::make_unique<ExtrusionResinCollection>(std::move(base),std::make_shared<const ExPolygons>(nearby)));
+        CHECK_THROWS_AS(region->simplify_infill_extrusion_entity(),Slic3r::InvalidArgument);
+        auto* kept=dynamic_cast<ExtrusionPath*>(guarded->entities.front());REQUIRE(kept);
+        CHECK(kept->polyline.points==original.points);CHECK(kept->polyline.fitting_result.empty());
+        guarded->entities.pop_back();REQUIRE_NOTHROW(region->simplify_infill_extrusion_entity());
+        CHECK(kept->polyline.points==original.points);CHECK(kept->polyline.fitting_result.empty());
+    }
+}
+
+TEST_CASE("a fitted resin arc that can collapse on the native output grid keeps its source",
+    "[ContinuousFiber][ResinBoundary][ResinArcBoundary]")
+{
+    const bool zero_ij=GENERATE(false,true);CAPTURE(zero_ij);
+    auto path=zero_ij ? path_from_points({{.000490,.000490},{-.000490,.000490},{-.000693,0}},.42) :
+        path_from_points({{-.00025,0},{0,-.00025},{.00025,0}},.42);
+    path.set_extrusion_role(erResinInfill);
+    ExtrusionEntityCollection base;base.append(path);
+    ExtrusionResinCollection guarded(std::move(base),std::make_shared<const ExPolygons>(ExPolygons{rectangle(10,10,20,20)}));
+    auto originals=guarded.backup_paths();auto* candidate=dynamic_cast<ExtrusionPath*>(guarded.entities.front());REQUIRE(candidate);
+    candidate->polyline.fitting_result={{0,2,EMovePathType::Arc_move_ccw,ArcSegment(Point(0,0),scale_(zero_ij ? std::hypot(.000490,.000490) : .00025),
+        candidate->polyline.points.front().to_point(),candidate->polyline.points.back().to_point(),ArcDirection::Arc_Dir_CCW)}};
+    REQUIRE_NOTHROW(Geometry::validate_with_arcs(candidate->polyline));
+    guarded.accept_safe_simplification(originals);
+    CHECK(candidate->polyline.points==path.polyline.points);CHECK(candidate->polyline.fitting_result.empty());
+}
+
+TEST_CASE("native linear resin simplification must preserve its hard material boundary",
+    "[ContinuousFiber][ResinBoundary][ResinLinearBoundary]")
+{
+    auto config=masked_print_config();
+    config.set_deserialize_strict("enable_arc_fitting","0");
+    config.set_deserialize_strict("resolution","0.012");
+    Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,.2));object->add_instance();
+    Print print;print.set_plate_origin(Vec3d::Zero());print.is_BBL_printer()=false;print.apply(model,config);
+    REQUIRE_FALSE(print.objects().empty());auto* printed=print.get_object(size_t(0));
+    auto* layer=printed->add_layer(0,.2,.2,.1);auto* region=layer->add_region(&printed->printing_region(0));
+    auto path=path_from_points({{0,0},{1,-.011},{2,0}},.42);path.set_extrusion_role(erResinInfill);
+    const ExPolygons core{rectangle(.6,.206,1.4,1)};
+    const auto overlap_mm2=[&](const ExtrusionPath& candidate) {
+        Polygons footprint;candidate.polygons_covered_by_width(footprint,0);
+        return area(intersection_ex(union_ex(footprint),core))*SCALING_FACTOR*SCALING_FACTOR;
+    };
+    REQUIRE(overlap_mm2(path)==0);
+    const auto install=[&](std::unique_ptr<ExtrusionEntityCollection> collection) {
+        auto* pointer=collection.get();region->fills.entities.push_back(collection.release());return pointer;
+    };
+    SECTION("ordinary native Douglas Peucker changes the safe source into an unsafe line") {
+        auto* plain=install(std::make_unique<ExtrusionEntityCollection>());plain->append(path);
+        region->simplify_infill_extrusion_entity();
+        auto* simplified=dynamic_cast<ExtrusionPath*>(plain->entities.front());REQUIRE(simplified);
+        REQUIRE(simplified->polyline.points.size()==2);
+        CHECK(simplified->polyline.fitting_result.empty());
+        CHECK(overlap_mm2(*simplified)==Catch::Approx(.0032).margin(.000001));
+    }
+    SECTION("the same existing material guard restores the safe linear source") {
+        ExtrusionEntityCollection base;base.append(path);
+        auto* guarded=install(std::make_unique<ExtrusionResinCollection>(std::move(base),std::make_shared<const ExPolygons>(core)));
+        region->simplify_infill_extrusion_entity();
+        auto* kept=dynamic_cast<ExtrusionPath*>(guarded->entities.front());REQUIRE(kept);
+        CHECK(kept->polyline.points==path.polyline.points);CHECK(kept->polyline.fitting_result.empty());
+        CHECK(kept->width==path.width);CHECK(kept->mm3_per_mm==path.mm3_per_mm);
+        CHECK(overlap_mm2(*kept)==0);
+    }
 }

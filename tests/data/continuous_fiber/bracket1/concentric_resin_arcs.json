@@ -1,0 +1,7 @@
+{
+  "fiber_resin_fill_pattern": "concentric",
+  "enable_arc_fitting": "1",
+  "fiber_layer_height_ratio": "27",
+  "fiber_contour_bend_radius": "0",
+  "fiber_infill_bend_radius": "0"
+}

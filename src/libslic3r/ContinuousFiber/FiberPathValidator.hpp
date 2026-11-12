@@ -12,6 +12,14 @@
 #include <vector>
 
 namespace Slic3r {
+namespace continuous_fiber_detail {
+// Complete geometry only: preserve all X scanbeam events at the queried Y.
+struct HoleQueryBand { coord_t min_y, max_y; };
+std::optional<HoleQueryBand> hole_query_band(const ExPolygons& frontier, double width_mm, double radius_mm);
+ExPolygons hole_query_material(const ExPolygons& material, const HoleQueryBand& band);
+ExPolygons hole_query_occupancy(const ExPolygons& footprint, const HoleQueryBand& band);
+}
+
 void audit_fiber_execution_connections(const std::map<FiberFragmentId,CompiledFiberPath>& paths);
 
 

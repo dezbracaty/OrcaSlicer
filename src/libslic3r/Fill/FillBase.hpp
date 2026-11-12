@@ -184,6 +184,10 @@ public:
     // It call fill_surface by default
     virtual void fill_surface_extrusion(const Surface *surface, const FillParams &params, ExtrusionEntitiesPtr &out);
 
+    // Original GapFill stage, exposed for composite callers which must finalize
+    // their main-material geometry before measuring its remaining area.
+    void _create_gap_fill(const Surface* surface, const FillParams& params, ExtrusionEntityCollection* out);
+
 protected:
     Fill() :
         layer_id(size_t(-1)),
@@ -218,10 +222,6 @@ protected:
 
     virtual std::pair<float, Point> _infill_direction(const Surface *surface) const;
     
-    // Orca: Dedicated function to calculate gap fill lines for the provided surface, according to the print object parameters
-    // and append them to the out ExtrusionEntityCollection.
-    void _create_gap_fill(const Surface* surface, const FillParams& params, ExtrusionEntityCollection* out);
-
 public:
     static void connect_infill(Polylines &&infill_ordered, const ExPolygon &boundary, Polylines &polylines_out, const double spacing, const FillParams &params);
     static void connect_infill(Polylines &&infill_ordered, const Polygons &boundary, const BoundingBox& bbox, Polylines &polylines_out, const double spacing, const FillParams &params);
