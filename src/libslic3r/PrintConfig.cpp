@@ -983,6 +983,12 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("Generate fiber contour loops around closed holes in the fiber region. Disabling this option keeps holes excluded from all material paths and does not change fiber infill patterns.");
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("fiber_contour_allow_partial_holes", coBool);
+    def->label = L("Allow partial hole contours");
+    def->category = L("Continuous fiber");
+    def->tooltip = L("Allow printable open fragments when a hole contour cannot be deposited as a complete loop. When disabled, reject the complete hole contour and leave its material for the configured matrix fill. Does not change outer contour closure or ring connection seams.");
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("fiber_connect_adjacent_rings", coBool);
     def->label = L("Connect adjacent fiber rings");
     def->category = L("Continuous fiber");

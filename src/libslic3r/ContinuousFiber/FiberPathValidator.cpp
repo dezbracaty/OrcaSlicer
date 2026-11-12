@@ -428,6 +428,7 @@ const char* fiber_rejection_reason_name(FiberRejectionReason reason)
     case FiberRejectionReason::None: return "none";
     case FiberRejectionReason::BendStabilizationTooShort: return "bend_stabilization_too_short";
     case FiberRejectionReason::OpenOuterContour: return "open_outer_contour";
+    case FiberRejectionReason::OpenHoleContour: return "open_hole_contour";
     case FiberRejectionReason::OccupiedContourRegion: return "occupied_by_prior_contour";
     case FiberRejectionReason::UnavailableContourRegion: return "outside_remaining_contour_region";
     case FiberRejectionReason::TooShort: return "too_short";
@@ -515,15 +516,19 @@ FiberAssignmentAudit FiberValidationResult::audit_assignments() const
         }
         std::vector<const FiberFragmentAssignment*> fragments = found->second;
         if (closed_loops.count(candidate_id)) {
-            // A closed exterior has exactly one whole-path outcome. Neither a
+            // A required closed contour has exactly one whole-path outcome. Neither a
             // partial acceptance nor an intentional void can satisfy closure.
             if (fragments.size() != 1 || fragments.front()->kind == FiberAssignmentKind::IntentionalVoid)
                 ++audit.invalid_assignment_count;
             for (const auto* fragment : fragments) if (fragment->kind == FiberAssignmentKind::AcceptedFiber) {
-                if (!fragment->centerline || !fragment->centerline->is_closed() || !fragment->prepared) {
+                if (!fragment->centerline || !fragment->centerline->is_closed() ||
+                    (!fragment->prepared && !fragment->chain_only)) {
                     ++audit.invalid_assignment_count;
                     continue;
                 }
+                // Certified ring connections retain complete source cycles;
+                // their intentional seams are checked by audit_open_chains().
+                if (fragment->chain_only) continue;
                 const FiberMotionSpan* first = nullptr;
                 const FiberMotionSpan* last = nullptr;
                 for (const auto& span : fragment->prepared->spans) if (span.deposits_fiber()) {
@@ -593,7 +598,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
     ExtrusionRole output_role,
     const FiberDomainId& domain_id,
     size_t job_ordinal, const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
-    const ExPolygons* physical_centerline_domain, bool collect_debug, bool requires_closed_loop,
+    const ExPolygons* physical_centerline_domain, bool collect_debug, bool outer_contour,
     const std::vector<ContourArc>* source_arcs, double bend_stabilization_length_mm,
     std::vector<FiberFragmentId>* policy_rejected)
 {
@@ -606,6 +611,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
         !planned_centerline_domain || !physical_centerline_domain))
         throw std::invalid_argument("Analytic fiber geometry requires one path and its centerline domains");
     const bool allocates_contour = purpose == FiberPathPurpose::Contour && planned_centerline_domain;
+    const bool requires_closed_loop = outer_contour || (allocates_contour && !config.contour_allow_partial_holes);
     const bool rounds_contours = purpose == FiberPathPurpose::Contour && config.contour_bend_radius_mm > 0;
     std::map<double, ExPolygons> centerline_domains;
     const auto centerline_domain_for_width = [&](double width) -> const ExPolygons& {
@@ -675,10 +681,10 @@ FiberValidationResult FiberPathValidator::validate_impl(
         std::string stability_detail;
         if (whole_path_reason == FiberRejectionReason::None && rounds_contours) {
             const ContourRoundingOptions options{config.contour_bend_radius_mm};
-            const ExPolygons rounding_domain = requires_closed_loop && geometry_domain && planned_centerline_domain ?
+            const ExPolygons rounding_domain = outer_contour && geometry_domain && planned_centerline_domain ?
                 intersection_ex(*geometry_domain, *planned_centerline_domain) :
                 (geometry_domain ? *geometry_domain : centerline_domain_for_width(path.width));
-            auto rounded=requires_closed_loop ?
+            auto rounded=outer_contour ?
                 ContinuousFiberFillStrategy::round_outer_contour(path.polyline, rounding_domain, options) :
                 ContinuousFiberFillStrategy::round_hole_contour(path.polyline, rounding_domain, options);
             if (!rounded.path) {
@@ -697,7 +703,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 reference_bends=std::move(rounded.bends);
             }
         }
-        if (whole_path_reason==FiberRejectionReason::None && requires_closed_loop &&
+        if (whole_path_reason==FiberRejectionReason::None && outer_contour &&
             bend_stabilization_length_mm>0) {
             const auto stable=minimum_closed_loop_stable_length_mm(unscale<double>(scale_(Geometry::length_with_arcs_mm(path.polyline))),reference_bends);
             if (stable) stability_detail="minimum_stable_path_mm="+std::to_string(*stable)+
@@ -737,11 +743,11 @@ FiberValidationResult FiberPathValidator::validate_impl(
                     throw std::runtime_error("Generated fiber infill leaves its centerline domain");
                 intervals={{0.0,scale_(Geometry::length_with_arcs_mm(path.polyline)),FiberAssignmentKind::AcceptedFiber,FiberRejectionReason::None}};
             } else if (requires_closed_loop) {
-                // Do not partition an exterior into printable strands. Geometry,
+                // Do not partition a required loop into printable strands. Geometry,
                 // occupancy and process validation belong to the entire loop;
                 // no coverage is committed until that single outcome succeeds.
                 if (!path.is_closed())
-                    whole_path_reason=FiberRejectionReason::OpenOuterContour;
+                    whole_path_reason=outer_contour ? FiberRejectionReason::OpenOuterContour : FiberRejectionReason::OpenHoleContour;
                 else if (!diff_pl(Polylines{check_view(path.polyline)}, partition_domain_for_width(path.width)).empty())
                     whole_path_reason=physical_centerline_domain &&
                         diff_pl(Polylines{check_view(path.polyline)}, *physical_centerline_domain).empty() ?
@@ -807,7 +813,8 @@ FiberValidationResult FiberPathValidator::validate_impl(
             assignment.detail = stability_detail;
             if (requires_closed_loop && assignment.kind == FiberAssignmentKind::Rejected)
                 assignment.detail += (assignment.detail.empty()?"":"; ")+
-                    std::string("Entire outer loop rejected; no partial deposition was committed");
+                    std::string(outer_contour ? "Entire outer loop rejected; no partial deposition was committed" :
+                        "Entire hole loop rejected; partial hole contours are disabled");
 
             for (const auto& issue : rounding_issues) {
                 if (!assignment.detail.empty()) assignment.detail += "; ";

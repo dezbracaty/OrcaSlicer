@@ -2900,6 +2900,8 @@ TEST_CASE("hole strands yield to a printable outer strand without moving it", "[
 {
     const ExPolygons region{rectangle_with_hole(0,0,100,80,20,2.06,60,30)};
     ContinuousFiberConfig config;
+    // This regression specifically exercises printable open hole fragments.
+    config.contour_allow_partial_holes=true;
     config.contour_bend_radius_mm=GENERATE(0.,.3);
     config.contour_flow=Flow(1.f,.13f,.4f); config.contour_count=1;
     config.contour_boundary_clearance_mm=.2;
@@ -3175,6 +3177,11 @@ TEST_CASE("hole contour settings separate fiber domain policies", "[ContinuousFi
     disabled.contour_include_holes = false;
     const std::set<FiberPolicyKey> policies{fiber_policy_key(enabled, 0, true), fiber_policy_key(disabled, 0, true)};
     CHECK(policies.size() == 2);
+    auto partial = enabled;
+    partial.contour_allow_partial_holes = true;
+    CHECK_FALSE(fiber_policy_key(partial, 0, true) == fiber_policy_key(enabled, 0, true));
+    partial.contour_include_holes = false;
+    CHECK(fiber_policy_key(partial, 0, true) == fiber_policy_key(disabled, 0, true));
 }
 
 TEST_CASE("unopened contours can borrow supports on both sides", "[ContinuousFiber][ContourRounding][bilateral]")
@@ -3494,24 +3501,72 @@ TEST_CASE("progressive process rejection leaves material for subsequent fill", "
     CHECK_THROWS_AS(FiberPathValidator::plan_contours(region, config, {}), std::invalid_argument);
 }
 
-TEST_CASE("clipped hole contours are leaves rather than parents", "[ContinuousFiber][progressive]")
+TEST_CASE("partial hole contour policy controls open deposition leaves", "[ContinuousFiber][progressive][HoleContourPolicy]")
 {
+    const bool allow_partial = GENERATE(false, true);
+    const double radius = GENERATE(0., .3);
     ContinuousFiberConfig config;
     config.contour_flow = Flow(1.f, .13f, .4f);
     config.contour_count = 3;
     config.contour_include_holes = true;
+    CHECK_FALSE(config.contour_allow_partial_holes);
+    config.contour_allow_partial_holes = allow_partial;
+    config.contour_bend_radius_mm = radius;
     config.contour_boundary_clearance_mm = .05;
     config.minimum_path_length_mm = 3;
     const auto plan = FiberPathValidator::plan_contours(
         {rectangle_with_hole(0, 0, 40, 30, 4.2, 10, 11, 20)}, config, {});
     REQUIRE(plan.audit_lineage());
+    REQUIRE(plan.validation.audit_assignments().valid());
+    for (const auto& assignment : plan.validation.assignments) {
+        if (assignment.kind != FiberAssignmentKind::AcceptedFiber) continue;
+        REQUIRE(assignment.centerline);
+        const auto node = std::find_if(plan.nodes.begin(), plan.nodes.end(), [&](const auto& n) {
+            return n.id == assignment.id.parent;
+        });
+        REQUIRE(node != plan.nodes.end());
+        if (!allow_partial || node->side == FiberContourSide::Outer) {
+            CHECK(assignment.centerline->is_closed());
+            REQUIRE(assignment.prepared);
+            const FiberMotionSpan* last = nullptr;
+            for (const auto& span : assignment.prepared->spans) if (span.deposits_fiber()) last = &span;
+            REQUIRE(last);
+            CHECK(assignment.prepared->entry.start == last->geometry.points.back());
+        }
+    }
     size_t leaves = 0;
     for (const auto& stop : plan.stops) if (stop.side == FiberContourSide::Hole && stop.reason == "open_deposition_leaf") {
         ++leaves;
         REQUIRE(stop.parent);
         CHECK(std::none_of(plan.nodes.begin(), plan.nodes.end(), [&](const auto& node) { return node.parent == stop.parent; }));
     }
-    CHECK(leaves > 0);
+    if (allow_partial) CHECK(leaves > 0);
+    else CHECK(leaves == 0);
+}
+
+TEST_CASE("complete hole contours retain hole rounding in both policies", "[ContinuousFiber][HoleContourPolicy]")
+{
+    ContinuousFiberConfig config;
+    config.contour_flow = Flow(1.f, .13f, .4f);
+    config.contour_count = 1;
+    config.contour_include_holes = true;
+    config.contour_bend_radius_mm = .3;
+    const ExPolygons region{rectangle_with_hole(0,0,60,60,20,20,40,40)};
+    const auto closed = FiberPathValidator::plan_contours(region, config, {});
+    config.contour_allow_partial_holes = true;
+    const auto partial = FiberPathValidator::plan_contours(region, config, {});
+    REQUIRE(closed.audit_lineage());
+    REQUIRE(partial.audit_lineage());
+    REQUIRE(closed.validation.accepted_count() == 2);
+    REQUIRE(partial.validation.assignments.size() == closed.validation.assignments.size());
+    for (size_t i=0; i<closed.validation.assignments.size(); ++i) {
+        const auto& a=closed.validation.assignments[i];
+        const auto& b=partial.validation.assignments[i];
+        REQUIRE(a.centerline); REQUIRE(b.centerline);
+        CHECK(a.centerline->is_closed());
+        CHECK(a.centerline->polyline.points == b.centerline->polyline.points);
+        CHECK(a.kind == b.kind);
+    }
 }
 
 TEST_CASE("4xiao fourth contour has three accepted ancestors", "[ContinuousFiber][progressive][4xiao]")
@@ -8162,6 +8217,9 @@ TEST_CASE("hole allocation and connected descendants match the original whole-do
     for(int mode=0;mode<4;++mode) {
         CAPTURE(mode);
         auto config=open_ring_config();config.contour_include_holes=true;
+        // The frozen pre-parameter reference intentionally exercises the
+        // legacy partial-hole policy; the new default is covered separately.
+        config.contour_allow_partial_holes=true;
         config.contour_bend_radius_mm=mode==3?0:.3;
         config.contour_boundary_clearance_mm=.05;
         auto region=rectangle(0,0,90,180);
@@ -8732,4 +8790,31 @@ TEST_CASE("native linear resin simplification must preserve its hard material bo
         CHECK(kept->width==path.width);CHECK(kept->mm3_per_mm==path.mm3_per_mm);
         CHECK(overlap_mm2(*kept)==0);
     }
+}
+
+TEST_CASE("partial hole policy changes invalidate cached fiber fills", "[ContinuousFiber][HoleContourPolicy]")
+{
+    auto config=masked_print_config();
+    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("fiber_contour_include_holes","1");
+    config.set_deserialize_strict("fiber_contour_allow_partial_holes","1");
+    Model model; auto* object=model.add_object();
+    object->add_volume(make_cube(20,20,2));
+    object->add_instance()->set_offset(Vec3d(60,60,0));
+    object->config.set_key_value("extruder",new ConfigOptionInt(1));
+    Print print; print.set_plate_origin(Vec3d::Zero());
+    print.apply(model,config); print.process();
+    REQUIRE(print.objects().size()==1);
+    auto* sliced=print.objects().front();
+    REQUIRE(sliced->is_step_done(posInfill));
+    const auto before=print.fiber_execution_plans(); REQUIRE(before);
+    config.set_deserialize_strict("fiber_contour_allow_partial_holes","0");
+    print.apply(model,config);
+    CHECK(sliced->is_step_done(posPerimeters));
+    CHECK_FALSE(sliced->is_step_done(posInfill));
+    CHECK_FALSE(print.fiber_execution_plans_current(before));
+    print.process();
+    CHECK(sliced->is_step_done(posInfill));
+    const auto after=print.fiber_execution_plans(); REQUIRE(after);
+    CHECK(after!=before);
 }

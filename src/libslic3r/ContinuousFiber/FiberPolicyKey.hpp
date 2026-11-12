@@ -17,6 +17,7 @@ struct FiberPolicyKey {
     double connection_tail_trim_widths {0.0}, connection_head_trim_widths {0.0};
     bool contour_enabled { false };
     bool contour_include_holes { true };
+    bool contour_allow_partial_holes { false };
     bool infill_enabled { false };
     int layer_interval { 1 };
     int contour_count { 0 };
@@ -79,7 +80,7 @@ struct FiberPolicyKey {
     {
         return std::tie(
             connect_adjacent_rings, connection_tail_trim_widths, connection_head_trim_widths,
-            contour_enabled, contour_include_holes, infill_enabled, layer_interval, contour_count,
+            contour_enabled, contour_include_holes, contour_allow_partial_holes, infill_enabled, layer_interval, contour_count,
             infill_pattern, infill_density, infill_direction, fixed_direction,
             contour_width, contour_spacing, contour_height, contour_nozzle,
             infill_width, infill_spacing, infill_height, infill_nozzle,
@@ -131,6 +132,7 @@ inline FiberPolicyKey fiber_policy_key(
         config.connect_adjacent_rings ? config.connection_head_trim_widths : 0.0,
         config.contour_enabled,
         config.contour_include_holes,
+        config.contour_include_holes && config.contour_allow_partial_holes,
         config.infill_enabled,
         config.layer_interval,
         config.contour_count,

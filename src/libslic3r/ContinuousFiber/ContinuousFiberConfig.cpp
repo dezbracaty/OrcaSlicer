@@ -14,11 +14,12 @@
 
 namespace Slic3r {
 
-const std::array<std::string_view, 42>& fiber_mask_parameter_keys()
+const std::array<std::string_view, 43>& fiber_mask_parameter_keys()
 {
-    static constexpr std::array<std::string_view, 42> keys{{
+    static constexpr std::array<std::string_view, 43> keys{{
         "generate_reinforced_perimeters",
         "fiber_contour_include_holes",
+        "fiber_contour_allow_partial_holes",
         "fiber_connect_adjacent_rings",
         "fiber_connection_tail_trim_widths",
         "fiber_connection_head_trim_widths",
@@ -639,6 +640,7 @@ static ContinuousFiberConfig resolve_region_fiber_config(
         result.connection_tail_trim_widths = source.fiber_connection_tail_trim_widths.value;
         result.connection_head_trim_widths = source.fiber_connection_head_trim_widths.value;
         result.contour_include_holes = source.fiber_contour_include_holes.value;
+        result.contour_allow_partial_holes = source.fiber_contour_allow_partial_holes.value;
         result.contour_count = std::max(0, source.outer_reinforced_perimeters_counts.value);
         result.contour_material = unsigned(std::max(1, source.reinforced_perimeters_filament.value));
         result.contour_boundary_clearance_mm = source.fiber_contour_boundary_clearance.value;

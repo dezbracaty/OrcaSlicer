@@ -2280,6 +2280,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     };
     const bool concentric=config.concentric_infill();
     FiberValidationResult contour_result;
+    std::set<FiberCandidateId> hole_candidates;
     if (collect_debug)
         record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
                        "original_contour_domain_before_candidate_generation");
@@ -2291,6 +2292,8 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         auto plan = FiberPathValidator::plan_contours(planning_area,ring_config,domain_id,collect_debug,
             display_depths,extra_spacing,concentric?config.concentric_corner_stabilization_length_mm:0.0);
         if (concentric) plan.set_display_cutoff(display_depths);
+        for (const auto& node : plan.nodes)
+            if (node.side == FiberContourSide::Hole) hole_candidates.insert(node.id);
         if (config.connect_adjacent_rings)
             FiberPathValidator::plan_open_ring_chains(plan, planning_area, ring_config, collect_debug);
         if (collect_debug) context.layer.fiber_connection_plans.push_back(
@@ -2474,8 +2477,11 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
             std::string detail = assignment.detail;
             const auto extent = std::find_if(validation.candidates.begin(), validation.candidates.end(),
                 [&](const auto& candidate) { return candidate.id == assignment.id.parent; });
-            if (extent != validation.candidates.end() && extent->requires_closed_loop)
-                ++context.layer.fiber_outer_contour_failures[fiber_rejection_reason_name(assignment.reason)];
+            if (extent != validation.candidates.end() && extent->requires_closed_loop) {
+                auto& failures = hole_candidates.count(assignment.id.parent) ?
+                    context.layer.fiber_hole_contour_failures : context.layer.fiber_outer_contour_failures;
+                ++failures[fiber_rejection_reason_name(assignment.reason)];
+            }
             if (context.layer.object()->print()->config().fiber_fill_debug.value && assignment.centerline) {
                 context.layer.fiber_fill_diagnostics.push_back({
                     assignment.centerline->polyline.to_polyline(),
@@ -2567,6 +2573,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     fiber_fill_diagnostics.clear();
     fiber_connection_plans.clear();
     fiber_outer_contour_failures.clear();
+    fiber_hole_contour_failures.clear();
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");

@@ -151,6 +151,7 @@
     "fiber_contour_boundary_clearance": "0.2",
     "fiber_contour_feed_ratio": "1",
     "fiber_contour_include_holes": "1",
+    "fiber_contour_allow_partial_holes": "1",
     "fiber_contour_infill_clearance": "0",
     "fiber_contour_max_speed": "10",
     "fiber_contour_min_speed": "10",

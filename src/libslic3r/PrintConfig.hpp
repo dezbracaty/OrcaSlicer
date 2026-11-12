@@ -1097,6 +1097,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                 generate_reinforced_perimeters))
     ((ConfigOptionInt,                  outer_reinforced_perimeters_counts))
     ((ConfigOptionBool,                 fiber_contour_include_holes))
+    ((ConfigOptionBool,                 fiber_contour_allow_partial_holes))
     ((ConfigOptionBool,                 fiber_connect_adjacent_rings))
     ((ConfigOptionFloat,                fiber_connection_tail_trim_widths))
     ((ConfigOptionFloat,                fiber_connection_head_trim_widths))

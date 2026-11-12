@@ -49,7 +49,8 @@ enum class FiberRejectionReason : uint8_t {
     OccupiedContourRegion,
     UnavailableContourRegion,
     OpenOuterContour,
-    BendStabilizationTooShort
+    BendStabilizationTooShort,
+    OpenHoleContour
 };
 
 const char* fiber_rejection_reason_name(FiberRejectionReason reason);
@@ -195,7 +196,7 @@ private:
         ExtrusionRole output_role, const FiberDomainId& domain_id, size_t job_ordinal,
         const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
         const ExPolygons* physical_centerline_domain, bool collect_debug,
-        bool requires_closed_loop = false, const std::vector<ContourArc>* source_arcs = nullptr,
+        bool outer_contour = false, const std::vector<ContourArc>* source_arcs = nullptr,
         double bend_stabilization_length_mm = 0.0,
         std::vector<FiberFragmentId>* policy_rejected = nullptr);
 };

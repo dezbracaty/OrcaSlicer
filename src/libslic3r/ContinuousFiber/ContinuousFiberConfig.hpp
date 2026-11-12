@@ -19,7 +19,7 @@ class LayerRegion;
 struct FiberPolicyBoundary;
 struct FiberGeometryContext;
 
-const std::array<std::string_view, 42>& fiber_mask_parameter_keys();
+const std::array<std::string_view, 43>& fiber_mask_parameter_keys();
 bool is_fiber_mask_parameter(std::string_view key);
 bool is_fiber_execution_parameter(std::string_view key);
 
@@ -30,6 +30,7 @@ struct ContinuousFiberConfig {
     double connection_head_trim_widths {1.0};
     bool contour_enabled { false };
     bool contour_include_holes { true };
+    bool contour_allow_partial_holes { false };
     bool infill_enabled { false };
     int layer_interval { 1 };
     int contour_count { 0 };
