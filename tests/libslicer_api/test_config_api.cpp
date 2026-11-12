@@ -29,6 +29,79 @@
 #include <string_view>
 #include <vector>
 
+TEST_CASE("Bracket bearing preserves complete hole contours through source extraction", "[libslicer_api][slice][SourceStationIdentity]")
+{
+    const int mode = GENERATE(0, 1, 2);
+    CAPTURE(mode);
+    std::ifstream fixture(std::string(LIBSLICER_TEST_DATA_DIR) + "/continuous_fiber/bracket_bearing/closed_hole.json");
+    REQUIRE(fixture.good());
+    nlohmann::json input; fixture >> input;
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    const auto& selected = input.at("selection");
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = selected.at("machine_model_id");
+    selection.machine_variant_id = selected.at("machine_variant_id");
+    selection.process_preset_id = selected.at("process_preset_id");
+    selection.filament_preset_ids = selected.at("filament_preset_ids").get<std::vector<std::string>>();
+    selection.filament_physical_tools = selected.at("filament_physical_tools").get<std::vector<unsigned>>();
+    auto configured = library->create_config(selection);
+    REQUIRE(configured.success); REQUIRE(configured.config);
+    auto settings = input.at("settings").get<std::map<std::string,std::string>>();
+    settings["fiber_contour_include_holes"] = mode == 0 ? "0" : "1";
+    settings["fiber_contour_allow_partial_holes"] = mode == 2 ? "1" : "0";
+    std::set<std::string> editable;
+    for (const auto& item : configured.config->settings()) if (!item.read_only) editable.insert(item.key);
+    std::vector<std::pair<std::string,std::string>> patch;
+    const auto initial = configured.config->snapshot();
+    for (const auto& [key,value] : settings) {
+        REQUIRE(initial.value(key));
+        if (editable.count(key)) patch.emplace_back(key,value);
+        else CHECK(initial.value(key) == value);
+    }
+    const auto applied = configured.config->apply_patch(patch);
+    std::ostringstream config_diagnostics;
+    for (const auto& diagnostic : applied.diagnostics) config_diagnostics << diagnostic.key << ": " << diagnostic.message << '\n';
+    INFO(config_diagnostics.str());
+    REQUIRE(applied.success);
+    libslicer::SliceRequest request;
+    request.config = configured.config->snapshot();
+    for (const auto& [key,value] : settings) CHECK(request.config.value(key) == value);
+    request.center_on_build_plate = false;
+    request.generate_preview = true;
+    request.generate_gcode_3mf = true;
+    libslicer::SliceObjectInput object;
+    const auto& source = input.at("object");
+    object.name = source.at("name");
+    object.transform = source.at("transform").get<std::array<double,16>>();
+    for (const auto& mesh : source.at("volumes")) {
+        libslicer::SliceVolumeInput volume;
+        volume.default_filament_slot = mesh.at("defaultFilamentSlot");
+        for (const auto& point : mesh.at("vertices"))
+            volume.vertices.push_back({point[0].get<float>(),point[1].get<float>(),point[2].get<float>()});
+        for (const auto& face : mesh.at("triangles"))
+            volume.triangles.push_back({face[0].get<std::uint32_t>(),face[1].get<std::uint32_t>(),face[2].get<std::uint32_t>()});
+        object.volumes.push_back(std::move(volume));
+    }
+    request.objects.push_back(std::move(object));
+    const auto result = library->slice(request);
+    std::ostringstream slice_diagnostics;
+    for (const auto& diagnostic : result.diagnostics) slice_diagnostics << diagnostic.code << ": " << diagnostic.message << '\n';
+    INFO(slice_diagnostics.str());
+    REQUIRE(result.success);
+    CHECK_FALSE(result.cancelled);
+    CHECK(result.summary.layer_count == 23);
+    REQUIRE(result.preview);
+    CHECK_FALSE(result.preview->segments.empty());
+    CHECK(std::filesystem::file_size(result.output.path) > 0);
+    CHECK(std::filesystem::file_size(result.gcode_3mf.path) > 0);
+    std::filesystem::remove(result.output.path);
+    std::filesystem::remove(result.gcode_3mf.path);
+}
+
 namespace {
 // Real-model validation must use the same explicit mesh placement as the App.
 // Compatibility file input does not apply SliceObjectInput::transform.
@@ -3452,6 +3525,7 @@ TEST_CASE("library rejects mismatched filament cardinality before slicing", "[li
 
 TEST_CASE("library slices a model with a preset-backed configuration", "[libslicer_api][slice]")
 {
+    const bool detailed_progress = GENERATE(false, true);
     libslicer::LibraryOptions options;
     options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
     options.vendors = {"Flashforge"};
@@ -3518,11 +3592,27 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     request.config = created.config->snapshot();
 
     float last_progress = 0.0f;
+    size_t legacy_calls = 0;
+    std::vector<float> progress_values;
+    std::vector<std::pair<size_t, size_t>> infill_counts;
     libslicer::SliceCallbacks callbacks;
-    callbacks.progress = [&last_progress](float progress, std::string_view) {
+    callbacks.progress = [&](float progress, std::string_view) {
+        ++legacy_calls;
+        progress_values.push_back(progress);
         CHECK(progress >= 0.0f);
         CHECK(progress <= 1.0f);
         last_progress = std::max(last_progress, progress);
+    };
+    if (detailed_progress) callbacks.progress_details = [&](const libslicer::SliceProgress& progress) {
+        progress_values.push_back(progress.progress);
+        CHECK(progress.progress >= 0.0f);
+        CHECK(progress.progress <= 1.0f);
+        last_progress = std::max(last_progress, progress.progress);
+        if (progress.total_layers) {
+            CHECK(progress.stage == "Generating infill toolpath");
+            CHECK(progress.completed_layers <= progress.total_layers);
+            infill_counts.emplace_back(progress.completed_layers, progress.total_layers);
+        }
     };
     const auto sliced = library->slice(request, callbacks);
     const std::string diagnostic = sliced.diagnostics.empty() ? std::string{} : sliced.diagnostics.front().message;
@@ -3579,6 +3669,15 @@ TEST_CASE("library slices a model with a preset-backed configuration", "[libslic
     CHECK_FALSE(sliced.preview->layers.empty());
     CHECK_FALSE(sliced.preview->colors.empty());
     CHECK(last_progress == 1.0f);
+    CHECK(std::is_sorted(progress_values.begin(), progress_values.end()));
+    if (detailed_progress) {
+        CHECK(legacy_calls == 0);
+        REQUIRE(infill_counts.size() >= 2);
+        CHECK(infill_counts.front().first == 0);
+        CHECK(infill_counts.back().first == infill_counts.back().second);
+        CHECK(infill_counts.back().second == sliced.summary.layer_count);
+        CHECK(std::is_sorted(infill_counts.begin(), infill_counts.end()));
+    } else CHECK(legacy_calls > 0);
 
     const auto count_extrusion_role = [](const libslicer::ToolpathPreview& preview,
                                          libslicer::ToolpathExtrusionRole role) {

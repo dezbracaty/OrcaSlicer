@@ -11,6 +11,7 @@
 #include <limits>
 #include <map>
 #include <iterator>
+#include <iomanip>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -222,13 +223,23 @@ bool project_onto_source(
     return true;
 }
 
+// Preserve the identity of known source boundaries across the scaled ledger.
+// Interior stations retain the existing conversion; do not snap or clamp them.
+double source_station_mm(double station_scaled, double source_length_mm)
+{
+    if (station_scaled == 0.0) return 0.0;
+    if (station_scaled == scale_(source_length_mm)) return source_length_mm;
+    return unscale<double>(station_scaled);
+}
+
 bool extract_subpath(const Polyline3& source,double begin_scaled,double end_scaled,Polyline3& output)
 {
     const double total=Geometry::length_with_arcs_mm(source);
-    const double begin=std::clamp(unscale<double>(begin_scaled),0.,total);
-    const double end=std::clamp(unscale<double>(end_scaled),0.,total);
+    const double begin=std::clamp(source_station_mm(begin_scaled,total),0.,total);
+    const double end=std::clamp(source_station_mm(end_scaled,total),0.,total);
     if(end<=begin) return false;
-    output=Geometry::slice_with_arcs_mm(source,begin,end);
+    // A complete interval already owns exact endpoints and analytic arc metadata.
+    output=begin==0.0 && end==total ? source : Geometry::slice_with_arcs_mm(source,begin,end);
     return output.points.size()>=2;
 }
 
@@ -705,7 +716,8 @@ FiberValidationResult FiberPathValidator::validate_impl(
         }
         if (whole_path_reason==FiberRejectionReason::None && outer_contour &&
             bend_stabilization_length_mm>0) {
-            const auto stable=minimum_closed_loop_stable_length_mm(unscale<double>(scale_(Geometry::length_with_arcs_mm(path.polyline))),reference_bends);
+            const double total=Geometry::length_with_arcs_mm(path.polyline);
+            const auto stable=minimum_closed_loop_stable_length_mm(total,reference_bends);
             if (stable) stability_detail="minimum_stable_path_mm="+std::to_string(*stable)+
                 "; required_mm="+std::to_string(bend_stabilization_length_mm);
             if (stable && *stable+interval_epsilon_mm<bend_stabilization_length_mm) {
@@ -715,7 +727,6 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 // The first bend then has the same stable entry as later bends.
                 // This changes the seam only; no point, radius or route is replanned.
                 const double seam=reference_bends.back().end_mm;
-                const double total=unscale<double>(scale_(Geometry::length_with_arcs_mm(path.polyline)));
                 const Point3 contact(reference_bends.back().exit_point,0);
                 const auto at=std::find(path.polyline.points.begin(),path.polyline.points.end()-1,contact);
                 if (at==path.polyline.points.end()-1)
@@ -766,7 +777,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
         // Measuring it with the analytic validator would throw before the
         // InvalidGeometry outcome can be returned to the caller.
         const double source_length_mm = whole_path_reason == FiberRejectionReason::InvalidGeometry ?
-            unscale<double>(path.polyline.length()) : unscale<double>(scale_(Geometry::length_with_arcs_mm(path.polyline)));
+            unscale<double>(path.polyline.length()) : Geometry::length_with_arcs_mm(path.polyline);
         if (whole_path_reason!=FiberRejectionReason::None)
             intervals={{0.0,scale_(source_length_mm),FiberAssignmentKind::Rejected,whole_path_reason}};
         else if (intervals.empty())
@@ -805,8 +816,8 @@ FiberValidationResult FiberPathValidator::validate_impl(
             }
             FiberFragmentAssignment assignment;
             assignment.id = {candidate_id, fragment_ordinal++};
-            assignment.source_begin_mm = unscale<double>(interval.begin_scaled);
-            assignment.source_end_mm = unscale<double>(interval.end_scaled);
+            assignment.source_begin_mm = source_station_mm(interval.begin_scaled, source_length_mm);
+            assignment.source_end_mm = source_station_mm(interval.end_scaled, source_length_mm);
             assignment.kind = interval.kind;
             assignment.reason = interval.reason;
             assignment.contour_issues = rounding_issues;
@@ -957,8 +968,66 @@ FiberValidationResult FiberPathValidator::validate_impl(
     result.outside_domain = union_ex(result.outside_domain);
     result.contour_to_infill_keepout = union_ex(result.contour_to_infill_keepout);
     const FiberAssignmentAudit audit = result.audit_assignments();
-    if (!audit.valid())
-        throw std::runtime_error("Continuous fiber candidate interval assignment audit failed");
+    if (!audit.valid()) {
+        std::ostringstream message;
+        message << std::setprecision(17)
+                << "Continuous fiber candidate interval assignment audit failed"
+                << "; object=" << domain_id.object_id << "; layer=" << domain_id.layer_id + 1
+                << "; group=" << domain_id.policy_group_id << "; component=" << domain_id.component_id
+                << "; job=" << job_ordinal << "; gap_mm=" << audit.gap_length_mm
+                << "; overlap_mm=" << audit.overlap_length_mm
+                << "; missing=" << audit.missing_candidate_count
+                << "; invalid=" << audit.invalid_assignment_count;
+        // Prefer visibly broken closed-loop outcomes, then include context.
+        // This selects diagnostics only; audit_assignments remains authoritative.
+        const auto requires_closed = [&](const FiberFragmentAssignment& assignment) {
+            const auto candidate = std::find_if(result.candidates.begin(), result.candidates.end(),
+                [&](const auto& item) { return item.id == assignment.id.parent; });
+            return candidate != result.candidates.end() && candidate->requires_closed_loop;
+        };
+        const auto depositing_end = [](const FiberFragmentAssignment& assignment) -> const Point3* {
+            if (assignment.prepared)
+                for (auto span = assignment.prepared->spans.rbegin(); span != assignment.prepared->spans.rend(); ++span)
+                    if (span->deposits_fiber()) return span->geometry.points.empty() ? nullptr : &span->geometry.points.back();
+            return nullptr;
+        };
+        std::vector<const FiberFragmentAssignment*> examples;
+        for (const auto& assignment : result.assignments) {
+            if (examples.size() == 3) break;
+            if (!requires_closed(assignment) || assignment.kind != FiberAssignmentKind::AcceptedFiber) continue;
+            const auto* end = depositing_end(assignment);
+            if (!assignment.centerline || !assignment.centerline->is_closed() ||
+                (!assignment.chain_only && (!end || assignment.prepared->entry.start != *end)))
+                examples.push_back(&assignment);
+        }
+        for (const auto& assignment : result.assignments) {
+            if (examples.size() == 3) break;
+            if (std::find(examples.begin(), examples.end(), &assignment) == examples.end())
+                examples.push_back(&assignment);
+        }
+        for (const auto* item : examples) {
+            const auto& assignment = *item;
+            message << "; candidate=" << assignment.id.parent.path_ordinal
+                    << ", fragment=" << assignment.id.fragment_ordinal
+                    << ", interval_mm=" << assignment.source_begin_mm << ':' << assignment.source_end_mm
+                    << ", kind=" << int(assignment.kind)
+                    << ", reason=" << fiber_rejection_reason_name(assignment.reason)
+                    << ", required_closed=" << requires_closed(assignment)
+                    << ", prepared=" << bool(assignment.prepared)
+                    << ", chain_only=" << assignment.chain_only;
+            if (assignment.centerline) {
+                const auto& points = assignment.centerline->polyline.points;
+                message << ", closed=" << assignment.centerline->is_closed();
+                if (!points.empty())
+                    message << ", endpoint_delta_mm=" << unscale<double>((points.back()-points.front()).cast<double>().norm());
+            }
+            const auto* end = depositing_end(assignment);
+            message << ", depositing_end_present=" << bool(end);
+            if (end)
+                message << ", depositing_delta_mm=" << unscale<double>((*end-assignment.prepared->entry.start).cast<double>().norm());
+        }
+        throw std::runtime_error(message.str());
+    }
     return result;
 }
 

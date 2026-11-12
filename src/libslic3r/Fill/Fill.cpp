@@ -2249,7 +2249,8 @@ struct FiberDomainExecutionResult {
 FiberDomainExecutionResult execute_continuous_fiber_domain(
     const FillExecutionContext& context,
     const FiberIslandDomainPlan& domain,
-    LayerFillTransaction& transaction)
+    LayerFillTransaction& transaction,
+    const std::function<void(const char*)>& progress)
 {
     const SurfaceFill& original_job = domain.candidate_job;
     const ContinuousFiberConfig& config = domain.config;
@@ -2285,6 +2286,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
                        "original_contour_domain_before_candidate_generation");
     if ((config.contour_enabled && config.contour_count > 0) || concentric) {
+        if (progress) progress("Planning fiber contours");
         const auto ring_config=concentric?fiber_ring_reference_config(config):config;
         const size_t display_depths=config.contour_enabled?size_t(config.contour_count):0;
         const double extra_spacing=concentric && config.infill_density<100?
@@ -2345,6 +2347,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
 
     FiberValidationResult infill_result;
     if (!concentric && config.infill_enabled && config.infill_density > 0.0) {
+        if (progress) progress("Generating fiber infill");
         SurfaceFill infill_job = original_job;
         // A safety expansion of the clip would introduce an unrequested gap
         // at nominal contact and remove one whole row from an exact-width core.
@@ -2565,7 +2568,8 @@ FillSurfaceView build_resin_surface_view(
 } // namespace
 
 // friend to Layer
-void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
+void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator,
+                       const std::function<void(const char*)>& progress)
 {
     solid_fill_audit = {};
     solid_fill_audit.enabled = this->object()->solid_fill_audit_enabled();
@@ -2614,7 +2618,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     std::map<FillDomainContributorId, ExPolygons> contributor_exclusions;
     for (const FiberIslandDomainPlan& domain : fiber_domains) {
         FiberDomainExecutionResult fiber_result = execute_continuous_fiber_domain(
-            execution_context, domain, transaction);
+            execution_context, domain, transaction, progress);
         if (fiber_result.accepted_exclusion.empty())
             continue;
         for (const FillDomainContributor* contributor : domain.contributors) {
@@ -2630,6 +2634,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         }
     }
 
+    if (progress) progress("Generating matrix infill");
     if (!fiber_domains.empty() || mask_layer_enabled) {
         // Residual-only contributors have no fiber domain coverage record.
         // Record their native source independently, including intentional void.

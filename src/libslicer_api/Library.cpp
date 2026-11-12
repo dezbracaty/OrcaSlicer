@@ -43,6 +43,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -1543,9 +1544,14 @@ bool cancellation_requested(const SliceCallbacks& callbacks)
     return callbacks.is_cancelled && callbacks.is_cancelled();
 }
 
-void report_progress(const SliceCallbacks& callbacks, float progress, std::string_view stage)
+void report_progress(const SliceCallbacks& callbacks, float progress, std::string_view stage,
+                     std::size_t completed_layers = 0, std::size_t total_layers = 0,
+                     std::string_view detail = {})
 {
-    if (callbacks.progress) {
+    if (callbacks.progress_details) {
+        callbacks.progress_details({std::clamp(progress, 0.0f, 1.0f), stage,
+                                    completed_layers, total_layers, detail});
+    } else if (callbacks.progress) {
         callbacks.progress(std::max(0.0f, std::min(progress, 1.0f)), stage);
     }
 }
@@ -4639,10 +4645,22 @@ SliceResult Library::slice_calibration(const CalibrationTask& task,
 }
 
 SliceResult Library::slice_impl(const SliceRequest& request,
-                                const SliceCallbacks& callbacks,
+                                const SliceCallbacks& caller_callbacks,
                                 const CalibrationTask* calibration,
                                 std::size_t plate_index) const
 {
+    // Native percentages are stage markers and may repeat for each object or
+    // during export. Keep one monotonic, serialized observer for this request,
+    // without reordering native work or estimating elapsed/remaining time.
+    std::mutex progress_mutex;
+    float progress_high_water = 0.0f;
+    SliceCallbacks callbacks = caller_callbacks;
+    callbacks.progress_details = [&](const SliceProgress& progress) {
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        progress_high_water = std::max(progress_high_water, progress.progress);
+        report_progress(caller_callbacks, progress_high_water, progress.stage,
+                        progress.completed_layers, progress.total_layers, progress.detail);
+    };
     SliceResult result;
     std::vector<std::string> generated_temporary_paths;
     const auto discard_generated_temporary = [&generated_temporary_paths]() {
@@ -4908,8 +4926,11 @@ SliceResult Library::slice_impl(const SliceRequest& request,
             if (cancellation_requested(callbacks)) {
                 print.cancel();
             }
+            // Preserve native status/warning delivery. The per-request relay
+            // holds the current percentage for notifications without a value.
             const float engine_progress = status.percent < 0 ? 0.0f : static_cast<float>(status.percent) / 100.0f;
-            report_progress(callbacks, 0.08f + engine_progress * 0.78f, status.text);
+            report_progress(callbacks, 0.08f + engine_progress * 0.78f, status.text,
+                            status.completed_layers, status.total_layers, status.detail);
         });
         print.apply(plate_model, config);
         // The first native apply normalizes the tower before building regions.
@@ -5872,8 +5893,9 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
                         // Bytes and detached previews outlive the reader's
                         // temporary backup folder.
                         auto preview_callbacks=callbacks;
-                        preview_callbacks.progress=[&](float progress,std::string_view message) {
-                            report_progress(callbacks,.8f+.15f*progress,message);
+                        preview_callbacks.progress_details=[&](const SliceProgress& progress) {
+                            report_progress(callbacks,.8f+.15f*progress.progress,progress.stage,
+                                progress.completed_layers,progress.total_layers,progress.detail);
                         };
                         const auto parsed=load_gcode_preview({path},preview_callbacks);
                         check_cancel();

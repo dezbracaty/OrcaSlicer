@@ -6389,6 +6389,104 @@ TEST_CASE("analytic slices preserve tiny junctions and closed circles", "[Contin
     CHECK(Geometry::length_with_arcs_mm(after)==Catch::Approx(20*PI-23).margin(.000003));
 }
 
+TEST_CASE("whole contour extraction preserves source stations and tiny terminal arcs", "[ContinuousFiber][NativeArc][SourceStationIdentity]")
+{
+    const bool clockwise=GENERATE(false,true);
+    const bool negative_coordinates=GENERATE(false,true);
+    CAPTURE(clockwise,negative_coordinates);
+    const coord_t dx=negative_coordinates ? -200000000 : 0;
+    const coord_t dy=negative_coordinates ? -100000000 : 0;
+    const coord_t sign=clockwise ? -1 : 1;
+    ExtrusionPath source(erContinuousFiberContour,.1,.8f,.2f);
+    source.polyline.points={Point3(dx+130111581,dy+sign*100,int64_t(0)),Point3(dx,dy+sign*69923468,int64_t(0)),
+        Point3(dx,dy,int64_t(0)),Point3(dx+130111480,dy,int64_t(0)),Point3(dx+130111581,dy+sign*100,int64_t(0))};
+    const auto direction=clockwise ? ArcDirection::Arc_Dir_CW : ArcDirection::Arc_Dir_CCW;
+    const auto type=clockwise ? EMovePathType::Arc_move_cw : EMovePathType::Arc_move_ccw;
+    // The one-grid radial difference is a valid quantized arc endpoint. A
+    // near-end re-projection must not replace this known source endpoint.
+    source.polyline.fitting_result={{0,3,EMovePathType::Linear_move,{}},
+        {3,4,type,ArcSegment(Point(dx+130111480,dy+sign*100),100,
+            source.polyline.points[3].to_point(),source.polyline.points[4].to_point(),direction)}};
+    REQUIRE_NOTHROW(Geometry::validate_with_arcs(source.polyline));
+    REQUIRE(source.is_closed());
+    const double length=Geometry::length_with_arcs_mm(source.polyline);
+    REQUIRE(unscale<double>(scale_(length))<length);
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(.8f,.2f,.4f);
+    config.contour_bend_radius_mm=0;
+    config.cut_to_contact_length_mm=23;
+    config.landing_length_mm=0;
+    config.z_hop_height_mm=2;
+    config.minimum_effective_length_mm=.5;
+    config.finish_extension_length_mm=23;
+    config.finish_overlap_length_mm=23;
+    const auto result=FiberPathValidator::validate({&source},{rectangle(-250,-200,170,120)},
+        config,FiberPathPurpose::Contour,erContinuousFiberContour,{1,12,0,0});
+    INFO(rejection_details(result));
+    REQUIRE(result.accepted_count()==1);
+    REQUIRE(result.assignments.size()==1);
+    REQUIRE(result.candidates.size()==1);
+    const auto& assignment=result.assignments.front();
+    REQUIRE(assignment.centerline);
+    CHECK(assignment.centerline->polyline.points==source.polyline.points);
+    REQUIRE(assignment.centerline->polyline.fitting_result.size()==source.polyline.fitting_result.size());
+    CHECK(assignment.centerline->polyline.fitting_result.front().start_point_index==0);
+    CHECK(assignment.centerline->polyline.fitting_result.front().end_point_index==3);
+    CHECK(assignment.centerline->polyline.fitting_result.front().path_type==EMovePathType::Linear_move);
+    const auto& actual=assignment.centerline->polyline.fitting_result.back();
+    const auto& expected=source.polyline.fitting_result.back();
+    CHECK(actual.start_point_index==expected.start_point_index);
+    CHECK(actual.end_point_index==expected.end_point_index);
+    CHECK(actual.path_type==expected.path_type);
+    CHECK(actual.arc_data.is_arc==expected.arc_data.is_arc);
+    CHECK(actual.arc_data.center==expected.arc_data.center);
+    CHECK(actual.arc_data.radius==expected.arc_data.radius);
+    CHECK(actual.arc_data.start_point==expected.arc_data.start_point);
+    CHECK(actual.arc_data.end_point==expected.arc_data.end_point);
+    CHECK(actual.arc_data.direction==expected.arc_data.direction);
+    CHECK(actual.arc_data.length==expected.arc_data.length);
+    CHECK(actual.arc_data.angle_radians==expected.arc_data.angle_radians);
+    CHECK(actual.arc_data.polar_start_theta==expected.arc_data.polar_start_theta);
+    CHECK(actual.arc_data.polar_end_theta==expected.arc_data.polar_end_theta);
+    CHECK(assignment.source_begin_mm==0);
+    CHECK(assignment.source_end_mm==length);
+    CHECK(result.candidates.front().length_mm==length);
+    REQUIRE(assignment.prepared);
+    CHECK(assignment.prepared->finish_strategy==FiberFinishStrategy::LoopOverlap);
+    const FiberMotionSpan* last=nullptr;
+    for(const auto& span:assignment.prepared->spans)if(span.deposits_fiber())last=&span;
+    REQUIRE(last);
+    CHECK(assignment.prepared->entry.start==last->geometry.points.back());
+
+    // Nearby interior/open geometry must not be snapped into a closed loop.
+    auto open=source;
+    open.polyline.points.back().x()+=1;
+    open.polyline.fitting_result.back().arc_data=ArcSegment(expected.arc_data.center,100,
+        open.polyline.points[3].to_point(),open.polyline.points[4].to_point(),direction);
+    const auto open_result=FiberPathValidator::validate({&open},{rectangle(-250,-200,170,120)},
+        config,FiberPathPurpose::Contour,erContinuousFiberContour,{1,12,0,0});
+    REQUIRE(open_result.accepted_count()==1);
+    REQUIRE(open_result.assignments.front().centerline);
+    CHECK(open_result.assignments.front().centerline->polyline.points==open.polyline.points);
+    CHECK_FALSE(open_result.assignments.front().centerline->is_closed());
+    REQUIRE(open_result.assignments.front().prepared);
+    CHECK(open_result.assignments.front().prepared->finish_strategy==FiberFinishStrategy::TangentExtension);
+
+    // Closure guards remain effective on both source geometry and deposition.
+    auto guarded=result;
+    guarded.candidates.front().requires_closed_loop=true;
+    REQUIRE(guarded.audit_assignments().valid());
+    auto corrupt_source=guarded;
+    corrupt_source.assignments.front().centerline=open;
+    CHECK(corrupt_source.audit_assignments().invalid_assignment_count>0);
+    auto corrupt_deposition=guarded;
+    corrupt_deposition.assignments.front().prepared=open_result.assignments.front().prepared;
+    CHECK(corrupt_deposition.audit_assignments().invalid_assignment_count>0);
+    ExtrusionEntitiesPtr published;
+    CHECK_THROWS(corrupt_deposition.release_to(published));
+    CHECK(published.empty());
+}
+
 TEST_CASE("preview shares literal E precision across fiber boundaries", "[ContinuousFiber][OrcaCorrections][preview]")
 {
     for (bool relative:{false,true}) for (bool streaming:{false,true}) {
@@ -8169,6 +8267,29 @@ TEST_CASE("hole allocation and connected descendants match the original whole-do
         }
         return digest(out);
     };
+    // Compare analytic source geometry, independently of redundant support
+    // points inside an arc. Keep every execution/coverage hash unchanged.
+    const auto source_points=[&](const Polyline3& source) {
+        REQUIRE_NOTHROW(Geometry::validate_with_arcs(source));
+        const double length=Geometry::length_with_arcs_mm(source);
+        const auto canonical=Geometry::slice_with_arcs_mm(source,0,length);
+        REQUIRE_NOTHROW(Geometry::validate_with_arcs(canonical));
+        CHECK(Geometry::length_with_arcs_mm(canonical)==length);
+        const double chord=ContourRoundingOptions{}.chord_tolerance_mm;
+        CHECK(Geometry::sample_with_arcs(source,chord).points==Geometry::sample_with_arcs(canonical,chord).points);
+        std::vector<ArcSegment> original_arcs,canonical_arcs;
+        for(const auto& fit:source.fitting_result)
+            if(fit.path_type!=EMovePathType::Linear_move)original_arcs.push_back(fit.arc_data);
+        for(const auto& fit:canonical.fitting_result)
+            if(fit.path_type!=EMovePathType::Linear_move)canonical_arcs.push_back(fit.arc_data);
+        REQUIRE(original_arcs.size()==canonical_arcs.size());
+        for(size_t i=0;i<original_arcs.size();++i) {
+            CHECK(original_arcs[i].center==canonical_arcs[i].center);
+            CHECK(original_arcs[i].radius==canonical_arcs[i].radius);
+            CHECK(original_arcs[i].direction==canonical_arcs[i].direction);
+        }
+        return points(canonical);
+    };
     const auto polygons=[&](const ExPolygons& regions) {
         Json out=Json::array();
         for(const auto& region:regions) {
@@ -8201,7 +8322,7 @@ TEST_CASE("hole allocation and connected descendants match the original whole-do
                 arc.sweep_radians,arc.begin_mm,arc.end_distance_mm});
             out["assignments"].push_back({{"id",{a.id.parent.job_ordinal,a.id.fragment_ordinal}},
                 {"kind",int(a.kind)},{"reason",int(a.reason)}, {"begin",a.source_begin_mm},{"end",a.source_end_mm},
-                {"chain_only",a.chain_only},{"source",a.centerline?points(a.centerline->polyline):Json(nullptr)},
+                {"chain_only",a.chain_only},{"source",a.centerline?source_points(a.centerline->polyline):Json(nullptr)},
                 {"arcs",arcs},{"prepared",prepared(a.prepared)}});
         }
         for(const auto& chain:plan.validation.chain_executions) {
@@ -8288,7 +8409,9 @@ TEST_CASE("hole allocation and connected descendants match the original whole-do
     };
     for(size_t i=0;i<actual.size();++i) {
         CAPTURE(i);const bool matches=equal(actual[i],expected.at(i),std::to_string(i),false);
-        INFO(mismatch);CHECK(matches);
+        INFO(mismatch);
+        INFO("snapshot delta: " << Json::diff(expected.at(i),actual.at(i)).dump());
+        CHECK(matches);
     }
 }
 
@@ -8817,4 +8940,66 @@ TEST_CASE("partial hole policy changes invalidate cached fiber fills", "[Continu
     CHECK(sliced->is_step_done(posInfill));
     const auto after=print.fiber_execution_plans(); REQUIRE(after);
     CHECK(after!=before);
+}
+
+TEST_CASE("infill progress counts completed work per object and skips cached fills", "[ContinuousFiber][InfillProgress]")
+{
+    const bool contours=GENERATE(false,true);
+    auto config=masked_print_config();
+    config.set_deserialize_strict("generate_reinforced_perimeters",contours?"1":"0");
+    config.set_deserialize_strict("reinforced_perimeters_filament","2");
+    config.set_deserialize_strict("outer_reinforced_perimeters_counts","1");
+    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    Model model;
+    for (const double height : {1.,2.}) {
+        auto* object=model.add_object();
+        object->add_volume(make_cube(20,20,height));
+        object->add_instance()->set_offset(Vec3d(60+height*30,60,0));
+        object->config.set_key_value("extruder",new ConfigOptionInt(1));
+    }
+    Print print; print.set_plate_origin(Vec3d::Zero());
+    print.apply(model,config);
+    std::vector<std::pair<size_t,size_t>> counts;
+    std::set<std::string> details;
+    print.set_status_callback([&](const PrintBase::SlicingStatus& status) {
+        if (!status.total_layers) return;
+        counts.emplace_back(status.completed_layers,status.total_layers);
+        if (!status.detail.empty()) details.insert(status.detail);
+    });
+    print.process();
+    REQUIRE(print.objects().size()==2);
+    REQUIRE(counts.size()>=4);
+    size_t completed_objects=0, previous=0;
+    for(const auto& count:counts) {
+        REQUIRE(completed_objects<print.objects().size());
+        CHECK(count.second==print.objects()[completed_objects]->layer_count());
+        CHECK(count.first>=previous);
+        CHECK(count.first<=count.second);
+        previous=count.first;
+        if(count.first==count.second) { ++completed_objects; previous=0; }
+    }
+    CHECK(completed_objects==2);
+    CHECK(details.count("Planning fiber contours")==size_t(contours));
+    CHECK(details.count("Generating fiber infill")==1);
+    counts.clear();
+    print.process();
+    CHECK(counts.empty());
+
+    // Cancellation from a progress observer must not certify unfinished layers
+    // or leave posInfill marked done. A subsequent apply/process can retry.
+    config.set_deserialize_strict("fiber_contour_allow_partial_holes","1");
+    print.apply(model,config);
+    print.set_status_callback([&](const PrintBase::SlicingStatus& status) {
+        if(status.total_layers && !status.detail.empty()) print.cancel();
+    });
+    CHECK_THROWS_AS(print.process(),CanceledException);
+    CHECK_FALSE(print.objects().front()->is_step_done(posInfill));
+    print.restart();
+    print.set_status_callback([&](const PrintBase::SlicingStatus& status) {
+        if(status.total_layers) counts.emplace_back(status.completed_layers,status.total_layers);
+    });
+    print.process();
+    REQUIRE_FALSE(counts.empty());
+    CHECK(counts.front().first==0);
+    CHECK(counts.back().first==counts.back().second);
 }

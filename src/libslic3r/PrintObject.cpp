@@ -27,10 +27,12 @@
 #include "AABBTreeLines.hpp"
 
 #include <cstddef>
+#include <chrono>
 #include <float.h>
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <oneapi/tbb/blocked_range.h>
@@ -741,7 +743,33 @@ void PrintObject::infill(std::shared_ptr<FiberEarlyExecutionBatch> early)
 
     if (this->set_started(posInfill)) {
         if (early && !m_print->prepare_fiber_early_slots(*early,m_layers.size())) early.reset();
-        m_print->set_status(35, L("Generating infill toolpath"));
+        // Progress observes the existing parallel work; it never changes task
+        // order or geometry. Counts belong to this object and restart for the
+        // next object. Serialize callbacks and throttle repeat notifications;
+        // each newly observed substage and final completion are always sent.
+        std::mutex progress_mutex;
+        size_t completed_layers = 0;
+        std::set<std::string_view> reported_details;
+        auto last_report = std::chrono::steady_clock::time_point::min();
+        const auto report = [&](bool completed, const char* detail) {
+            m_print->throw_if_canceled();
+            std::lock_guard<std::mutex> lock(progress_mutex);
+            if (completed) ++completed_layers;
+            const auto now = std::chrono::steady_clock::now();
+            const bool new_detail = *detail && reported_details.insert(detail).second;
+            if (last_report != std::chrono::steady_clock::time_point::min() &&
+                completed_layers != m_layers.size() && !new_detail &&
+                now-last_report < std::chrono::milliseconds(200))
+                return;
+            last_report = now;
+            PrintBase::SlicingStatus status(35 + (m_layers.empty() ? 0 : int(4*completed_layers/m_layers.size())),
+                                           L("Generating infill toolpath"));
+            status.completed_layers = completed_layers;
+            status.total_layers = m_layers.size();
+            status.detail = detail;
+            m_print->set_status(status);
+        };
+        report(false, "");
         const auto& adaptive_fill_octree = this->m_adaptive_fill_octrees.first;
         const auto& support_fill_octree = this->m_adaptive_fill_octrees.second;
 
@@ -765,12 +793,17 @@ void PrintObject::infill(std::shared_ptr<FiberEarlyExecutionBatch> early)
         }
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this, early, &layer_work, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
+            [this, early, &report, &layer_work, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
                 for (size_t work_idx = range.begin(); work_idx < range.end(); ++ work_idx) {
                     const size_t layer_idx=layer_work.empty()?work_idx:layer_work[work_idx].second;
                     m_print->throw_if_canceled();
-                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get());
-                    if (early) m_print->compile_fiber_early_layer(*early,*m_layers[layer_idx],layer_idx);
+                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get(),
+                        [&report](const char* detail) { report(false, detail); });
+                    if (early) {
+                        report(false, "Compiling fiber toolpath");
+                        m_print->compile_fiber_early_layer(*early,*m_layers[layer_idx],layer_idx);
+                    }
+                    report(true, "");
                 }
             }
         );

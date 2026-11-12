@@ -404,10 +404,24 @@ struct SliceDiagnostic
     std::string option_key;
 };
 
+// Views are valid only for the synchronous callback invocation. Layer counts
+// describe the current object's infill work, not a time estimate or all objects.
+struct SliceProgress
+{
+    float progress{0.0f};
+    std::string_view stage;
+    std::size_t completed_layers{0};
+    std::size_t total_layers{0};
+    std::string_view detail;
+};
+
 struct SliceCallbacks
 {
     std::function<void(float progress, std::string_view stage)> progress;
     std::function<bool()> is_cancelled;
+    // Optional richer notification; when set it replaces the legacy progress
+    // callback. Source strings remain untranslated for the consumer's locale.
+    std::function<void(const SliceProgress&)> progress_details;
 };
 
 struct SliceResult
