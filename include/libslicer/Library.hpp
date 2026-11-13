@@ -744,6 +744,7 @@ public:
 
     const std::string& resource_directory() const noexcept;
     const std::vector<MachineModelOption>& machine_models() const noexcept;
+    std::vector<MachineModelOption> project_machine_models() const;
     const std::vector<BuildPlateOption>& build_plate_options() const noexcept;
     std::vector<PresetOption> printer_presets(std::string_view model, std::string_view variant) const;
     ConfigCreateResult create_config(const ConfigSelection& selection) const;
