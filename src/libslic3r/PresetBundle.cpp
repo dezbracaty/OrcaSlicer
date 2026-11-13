@@ -4692,6 +4692,10 @@ std::pair<PresetsConfigSubstitutions, size_t> PresetBundle::load_vendor_configs_
         machine_subfiles.clear();
         process_subfiles.clear();
     }
+    if (flags.has(LoadConfigBundleAttribute::LoadPrinterOnly)) {
+        process_subfiles.clear();
+        filament_subfiles.clear();
+    }
 
     //2) paste the machine model
     for (auto& machine_model : machine_model_subfiles)

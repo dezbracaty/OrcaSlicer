@@ -104,6 +104,12 @@ struct LibraryOptions
     std::string user_preset_directory;
 };
 
+// OnDemand retains the complete system/user printer catalog, but loads a
+// vendor's process and filament presets only when a configuration needs them.
+// Like the existing Library API, operations on one instance are serialized by
+// its caller. The original open overload retains eager loading and diagnostics.
+enum class PresetLoadingMode { Eager, OnDemand };
+
 struct ConfigCreateResult
 {
     bool success{false};
@@ -735,6 +741,9 @@ class LIBSLICER_API Library final
 public:
     static std::unique_ptr<Library> open(const LibraryOptions& options = {},
                                          std::vector<ConfigDiagnostic>* diagnostics = nullptr);
+    static std::unique_ptr<Library> open(const LibraryOptions& options,
+                                       PresetLoadingMode mode,
+                                       std::vector<ConfigDiagnostic>* diagnostics = nullptr);
 
     Library(const Library&) = delete;
     Library(Library&&) noexcept;

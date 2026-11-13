@@ -2468,12 +2468,17 @@ class Library::Impl
 {
 public:
     std::string resource_directory;
-    std::vector<std::unique_ptr<Slic3r::PresetBundle>> vendor_presets;
+    mutable std::vector<std::unique_ptr<Slic3r::PresetBundle>> vendor_presets;
+    mutable std::vector<bool> complete_vendors;
+    mutable std::unique_ptr<Slic3r::PresetBundle> filament_library;
     fs::path user_preset_directory;
     void load_user_presets(Slic3r::PresetBundle&, std::string_view vendor,
-                           std::vector<ConfigDiagnostic>* diagnostics) const;
+                           std::vector<ConfigDiagnostic>* diagnostics,
+                           bool printers_only = false) const;
     std::string vendor_for(std::string_view model, std::string_view variant) const;
     Slic3r::PresetBundle* installed_presets(const std::string& model, const std::string& variant) const;
+    Slic3r::PresetBundle* complete_vendor(std::size_t index) const;
+    Slic3r::PresetBundle* complete_presets(const std::string& model, const std::string& variant) const;
     std::vector<MachineModelOption> machines;
     std::vector<BuildPlateOption> build_plates;
     std::shared_ptr<ConfigurationState::Impl> active = std::make_shared<ConfigurationState::Impl>();
@@ -3127,8 +3132,28 @@ Library::~Library() = default;
 std::unique_ptr<Library> Library::open(const LibraryOptions& options,
                                        std::vector<ConfigDiagnostic>* diagnostics)
 {
+    return open(options, PresetLoadingMode::Eager, diagnostics);
+}
+
+std::unique_ptr<Library> Library::open(const LibraryOptions& options, PresetLoadingMode mode,
+                                       std::vector<ConfigDiagnostic>* diagnostics)
+{
+    const char* profile_environment = std::getenv("GP_STARTUP_PROFILE");
+    const bool profile_startup = profile_environment != nullptr && std::string_view(profile_environment) == "1";
+    const auto profile_start = std::chrono::steady_clock::now();
+    auto profile_previous = profile_start;
+    const auto profile_phase = [&](const char* phase, const char* detail = "none") {
+        if (!profile_startup) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(now - profile_previous).count();
+        const auto total = std::chrono::duration_cast<std::chrono::microseconds>(now - profile_start).count();
+        std::fprintf(stderr, "[STARTUP DETAIL] function=Library::open phase=%s detail=%s durationUs=%lld totalUs=%lld\n",
+                     phase, detail, static_cast<long long>(duration), static_cast<long long>(total));
+        profile_previous = std::chrono::steady_clock::now();
+    };
     try {
         auto library = std::unique_ptr<Library>(new Library());
+        profile_phase("construct-library");
         library->impl_->resource_directory = locate_resource_directory(options.resource_directory);
         Slic3r::set_resources_dir(library->impl_->resource_directory);
         const fs::path data_directory = fs::temp_directory_path() / "libslicer";
@@ -3139,6 +3164,7 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
         const fs::path working_directory = data_directory / "work";
         fs::create_directories(working_directory);
         Slic3r::set_temporary_dir(working_directory.string());
+        profile_phase("locate-resources-and-directories");
 
         const fs::path profiles_directory = fs::path(library->impl_->resource_directory) / "profiles";
         std::vector<std::string> vendors = options.vendors.empty() ?
@@ -3147,22 +3173,33 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
         if (vendors.empty()) {
             throw std::runtime_error("libslicer contains no vendor preset bundles");
         }
+        profile_phase("discover-vendors");
 
         constexpr const char* filament_library = "OrcaFilamentLibrary";
         const bool has_filament_library = fs::is_regular_file(profiles_directory / "OrcaFilamentLibrary.json");
-        Slic3r::PresetBundle filament_presets;
+        std::unique_ptr<Slic3r::PresetBundle> filament_presets;
         if (has_filament_library) {
             vendors.erase(std::remove(vendors.begin(), vendors.end(), filament_library), vendors.end());
-            filament_presets.load_vendor_configs_from_json(
+        }
+        if (has_filament_library && mode == PresetLoadingMode::Eager) {
+            filament_presets = std::make_unique<Slic3r::PresetBundle>();
+            profile_phase("construct-filament-bundle");
+            filament_presets->load_vendor_configs_from_json(
                 profiles_directory.string(), filament_library, Slic3r::PresetBundle::LoadSystem,
                 Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
         }
+        if (mode == PresetLoadingMode::Eager) profile_phase("load-vendor-json", filament_library);
         for (const std::string& vendor : vendors) {
             auto presets = std::make_unique<Slic3r::PresetBundle>();
+            profile_phase("construct-vendor-bundle", vendor.c_str());
             presets->load_vendor_configs_from_json(
-                profiles_directory.string(), vendor, Slic3r::PresetBundle::LoadSystem,
+                profiles_directory.string(), vendor,
+                mode == PresetLoadingMode::OnDemand
+                    ? Slic3r::PresetBundle::LoadSystem | Slic3r::PresetBundle::LoadPrinterOnly
+                    : Slic3r::PresetBundle::LoadSystem,
                 Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent,
-                has_filament_library ? &filament_presets : nullptr);
+                filament_presets.get());
+            profile_phase(mode == PresetLoadingMode::OnDemand ? "load-printer-json" : "load-vendor-json", vendor.c_str());
 
             for (const auto& [vendor_id, vendor_profile] : presets->vendors) {
                 for (const auto& model : vendor_profile.models) {
@@ -3228,8 +3265,12 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
                     }
                 }
             }
-            library->impl_->load_user_presets(*presets, vendor, diagnostics);
+            profile_phase("build-machine-catalog", vendor.c_str());
+            library->impl_->load_user_presets(*presets, vendor, diagnostics,
+                                               mode == PresetLoadingMode::OnDemand);
             library->impl_->vendor_presets.push_back(std::move(presets));
+            library->impl_->complete_vendors.push_back(mode == PresetLoadingMode::Eager);
+            profile_phase("load-user-presets", vendor.c_str());
         }
         std::sort(library->impl_->machines.begin(), library->impl_->machines.end(),
                   [](const MachineModelOption& left, const MachineModelOption& right) {
@@ -3238,8 +3279,10 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
         if (library->impl_->machines.empty()) {
             throw std::runtime_error("libslicer loaded no FFF machine variants");
         }
+        profile_phase("sort-machine-catalog");
 
         const auto settings = Config::defaults().settings();
+        profile_phase("default-config-settings-schema");
         const auto plate_setting = std::find_if(settings.begin(), settings.end(), [](const SettingItem& item) {
             return item.key == "curr_bed_type";
         });
@@ -3252,6 +3295,7 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
                 });
             }
         }
+        profile_phase("build-plate-options");
         return library;
     } catch (const std::exception& error) {
         append_diagnostic(diagnostics, "resources", error.what());
@@ -3306,7 +3350,7 @@ ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selectio
             selection.process_preset_id.empty() && selection.filament_preset_ids.empty() &&
             requested_printer(active->bundle->printers, selection);
         const auto* source_presets = editing_project || keep_compatible ? active->bundle.get()
-            : installed_presets(selection.machine_model_id, selection.machine_variant_id);
+            : complete_presets(selection.machine_model_id, selection.machine_variant_id);
         if (source_presets == nullptr) {
             result.diagnostics.push_back({"machine", "Unknown machine model or nozzle variant"});
             return result;
@@ -3560,7 +3604,7 @@ ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selectio
 }
 
 void Library::Impl::load_user_presets(Slic3r::PresetBundle& bundle, std::string_view vendor,
-                                      std::vector<ConfigDiagnostic>* diagnostics) const
+                                      std::vector<ConfigDiagnostic>* diagnostics, bool printers_only) const
 {
     if (user_preset_directory.empty() || vendor.empty()) return;
     const auto directory = user_preset_directory / std::string(vendor);
@@ -3568,6 +3612,7 @@ void Library::Impl::load_user_presets(Slic3r::PresetBundle& bundle, std::string_
     for (const auto& [collection, section] : {
         std::pair<Slic3r::PresetCollection*, const char*>{&bundle.printers, PRESET_PRINTER_NAME},
         {&bundle.prints, PRESET_PRINT_NAME}, {&bundle.filaments, PRESET_FILAMENT_NAME}}) {
+        if (printers_only && collection != &bundle.printers) continue;
         try {
             if (fs::is_directory(directory / section))
                 collection->load_presets(directory.string(), section, substitutions,
@@ -3593,6 +3638,48 @@ Slic3r::PresetBundle* Library::Impl::installed_presets(const std::string& model,
     for (const auto& bundle : vendor_presets)
         if (bundle->printers.find_system_preset_by_model_and_variant(model, variant))
             return bundle.get();
+    return nullptr;
+}
+
+Slic3r::PresetBundle* Library::Impl::complete_vendor(std::size_t index) const
+{
+    if (complete_vendors.at(index)) return vendor_presets.at(index).get();
+    const auto started = std::chrono::steady_clock::now();
+    const auto profiles = fs::path(resource_directory) / "profiles";
+    if (!filament_library && fs::is_regular_file(profiles / "OrcaFilamentLibrary.json")) {
+        auto candidate = std::make_unique<Slic3r::PresetBundle>();
+        candidate->load_vendor_configs_from_json(profiles.string(), "OrcaFilamentLibrary",
+            Slic3r::PresetBundle::LoadSystem, Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
+        filament_library = std::move(candidate);
+    }
+    const auto vendor = vendor_presets.at(index)->vendors.begin()->first;
+    auto candidate = std::make_unique<Slic3r::PresetBundle>();
+    candidate->load_vendor_configs_from_json(profiles.string(), vendor,
+        Slic3r::PresetBundle::LoadSystem, Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent,
+        filament_library.get());
+    std::vector<ConfigDiagnostic> warnings;
+    load_user_presets(*candidate, vendor, &warnings);
+    for (const auto& warning : warnings)
+        BOOST_LOG_TRIVIAL(warning) << "libslicer " << warning.key << ": " << warning.message;
+    // No active configuration borrows a partial bundle: every seed consumer
+    // completes it before taking its private copy. Publish only a full candidate.
+    vendor_presets[index] = std::move(candidate);
+    complete_vendors[index] = true;
+    if (const char* profile = std::getenv("GP_STARTUP_PROFILE"); profile && std::string_view(profile) == "1") {
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        std::fprintf(stderr, "[STARTUP DETAIL] function=Library::complete_vendor phase=load-full-vendor detail=%s durationUs=%lld totalUs=%lld\n",
+                     vendor.c_str(), static_cast<long long>(us), static_cast<long long>(us));
+    }
+    return vendor_presets[index].get();
+}
+
+Slic3r::PresetBundle* Library::Impl::complete_presets(const std::string& model, const std::string& variant) const
+{
+    const auto* installed = installed_presets(model, variant);
+    if (!installed) return nullptr;
+    for (std::size_t index = 0; index < vendor_presets.size(); ++index)
+        if (vendor_presets[index].get() == installed) return complete_vendor(index);
     return nullptr;
 }
 
@@ -3737,7 +3824,13 @@ PrinterSwitchReview Library::review_printer_switch(const ConfigSelection& select
 {
     PrinterSwitchReview result;
     result.revision = impl_->active_revision;
-    const auto* catalog = impl_->installed_presets(selection.machine_model_id, selection.machine_variant_id);
+    const Slic3r::PresetBundle* catalog = nullptr;
+    try {
+        catalog = impl_->complete_presets(selection.machine_model_id, selection.machine_variant_id);
+    } catch (const std::exception& error) {
+        result.diagnostics.push_back({"printer_switch", error.what()});
+        return result;
+    }
     if (!catalog) {
         result.diagnostics.push_back({"machine", "Unknown machine model or nozzle variant"});
         return result;
@@ -3838,7 +3931,7 @@ PrinterSwitchSaveResult Library::save_printer_switch_preset(
         std::ifstream written(fs::u8path(saved.file));
         if (ProjectJson::parse(written, nullptr, false).is_discarded())
             throw std::runtime_error("Could not save user preset: " + name);
-        auto* catalog = impl_->installed_presets(selection.machine_model_id, selection.machine_variant_id);
+        auto* catalog = impl_->complete_presets(selection.machine_model_id, selection.machine_variant_id);
         auto& catalog_collection = switch_collection(*catalog, type);
         auto& installed = catalog_collection.load_preset(saved.file, saved.name, saved.config, false, saved.version);
         installed = saved;
@@ -4550,11 +4643,15 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
         }
         const Slic3r::PresetBundle* seed = nullptr;
         const auto model                 = config.opt_string("printer_model");
-        for (const auto& candidate : impl_->vendor_presets)
-            for (const auto& vendor : candidate->vendors)
-                if (std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
-                                [&](const auto& item) { return item.id == model; }))
-                    seed = candidate.get();
+        for (std::size_t index = 0; index < impl_->vendor_presets.size(); ++index) {
+            const auto& candidate = impl_->vendor_presets[index];
+            const bool matches = std::any_of(candidate->vendors.begin(), candidate->vendors.end(),
+                [&](const auto& vendor) {
+                    return std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
+                        [&](const auto& item) { return item.id == model; });
+                });
+            if (matches) seed = impl_->complete_vendor(index);
+        }
         if (impl_->active->bundle && model == impl_->active->selection.machine_model_id) seed=impl_->active->bundle.get();
         if (request.mode == libslicer::CalibMode::Calib_Flow_Rate) {
             const auto count = config.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size();
@@ -5478,7 +5575,7 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
             if (request.mode==ProjectReadMode::Geometry)
                 throw std::invalid_argument("Geometry import requires a captured current configuration");
             state->bundle=impl_->vendor_presets.empty() ? std::make_shared<PresetBundle>()
-                : std::make_shared<PresetBundle>(*impl_->vendor_presets.front());
+                : std::make_shared<PresetBundle>(*impl_->complete_vendor(0));
         }
         auto& bundle=*state->bundle;
         // Plater::load_project -> reset: discard embedded presets locally. The
@@ -6335,13 +6432,7 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
 
             Slic3r::PresetBundle* preset_bundle = nullptr;
             if (machine != nullptr && variant != nullptr) {
-                for (const auto& candidate : impl_->vendor_presets) {
-                    if (candidate->printers.find_system_preset_by_model_and_variant(
-                            machine->id, variant->id) != nullptr) {
-                        preset_bundle = candidate.get();
-                        break;
-                    }
-                }
+                preset_bundle = impl_->complete_presets(machine->id, variant->id);
             }
 
             if (preset_bundle == nullptr) {

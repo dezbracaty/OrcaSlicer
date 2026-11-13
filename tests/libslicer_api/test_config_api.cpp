@@ -3,6 +3,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include <libslicer/Config.hpp>
+#include <libslicer/Calibration.hpp>
 #include <libslicer/Library.hpp>
 
 #include <miniz.h>
@@ -3324,6 +3325,142 @@ TEST_CASE("disabling continuous fiber preserves the ordinary Orca fill path", "[
     std::filesystem::remove(output, remove_error);
 }
 
+namespace {
+nlohmann::json startup_preset_options(const std::vector<libslicer::PresetOption>& options)
+{
+    auto result = nlohmann::json::array();
+    for (const auto& option : options) result.push_back({option.id, option.name, option.is_default});
+    return result;
+}
+nlohmann::json startup_catalog(const libslicer::Library& library)
+{
+    auto catalog = nlohmann::json::array();
+    for (const auto& machine : library.machine_models()) {
+        auto variants = nlohmann::json::array();
+        for (const auto& variant : machine.variants) {
+            auto area = nlohmann::json::array();
+            for (const auto& point : variant.printable_area) area.push_back({point.x, point.y});
+            auto printers = nlohmann::json::array();
+            for (const auto& preset : library.printer_presets(machine.id, variant.id))
+                printers.push_back({preset.id, preset.name, preset.is_default});
+            variants.push_back({variant.id, variant.name, variant.nozzle_diameter,
+                variant.printable_width, variant.printable_depth, variant.printable_height,
+                variant.physical_tool_count, variant.variable_filament_slots,
+                variant.filament_slots_bound_to_physical_tools, variant.max_filament_slots,
+                variant.toolhead_filament_capacity, area, variant.printer_preset_id, printers});
+        }
+        catalog.push_back({machine.id, machine.vendor_id, machine.name, machine.family,
+            machine.cover_image_path, machine.bed_model_path, machine.bed_texture_path, variants});
+    }
+    return catalog;
+}
+}
+
+TEST_CASE("on demand presets preserve complete printer catalogs and configurations", "[libslicer_api][startup-presets]")
+{
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("libslicer-startup-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    options.user_preset_directory = directory.string();
+    struct Cleanup { std::filesystem::path path; ~Cleanup() { std::error_code ec; std::filesystem::remove_all(path, ec); } } cleanup{directory};
+    auto eager = libslicer::Library::open(options);
+    REQUIRE(eager);
+    libslicer::ConfigSelection user;
+    user.machine_model_id = "P3"; user.machine_variant_id = "0.4";
+    REQUIRE(eager->activate_config(user).success);
+    const auto saved = eager->save_printer_switch_preset(eager->configuration_revision(),
+        libslicer::PrinterSwitchPreset::Printer, "Startup User Printer");
+    REQUIRE(bool(saved));
+    // Reopen both modes against the same saved user-printer source.
+    eager = libslicer::Library::open(options);
+    auto lazy = libslicer::Library::open(options, libslicer::PresetLoadingMode::OnDemand);
+    REQUIRE(eager); REQUIRE(lazy);
+    const auto expected = startup_catalog(*eager);
+    REQUIRE(startup_catalog(*lazy) == expected);
+    for (const auto& machine : eager->machine_models()) {
+        for (const auto& variant : machine.variants) {
+            CAPTURE(machine.id, variant.id);
+            libslicer::ConfigSelection selection;
+            selection.machine_model_id = machine.id; selection.machine_variant_id = variant.id;
+            const auto before = eager->create_config(selection);
+            const auto after = lazy->create_config(selection);
+            REQUIRE(after.success == before.success);
+            if (!before.success) continue;
+            CHECK(after.config->snapshot().values() == before.config->snapshot().values());
+            CHECK(after.selection.printer_preset_id == before.selection.printer_preset_id);
+            CHECK(after.selection.process_preset_id == before.selection.process_preset_id);
+            CHECK(after.selection.filament_preset_ids == before.selection.filament_preset_ids);
+            CHECK(startup_preset_options(after.compatible_processes) == startup_preset_options(before.compatible_processes));
+            CHECK(startup_preset_options(after.compatible_filaments) == startup_preset_options(before.compatible_filaments));
+        }
+    }
+    CHECK(startup_catalog(*lazy) == expected);
+    user.printer_preset_id = "Startup User Printer";
+    REQUIRE(lazy->activate_config(user).success);
+    CHECK(lazy->active_config()->selection.printer_preset_id == user.printer_preset_id);
+}
+
+TEST_CASE("on demand printer queries do not parse unused process files and failures stay atomic", "[libslicer_api][startup-presets]")
+{
+    namespace fs = std::filesystem;
+    const auto directory = fs::temp_directory_path() /
+        ("libslicer-lazy-failure-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path, ec); } } cleanup{directory};
+    fs::create_directories(directory / "profiles");
+    const fs::path resources = LIBSLICER_TEST_RESOURCE_DIR;
+    // Real native profiles with a controlled broken process, never production files.
+    for (const auto& vendor : {"P3", "CFSYS", "OrcaFilamentLibrary"}) {
+        fs::copy_file(resources / "profiles" / (std::string(vendor) + ".json"), directory / "profiles" / (std::string(vendor) + ".json"));
+        fs::copy(resources / "profiles" / vendor, directory / "profiles" / vendor, fs::copy_options::recursive);
+    }
+    std::ifstream manifest_file(directory / "profiles/P3.json");
+    nlohmann::json manifest; manifest_file >> manifest;
+    const auto process = directory / "profiles/P3" / manifest.at("process_list").at(0).at("sub_path").get<std::string>();
+    std::ofstream(process) << "{ broken json";
+    libslicer::LibraryOptions options;
+    options.resource_directory = directory.string(); options.vendors = {"P3", "CFSYS"};
+    REQUIRE_FALSE(libslicer::Library::open(options));
+    auto lazy = libslicer::Library::open(options, libslicer::PresetLoadingMode::OnDemand);
+    REQUIRE(lazy);
+    REQUIRE_FALSE(lazy->printer_presets("P3", "0.4").empty());
+    REQUIRE(lazy->machine_models().size() == 2);
+    libslicer::ConfigSelection current; current.machine_model_id = "CFSYS Alpha500 Printer"; current.machine_variant_id = "0.4";
+    REQUIRE(lazy->activate_config(current).success);
+    const auto revision = lazy->configuration_revision();
+    const auto snapshot = lazy->active_config_snapshot()->values();
+    libslicer::ConfigSelection broken; broken.machine_model_id = "P3"; broken.machine_variant_id = "0.4";
+    const auto failed = lazy->review_printer_switch(broken);
+    REQUIRE_FALSE(failed.diagnostics.empty());
+    REQUIRE_FALSE(lazy->create_config(broken).success);
+    CHECK(lazy->configuration_revision() == revision);
+    CHECK(lazy->active_config_snapshot()->values() == snapshot);
+    CHECK_FALSE(lazy->printer_presets("P3", "0.4").empty());
+}
+
+TEST_CASE("on demand corrupted user presets retain native nonfatal loading", "[libslicer_api][startup-presets]")
+{
+    namespace fs = std::filesystem;
+    const auto directory = fs::temp_directory_path() /
+        ("libslicer-user-warning-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path, ec); } } cleanup{directory};
+    fs::create_directories(directory / "P3/process");
+    std::ofstream(directory / "P3/process/Broken User Process.json") << "{ broken json";
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.user_preset_directory = directory.string(); options.vendors = {"P3"};
+    auto eager = libslicer::Library::open(options);
+    REQUIRE(eager);
+    auto lazy = libslicer::Library::open(options, libslicer::PresetLoadingMode::OnDemand);
+    REQUIRE(lazy);
+    libslicer::ConfigSelection selection; selection.machine_model_id = "P3"; selection.machine_variant_id = "0.4";
+    CHECK(lazy->review_printer_switch(selection).diagnostics.empty());
+    REQUIRE(lazy->activate_config(selection).success);
+    REQUIRE(eager->activate_config(selection).success);
+    CHECK(lazy->active_config_snapshot()->values() == eager->active_config_snapshot()->values());
+    CHECK(fs::exists(directory / "P3/process/Broken User Process.json"));
+}
+
 TEST_CASE("library owns machine presets and builds a selected configuration", "[libslicer_api][presets]")
 {
     libslicer::LibraryOptions options;
@@ -5947,6 +6084,44 @@ std::unique_ptr<libslicer::Library> project_test_library() {
     const auto activated=library->activate_config(selection);for(const auto& d:activated.diagnostics)INFO(d.message);REQUIRE(activated.success);return library;
 }
 }
+TEST_CASE("on demand unselected vendor seeds preserve project read import and calibration", "[libslicer_api][startup-presets]")
+{
+    auto source_library = project_test_library();
+    const auto snapshot = *source_library->active_config_snapshot();
+    const auto path = project_candidate_fixture(snapshot, false);
+    struct Cleanup { std::filesystem::path path; ~Cleanup() { std::error_code ec; std::filesystem::remove(path, ec); } } cleanup{path};
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3", "Flashforge"};
+    auto eager = libslicer::Library::open(options);
+    auto lazy = libslicer::Library::open(options, libslicer::PresetLoadingMode::OnDemand);
+    REQUIRE(eager); REQUIRE(lazy);
+    // Fresh SDK instances exercise the original first-vendor seed, while the
+    // project and calibration snapshot identify a different installed vendor.
+    const auto expected = eager->read_project({path.string(), libslicer::ProjectReadMode::Project});
+    const auto actual = lazy->read_project({path.string(), libslicer::ProjectReadMode::Project});
+    for (const auto& issue : actual.diagnostics) INFO(issue.message);
+    REQUIRE(expected.success); REQUIRE(actual.success);
+    CHECK(actual.configuration.snapshot().values() == expected.configuration.snapshot().values());
+    CHECK(actual.configuration.machine().project_local == expected.configuration.machine().project_local);
+    CHECK(actual.scene->objects.size() == expected.scene->objects.size());
+    // A new instance ensures legacy import cannot reuse the completed read seed.
+    lazy = libslicer::Library::open(options, libslicer::PresetLoadingMode::OnDemand);
+    const auto imported_expected = eager->import_project({path.string()});
+    const auto imported_actual = lazy->import_project({path.string()});
+    REQUIRE(imported_expected.success); REQUIRE(imported_actual.success);
+    CHECK(imported_actual.objects.size() == imported_expected.objects.size());
+    CHECK(lazy->active_config_snapshot()->values() == eager->active_config_snapshot()->values());
+    lazy = libslicer::Library::open(options, libslicer::PresetLoadingMode::OnDemand);
+    libslicer::CalibrationRequest request;
+    request.config = snapshot; request.mode = libslicer::CalibMode::Calib_Flow_Rate;
+    const auto calibration_expected = eager->prepare_calibration(request);
+    const auto calibration_actual = lazy->prepare_calibration(request);
+    for (const auto& issue : calibration_actual.diagnostics) INFO(issue.message);
+    REQUIRE(bool(calibration_expected)); REQUIRE(bool(calibration_actual));
+    CHECK_FALSE(lazy->active_config().has_value());
+}
+
 TEST_CASE("native rollback retains an imported project preset baseline", "[libslicer_api][preset-restore]")
 {
     auto library = project_test_library();

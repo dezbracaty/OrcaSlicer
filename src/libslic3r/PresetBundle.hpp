@@ -408,6 +408,7 @@ public:
         LoadSystem,
         LoadVendorOnly,
         LoadFilamentOnly,
+        LoadPrinterOnly,
     };
     using LoadConfigBundleAttributes = enum_bitmask<LoadConfigBundleAttribute>;
     // Load the config bundle based on the flags.
