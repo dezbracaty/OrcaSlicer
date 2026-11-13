@@ -6122,6 +6122,61 @@ TEST_CASE("on demand unselected vendor seeds preserve project read import and ca
     CHECK_FALSE(lazy->active_config().has_value());
 }
 
+TEST_CASE("on demand project processes retain collision and save semantics", "[libslicer_api][startup-presets]")
+{
+    namespace fs = std::filesystem;
+    auto source = project_test_library();
+    const std::string process_name = "Startup project process";
+    const auto path = project_candidate_fixture(*source->active_config_snapshot(), true, {
+        {"print_settings_id", process_name}, {"inherits_group", ""}, {"outer_wall_speed", "83"}});
+    const auto directory = fs::temp_directory_path() /
+        ("libslicer-project-lazy-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct Cleanup {
+        fs::path directory, project;
+        ~Cleanup() { std::error_code ec; fs::remove_all(directory, ec); fs::remove(project, ec); }
+    } cleanup{directory, path};
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.user_preset_directory = directory.string();
+    options.vendors = {"P3"};
+    auto installed = libslicer::Library::open(options);
+    REQUIRE(installed);
+    libslicer::ConfigSelection p3; p3.machine_model_id = "P3"; p3.machine_variant_id = "0.4";
+    REQUIRE(installed->activate_config(p3).success);
+    REQUIRE(installed->set_active_config_value("outer_wall_speed", "91").success);
+    const auto collision = process_name + "(" + path.filename().string() + ")";
+    REQUIRE(bool(installed->save_printer_switch_preset(installed->configuration_revision(),
+        libslicer::PrinterSwitchPreset::Process, collision)));
+    options.vendors = {"Flashforge", "P3"};
+    auto eager = libslicer::Library::open(options);
+    auto lazy = libslicer::Library::open(options, libslicer::PresetLoadingMode::OnDemand);
+    REQUIRE(eager); REQUIRE(lazy);
+    const auto expected = eager->read_project({path.string(), libslicer::ProjectReadMode::Project});
+    const auto actual = lazy->read_project({path.string(), libslicer::ProjectReadMode::Project});
+    for (const auto& issue : actual.diagnostics) INFO(issue.message);
+    REQUIRE(expected.success); REQUIRE(actual.success);
+    CHECK(actual.configuration.snapshot().values() == expected.configuration.snapshot().values());
+    const auto project_selection = actual.configuration.view().selection;
+    CHECK(project_selection.process_preset_id != collision);
+    REQUIRE(lazy->install_configuration(actual.configuration, lazy->configuration_revision()).success);
+    REQUIRE(lazy->set_active_config_value("outer_wall_speed", "87").success);
+    const auto review = lazy->review_printer_switch(p3);
+    REQUIRE(review.diagnostics.empty());
+    const auto process = std::find_if(review.presets.begin(), review.presets.end(), [](const auto& item) {
+        return item.type == libslicer::PrinterSwitchPreset::Process;
+    });
+    REQUIRE(process != review.presets.end());
+    CHECK_FALSE(process->save_as);
+    REQUIRE(bool(lazy->save_printer_switch_preset(lazy->configuration_revision(),
+        libslicer::PrinterSwitchPreset::Process, {})));
+    CHECK(lazy->active_config_snapshot()->value("outer_wall_speed") == "87");
+    CHECK(lazy->active_config()->selection.process_preset_id == project_selection.process_preset_id);
+    REQUIRE(lazy->activate_config(p3).success);
+    p3.process_preset_id = collision;
+    REQUIRE(lazy->activate_config(p3).success);
+    CHECK(lazy->active_config_snapshot()->value("outer_wall_speed") == "91");
+}
+
 TEST_CASE("native rollback retains an imported project preset baseline", "[libslicer_api][preset-restore]")
 {
     auto library = project_test_library();
