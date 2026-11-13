@@ -5936,10 +5936,15 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
                     const auto& partial=impl_->vendor_presets[index];
                     // Printer-only catalogs omit user processes. Complete only
                     // catalogs that may contribute a competing saved process.
-                    if (!impl_->complete_vendors[index] &&
-                        (impl_->user_preset_directory.empty() || !fs::is_directory(
-                            impl_->user_preset_directory / partial->vendors.begin()->first / PRESET_PRINT_NAME)))
-                        continue;
+                    if (!impl_->complete_vendors[index]) {
+                        if (impl_->user_preset_directory.empty()) continue;
+                        const auto directory=impl_->user_preset_directory /
+                            partial->vendors.begin()->first / PRESET_PRINT_NAME;
+                        boost::system::error_code error;
+                        const bool has_processes=fs::is_directory(directory,error);
+                        if (error) BOOST_LOG_TRIVIAL(warning) << "libslicer user process directory: " << error.message();
+                        if (!has_processes) continue;
+                    }
                     const auto* catalog=impl_->complete_vendor(index);
                     for (const auto& preset:catalog->prints) {
                         // Only prefilter names here; Orca resolves exact candidates.
