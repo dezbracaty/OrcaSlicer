@@ -7181,3 +7181,106 @@ TEST_CASE("explicit geometry mapping preserves an installed nonzero color cursor
     request.filament_color_cursor.reset();CHECK(library->read_project(request).filament_color_cursor==9);
     std::filesystem::remove(source);
 }
+
+TEST_CASE("editable project writer preserves model graph configuration and masks", "[libslicer_api][project-write]") {
+    auto library=project_test_library();
+    REQUIRE(library->resize_active_filament_slots(3).success);
+    REQUIRE(library->set_active_config_value("outer_wall_speed","83").success);
+    REQUIRE(library->set_active_filament_color(2,{0x12,0x34,0x56,0xff}).success);
+    const auto fixture=project_candidate_fixture(*library->active_config_snapshot(),false);
+    auto imported=library->read_project({fixture.string(),libslicer::ProjectReadMode::Project});
+    for(const auto& d:imported.diagnostics)INFO(d.message);
+    REQUIRE(imported.success);REQUIRE(imported.scene);REQUIRE_FALSE(imported.scene->objects.empty());
+    libslicer::ProjectWriteRequest request;request.scene=*imported.scene;request.config=*library->active_config_snapshot();
+    request.path=(std::filesystem::temp_directory_path()/"libslicer-editable-roundtrip.3mf").string();
+    auto& object=request.scene.objects.front();
+    object.name="Editable multipart";object.default_filament_slot=2;
+    request.scene.default_filament_slot=3;object.parts.front().inherit_project_filament=true;
+    object.settings={{"sparse_infill_density","37%"}};
+    auto modifier=object.parts.front();modifier.name="Local modifier";modifier.role=libslicer::ProjectPartRole::ParameterModifier;
+    modifier.settings={{"sparse_infill_density","63%"}};object.parts.push_back(modifier);
+    auto& first=object.instances.front();first.name="Named first";first.printable=false;
+    libslicer::SliceFiberMaskInput mask;mask.id="region-1";mask.name="Saved region";mask.dimensions_mm={4,4,4};
+    mask.enabled=false;first.fiber_masks.push_back(mask);
+    auto second=first;second.id="second";second.name="Second instance";second.printable=true;second.transform[3]+=25;second.fiber_masks.clear();
+    object.instances.push_back(second);
+    const auto written=library->write_project(request);for(const auto& d:written.diagnostics)INFO(d.message);REQUIRE(written.success);
+    auto reopened=library->read_project({request.path,libslicer::ProjectReadMode::Project});for(const auto& d:reopened.diagnostics)INFO(d.message);
+    REQUIRE(reopened.success);REQUIRE(reopened.scene);REQUIRE(reopened.scene->objects.size()==1);
+    const auto& restored=reopened.scene->objects.front();REQUIRE(restored.instances.size()==2);REQUIRE(restored.parts.size()==2);
+    CHECK(restored.name==object.name);CHECK(restored.default_filament_slot==2);
+    CHECK(reopened.scene->default_filament_slot==3);CHECK(restored.parts.front().inherit_project_filament);
+    CHECK(restored.instances[0].name=="Named first");CHECK_FALSE(restored.instances[0].printable);
+    CHECK(restored.instances[1].name==second.name);CHECK(restored.instances[1].transform[3]==Catch::Approx(second.transform[3]));
+    REQUIRE(restored.instances[0].fiber_masks.size()==1);CHECK(restored.instances[0].fiber_masks[0].name==mask.name);CHECK_FALSE(restored.instances[0].fiber_masks[0].enabled);
+    CHECK(restored.parts[1].role==libslicer::ProjectPartRole::ParameterModifier);
+    CHECK(restored.settings==object.settings);CHECK(restored.parts[1].settings==modifier.settings);
+    REQUIRE(reopened.configuration.valid());CHECK(reopened.configuration.view().filament_slots.size()==3);
+    CHECK(reopened.configuration.snapshot().value("outer_wall_speed")=="83");
+    CHECK(reopened.configuration.snapshot().value("filament_colour")==request.config.value("filament_colour"));
+    request.path=(std::filesystem::temp_directory_path()/"libslicer-editable-roundtrip.stl").string();request.format=libslicer::ModelFileFormat::Stl;
+    const auto stl=library->write_project(request);for(const auto& d:stl.diagnostics)INFO(d.message);REQUIRE(stl.success);
+    const auto mesh=binary_stl_on_bed(request.path);REQUIRE(mesh.volumes.size()==1);
+    CHECK(mesh.volumes.front().triangles.size()==object.parts[0].mesh->triangles.size()*2);
+    const auto previousSize=std::filesystem::file_size(request.path);
+    libslicer::SliceCallbacks cancelled;cancelled.is_cancelled=[]{return true;};
+    const auto aborted=library->write_project(request,cancelled);CHECK_FALSE(aborted.success);CHECK(aborted.cancelled);
+    CHECK(std::filesystem::file_size(request.path)==previousSize);
+    std::filesystem::remove(request.path);std::filesystem::remove(written.path);std::filesystem::remove(fixture);
+}
+
+TEST_CASE("STL export applies native negative CSG and mirrored instance placement", "[libslicer_api][project-write]") {
+    auto library=project_test_library();libslicer::ProjectWriteRequest request;
+    request.config=*library->active_config_snapshot();request.format=libslicer::ModelFileFormat::Stl;
+    request.path=(std::filesystem::temp_directory_path()/"libslicer-editable-negative.stl").string();
+    auto cube=[](float low,float high) {
+        auto mesh=std::make_shared<libslicer::ProjectMesh>();
+        mesh->vertices={{low,low,low},{high,low,low},{high,high,low},{low,high,low},
+                        {low,low,high},{high,low,high},{high,high,high},{low,high,high}};
+        mesh->triangles={{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                         {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+        return mesh;
+    };
+    libslicer::ProjectObject object;object.name="Boolean cube";
+    // Orca STL export ignores process/material/painting and mask validity.
+    object.default_filament_slot=999;object.settings={{"not_a_process_parameter","ignored for STL"}};
+
+    libslicer::ProjectPart positive;positive.mesh=cube(0,10);object.parts.push_back(positive);
+    auto negative=positive;negative.mesh=cube(3,7);negative.role=libslicer::ProjectPartRole::NegativeVolume;object.parts.push_back(negative);
+    auto modifier=positive;modifier.mesh=cube(-100,100);modifier.role=libslicer::ProjectPartRole::ParameterModifier;object.parts.push_back(modifier);
+    libslicer::ProjectInstance instance;instance.transform[0]=-1;instance.transform[3]=50;libslicer::SliceFiberMaskInput irrelevant;irrelevant.id="ignored";irrelevant.dimensions_mm={0,0,0};instance.fiber_masks={irrelevant};object.instances.push_back(instance);
+    request.scene.objects.push_back(object);
+    const auto result=library->write_project(request);for(const auto& d:result.diagnostics)INFO(d.message);
+    REQUIRE(result.success);CHECK(result.diagnostics.empty());
+    const auto mesh=binary_stl_on_bed(result.path).volumes.front();
+    double volume=0;float minimum=10000,maximum=-10000;
+    for(const auto& vertex:mesh.vertices){minimum=std::min(minimum,vertex.x);maximum=std::max(maximum,vertex.x);}
+    for(const auto& t:mesh.triangles){const auto& a=mesh.vertices[t.vertex_a];const auto& b=mesh.vertices[t.vertex_b];const auto& c=mesh.vertices[t.vertex_c];
+        volume+=(double(a.x)*(double(b.y)*c.z-double(b.z)*c.y)+double(a.y)*(double(b.z)*c.x-double(b.x)*c.z)+double(a.z)*(double(b.x)*c.y-double(b.y)*c.x))/6;}
+    CHECK(std::abs(volume)==Catch::Approx(936));CHECK(minimum==Catch::Approx(40));CHECK(maximum==Catch::Approx(50));
+    std::filesystem::remove(result.path);
+}
+
+TEST_CASE("editable P3 project retains six physical material bindings", "[libslicer_api][project-write]") {
+    libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"P3"};
+    auto library=libslicer::Library::open(options);REQUIRE(library);
+    libslicer::ConfigSelection selection;selection.machine_model_id="P3";selection.machine_variant_id="0.4";
+    REQUIRE(library->activate_config(selection).success);
+    const auto snapshot=*library->active_config_snapshot();
+    auto sourceLibrary=project_test_library();const auto fixture=project_candidate_fixture(*sourceLibrary->active_config_snapshot(),false);
+    const auto source=sourceLibrary->read_project({fixture.string(),libslicer::ProjectReadMode::Project});REQUIRE(source.success);REQUIRE(source.scene);
+    libslicer::ProjectWriteRequest request;request.config=snapshot;request.scene=*source.scene;
+    request.scene.default_filament_slot=5;request.scene.objects.front().default_filament_slot=5;
+    libslicer::SliceFiberMaskInput mask;mask.id="enabled-region";mask.dimensions_mm={5,5,5};mask.settings={{"fiber_contour_include_holes","1"}};
+    request.scene.objects.front().instances.front().fiber_masks={mask};
+    request.path=(std::filesystem::temp_directory_path()/"libslicer-editable-p3.3mf").string();
+    const auto written=library->write_project(request);for(const auto& d:written.diagnostics)INFO(d.message);REQUIRE(written.success);
+    const auto reopened=library->read_project({request.path,libslicer::ProjectReadMode::Project});for(const auto& d:reopened.diagnostics)INFO(d.message);REQUIRE(reopened.success);
+    REQUIRE(reopened.configuration.valid());CHECK(reopened.configuration.view().filament_slots.size()==6);
+    for(const auto* key:{"filament_map","filament_process_type","filament_settings_id","filament_colour","nozzle_diameter"})
+        CHECK(reopened.configuration.snapshot().value(key)==snapshot.value(key));
+    REQUIRE(reopened.scene);CHECK(reopened.scene->default_filament_slot==5);
+    REQUIRE(reopened.scene->objects.front().instances.front().fiber_masks.size()==1);
+    CHECK(reopened.scene->objects.front().instances.front().fiber_masks.front().enabled);
+    std::filesystem::remove(request.path);std::filesystem::remove(fixture);
+}
