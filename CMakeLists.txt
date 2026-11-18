@@ -249,6 +249,13 @@ add_library(libslicer::core ALIAS libslic3r)
 add_library(libslicer::libslicer ALIAS libslicer_api)
 add_custom_target(libslicer DEPENDS libslicer_api)
 
+set(LIBSLICER_NATIVE_REGRESSION_CMAKE "" CACHE FILEPATH
+    "Optional native regression targets for this libslicer build")
+if(LIBSLICER_NATIVE_REGRESSION_CMAKE)
+    enable_testing()
+    include("${LIBSLICER_NATIVE_REGRESSION_CMAKE}")
+endif()
+
 set(LIBSLICER_INSTALL_CMAKEDIR
     "${CMAKE_INSTALL_LIBDIR}/cmake/libslicer"
     CACHE STRING "Install directory for the libslicer CMake package")
