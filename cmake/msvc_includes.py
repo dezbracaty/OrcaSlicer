@@ -38,6 +38,25 @@ def prefixes(detected):
     return result
 
 
+def ninja_include_path(path):
+    if os.name != 'nt':
+        return path
+    drive, _ = os.path.splitdrive(path)
+    if len(drive) != 2 or not os.path.isabs(path):
+        return path
+    cwd = os.getcwd()
+    if os.path.splitdrive(cwd)[0].casefold() != drive.casefold():
+        return path
+
+    # Ninja's MSVC parser makes same-drive includes relative to its build
+    # directory. Win32 can reject that longer spelling before resolving '..'.
+    relative = os.path.relpath(path, cwd)
+    extended = '//?/' + os.path.abspath(path).replace('\\', '/')
+    if len(os.path.join(cwd, relative)) >= 260 and len(extended.encode('utf-8')) <= 260:
+        return extended
+    return path
+
+
 def normalize(line, markers):
     for marker, encoding in markers:
         if line.startswith(marker):
@@ -53,7 +72,7 @@ def normalize(line, markers):
             if not decoded:
                 return line
             path = next((p for p in decoded if os.path.isfile(p)), decoded[0])
-            return CANONICAL + path.encode('utf-8') + b'\n'
+            return CANONICAL + ninja_include_path(path).encode('utf-8') + b'\n'
     return line
 
 
