@@ -278,7 +278,7 @@ if(WIN32)
         "([Ss][Yy][Ss][Tt][Ee][Mm]32|[Ss][Yy][Ss][Ww][Oo][Ww]64|[Ww][Ii][Nn][Ss][Xx][Ss])[/\\\\].*")
     set(_libslicer_runtime_dependencies
         RUNTIME_DEPENDENCIES
-        DIRECTORIES "$<TARGET_FILE_DIR:TKernel>" "${GMP_ROOT}/bin"
+        DIRECTORIES "$<TARGET_FILE_DIR:TKernel>" "${GMP_ROOT}/bin" "${MPFR_ROOT}/bin"
         PRE_EXCLUDE_REGEXES "api-ms-.*" "ext-ms-.*"
         POST_EXCLUDE_REGEXES "${_libslicer_system_dll_regex}")
 endif()
