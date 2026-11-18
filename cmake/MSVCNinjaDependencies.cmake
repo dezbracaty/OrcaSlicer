@@ -30,15 +30,16 @@ if(MSVC AND CMAKE_GENERATOR MATCHES "^Ninja" AND
         message(FATAL_ERROR
             "Cannot detect MSVC /showIncludes prefix: ${_probe_output}")
     endif()
-    set(CMAKE_CL_SHOWINCLUDES_PREFIX "${CMAKE_MATCH_2}")
+    set(_include_prefix "${CMAKE_MATCH_2}")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    # Ninja expects UTF-8 /showIncludes records. Normalize the compiler's raw
+    # output before it reaches Ninja so incremental builds always record headers.
+    set(CMAKE_CL_SHOWINCLUDES_PREFIX "Note: including file: ")
     foreach(_language C CXX)
-        set(CMAKE_${_language}_CL_SHOWINCLUDES_PREFIX
-            "${CMAKE_CL_SHOWINCLUDES_PREFIX}")
-        set(_launcher
-            "${CMAKE_COMMAND};-E;env;--unset=VS_UNICODE_OUTPUT;VSLANG=1033")
-        if(CMAKE_${_language}_COMPILER_LAUNCHER)
-            list(APPEND _launcher ${CMAKE_${_language}_COMPILER_LAUNCHER})
-        endif()
-        set(CMAKE_${_language}_COMPILER_LAUNCHER "${_launcher}")
+        set(CMAKE_${_language}_CL_SHOWINCLUDES_PREFIX "${CMAKE_CL_SHOWINCLUDES_PREFIX}")
+        set(CMAKE_${_language}_COMPILER_LAUNCHER
+            "${CMAKE_COMMAND}" -E env --unset=VS_UNICODE_OUTPUT VSLANG=1033
+            "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/msvc_includes.py"
+            --prefix "${_include_prefix}" -- ${CMAKE_${_language}_COMPILER_LAUNCHER})
     endforeach()
 endif()
