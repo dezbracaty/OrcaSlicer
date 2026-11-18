@@ -1,6 +1,8 @@
 #include <catch2/catch_all.hpp>
 
 #include <boost/filesystem.hpp>
+#include <array>
+#include <memory>
 
 #include "libslic3r/PresetBundle.hpp"
 
@@ -154,6 +156,49 @@ TEST_CASE("Current vendor type tolerates missing printer model", "[Preset][Bundl
     bundle.printers.get_edited_preset().config.erase("printer_model");
 
     CHECK(bundle.get_current_vendor_type() == VendorType::Unknown);
+}
+
+TEST_CASE("Copied preset bundles own their edited vendors", "[Preset][Bundle][Copy]")
+{
+    auto source = std::make_unique<PresetBundle>();
+    source->vendors.emplace("copy-test", VendorProfile("copy-test"));
+    auto *source_vendor = &source->vendors.at("copy-test");
+    auto collections = [](PresetBundle &bundle) {
+        return std::array<PresetCollection *, 5>{ &bundle.prints, &bundle.sla_prints,
+            &bundle.filaments, &bundle.sla_materials, &bundle.printers };
+    };
+    for (auto *collection : collections(*source)) {
+        auto &preset = add_inmemory_preset(*collection, "System preset");
+        preset.is_system = true;
+        preset.vendor = source_vendor;
+        REQUIRE(collection->select_preset_by_name(preset.name, true));
+        collection->get_edited_preset().alias = "Unsaved edit";
+        collection->get_edited_preset().is_dirty = true;
+        collection->update_saved_preset_from_current_preset();
+    }
+
+    std::unique_ptr<PresetBundle> copy;
+    SECTION("copy construction") { copy = std::make_unique<PresetBundle>(*source); }
+    SECTION("copy assignment") {
+        copy = std::make_unique<PresetBundle>();
+        *copy = *source;
+    }
+    const auto *copied_vendor = &copy->vendors.at("copy-test");
+    REQUIRE(copied_vendor != source_vendor);
+    for (auto *collection : collections(*copy)) {
+        // Fail deterministically while source is alive, before dereferencing a
+        // dangling pointer can depend on allocator reuse or platform timing.
+        REQUIRE(collection->get_edited_preset_with_vendor_profile().vendor == copied_vendor);
+        CHECK(collection->get_selected_preset().vendor == copied_vendor);
+        CHECK(collection->default_preset().vendor == nullptr);
+        CHECK(collection->get_edited_preset().alias == "Unsaved edit");
+        CHECK(collection->get_edited_preset().is_dirty);
+    }
+    source.reset();
+    for (auto *collection : collections(*copy))
+        CHECK(collection->get_edited_preset_with_vendor_profile().vendor->id == "copy-test");
+    CHECK(is_compatible_with_printer(copy->filaments.get_edited_preset_with_vendor_profile(),
+        copy->printers.get_edited_preset_with_vendor_profile()));
 }
 
 TEST_CASE("Printer extruder count tolerates missing nozzle diameter", "[Preset][Bundle]")
