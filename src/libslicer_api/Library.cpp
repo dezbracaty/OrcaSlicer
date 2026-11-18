@@ -17,6 +17,9 @@
 #include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/GCode/ThumbnailData.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
+#include <libslic3r/Format/STL.hpp>
+#include <libslic3r/CSGMesh/ModelToCSGMesh.hpp>
+#include <libslic3r/CSGMesh/PerformCSGMeshBooleans.hpp>
 #include <libslic3r/PNGReadWrite.hpp>
 #include <libslic3r/Support/BeltSupportDebug.hpp>
 #include <libslic3r/TriangleMeshSlicer.hpp>
@@ -2773,6 +2776,257 @@ std::string encode_project_object_semantics(const ProjectObject& object) {
 }
 
 std::string encode_project_part_semantics(const ProjectPart& part) {return ProjectJson{{"version",1},{"scope","part"},{"settings",settings_json(part.settings)}}.dump();}
+
+ProjectObject decode_project_object_semantics(std::string_view payload)
+{
+    ProjectObject out;
+    if (payload.empty()) return out;
+    const auto j=semantic_json(payload,"object");
+    out.settings=project_settings(semantic_settings(j));
+    for(const auto& r:j.at("layer_ranges"))
+        out.layer_ranges.push_back({r.at("minimum_z"),r.at("maximum_z"),project_settings(semantic_settings(r),false)});
+    out.layer_height_profile=j.at("layer_height_profile").get<std::vector<double>>();
+    for(const auto& b:j.at("brim_points"))
+        out.brim_points.push_back({b.at("x"),b.at("y"),b.at("z"),b.at("head_front_radius")});
+    return out;
+}
+ProjectPart decode_project_part_semantics(std::string_view payload, std::string_view annotations)
+{
+    ProjectPart out;
+    if(!payload.empty())out.settings=project_settings(semantic_settings(semantic_json(payload,"part")));
+    if(!annotations.empty()) {
+        const auto j=semantic_json(annotations,"part_annotations");
+        out.support_facets=facets_from_json(j.at("support_facets"));
+        out.seam_facets=facets_from_json(j.at("seam_facets"));
+        out.fuzzy_skin_facets=facets_from_json(j.at("fuzzy_skin_facets"));
+    }
+    return out;
+}
+ProjectPlate decode_project_plate_semantics(std::string_view payload)
+{
+    ProjectPlate out;
+    if(payload.empty())return out;
+    const auto j=semantic_json(payload,"plate");
+    out.settings=project_settings(semantic_settings(j),false);
+    out.native_plate_index=j.value("native_plate_index",0);
+    out.custom_gcode_mode=j.at("custom_gcode_mode");
+    for(const auto& c:j.at("custom_gcodes"))
+        out.custom_gcodes.push_back({c.at("print_z"),c.at("type"),c.at("filament_slot"),c.at("color"),c.at("extra")});
+    return out;
+}
+
+namespace {
+constexpr const char* project_edit_metadata="Metadata/GPlatform/model-editing.json";
+ProjectJson project_mask_json(const SliceFiberMaskInput& m) {
+    return {{"id",m.id},{"name",m.name},{"shape",int(m.shape)},{"dimensions",m.dimensions_mm},
+        {"transform",m.mask_to_object},{"enabled",m.enabled},{"settings",m.settings}};
+}
+SliceFiberMaskInput project_mask_from_json(const ProjectJson& j) {
+    SliceFiberMaskInput m;m.id=j.at("id");m.name=j.value("name",m.id);
+    const int shape=j.at("shape");
+    if(shape<0 || shape>2)throw std::invalid_argument("Invalid saved fiber-mask shape");
+    m.shape=FiberMaskShape(shape);m.dimensions_mm=j.at("dimensions").get<std::array<double,3>>();
+    m.mask_to_object=j.at("transform").get<std::array<double,16>>();m.enabled=j.at("enabled");
+    m.settings=j.at("settings").get<ProjectSettings>();validate_mask_geometry(m);return m;
+}
+void restore_project_edit_metadata(const std::string& path,ProjectScene& scene) {
+    mz_zip_archive archive{};
+    if(!mz_zip_reader_init_file(&archive,path.c_str(),0))throw std::runtime_error("Cannot read project editing metadata");
+    const auto close=[&] {mz_zip_reader_end(&archive);};
+    try {
+        if(mz_zip_reader_locate_file(&archive,project_edit_metadata,nullptr,0)<0){close();return;}
+        std::vector<unsigned char> bytes;
+        if(!extract_zip_entry(archive,project_edit_metadata,bytes))throw std::runtime_error("Cannot extract project editing metadata");
+        const auto j=ProjectJson::parse(bytes);
+        if(j.at("version")!=1 || j.at("objects").size()!=scene.objects.size())
+            throw std::invalid_argument("Project editing metadata does not match its models");
+        auto restored=scene;
+        restored.default_filament_slot=j.at("default_filament_slot");
+        if(restored.default_filament_slot<1 || std::size_t(restored.default_filament_slot)>restored.source_filaments.size())
+            throw std::invalid_argument("Invalid project-default material slot");
+        for(std::size_t o=0;o<restored.objects.size();++o) {
+            const auto& data=j.at("objects").at(o);auto& object=restored.objects[o];
+            object.default_filament_slot=data.at("default_filament_slot");
+            if(data.at("parts").size()!=object.parts.size())throw std::invalid_argument("Project part metadata count mismatch");
+            for(std::size_t p=0;p<object.parts.size();++p) {
+                auto& part=object.parts[p];const auto& binding=data.at("parts").at(p);
+                part.default_filament_slot=binding.at("default_filament_slot");
+                part.explicit_filament_binding=binding.at("explicit_filament_binding");
+                part.inherit_project_filament=binding.at("inherit_project_filament");
+            }
+            const auto& records=data.at("instances");
+            if(records.size()!=object.instances.size())throw std::invalid_argument("Project instance metadata count mismatch");
+            for(std::size_t i=0;i<records.size();++i) {
+                auto& instance=object.instances[i];
+                // Native data owns the matrix; the extension only restores the
+                // editor's explicit plate/unassigned relationship.
+                for(const auto& plate:restored.plates)if(plate.id==instance.plate_id)
+                    for(int axis=0;axis<3;++axis)instance.transform[axis*4+3]+=plate.origin_mm[axis];
+                instance.plate_id.clear();
+                if(!records[i].at("plate_index").is_null()) {
+                    const auto index=records[i].at("plate_index").get<std::size_t>();
+                    const auto& plate=restored.plates.at(index);instance.plate_id=plate.id;
+                    for(int axis=0;axis<3;++axis)instance.transform[axis*4+3]-=plate.origin_mm[axis];
+                }
+                instance.name=records[i].at("name");
+                std::set<std::string> ids;
+                for(const auto& mask:records[i].at("fiber_masks")) {
+                    auto value=project_mask_from_json(mask);
+                    if(!ids.insert(value.id).second)throw std::invalid_argument("Duplicate saved fiber mask");
+                    object.instances[i].fiber_masks.push_back(std::move(value));
+                }
+            }
+        }
+        scene=std::move(restored);
+        close();
+    }catch(...){close();throw;}
+}
+}
+
+ProjectWriteResult Library::write_project(const ProjectWriteRequest& request,const SliceCallbacks& callbacks) const
+{
+    using namespace Slic3r;
+    ProjectWriteResult result;fs::path staging;
+    Model model;
+    const bool editable=request.format==ModelFileFormat::ThreeMf;
+    struct Cleanup {
+        Model& model;fs::path& staging;
+        ~Cleanup(){std::error_code e;if(!staging.empty())fs::remove(staging,e);try{model.remove_backup_path_if_exist();}catch(...){}}
+    } cleanup{model,staging};
+    try {
+        const auto cancelled=[&]{if(cancellation_requested(callbacks))throw std::runtime_error("Project export cancelled");};
+        cancelled();
+        if(request.format!=ModelFileFormat::Stl && request.format!=ModelFileFormat::ThreeMf)throw std::invalid_argument("Unknown model export format");
+        if(request.path.empty() || !request.config.valid())throw std::invalid_argument("Export needs a path and captured configuration");
+        const fs::path target=fs::absolute(fs::u8path(request.path));
+        if(!fs::is_directory(target.parent_path()))throw std::invalid_argument("Export directory does not exist");
+        if(request.scene.objects.empty())throw std::invalid_argument("There are no models to export");
+        static std::atomic_uint64_t sequence{0};
+        staging=target.parent_path()/(target.filename().string()+".writing-"+
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+"-"+std::to_string(++sequence));
+        auto config=dynamic_config(request.config);
+        const auto machine=describe_project_machine(config);
+        const auto size=project_native_plate_size(machine.variant, project_axes_length(machine.variant));
+        const auto count=std::max(std::size_t(1),request.scene.plates.size());
+        if(count>native_plate_limit)throw std::invalid_argument("Too many project plates");
+        const float root=std::sqrt(float(count)),rounded=std::round(root);
+        const int columns=root>rounded?int(rounded)+1:int(rounded);
+        std::map<std::string,std::size_t> plate_ids;
+        std::vector<std::unique_ptr<PlateData>> plates;
+        for(std::size_t i=0;i<count;++i) {
+            auto p=std::make_unique<PlateData>();p->plate_index=int(i);p->is_sliced_valid=false;
+            if(i<request.scene.plates.size()) {
+                const auto& source=request.scene.plates[i];
+                if(!plate_ids.emplace(source.id,i).second)throw std::invalid_argument("Duplicate project plate ID");
+                p->plate_name=source.name;p->locked=source.locked;
+                if(editable) {
+                    auto semantics=source;semantics.native_plate_index=int(i);
+                    Model scratch;auto plate_config=config;apply_plate_semantics(scratch,plate_config,encode_project_plate_semantics(semantics));
+                    p->config.apply(semantic_settings(semantic_json(encode_project_plate_semantics(semantics),"plate")));
+                    model.plates_custom_gcodes[int(i)]=scratch.plates_custom_gcodes[int(i)];
+                }
+            }
+            p->printer_model_id=config.opt_serialize("printer_model");
+            p->nozzle_diameters=config.opt_serialize("nozzle_diameter");
+            p->filament_maps=config.option<ConfigOptionInts>("filament_map")->values;
+            plates.push_back(std::move(p));
+        }
+        const auto filament_count=serialized_option_values(config,"filament_diameter").size();
+        if(editable && (request.scene.default_filament_slot<1 || std::size_t(request.scene.default_filament_slot)>filament_count))
+            throw std::invalid_argument("Export project refers to an unavailable default material");
+        ProjectJson editing={{"version",1},{"default_filament_slot",request.scene.default_filament_slot},{"objects",ProjectJson::array()}};
+        for(std::size_t oi=0;oi<request.scene.objects.size();++oi) {
+            cancelled();const auto& source=request.scene.objects[oi];auto* object=model.add_object();object->name=source.name;
+            if(editable) {
+                apply_object_semantics(*object,encode_project_object_semantics(source));
+                if(source.default_filament_slot<0 || std::size_t(source.default_filament_slot)>filament_count)
+                    throw std::invalid_argument("Export object refers to an unavailable material slot");
+                object->config.set("extruder",source.default_filament_slot?source.default_filament_slot:request.scene.default_filament_slot);
+            }
+            auto bindings=ProjectJson::array();
+            for(const auto& part:source.parts) {
+                if(!editable && part.role!=ProjectPartRole::Model && part.role!=ProjectPartRole::NegativeVolume)continue;
+                cancelled();if(!part.mesh || part.mesh->vertices.empty() || part.mesh->triangles.empty())
+                    throw std::invalid_argument("Cannot export an empty part");
+                std::vector<Vec3f> vertices;std::vector<Vec3i32> faces;
+                for(const auto& p:part.mesh->vertices){Vec3f v(p.x,p.y,p.z);if(!v.allFinite())throw std::invalid_argument("Nonfinite export vertex");vertices.push_back(v);}
+                for(const auto& f:part.mesh->triangles) {
+                    if(f.vertex_a>=vertices.size()||f.vertex_b>=vertices.size()||f.vertex_c>=vertices.size())throw std::invalid_argument("Invalid export triangle index");
+                    faces.emplace_back(f.vertex_a,f.vertex_b,f.vertex_c);
+                }
+                ModelVolumeType type;
+                switch(part.role){case ProjectPartRole::Model:type=ModelVolumeType::MODEL_PART;break;
+                case ProjectPartRole::NegativeVolume:type=ModelVolumeType::NEGATIVE_VOLUME;break;
+                case ProjectPartRole::ParameterModifier:type=ModelVolumeType::PARAMETER_MODIFIER;break;
+                case ProjectPartRole::SupportEnforcer:type=ModelVolumeType::SUPPORT_ENFORCER;break;
+                case ProjectPartRole::SupportBlocker:type=ModelVolumeType::SUPPORT_BLOCKER;break;
+                default:throw std::invalid_argument("Unknown export part role");}
+                auto* volume=object->add_volume(TriangleMesh(std::move(vertices),std::move(faces)),type,false);
+                volume->name=part.name;volume->set_transformation(mask_matrix(part.local_transform));
+                if(editable) {
+                    volume->config.apply(semantic_settings(semantic_json(encode_project_part_semantics(part),"part")));
+                    if(part.explicit_filament_binding){if(part.default_filament_slot<1 || std::size_t(part.default_filament_slot)>filament_count)throw std::invalid_argument("Export part material is unavailable");volume->config.set("extruder",part.default_filament_slot);}
+                    else if(part.inherit_project_filament)volume->config.set("extruder",request.scene.default_filament_slot);
+                    bindings.push_back({{"default_filament_slot",part.default_filament_slot},{"explicit_filament_binding",part.explicit_filament_binding},{"inherit_project_filament",part.inherit_project_filament}});
+                    volume->mmu_segmentation_facets.set_data(native_facets(part.material_facets,part.mesh->triangles.size(),int(EnforcerBlockerType::ExtruderMax)));
+                    apply_part_annotations(*volume,encode_project_part_annotations(part));
+                }
+            }
+            if(source.instances.empty())throw std::invalid_argument("Export object has no instances");
+            ProjectJson records=ProjectJson::array();
+            for(std::size_t ii=0;ii<source.instances.size();++ii) {
+                const auto& input=source.instances[ii];std::optional<std::size_t> plate;
+                if(!input.plate_id.empty()){const auto found=plate_ids.find(input.plate_id);if(found==plate_ids.end())throw std::invalid_argument("Export instance has no assigned plate");plate=found->second;}
+                auto transform=mask_matrix(input.transform);
+                if(plate)transform.translation()+=Vec3d(double(*plate%columns)*size[0]*1.2,-double(*plate/columns)*size[1]*1.2,0);
+                auto* instance=object->add_instance();instance->set_transformation(Geometry::Transformation(transform));instance->printable=input.printable;
+                if(plate)plates[*plate]->objects_and_instances.emplace_back(int(oi),int(ii));
+                ProjectJson masks=ProjectJson::array();
+                if(editable)for(const auto& m:input.fiber_masks){validate_mask_geometry(m);if(m.enabled)mask_process_patch(m,config);masks.push_back(project_mask_json(m));}
+                records.push_back({{"name",input.name},{"fiber_masks",masks},{"plate_index",plate?ProjectJson(*plate):ProjectJson(nullptr)}});
+            }
+            editing["objects"].push_back({{"default_filament_slot",source.default_filament_slot},{"parts",bindings},{"instances",records}});
+        }
+        model.curr_plate_index=int(std::min(request.scene.active_plate_index,count-1));
+        cancelled();
+        if(request.format==ModelFileFormat::Stl) {
+            // Orca Plater::export_stl (3c8c667dbd): use its CSG path and
+            // positive-only fallback, retaining explicit warning diagnostics.
+            TriangleMesh combined;
+            for(const auto* object:model.objects) {
+                std::vector<csg::CSGPart> csgmesh;
+                csg::model_to_csgmesh(*object,Transform3d::Identity(),std::back_inserter(csgmesh),csg::mpartsPositive|csg::mpartsNegative|csg::mpartsDoSplits);
+                auto range=Slic3r::range(csgmesh);TriangleMesh mesh;
+                if(csg::is_all_positive(range))mesh=TriangleMesh{csg::csgmesh_merge_positive_parts(range)};
+                else if(std::get<2>(csg::check_csgmesh_booleans(range))==range.end()) {
+                    try{mesh=MeshBoolean::cgal::cgal_to_triangle_mesh(*csg::perform_csgmesh_booleans(range));}catch(...){}
+                }
+                if(mesh.empty()) {
+                    result.diagnostics.push_back({"warning","export.boolean",object->name,"Boolean export failed; only positive parts were exported."});
+                    for(const auto* v:object->volumes)if(v->is_model_part()){auto positive=v->mesh();positive.transform(v->get_matrix(),true);mesh.merge(positive);}
+                }
+                for(const auto* instance:object->instances){cancelled();auto copy=mesh;copy.transform(instance->get_matrix(),true);combined.merge(copy);}
+            }
+            if(combined.empty() || !store_stl(staging.string().c_str(),&combined,true))throw std::runtime_error("STL export failed");
+        } else {
+            // Preserve the original secure full-config export boundary.
+            for(const char* key:{"print_host","print_host_webui","printhost_apikey","printhost_cafile","printhost_user","printhost_password","printhost_port"})config.erase(key);
+            mark_full_config_authoritative(config);
+            StoreParams params;const auto path=staging.string();params.path=path.c_str();params.model=&model;params.config=&config;
+            for(auto& plate:plates)params.plate_data_list.push_back(plate.get());
+            params.strategy=SaveStrategy::Silence|SaveStrategy::Zip64|SaveStrategy::SkipAuxiliary;
+            params.proFn=[&](int stage,int current,int total,bool& cancel){cancel=cancellation_requested(callbacks);report_progress(callbacks,float(stage)/14.f,"Exporting project");};
+            if(!store_bbs_3mf(params))throw std::runtime_error("3MF export failed");
+            const auto metadata=editing.dump();
+            if(!mz_zip_add_mem_to_archive_file_in_place(path.c_str(),project_edit_metadata,metadata.data(),metadata.size(),nullptr,0,MZ_DEFAULT_COMPRESSION))
+                throw std::runtime_error("Cannot preserve project editing metadata");
+        }
+        cancelled();
+        if(auto error=Slic3r::rename_file(staging.string(),target.string()))throw std::system_error(error,"Cannot finalize exported file");
+        staging.clear();result.success=true;result.path=target.string();report_progress(callbacks,1.f,"Export complete");
+    }catch(const std::exception& error){result.cancelled=cancellation_requested(callbacks);result.diagnostics.push_back({"error","export.write",request.path,error.what()});}
+    return result;
+}
 
 Config Config::for_project_overrides(const ConfigSnapshot& base, std::string_view plate,
     std::string_view target, std::optional<std::string_view> parent_object)
@@ -6234,6 +6488,12 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
         }
         if (result.configuration_changed) scene->source_filaments=state->prepared_view.filament_slots;
         else if (context.valid()) scene->source_filaments=context.view().filament_slots;
+        if(load_config && !scene->objects.empty()) {
+            // Extension failure must not reject a valid native Orca project.
+            // The atomic restore retains the native model/material fallback.
+            try { restore_project_edit_metadata(request.path,*scene); }
+            catch(const std::exception& error) { diagnostic("project.editing_metadata_ignored",error.what()); }
+        }
         // These are diagnostics, not a new file-acceptance policy. Native slice
         // validation is responsible for invalid settings and material bindings.
         if (max_slot>int(scene->source_filaments.size()))

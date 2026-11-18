@@ -325,6 +325,7 @@ struct SliceFiberMaskInput
     bool enabled{true};
     // Partial serialized patch restricted to ConfigScope::FiberMask parameters.
     std::vector<std::pair<std::string, std::string>> settings;
+    std::string name; // Optional editor label, retained by editable project export.
 };
 
 // Dimensions and transformed coordinates are limited to 1,000,000 mm.
@@ -622,6 +623,7 @@ struct ProjectPart {
     std::array<double,16> local_transform{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
     int default_filament_slot{0};
     bool explicit_filament_binding{false};
+    bool inherit_project_filament{false}; // GPlatform project-default vs object-default binding.
     std::shared_ptr<const ProjectMesh> mesh;
     ProjectSettings settings;
     SliceFacetLabels material_facets, support_facets, seam_facets, fuzzy_skin_facets;
@@ -630,6 +632,7 @@ struct ProjectInstance {
     std::string id, name, plate_id;
     std::array<double,16> transform{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
     bool printable{true};
+    std::vector<SliceFiberMaskInput> fiber_masks;
 };
 struct ProjectObject {
     std::string id, name;
@@ -666,6 +669,24 @@ struct ProjectScene {
     std::vector<FilamentSlotInfo> source_filaments;
     std::size_t active_plate_index{0};
     bool preview_only{false};
+    int default_filament_slot{1}; // Application project fallback, independent of object overrides.
+};
+// Editable model/project export. Instances with a plate ID use plate-local
+// matrices; unassigned instances retain world placement, as read_project returns.
+// STL contains positive/negative CSG
+// results only; 3MF retains all part roles, annotations and configurations.
+enum class ModelFileFormat { Stl, ThreeMf };
+struct ProjectWriteRequest {
+    std::string path;
+    ModelFileFormat format{ModelFileFormat::ThreeMf};
+    ProjectScene scene;
+    ConfigSnapshot config;
+};
+struct ProjectWriteResult {
+    bool success{false}, cancelled{false};
+    std::string path;
+    std::vector<ProjectDiagnostic> diagnostics;
+    explicit operator bool() const noexcept { return success; }
 };
 class LIBSLICER_API ConfigurationState final {
 public:
@@ -722,6 +743,11 @@ LIBSLICER_API std::string encode_project_object_semantics(const ProjectObject&);
 LIBSLICER_API std::string encode_project_part_semantics(const ProjectPart&);
 LIBSLICER_API std::string encode_project_part_annotations(const ProjectPart&);
 LIBSLICER_API std::string encode_project_plate_semantics(const ProjectPlate&);
+// Restore the library-owned DB semantic payload without duplicating its
+// versioned format or native parameter rules in application code.
+LIBSLICER_API ProjectObject decode_project_object_semantics(std::string_view);
+LIBSLICER_API ProjectPart decode_project_part_semantics(std::string_view, std::string_view annotations = {});
+LIBSLICER_API ProjectPlate decode_project_plate_semantics(std::string_view);
 LIBSLICER_API SettingsResult edit_project_override(const ConfigSnapshot& base,
     std::string_view plate, std::string& target, std::optional<std::string_view> parent_object,
     std::string_view key, std::optional<std::string_view> value);
@@ -795,6 +821,7 @@ public:
         const CalibrationOutputOptions& output, const SliceCallbacks& callbacks = {}) const;
     GCodePreviewResult load_gcode_preview(const GCodePreviewRequest& request,
                                           const SliceCallbacks& callbacks = {}) const;
+    ProjectWriteResult write_project(const ProjectWriteRequest&, const SliceCallbacks& = {}) const;
     ProjectImportResult import_project(const ProjectImportRequest& request,
                                        const SliceCallbacks& callbacks = {}) const;
     ProjectReadResult read_project(const ProjectReadRequest&, const SliceCallbacks& = {}) const;
