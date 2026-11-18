@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.13)
 project(libslic3r)
 
+if(LIBSLICER_BUILD_TESTS)
+    # Validate scanbeam reuse and intersection ordering while the existing native/model suites
+    # exercise real append/insertion sequences. Production SDKs do not rescan.
+    set_property(SOURCE clipper.cpp APPEND PROPERTY COMPILE_DEFINITIONS CLIPPER_VERIFY_INVARIANTS)
+    target_compile_definitions(clipper PRIVATE CLIPPER_VERIFY_INVARIANTS)
+endif()
+
 include(PrecompiledHeader)
 
 if(NOT DEFINED ORCA_CHECK_GCODE_PLACEHOLDERS)

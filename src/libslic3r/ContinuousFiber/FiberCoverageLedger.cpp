@@ -97,6 +97,40 @@ void FiberCoverageLedger::add(FiberCoverageRecord record)
     m_records.emplace_back(std::move(record));
 }
 
+ExPolygons FiberCoverageLedger::resin_protected_core() const
+{
+    ExPolygons fiber;
+    for (const auto& record : m_records) {
+        append(fiber, record.accepted_contour_exclusion);
+        append(fiber, record.accepted_infill_exclusion);
+    }
+    if (fiber.empty()) return {};
+    fiber = union_ex(fiber);
+    ExPolygons source;
+    for (const auto& record : m_records) append(source, record.source_domain);
+    // Only real residual material, including adjacent disabled-policy sources,
+    // may seed edge contact. Per-strand shrinkage would invent internal channels.
+    const ExPolygons residual = diff_ex(union_ex(source), fiber, ApplySafetyOffset::No);
+    std::map<double, ExPolygons> contact_bands;
+    ExPolygons protected_core;
+    for (const auto& record : m_records) {
+        ExPolygons own = union_ex(record.accepted_contour_exclusion, record.accepted_infill_exclusion);
+        if (own.empty()) continue;
+        const double overlap = record.resin_overlap_mm;
+        if (!std::isfinite(overlap) || overlap < 0)
+            throw FiberExecutionError("Invalid resin contact allowance");
+        if (overlap > 0 && !residual.empty()) {
+            auto band = contact_bands.find(overlap);
+            if (band == contact_bands.end())
+                band = contact_bands.emplace(overlap, offset_ex(residual, float(scale_(overlap)),
+                    ClipperLib::jtRound, double(SCALED_EPSILON))).first;
+            own = diff_ex(own, band->second, ApplySafetyOffset::No);
+        }
+        append(protected_core, std::move(own));
+    }
+    return union_ex(protected_core);
+}
+
 FiberCoverageAudit FiberCoverageLedger::audit(FiberCoverageAuditMode mode) const
 {
     FiberCoverageAudit result;

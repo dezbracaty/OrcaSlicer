@@ -1634,8 +1634,10 @@ Json benchmark_ring_slice(libslicer::Library& library,const fixture_fs::path& mo
     report["median_ratio"]=timings[1][1]/timings[0][1];report["passed"]=true;return report;
 }
 
-int ring_model_acceptance(const fixture_fs::path& model,size_t layers,const fixture_fs::path& output)
+int ring_model_acceptance(const fixture_fs::path& model,size_t layers,const fixture_fs::path& output,
+    const std::string& mode="all")
 {
+    require(mode=="all" || mode=="S0" || mode=="S5" || mode=="benchmark","Unknown ring matrix mode");
     fixture_fs::create_directories(output);
     const auto pinned=read_json(fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao/config.json");const auto& selection=pinned.at("selection");
     libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};
@@ -1644,40 +1646,49 @@ int ring_model_acceptance(const fixture_fs::path& model,size_t layers,const fixt
     selected.filament_preset_ids=selection.at("filament_preset_ids").get<std::vector<std::string>>();selected.filament_physical_tools=selection.at("filament_physical_tools").get<std::vector<unsigned>>();
     require(library->activate_config(selected).success,"Cannot activate ring presets");
     const double preset_radius=std::stod(*library->active_config_snapshot()->value("fiber_contour_bend_radius"));
-    Json report={{"passed",false},{"model",model.string()},{"fingerprint",fingerprint(model)},{"cases",Json::array()}};
+    Json report={{"passed",false},{"model",model.string()},{"fingerprint",fingerprint(model)},
+        {"mode",mode},{"cases",Json::array()}};
     for(double stability:{0.,5.}) {
+        if ((mode=="S0" || mode=="benchmark") && stability!=0) continue;
+        if (mode=="S5" && stability!=5) continue;
         const auto base=output/("S"+std::to_string(int(stability)));
         RingCaseOptions capture;capture.capture_geometry=true;
-        auto reference=ring_slice(*library,model,layers,preset_radius,100,stability,false,base/"contour100",capture);report["cases"].push_back(reference.report);
-        for(int count=0;count<=4;++count) {
-            auto concentric=ring_slice(*library,model,layers,preset_radius,count,stability,true,base/("concentric"+std::to_string(count)));
-            if(stability==0) {
-                require(concentric.commands==reference.commands,"Concentric commands differ from 100 contour reference at N="+std::to_string(count));
-                require(concentric.report["candidates"]==reference.report["candidates"],"Candidate count differs");
-                concentric.report["equivalent_to_contour100"]=true;
-            } else if(count>0) {
-                const auto ordinary=ring_slice(*library,model,layers,preset_radius,count,stability,false,base/("outer-reference"+std::to_string(count)));
-                check_ring_outer_unchanged(ordinary,concentric);
-                concentric.report["original_outer_unchanged"]=true;
+        auto reference=ring_slice(*library,model,layers,preset_radius,100,stability,false,base/"contour100",capture);
+        reference.report["matrix_role"]=mode=="benchmark"?"benchmark_setup":"contour_reference";
+        report["cases"].push_back(reference.report);
+        if (mode!="benchmark") {
+            for(int count=0;count<=4;++count) {
+                auto concentric=ring_slice(*library,model,layers,preset_radius,count,stability,true,base/("concentric"+std::to_string(count)));
+                if(stability==0) {
+                    require(concentric.commands==reference.commands,"Concentric commands differ from 100 contour reference at N="+std::to_string(count));
+                    require(concentric.report["candidates"]==reference.report["candidates"],"Candidate count differs");
+                    concentric.report["equivalent_to_contour100"]=true;
+                } else if(count>0) {
+                    const auto ordinary=ring_slice(*library,model,layers,preset_radius,count,stability,false,base/("outer-reference"+std::to_string(count)));
+                    check_ring_outer_unchanged(ordinary,concentric);
+                    auto outer_report=ordinary.report;outer_report["matrix_role"]="outer_reference";
+                    report["cases"].push_back(std::move(outer_report));
+                    concentric.report["original_outer_unchanged"]=true;
+                }
+                report["cases"].push_back(concentric.report);
             }
-            report["cases"].push_back(concentric.report);
+            for(int count=1;count<=4;++count) {
+                report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,count,stability,false,base/("contour"+std::to_string(count))).report);
+                RingCaseOptions options;options.rectilinear=true;
+                report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,count,stability,false,base/("rectilinear"+std::to_string(count)),options).report);
+            }
+            for(double density:{0.,50.,75.})for(int count:{1,4}) {
+                RingCaseOptions options;options.density=density;
+                report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,count,stability,true,
+                    base/("density"+std::to_string(int(density))+"-N"+std::to_string(count)),options).report);
+            }
+            for(double radius:{.3,.6}) {
+                RingCaseOptions options;options.radius=radius;
+                report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,1,stability,false,
+                    base/("radius"+std::to_string(radius)),options).report);
+            }
         }
-        for(int count=1;count<=4;++count) {
-            report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,count,stability,false,base/("contour"+std::to_string(count))).report);
-            RingCaseOptions options;options.rectilinear=true;
-            report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,count,stability,false,base/("rectilinear"+std::to_string(count)),options).report);
-        }
-        for(double density:{0.,50.,75.})for(int count:{1,4}) {
-            RingCaseOptions options;options.density=density;
-            report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,count,stability,true,
-                base/("density"+std::to_string(int(density))+"-N"+std::to_string(count)),options).report);
-        }
-        for(double radius:{.3,.6}) {
-            RingCaseOptions options;options.radius=radius;
-            report["cases"].push_back(ring_slice(*library,model,layers,preset_radius,1,stability,false,
-                base/("radius"+std::to_string(radius)),options).report);
-        }
-        if(stability==0) {
+        if(stability==0 && (mode=="all" || mode=="benchmark")) {
             const auto geometry_timing=benchmark_ring_geometry(reference.domains);
             write_json(base/"geometry-benchmark.json",geometry_timing);
             report["geometry_benchmark"+std::to_string(int(stability))]=geometry_timing;
@@ -1687,6 +1698,10 @@ int ring_model_acceptance(const fixture_fs::path& model,size_t layers,const fixt
         }
         write_json(output/"report.json",report);
     }
+    const size_t expected=mode=="S0"?22:mode=="S5"?26:mode=="benchmark"?1:48;
+    require(report["cases"].size()==expected,"Ring matrix case inventory is incomplete");
+    report["functional_slices"]=mode=="benchmark"?0:expected;
+    report["setup_slices"]=mode=="benchmark"?1:0;
     report["passed"]=true;write_json(output/"report.json",report);return 0;
 }
 
@@ -1821,7 +1836,7 @@ int ring_positive_acceptance(const fixture_fs::path& output)
 }
 
 int snapshot_benchmark(const fixture_fs::path& model,const fixture_fs::path& snapshot_file,const fixture_fs::path& output,
-    bool plan_statistics=false,bool no_fiber_contract=false)
+    bool plan_statistics=false,bool no_fiber_contract=false,bool native_stages=false)
 {
     std::string loaded_library;
 #ifdef __APPLE__
@@ -1862,7 +1877,7 @@ int snapshot_benchmark(const fixture_fs::path& model,const fixture_fs::path& sna
     std::ofstream(output/"effective_config.json")<<effective.dump(2);
     require(effective==pinned.at("settings"),"Effective snapshot differs from pinned full snapshot");
     request.objects.push_back(read_model(model));request.output_gcode_path=(output/"model.gcode").string();
-    if(plan_statistics) {
+    if(plan_statistics || native_stages) {
         // Separate native planning probe: public-SDK timing above remains a
         // different measurement. No diagnostic/counter is added to the SDK.
         Slic3r::DynamicPrintConfig config;config.apply(Slic3r::FullPrintConfig::defaults());
@@ -1882,11 +1897,69 @@ int snapshot_benchmark(const fixture_fs::path& model,const fixture_fs::path& sna
         for(int r=0;r<4;++r)for(int c=0;c<4;++c)transform(r,c)=input.transform[size_t(r*4+c)];
         object->add_instance()->set_transformation(Slic3r::Geometry::Transformation(transform));
         const auto& area=config.option<Slic3r::ConfigOptionPoints>("printable_area")->values;
-        plate.center_instances_around_point(Slic3r::BoundingBoxf(area).center());
+        if(pinned.value("center_on_build_plate",true))
+            plate.center_instances_around_point(Slic3r::BoundingBoxf(area).center());
         Slic3r::Print print;print.set_plate_origin(Slic3r::Vec3d::Zero());
         print.is_BBL_printer()=config.opt_string("printer_model").rfind("Bambu Lab",0)==0;
         print.apply(plate,config);Slic3r::StringObjectException warning;const auto error=print.validate(&warning);
-        require(error.string.empty(),error.string);print.process();const auto table=print.fiber_execution_plans();
+        require(error.string.empty(),error.string);
+        bool captured=false;
+        const auto capture_stage=[&](const char* phase) {
+            Json data={{"phase",phase},{"scope","native LayerXY geometry; not delivered G-code"},
+                {"source",Json::array()},{"fiber",Json::array()},{"paths",Json::array()}};
+            for(const auto* printed:print.objects())for(const auto* layer:printed->layers()) {
+                if(layer->id()+1!=pinned.value("diagnostic_layer",4u))continue;
+                for(const auto& diagnostic:layer->fiber_fill_diagnostics)
+                    if(diagnostic.kind==Slic3r::Layer::FiberDiagnosticKind::OriginalContourRegion)
+                        data["source"].push_back(fiber_regions_json({diagnostic.region})[0]);
+                const auto collect=[&](const auto& self,const Slic3r::ExtrusionEntity& entity)->void {
+                    if(const auto* collection=dynamic_cast<const Slic3r::ExtrusionEntityCollection*>(&entity)) {
+                        for(const auto* child:collection->entities)self(self,*child);
+                    } else if(const auto* fiber=dynamic_cast<const Slic3r::ExtrusionFiberPath*>(&entity)) {
+                        const auto& path=*fiber->prepared_path();
+                        for(const auto& region:fiber_regions_json(path.physical_coverage))data["fiber"].push_back(region);
+                    } else if(const auto* path=dynamic_cast<const Slic3r::ExtrusionPath*>(&entity)) {
+                        if(path->role()==Slic3r::erResinInfill || path->role()==Slic3r::erGapFill)
+                        {
+                            Json fitting=Json::array();
+                            for(const auto& fit:path->polyline.fitting_result) {
+                                Json entry={{"first",fit.start_point_index},{"last",fit.end_point_index},{"type",int(fit.path_type)}};
+                                if(fit.path_type==Slic3r::EMovePathType::Arc_move_cw || fit.path_type==Slic3r::EMovePathType::Arc_move_ccw) {
+                                    const auto& arc=fit.arc_data;
+                                    entry["center"]={Slic3r::unscale<double>(arc.center.x()),Slic3r::unscale<double>(arc.center.y())};
+                                    entry["radius"]=Slic3r::unscale<double>(arc.radius);
+                                    entry["angle"]=arc.angle_radians;
+                                    entry["clockwise"]=fit.path_type==Slic3r::EMovePathType::Arc_move_cw;
+                                }
+                                fitting.push_back(std::move(entry));
+                            }
+                            data["paths"].push_back({{"id",std::uintptr_t(path)},{"width",path->width},
+                                {"role",path->role()==Slic3r::erResinInfill?"resin":"gap"},
+                                {"points",fiber_points_json(path->polyline)},{"fitting_records",path->polyline.fitting_result.size()},
+                                {"fitting",std::move(fitting)}});
+                        }
+                    } else if(const auto* multi=dynamic_cast<const Slic3r::ExtrusionMultiPath*>(&entity)) {
+                        for(const auto& path:multi->paths)self(self,path);
+                    } else if(const auto* loop=dynamic_cast<const Slic3r::ExtrusionLoop*>(&entity)) {
+                        for(const auto& path:loop->paths)self(self,path);
+                    }
+                };
+                for(const auto* region:layer->regions())collect(collect,region->fills);
+            }
+            require(!data["source"].empty(),"Native source diagnostics are required for the stage probe");
+            write_json(output/(std::string(phase)+".json"),data);
+        };
+        if(native_stages) {
+            print.set_status_callback([&](const Slic3r::PrintBase::SlicingStatus& status) {
+                if(status.percent==75 && !captured){capture_stage("before-simplify");captured=true;}
+            });
+        }
+        print.process();
+        if(native_stages) {
+            require(captured,"Did not observe native simplification entry");capture_stage("after-simplify");
+            write_json(output/"report.json",{{"native_stages",true},{"captured",true}});return 0;
+        }
+        const auto table=print.fiber_execution_plans();
         require(bool(table),"Missing execution statistics table");
         const auto& stats=table->statistics;
         Json report={{"scope","native planning counters only; not a public-SDK timing"},{"paths",table->paths.size()},
@@ -1958,6 +2031,61 @@ int snapshot_benchmark(const fixture_fs::path& model,const fixture_fs::path& sna
     return result.success?0:2;
 }
 
+// Replay one captured rounding input without slicing the full model matrix.
+int rounding_fixture(const fixture_fs::path& input,const fixture_fs::path& output)
+{
+    const auto fixture=read_json(input);
+    Slic3r::Polyline3 source;
+    for(const auto& point:fixture.at("source"))
+        source.points.emplace_back(point[0].get<coord_t>(),point[1].get<coord_t>(),coord_t(0));
+    Slic3r::ExPolygons domain;
+    for(const auto& rings:fixture.at("domain")) {
+        Slic3r::ExPolygon region;
+        for(size_t i=0;i<rings.size();++i) {
+            Slic3r::Polygon ring;
+            for(const auto& point:rings[i])ring.points.emplace_back(point[0].get<coord_t>(),point[1].get<coord_t>());
+            if(i==0)region.contour=std::move(ring);else region.holes.push_back(std::move(ring));
+        }
+        domain.push_back(std::move(region));
+    }
+    Slic3r::ContourRoundingOptions options{fixture.at("radius").get<double>()};
+    options.chord_tolerance_mm=fixture.value("chord_tolerance",options.chord_tolerance_mm);
+    options.geometry_tolerance_mm=fixture.value("geometry_tolerance",options.geometry_tolerance_mm);
+    const auto started=std::chrono::steady_clock::now();
+    const auto result=Slic3r::ContinuousFiberFillStrategy::round_outer_contour(source,domain,options);
+    const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+    Json geometry={{"path",nullptr},{"fitting",Json::array()},{"arcs",Json::array()},{"bends",Json::array()},{"issues",Json::array()}};
+    if(result.path) {
+        geometry["path"]=Json::array();
+        for(const auto& point:result.path->points)geometry["path"].push_back({point.x(),point.y(),point.z()});
+        for(const auto& fit:result.path->fitting_result) {
+            Json entry={fit.start_point_index,fit.end_point_index,int(fit.path_type)};
+            if(fit.path_type==Slic3r::EMovePathType::Arc_move_cw || fit.path_type==Slic3r::EMovePathType::Arc_move_ccw) {
+                const auto& arc=fit.arc_data;
+                entry.push_back({{arc.center.x(),arc.center.y()},arc.radius,arc.is_arc,arc.length,arc.angle_radians,
+                    arc.polar_start_theta,arc.polar_end_theta,{arc.start_point.x(),arc.start_point.y()},
+                    {arc.end_point.x(),arc.end_point.y()},int(arc.direction)});
+            }
+            geometry["fitting"].push_back(std::move(entry));
+        }
+    }
+    for(const auto& arc:result.arcs)geometry["arcs"].push_back({{arc.center_mm.x(),arc.center_mm.y()},
+        {arc.start_mm.x(),arc.start_mm.y()},{arc.end_mm.x(),arc.end_mm.y()},arc.radius_mm,
+        arc.sweep_radians,arc.begin_mm,arc.end_distance_mm,arc.source_sweep_radians});
+    for(const auto& bend:result.bends)geometry["bends"].push_back({bend.begin_mm,bend.end_mm,
+        {bend.entry_point.x(),bend.entry_point.y()},{bend.exit_point.x(),bend.exit_point.y()}});
+    for(const auto& issue:result.issues) {
+        Json points=Json::array();for(const auto& point:issue.source.points)points.push_back({point.x(),point.y()});
+        geometry["issues"].push_back({int(issue.reason),std::move(points)});
+    }
+    fixture_fs::create_directories(output);
+    write_json(output/"geometry.json",geometry);
+    write_json(output/"report.json",{{"seconds",seconds},{"has_path",bool(result.path)},
+        {"source_points",source.points.size()},{"scope","one exact captured outer rounding call"}});
+    std::cout<<"Captured rounding seconds="<<seconds<<" path="<<bool(result.path)<<std::endl;
+    return 0;
+}
+
 int run_acceptance(int argc,char** argv)
 {
     const fixture_fs::path assets=fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao";
@@ -1969,9 +2097,11 @@ int run_acceptance(int argc,char** argv)
         fixture_fs::path(FIBER_ACCEPTANCE_OUTPUT_DIR);
     const bool checking=argc==2 && std::string(argv[1])=="--self-test";
     try {
+        if(argc==4 && std::string(argv[1])=="--rounding-fixture")return rounding_fixture(argv[2],argv[3]);
         if(argc==5 && std::string(argv[1])=="--snapshot-benchmark")return snapshot_benchmark(argv[2],argv[3],argv[4]);
         if(argc==5 && std::string(argv[1])=="--snapshot-benchmark-no-fiber")return snapshot_benchmark(argv[2],argv[3],argv[4],false,true);
         if(argc==5 && std::string(argv[1])=="--snapshot-plan-statistics")return snapshot_benchmark(argv[2],argv[3],argv[4],true);
+        if(argc==5 && std::string(argv[1])=="--snapshot-native-stages")return snapshot_benchmark(argv[2],argv[3],argv[4],false,false,true);
         if((argc==7 || argc==8) && std::string(argv[1])=="--connection-model") {
             const auto pinned=read_json(fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao/config.json");const auto& selected=pinned.at("selection");
             libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};auto library=libslicer::Library::open(options);
@@ -1987,7 +2117,7 @@ int run_acceptance(int argc,char** argv)
             ring_slice(*library,argv[2],std::stoul(argv[3]),.3,3,0,mode=="con100" || mode=="con30",argv[6],test_options);return 0;
         }
         if(argc==3 && std::string(argv[1])=="--ring-positive")return ring_positive_acceptance(argv[2]);
-        if(argc==8 && std::string(argv[1])=="--ring-case") {
+        if((argc==8 || argc==9) && std::string(argv[1])=="--ring-case") {
             const auto pinned=read_json(fixture_fs::path(LIBSLICER_TEST_DATA_DIR)/"continuous_fiber/4xiao/config.json");const auto& selected=pinned.at("selection");
             libslicer::LibraryOptions options;options.resource_directory=LIBSLICER_TEST_RESOURCE_DIR;options.vendors={"CFSYS"};auto library=libslicer::Library::open(options);
             libslicer::ConfigSelection selection;selection.machine_model_id=selected.at("machine_model_id");selection.machine_variant_id=selected.at("machine_variant_id");selection.process_preset_id=selected.at("process_preset_id");
@@ -1995,10 +2125,12 @@ int run_acceptance(int argc,char** argv)
             require(library->activate_config(selection).success,"Cannot activate ring case");
             const double preset_radius=std::stod(*library->active_config_snapshot()->value("fiber_contour_bend_radius"));
             RingCaseOptions test_options;test_options.use_default_stability=std::string(argv[5])=="default";
+            if(argc==9)test_options.radius=std::stod(argv[8]);
             ring_slice(*library,argv[2],std::stoul(argv[3]),preset_radius,std::stoi(argv[4]),
                 test_options.use_default_stability?0:std::stod(argv[5]),std::stoi(argv[6])!=0,argv[7],test_options);return 0;
         }
-        if(argc==5 && std::string(argv[1])=="--ring-model")return ring_model_acceptance(argv[2],std::stoul(argv[3]),argv[4]);
+        if((argc==5 || argc==6) && std::string(argv[1])=="--ring-model")
+            return ring_model_acceptance(argv[2],std::stoul(argv[3]),argv[4],argc==6?argv[5]:"all");
         if((argc==4 || argc==5) && std::string(argv[1])=="--resin-model")return resin_model(argv[2],argv[3],argc==5?fixture_fs::path(argv[4]):fixture_fs::path{});
         if(argc==2 && std::string(argv[1])=="--rounded-self-test") {rounded_checker_self_test();return 0;}
         if(argc==6 && std::string(argv[1])=="--rounded-model")

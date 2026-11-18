@@ -12,6 +12,14 @@
 #include <vector>
 
 namespace Slic3r {
+namespace continuous_fiber_detail {
+// Complete geometry only: preserve all X scanbeam events at the queried Y.
+struct HoleQueryBand { coord_t min_y, max_y; };
+std::optional<HoleQueryBand> hole_query_band(const ExPolygons& frontier, double width_mm, double radius_mm);
+ExPolygons hole_query_material(const ExPolygons& material, const HoleQueryBand& band);
+ExPolygons hole_query_occupancy(const ExPolygons& footprint, const HoleQueryBand& band);
+}
+
 void audit_fiber_execution_connections(const std::map<FiberFragmentId,CompiledFiberPath>& paths);
 
 
@@ -41,7 +49,8 @@ enum class FiberRejectionReason : uint8_t {
     OccupiedContourRegion,
     UnavailableContourRegion,
     OpenOuterContour,
-    BendStabilizationTooShort
+    BendStabilizationTooShort,
+    OpenHoleContour
 };
 
 const char* fiber_rejection_reason_name(FiberRejectionReason reason);
@@ -187,7 +196,7 @@ private:
         ExtrusionRole output_role, const FiberDomainId& domain_id, size_t job_ordinal,
         const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
         const ExPolygons* physical_centerline_domain, bool collect_debug,
-        bool requires_closed_loop = false, const std::vector<ContourArc>* source_arcs = nullptr,
+        bool outer_contour = false, const std::vector<ContourArc>* source_arcs = nullptr,
         double bend_stabilization_length_mm = 0.0,
         std::vector<FiberFragmentId>* policy_rejected = nullptr);
 };

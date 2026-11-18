@@ -1,6 +1,9 @@
 #include <catch2/catch_all.hpp>
 
 #include <numeric>
+#include <random>
+#include <type_traits>
+#include "clipper_z.hpp"
 #include <iostream>
 #include <boost/filesystem.hpp>
 
@@ -9,6 +12,173 @@
 #include "libslic3r/SVG.hpp"
 
 using namespace Slic3r;
+
+// Test existing internal functions without adding a production test interface.
+namespace Slic3r::ClipperLib {
+OutPt* GetBottomPt(OutPt*);
+bool FirstIsBottomPt(const OutPt*,const OutPt*);
+}
+namespace ClipperLib_Z {
+OutPt* GetBottomPt(OutPt*);
+bool FirstIsBottomPt(const OutPt*,const OutPt*);
+}
+
+namespace {
+// Frozen bf946c941824 implementation: compare node identity, including all
+// repeated-bottom tie breaking, rather than merely the returned coordinate.
+// clipper.cpp's local IntPoint comparison ignores Z; spell that comparison
+// explicitly here because Eigen's default comparison would also compare Z.
+template<class PointType>
+bool same_clipper_xy(const PointType& a,const PointType& b)
+{ return a.x()==b.x() && a.y()==b.y(); }
+
+template<class OutPt>
+OutPt* original_bottom_point(OutPt *pp)
+{
+  OutPt* dups = nullptr;
+  OutPt* p = pp->Next;
+  while (p != pp)
+  {
+    if (p->Pt.y() > pp->Pt.y())
+    {
+      pp = p;
+      dups = nullptr;
+    }
+    else if (p->Pt.y() == pp->Pt.y() && p->Pt.x() <= pp->Pt.x())
+    {
+      if (p->Pt.x() < pp->Pt.x())
+      {
+        dups = nullptr;
+        pp = p;
+      } else
+      {
+        if (p->Next != pp && p->Prev != pp) dups = p;
+      }
+    }
+    p = p->Next;
+  }
+  if (dups)
+  {
+    //there appears to be at least 2 vertices at BottomPt so ...
+    while (dups != p)
+    {
+      if (!FirstIsBottomPt(p, dups)) pp = dups;
+      dups = dups->Next;
+      while (!same_clipper_xy(dups->Pt,pp->Pt)) dups = dups->Next;
+    }
+  }
+  return pp;
+}
+
+}
+
+TEST_CASE("bottom point scan preserves original node identity from every start", "[ClipperUtils][BottomPoint]")
+{
+    const auto check=[](const Points& points,auto node_type) {
+        using Node=std::remove_pointer_t<decltype(node_type)>;
+        std::vector<Node> nodes(points.size());
+        for(size_t i=0;i<nodes.size();++i) {
+            nodes[i].Idx=int(i);nodes[i].Pt.x()=points[i].x();nodes[i].Pt.y()=points[i].y();
+            if constexpr(std::is_same_v<Node,::ClipperLib_Z::OutPt>)nodes[i].Pt.z()=coord_t(i%3);
+        }
+        for(bool reverse:{false,true}) {
+            for(size_t i=0;i<nodes.size();++i) {
+                const size_t next=(i+1)%nodes.size(),previous=(i+nodes.size()-1)%nodes.size();
+                nodes[i].Next=&nodes[reverse?previous:next];
+                nodes[i].Prev=&nodes[reverse?next:previous];
+            }
+            for(size_t start=0;start<nodes.size();++start) {
+                CAPTURE(points.size(),reverse,start);
+                const auto expected=original_bottom_point(&nodes[start]);
+                if constexpr(std::is_same_v<Node,::ClipperLib_Z::OutPt>)
+                    CHECK(::ClipperLib_Z::GetBottomPt(&nodes[start])==expected);
+                else CHECK(ClipperLib::GetBottomPt(&nodes[start])==expected);
+            }
+        }
+    };
+    const auto both=[&](const Points& points) {
+        check(points,static_cast<ClipperLib::OutPt*>(nullptr));
+        check(points,static_cast<::ClipperLib_Z::OutPt*>(nullptr));
+    };
+    for(const Points& points:std::vector<Points>{
+        {{0,0}},{{0,0},{0,0}},{{0,0},{1,1}},
+        {{2,4},{0,4},{1,4},{0,4}},
+        {{0,0},{0,3},{0,3},{1,0},{0,3},{-1,0},{0,3}},
+        {{2,1},{0,5},{2,3},{0,5},{-2,3},{0,5},{-2,1}},
+        Points(12,Point(3,5))})both(points);
+    const coord_t large=coord_t(1)<<60;
+    both({{large,large},{large+1000,large+2000},{large,large+2000},
+        {large+500,large+1000},{large,large+2000}});
+    both({{-large,-large},{-large+1000,-large+2000},{-large,-large+2000},
+        {-large+500,-large+1000},{-large,-large+2000}});
+    std::mt19937_64 random(0x72d6);
+    for(size_t trial=0;trial<1000;++trial) {
+        Points points;
+        const size_t count=1+random()%32;
+        for(size_t i=0;i<count;++i)points.emplace_back(coord_t(random()%7)-3,coord_t(random()%7)-3);
+        both(points);
+    }
+}
+
+
+TEST_CASE("scanbeam reuse preserves XY and XYZ clipping events", "[ClipperUtils][Scanbeam]")
+{
+    // Test builds compare every scanbeam with the frozen original bubble
+    // events, and check the reused TopX before its original second evaluation.
+    const auto check=[](const std::vector<Points>& rings) {
+        ClipperLib::Paths subject, clip;
+        ::ClipperLib_Z::Paths subject_z, clip_z;
+        for (size_t i=0;i<rings.size();++i) {
+            (i%2?clip:subject).push_back(rings[i]);
+            ::ClipperLib_Z::Path z;
+            for(size_t j=0;j<rings[i].size();++j)
+                z.emplace_back(rings[i][j].x(),rings[i][j].y(),coord_t(j%7));
+            (i%2?clip_z:subject_z).push_back(std::move(z));
+        }
+        for (int operation=0;operation<4;++operation) {
+            ClipperLib::Clipper xy(ClipperLib::ioStrictlySimple);
+            ::ClipperLib_Z::Clipper xyz(::ClipperLib_Z::ioStrictlySimple);
+            xy.AddPaths(subject,ClipperLib::ptSubject,true);
+            xy.AddPaths(clip,ClipperLib::ptClip,true);
+            xyz.AddPaths(subject_z,::ClipperLib_Z::ptSubject,true);
+            xyz.AddPaths(clip_z,::ClipperLib_Z::ptClip,true);
+            ClipperLib::Paths result;
+            ::ClipperLib_Z::Paths result_z;
+            REQUIRE(xy.Execute(static_cast<ClipperLib::ClipType>(operation),result,
+                ClipperLib::pftEvenOdd,ClipperLib::pftEvenOdd));
+            REQUIRE(xyz.Execute(static_cast<::ClipperLib_Z::ClipType>(operation),result_z,
+                ::ClipperLib_Z::pftEvenOdd,::ClipperLib_Z::pftEvenOdd));
+            REQUIRE(result.size()==result_z.size());
+            for(size_t i=0;i<result.size();++i) {
+                REQUIRE(result[i].size()==result_z[i].size());
+                for(size_t j=0;j<result[i].size();++j) {
+                    CHECK(result[i][j].x()==result_z[i][j].x());
+                    CHECK(result[i][j].y()==result_z[i][j].y());
+                }
+            }
+        }
+    };
+    check({{{0,0},{8000,8000},{0,8000},{8000,0}},
+           {{0,4000},{4000,0},{8000,4000},{4000,8000}}});
+    check({{{0,0},{9000,0},{9000,9000},{0,9000}},
+           {{3000,0},{6000,0},{6000,9000},{3000,9000}}});
+    std::mt19937_64 random(0x328af);
+    for(size_t trial=0;trial<64;++trial) {
+        CAPTURE(trial);
+        std::vector<Points> rings(4);
+        for(size_t ring=0;ring<rings.size();++ring) {
+            const size_t count=6+random()%27;
+            for(size_t i=0;i<count;++i) {
+                const double angle=2*PI*double(i)/count;
+                const double radius=2000+random()%6000;
+                rings[ring].emplace_back(coord_t(2500*ring+radius*std::cos(angle)),
+                    coord_t(1000*ring+radius*std::sin(angle)));
+            }
+            if(trial%2)std::reverse(rings[ring].begin(),rings[ring].end());
+        }
+        check(rings);
+    }
+}
 
 SCENARIO("Various Clipper operations - xs/t/11_clipper.t", "[ClipperUtils]") {
     // CCW oriented contour

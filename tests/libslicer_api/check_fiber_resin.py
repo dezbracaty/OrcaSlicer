@@ -16,16 +16,49 @@ import math
 import re
 from collections import defaultdict
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from shapely.geometry import LineString, Polygon, GeometryCollection, box
 from shapely.ops import unary_union
 from shapely.prepared import prep
 
 EMPTY = GeometryCollection()
+# Current native writer: .001 mm XY/IJ, with a 1e-6 mm primitive grid.
+NATIVE_XY_QUANTUM_MM = .001
+ARC_RADIUS_MISMATCH_MM = 2 * math.sqrt(2) * NATIVE_XY_QUANTUM_MM + 4 * math.sqrt(2) * 1e-6
 
 def sweep(points, radius):
     return LineString(points).buffer(radius, cap_style=2, join_style=1, quad_segs=64)
 
-def parse(folder):
+def arc_points(start, end, offset, clockwise, error=.00005, diagnostics=None):
+    """Expand native XY/IJ arcs independently of the production parser."""
+    center = [start[i] + offset[i] for i in (0, 1)]
+    radius = math.hypot(*offset)
+    if not math.isfinite(radius) or radius <= 0:
+        raise AssertionError('Invalid XY arc radius')
+    mismatch = abs(math.dist(end, center) - radius)
+    if not math.isfinite(mismatch) or mismatch > ARC_RADIUS_MISMATCH_MM:
+        raise AssertionError('Arc endpoint radius mismatch exceeds the native command-grid budget')
+    if diagnostics is not None:
+        diagnostics['commands'] += 1
+        diagnostics['maximum_radius_mismatch_mm'] = max(diagnostics['maximum_radius_mismatch_mm'], mismatch)
+    # The circle chords obey error; the final native endpoint also carries the
+    # separately reported, bounded command-grid radius mismatch.
+    first = math.atan2(start[1] - center[1], start[0] - center[0])
+    last = math.atan2(end[1] - center[1], end[0] - center[0])
+    angle = (first - last if clockwise else last - first) % (2 * math.pi)
+    if start == end:
+        angle = 2 * math.pi
+    step = 2 * math.acos(max(-1., min(1., 1 - error / radius)))
+    count = math.ceil(angle / step) if step else 1000001
+    if count > 1000000:
+        raise AssertionError('Arc exceeds independent sampling budget')
+    count = max(1, count)
+    direction = -1 if clockwise else 1
+    return [[center[0] + radius * math.cos(first + direction * angle * i / count),
+             center[1] + radius * math.sin(first + direction * angle * i / count)]
+            for i in range(1, count)] + [list(end)]
+
+def parse(folder, arc_diagnostics=None):
     config = json.loads((folder / 'effective_config.json').read_text())
     offsets = [tuple(map(float, s.split('x'))) for s in config['extruder_offset'].split(',')]
     layers = defaultdict(lambda: {'fiber': [], 'resin': []})
@@ -65,20 +98,30 @@ def parse(folder):
         if op == 'G91': absolute = False
         if op == 'M83': relative_e = True
         if op == 'M82': relative_e = False
-        if op in ('G2','G3'): raise AssertionError('Arc G-code requires explicit oracle expansion')
-        if op not in ('G0', 'G1', 'G92'): continue
-        v = {w[0]: float(w[1:]) for w in words[1:] if w[0] in 'XYZE' and len(w) > 1}
+        if op in ('G20', 'G18', 'G19', 'G90.1'):
+            raise AssertionError('Oracle requires millimetres, XY arcs and relative IJ')
+        if op not in ('G0', 'G1', 'G2', 'G3', 'G92'): continue
+        v = {w[0]: float(w[1:]) for w in words[1:] if w[0] in 'XYZEIJR' and len(w) > 1}
+        if op == 'G92' and any(axis in v for axis in 'XY'):
+            raise AssertionError('Oracle does not support XY coordinate-system resets')
         end = [v.get(k, xy[i]) if absolute or op == 'G92' else xy[i] + v.get(k, 0) for i, k in enumerate('XY')]
         de = v.get('E', 0) if relative_e else v.get('E', e) - e
         if op == 'G92': e = v.get('E', e)
         elif 'E' in v: e = e + v['E'] if relative_e else v['E']
-        if op != 'G92' and xy != end and layer:
+        arc = op in ('G2', 'G3')
+        if arc and 'R' in v:
+            raise AssertionError('Oracle expects native IJ arc output, not R arcs')
+        moving = xy != end or arc
+        if op != 'G92' and moving and layer:
+            points = arc_points(xy, end, [v.get('I', 0), v.get('J', 0)], op == 'G2', diagnostics=arc_diagnostics) if arc else [end]
             a = [xy[i] + offsets[tool][i] for i in (0, 1)]
-            b = [end[i] + offsets[tool][i] for i in (0, 1)]
-            if active and deposit: block['points'].append(b)
-            elif not active and de > 0 and role in ('Resin infill', 'Gap infill'):
-                layers[layer]['resin'].append({'points': [a, b], 'width': width, 'line': number, 'role': role, 'run': resin_run})
-        if op == 'G92' or (op in ('G0','G1') and (active or de <= 0) and xy != end):
+            for point in points:
+                b = [point[i] + offsets[tool][i] for i in (0, 1)]
+                if active and deposit: block['points'].append(b)
+                elif not active and de > 0 and role in ('Resin infill', 'Gap infill'):
+                    layers[layer]['resin'].append({'points': [a, b], 'width': width, 'line': number, 'role': role, 'run': resin_run})
+                a = b
+        if op == 'G92' or (op in ('G0','G1','G2','G3') and (active or de <= 0) and moving):
             resin_run += 1
         xy = end
     return config, layers
@@ -106,7 +149,9 @@ def protected_domain(area, physical, overlap):
     return area.difference(resin)
 
 def inspect(folder, baseline=None, expected_layers=None):
-    config, layers = parse(folder)
+    arc_diagnostics = {'commands': 0, 'maximum_radius_mismatch_mm': 0.,
+                       'radius_mismatch_limit_mm': ARC_RADIUS_MISMATCH_MM, 'circle_chord_error_mm': .00005}
+    config, layers = parse(folder, arc_diagnostics)
     domains = defaultdict(list)
     for d in json.loads((folder / 'domains.json').read_text()):
         if d['kind'] == 1:
@@ -114,7 +159,8 @@ def inspect(folder, baseline=None, expected_layers=None):
             domains[d['layer']].append(Polygon(rings[0], rings[1:]).buffer(0))
     baseline_layers = parse(baseline)[1] if baseline else None
     report = {'scope': 'fiber_intrusion_and_optional_fiber_identity_only',
-              'coverage_acceptance': 'not_evaluated', 'passed': True, 'layers': [], 'quantization_intrusion_depth_mm': .003}
+              'coverage_acceptance': 'not_evaluated', 'passed': True, 'layers': [],
+              'native_arc_expansion': arc_diagnostics, 'quantization_intrusion_depth_mm': .003}
     layer_count = json.loads((folder / 'report.json').read_text())['layer_count']
     if expected_layers is not None and layer_count != expected_layers: report['passed'] = False
     report['layer_count'] = layer_count
@@ -188,7 +234,47 @@ def self_test():
     core = box(0,0,10,3)
     omitted = box(4,0,6,3)
     assert core.difference(core.difference(omitted)).area == 6
-    print('PASS checker negative controls: injected strand, legacy erosion, omitted pocket')
+    for clockwise in (False, True):
+        end = [0., -1.] if clockwise else [0., 1.]
+        points = [[1., 0.]] + arc_points([1., 0.], end, [-1., 0.], clockwise)
+        assert points[-1] == end
+        for a, b in zip(points, points[1:]):
+            midpoint = [(a[i] + b[i]) / 2 for i in (0, 1)]
+            assert abs(math.hypot(*midpoint) - 1) <= .00005 * 1.001
+        full = arc_points([1., 0.], [1., 0.], [-1., 0.], clockwise)
+        assert len(full) > len(points) and full[-1] == [1., 0.]
+    try:
+        arc_points([1., 0.], [0., 2.], [-1., 0.], False)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('Malformed arc was accepted')
+    with TemporaryDirectory() as temporary:
+        folder = Path(temporary)
+        (folder / 'effective_config.json').write_text(json.dumps({'extruder_offset': '2x3'}))
+        common = ';LAYER_CHANGE\nT0\nG90\nM82\nG92 E4\nG1 X1 Y0\n;TYPE:Resin infill\n;WIDTH:0.42\n'
+        absolute = common + 'G3 X0 Y1 I-1 J0 E5\n'
+        relative = common + 'G91\nM83\nG3 X-1 Y1 I-1 J0 E1\n'
+        parsed = []
+        for gcode in (absolute, relative):
+            (folder / 'model.gcode').write_text(gcode)
+            parsed.append(parse(folder)[1][1]['resin'])
+        geometry = [[(segment['points'], segment['width'], segment['role']) for segment in rows] for rows in parsed]
+        assert geometry[0] == geometry[1]
+        assert parsed[0][0]['points'][0] == [3., 3.]
+        assert parsed[0][-1]['points'][-1] == [2., 4.]
+        for gcode in (common + 'G3 X0 Y1 I-1 J0 E4\n', common + 'G91\nM83\nG3 X-1 Y1 I-1 J0 E0\n'):
+            (folder / 'model.gcode').write_text(gcode)
+            assert not parse(folder)[1][1]['resin']
+        for unsupported in ('G20', 'G92 X0', 'G18', 'G90.1'):
+            (folder / 'model.gcode').write_text(common + unsupported + '\n')
+            try:
+                parse(folder)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError('Unsupported modal command was accepted')
+    print('PASS checker controls: intrusion, legacy erosion, pocket, arcs and modal parsing')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

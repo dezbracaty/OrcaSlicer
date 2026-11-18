@@ -19,7 +19,7 @@ namespace {
 
 // Normalize before coverage/validation, never while emitting. Two microns is
 // above the diagonal of the G-code coordinate grid and below Fill resolution.
-constexpr double command_resolution_mm = 0.002;
+constexpr double command_resolution_mm = fiber_normalization_error_mm;
 constexpr double normalization_error_mm = command_resolution_mm;
 
 double area_mm2(const ExPolygons& polygons)
@@ -590,9 +590,15 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     const FiberFragmentId& id, const FiberFinishRoute& finish,
     const std::vector<ContourArc>& arcs, const ExPolygons* planned_centerline_domain,
     const std::vector<FiberExecutionPiece>& pieces,
-    const std::vector<FiberExecutionPiece>& finish_pieces)
+    const std::vector<FiberExecutionPiece>& finish_pieces,
+    const ExPolygons* expanded_centerline_domain)
 {
     FiberFinalizationResult result;
+    if (expanded_centerline_domain && !planned_centerline_domain) {
+        result.failure=FiberFinalizationFailure::InvalidParameter;
+        result.detail="A derived centerline query requires its original planning domain";
+        return result;
+    }
     // The validator owns source normalization, before geometry checks and
     // interval mapping. Splitting below may introduce short end edges, so each
     // process span still preserves its endpoints when preparing command samples.
@@ -762,10 +768,11 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
     append_finish(*prepared, finish);
     if (!pieces.empty()) prepared->finish_strategy=finish.strategy;
     const bool check_centerline = planned_centerline_domain || !arcs.empty();
-    const ExPolygons centerline_domain = planned_centerline_domain ?
+    const ExPolygons computed_centerline_domain = expanded_centerline_domain ? ExPolygons{} : planned_centerline_domain ?
         offset_ex(*planned_centerline_domain, float(scale_(ContourRoundingOptions{}.geometry_tolerance_mm))) :
         check_centerline ? offset_ex(allowed_domain, -float(scale_(0.5*candidate.width +
             (contour ? config.contour_boundary_clearance_mm : 0.0) - ContourRoundingOptions{}.geometry_tolerance_mm))) : ExPolygons{};
+    const ExPolygons& centerline_domain = expanded_centerline_domain ? *expanded_centerline_domain : computed_centerline_domain;
     try {
         plan_edges(*prepared, candidate.polyline, config, arcs,
                    pieces,finish.geometry,finish_pieces);
@@ -797,14 +804,15 @@ FiberFinalizationResult FiberPathFinalizer::finalize(
 
     // A derived check chord can fall outside a valid concave arc. Give only
     // that query its known sagitta budget; material/policy domains stay fixed.
-    const auto arc_query_domain=check_centerline?offset_ex(centerline_domain,
-        float(scale_(ContourRoundingOptions{}.chord_tolerance_mm))):ExPolygons{};
+    std::optional<ExPolygons> arc_query_domain;
     const auto centerline_inside=[&](const Polyline3& route) {
         const bool curved=std::any_of(route.fitting_result.begin(),route.fitting_result.end(),[](const auto& p) {
             return p.path_type!=EMovePathType::Linear_move;
         });
+        if (curved && !arc_query_domain)
+            arc_query_domain=offset_ex(centerline_domain,float(scale_(ContourRoundingOptions{}.chord_tolerance_mm)));
         return diff_pl(Polylines{Geometry::sample_with_arcs(route,ContourRoundingOptions{}.chord_tolerance_mm).to_polyline()},
-            curved?arc_query_domain:centerline_domain).empty();
+            curved?*arc_query_domain:centerline_domain).empty();
     };
     if (check_centerline && prepared->entry.lowers() && prepared->entry.end_station_mm>0 &&
         !centerline_inside(prepared->entry.geometry)) {

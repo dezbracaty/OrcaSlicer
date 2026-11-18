@@ -240,6 +240,8 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
                           "outer_reinforced_perimeters_counts",
                           "reinforced_perimeters_filament"})) {
         item.enabled = contour_enabled || (concentric && item.key!="outer_reinforced_perimeters_counts");
+    } else if (item.key == "fiber_contour_allow_partial_holes") {
+        item.enabled = (contour_enabled || concentric) && boolean_value(config, "fiber_contour_include_holes");
     } else if (key_is(item.key, {"reinforced_infill_density",
                                  "reinforced_infill_pattern",
                                  "reinforced_infill_filament"})) {

@@ -449,6 +449,9 @@ public:
         }
         int             percent { -1 };
         std::string     text;
+        size_t          completed_layers { 0 };
+        size_t          total_layers { 0 };
+        std::string     detail;
         // Bitmap of flags.
         enum FlagBits {
             DEFAULT                             = 0,
@@ -479,6 +482,7 @@ public:
     void                    set_status_callback(status_callback_type cb) { m_status_callback = cb; }
     // Calls a registered callback to update the status, or print out the default message.
     void                    set_status(int percent, const std::string &message, unsigned int flags = SlicingStatus::DEFAULT, int warning_step = -1) const;
+    void                    set_status(const SlicingStatus& status) const;
 
     typedef std::function<void()>  cancel_callback_type;
     // Various methods will call this callback to stop the background processing (the Print::process() call)

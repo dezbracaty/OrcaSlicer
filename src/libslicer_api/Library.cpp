@@ -17,6 +17,9 @@
 #include <libslic3r/GCode/GCodeProcessor.hpp>
 #include <libslic3r/GCode/ThumbnailData.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
+#include <libslic3r/Format/STL.hpp>
+#include <libslic3r/CSGMesh/ModelToCSGMesh.hpp>
+#include <libslic3r/CSGMesh/PerformCSGMeshBooleans.hpp>
 #include <libslic3r/PNGReadWrite.hpp>
 #include <libslic3r/Support/BeltSupportDebug.hpp>
 #include <libslic3r/TriangleMeshSlicer.hpp>
@@ -43,6 +46,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -1543,9 +1547,14 @@ bool cancellation_requested(const SliceCallbacks& callbacks)
     return callbacks.is_cancelled && callbacks.is_cancelled();
 }
 
-void report_progress(const SliceCallbacks& callbacks, float progress, std::string_view stage)
+void report_progress(const SliceCallbacks& callbacks, float progress, std::string_view stage,
+                     std::size_t completed_layers = 0, std::size_t total_layers = 0,
+                     std::string_view detail = {})
 {
-    if (callbacks.progress) {
+    if (callbacks.progress_details) {
+        callbacks.progress_details({std::clamp(progress, 0.0f, 1.0f), stage,
+                                    completed_layers, total_layers, detail});
+    } else if (callbacks.progress) {
         callbacks.progress(std::max(0.0f, std::min(progress, 1.0f)), stage);
     }
 }
@@ -2430,6 +2439,9 @@ public:
     ResolvedSelection selection;
     std::vector<PresetOption> compatible_processes, compatible_filaments;
     std::shared_ptr<Slic3r::PresetBundle> bundle;
+    // Saved definitions for embedded presets edited through the flat multi-slot
+    // API. The bundle always owns their current working values. No Qt/App state.
+    std::map<std::string, Slic3r::DynamicPrintConfig> filament_saved_configs;
     ProjectMachine machine;
     ActiveConfigView prepared_view;
     std::string resource_directory;
@@ -2439,6 +2451,7 @@ public:
         selection(other.selection), compatible_processes(other.compatible_processes),
         compatible_filaments(other.compatible_filaments),
         bundle(other.bundle ? std::make_shared<Slic3r::PresetBundle>(*other.bundle) : nullptr),
+        filament_saved_configs(other.filament_saved_configs),
         machine(other.machine), prepared_view(other.prepared_view),
         resource_directory(other.resource_directory) {}
 };
@@ -2458,12 +2471,17 @@ class Library::Impl
 {
 public:
     std::string resource_directory;
-    std::vector<std::unique_ptr<Slic3r::PresetBundle>> vendor_presets;
+    mutable std::vector<std::unique_ptr<Slic3r::PresetBundle>> vendor_presets;
+    mutable std::vector<bool> complete_vendors;
+    mutable std::unique_ptr<Slic3r::PresetBundle> filament_library;
     fs::path user_preset_directory;
     void load_user_presets(Slic3r::PresetBundle&, std::string_view vendor,
-                           std::vector<ConfigDiagnostic>* diagnostics) const;
+                           std::vector<ConfigDiagnostic>* diagnostics,
+                           bool printers_only = false) const;
     std::string vendor_for(std::string_view model, std::string_view variant) const;
     Slic3r::PresetBundle* installed_presets(const std::string& model, const std::string& variant) const;
+    Slic3r::PresetBundle* complete_vendor(std::size_t index) const;
+    Slic3r::PresetBundle* complete_presets(const std::string& model, const std::string& variant) const;
     const Slic3r::Preset* project_printer(const ConfigSelection&) const;
     std::vector<MachineModelOption> machines;
     std::vector<BuildPlateOption> build_plates;
@@ -2474,6 +2492,9 @@ public:
     void apply_installed_machine_capabilities(ProjectMachine& machine, const ResolvedSelection& selection) const;
     void prepare(const std::shared_ptr<ConfigurationState::Impl>& state, bool import_full_config = true);
     void prepare_preset_edit(const std::shared_ptr<ConfigurationState::Impl>& state);
+    Slic3r::DynamicPrintConfig restored_config(const ConfigurationState::Impl& state,
+        const Slic3r::DynamicPrintConfig& current, SettingGroup group,
+        std::optional<std::size_t> filament_slot = std::nullopt) const;
     ConfigCreateResult resolve_config(const ConfigSelection& selection,
         std::shared_ptr<Slic3r::PresetBundle>* switch_bundle = nullptr) const;
 };
@@ -2756,6 +2777,257 @@ std::string encode_project_object_semantics(const ProjectObject& object) {
 
 std::string encode_project_part_semantics(const ProjectPart& part) {return ProjectJson{{"version",1},{"scope","part"},{"settings",settings_json(part.settings)}}.dump();}
 
+ProjectObject decode_project_object_semantics(std::string_view payload)
+{
+    ProjectObject out;
+    if (payload.empty()) return out;
+    const auto j=semantic_json(payload,"object");
+    out.settings=project_settings(semantic_settings(j));
+    for(const auto& r:j.at("layer_ranges"))
+        out.layer_ranges.push_back({r.at("minimum_z"),r.at("maximum_z"),project_settings(semantic_settings(r),false)});
+    out.layer_height_profile=j.at("layer_height_profile").get<std::vector<double>>();
+    for(const auto& b:j.at("brim_points"))
+        out.brim_points.push_back({b.at("x"),b.at("y"),b.at("z"),b.at("head_front_radius")});
+    return out;
+}
+ProjectPart decode_project_part_semantics(std::string_view payload, std::string_view annotations)
+{
+    ProjectPart out;
+    if(!payload.empty())out.settings=project_settings(semantic_settings(semantic_json(payload,"part")));
+    if(!annotations.empty()) {
+        const auto j=semantic_json(annotations,"part_annotations");
+        out.support_facets=facets_from_json(j.at("support_facets"));
+        out.seam_facets=facets_from_json(j.at("seam_facets"));
+        out.fuzzy_skin_facets=facets_from_json(j.at("fuzzy_skin_facets"));
+    }
+    return out;
+}
+ProjectPlate decode_project_plate_semantics(std::string_view payload)
+{
+    ProjectPlate out;
+    if(payload.empty())return out;
+    const auto j=semantic_json(payload,"plate");
+    out.settings=project_settings(semantic_settings(j),false);
+    out.native_plate_index=j.value("native_plate_index",0);
+    out.custom_gcode_mode=j.at("custom_gcode_mode");
+    for(const auto& c:j.at("custom_gcodes"))
+        out.custom_gcodes.push_back({c.at("print_z"),c.at("type"),c.at("filament_slot"),c.at("color"),c.at("extra")});
+    return out;
+}
+
+namespace {
+constexpr const char* project_edit_metadata="Metadata/GPlatform/model-editing.json";
+ProjectJson project_mask_json(const SliceFiberMaskInput& m) {
+    return {{"id",m.id},{"name",m.name},{"shape",int(m.shape)},{"dimensions",m.dimensions_mm},
+        {"transform",m.mask_to_object},{"enabled",m.enabled},{"settings",m.settings}};
+}
+SliceFiberMaskInput project_mask_from_json(const ProjectJson& j) {
+    SliceFiberMaskInput m;m.id=j.at("id");m.name=j.value("name",m.id);
+    const int shape=j.at("shape");
+    if(shape<0 || shape>2)throw std::invalid_argument("Invalid saved fiber-mask shape");
+    m.shape=FiberMaskShape(shape);m.dimensions_mm=j.at("dimensions").get<std::array<double,3>>();
+    m.mask_to_object=j.at("transform").get<std::array<double,16>>();m.enabled=j.at("enabled");
+    m.settings=j.at("settings").get<ProjectSettings>();validate_mask_geometry(m);return m;
+}
+void restore_project_edit_metadata(const std::string& path,ProjectScene& scene) {
+    mz_zip_archive archive{};
+    if(!mz_zip_reader_init_file(&archive,path.c_str(),0))throw std::runtime_error("Cannot read project editing metadata");
+    const auto close=[&] {mz_zip_reader_end(&archive);};
+    try {
+        if(mz_zip_reader_locate_file(&archive,project_edit_metadata,nullptr,0)<0){close();return;}
+        std::vector<unsigned char> bytes;
+        if(!extract_zip_entry(archive,project_edit_metadata,bytes))throw std::runtime_error("Cannot extract project editing metadata");
+        const auto j=ProjectJson::parse(bytes);
+        if(j.at("version")!=1 || j.at("objects").size()!=scene.objects.size())
+            throw std::invalid_argument("Project editing metadata does not match its models");
+        auto restored=scene;
+        restored.default_filament_slot=j.at("default_filament_slot");
+        if(restored.default_filament_slot<1 || std::size_t(restored.default_filament_slot)>restored.source_filaments.size())
+            throw std::invalid_argument("Invalid project-default material slot");
+        for(std::size_t o=0;o<restored.objects.size();++o) {
+            const auto& data=j.at("objects").at(o);auto& object=restored.objects[o];
+            object.default_filament_slot=data.at("default_filament_slot");
+            if(data.at("parts").size()!=object.parts.size())throw std::invalid_argument("Project part metadata count mismatch");
+            for(std::size_t p=0;p<object.parts.size();++p) {
+                auto& part=object.parts[p];const auto& binding=data.at("parts").at(p);
+                part.default_filament_slot=binding.at("default_filament_slot");
+                part.explicit_filament_binding=binding.at("explicit_filament_binding");
+                part.inherit_project_filament=binding.at("inherit_project_filament");
+            }
+            const auto& records=data.at("instances");
+            if(records.size()!=object.instances.size())throw std::invalid_argument("Project instance metadata count mismatch");
+            for(std::size_t i=0;i<records.size();++i) {
+                auto& instance=object.instances[i];
+                // Native data owns the matrix; the extension only restores the
+                // editor's explicit plate/unassigned relationship.
+                for(const auto& plate:restored.plates)if(plate.id==instance.plate_id)
+                    for(int axis=0;axis<3;++axis)instance.transform[axis*4+3]+=plate.origin_mm[axis];
+                instance.plate_id.clear();
+                if(!records[i].at("plate_index").is_null()) {
+                    const auto index=records[i].at("plate_index").get<std::size_t>();
+                    const auto& plate=restored.plates.at(index);instance.plate_id=plate.id;
+                    for(int axis=0;axis<3;++axis)instance.transform[axis*4+3]-=plate.origin_mm[axis];
+                }
+                instance.name=records[i].at("name");
+                std::set<std::string> ids;
+                for(const auto& mask:records[i].at("fiber_masks")) {
+                    auto value=project_mask_from_json(mask);
+                    if(!ids.insert(value.id).second)throw std::invalid_argument("Duplicate saved fiber mask");
+                    object.instances[i].fiber_masks.push_back(std::move(value));
+                }
+            }
+        }
+        scene=std::move(restored);
+        close();
+    }catch(...){close();throw;}
+}
+}
+
+ProjectWriteResult Library::write_project(const ProjectWriteRequest& request,const SliceCallbacks& callbacks) const
+{
+    using namespace Slic3r;
+    ProjectWriteResult result;fs::path staging;
+    Model model;
+    const bool editable=request.format==ModelFileFormat::ThreeMf;
+    struct Cleanup {
+        Model& model;fs::path& staging;
+        ~Cleanup(){std::error_code e;if(!staging.empty())fs::remove(staging,e);try{model.remove_backup_path_if_exist();}catch(...){}}
+    } cleanup{model,staging};
+    try {
+        const auto cancelled=[&]{if(cancellation_requested(callbacks))throw std::runtime_error("Project export cancelled");};
+        cancelled();
+        if(request.format!=ModelFileFormat::Stl && request.format!=ModelFileFormat::ThreeMf)throw std::invalid_argument("Unknown model export format");
+        if(request.path.empty() || !request.config.valid())throw std::invalid_argument("Export needs a path and captured configuration");
+        const fs::path target=fs::absolute(fs::u8path(request.path));
+        if(!fs::is_directory(target.parent_path()))throw std::invalid_argument("Export directory does not exist");
+        if(request.scene.objects.empty())throw std::invalid_argument("There are no models to export");
+        static std::atomic_uint64_t sequence{0};
+        staging=target.parent_path()/(target.filename().string()+".writing-"+
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+"-"+std::to_string(++sequence));
+        auto config=dynamic_config(request.config);
+        const auto machine=describe_project_machine(config);
+        const auto size=project_native_plate_size(machine.variant, project_axes_length(machine.variant));
+        const auto count=std::max(std::size_t(1),request.scene.plates.size());
+        if(count>native_plate_limit)throw std::invalid_argument("Too many project plates");
+        const float root=std::sqrt(float(count)),rounded=std::round(root);
+        const int columns=root>rounded?int(rounded)+1:int(rounded);
+        std::map<std::string,std::size_t> plate_ids;
+        std::vector<std::unique_ptr<PlateData>> plates;
+        for(std::size_t i=0;i<count;++i) {
+            auto p=std::make_unique<PlateData>();p->plate_index=int(i);p->is_sliced_valid=false;
+            if(i<request.scene.plates.size()) {
+                const auto& source=request.scene.plates[i];
+                if(!plate_ids.emplace(source.id,i).second)throw std::invalid_argument("Duplicate project plate ID");
+                p->plate_name=source.name;p->locked=source.locked;
+                if(editable) {
+                    auto semantics=source;semantics.native_plate_index=int(i);
+                    Model scratch;auto plate_config=config;apply_plate_semantics(scratch,plate_config,encode_project_plate_semantics(semantics));
+                    p->config.apply(semantic_settings(semantic_json(encode_project_plate_semantics(semantics),"plate")));
+                    model.plates_custom_gcodes[int(i)]=scratch.plates_custom_gcodes[int(i)];
+                }
+            }
+            p->printer_model_id=config.opt_serialize("printer_model");
+            p->nozzle_diameters=config.opt_serialize("nozzle_diameter");
+            p->filament_maps=config.option<ConfigOptionInts>("filament_map")->values;
+            plates.push_back(std::move(p));
+        }
+        const auto filament_count=serialized_option_values(config,"filament_diameter").size();
+        if(editable && (request.scene.default_filament_slot<1 || std::size_t(request.scene.default_filament_slot)>filament_count))
+            throw std::invalid_argument("Export project refers to an unavailable default material");
+        ProjectJson editing={{"version",1},{"default_filament_slot",request.scene.default_filament_slot},{"objects",ProjectJson::array()}};
+        for(std::size_t oi=0;oi<request.scene.objects.size();++oi) {
+            cancelled();const auto& source=request.scene.objects[oi];auto* object=model.add_object();object->name=source.name;
+            if(editable) {
+                apply_object_semantics(*object,encode_project_object_semantics(source));
+                if(source.default_filament_slot<0 || std::size_t(source.default_filament_slot)>filament_count)
+                    throw std::invalid_argument("Export object refers to an unavailable material slot");
+                object->config.set("extruder",source.default_filament_slot?source.default_filament_slot:request.scene.default_filament_slot);
+            }
+            auto bindings=ProjectJson::array();
+            for(const auto& part:source.parts) {
+                if(!editable && part.role!=ProjectPartRole::Model && part.role!=ProjectPartRole::NegativeVolume)continue;
+                cancelled();if(!part.mesh || part.mesh->vertices.empty() || part.mesh->triangles.empty())
+                    throw std::invalid_argument("Cannot export an empty part");
+                std::vector<Vec3f> vertices;std::vector<Vec3i32> faces;
+                for(const auto& p:part.mesh->vertices){Vec3f v(p.x,p.y,p.z);if(!v.allFinite())throw std::invalid_argument("Nonfinite export vertex");vertices.push_back(v);}
+                for(const auto& f:part.mesh->triangles) {
+                    if(f.vertex_a>=vertices.size()||f.vertex_b>=vertices.size()||f.vertex_c>=vertices.size())throw std::invalid_argument("Invalid export triangle index");
+                    faces.emplace_back(f.vertex_a,f.vertex_b,f.vertex_c);
+                }
+                ModelVolumeType type;
+                switch(part.role){case ProjectPartRole::Model:type=ModelVolumeType::MODEL_PART;break;
+                case ProjectPartRole::NegativeVolume:type=ModelVolumeType::NEGATIVE_VOLUME;break;
+                case ProjectPartRole::ParameterModifier:type=ModelVolumeType::PARAMETER_MODIFIER;break;
+                case ProjectPartRole::SupportEnforcer:type=ModelVolumeType::SUPPORT_ENFORCER;break;
+                case ProjectPartRole::SupportBlocker:type=ModelVolumeType::SUPPORT_BLOCKER;break;
+                default:throw std::invalid_argument("Unknown export part role");}
+                auto* volume=object->add_volume(TriangleMesh(std::move(vertices),std::move(faces)),type,false);
+                volume->name=part.name;volume->set_transformation(mask_matrix(part.local_transform));
+                if(editable) {
+                    volume->config.apply(semantic_settings(semantic_json(encode_project_part_semantics(part),"part")));
+                    if(part.explicit_filament_binding){if(part.default_filament_slot<1 || std::size_t(part.default_filament_slot)>filament_count)throw std::invalid_argument("Export part material is unavailable");volume->config.set("extruder",part.default_filament_slot);}
+                    else if(part.inherit_project_filament)volume->config.set("extruder",request.scene.default_filament_slot);
+                    bindings.push_back({{"default_filament_slot",part.default_filament_slot},{"explicit_filament_binding",part.explicit_filament_binding},{"inherit_project_filament",part.inherit_project_filament}});
+                    volume->mmu_segmentation_facets.set_data(native_facets(part.material_facets,part.mesh->triangles.size(),int(EnforcerBlockerType::ExtruderMax)));
+                    apply_part_annotations(*volume,encode_project_part_annotations(part));
+                }
+            }
+            if(source.instances.empty())throw std::invalid_argument("Export object has no instances");
+            ProjectJson records=ProjectJson::array();
+            for(std::size_t ii=0;ii<source.instances.size();++ii) {
+                const auto& input=source.instances[ii];std::optional<std::size_t> plate;
+                if(!input.plate_id.empty()){const auto found=plate_ids.find(input.plate_id);if(found==plate_ids.end())throw std::invalid_argument("Export instance has no assigned plate");plate=found->second;}
+                auto transform=mask_matrix(input.transform);
+                if(plate)transform.translation()+=Vec3d(double(*plate%columns)*size[0]*1.2,-double(*plate/columns)*size[1]*1.2,0);
+                auto* instance=object->add_instance();instance->set_transformation(Geometry::Transformation(transform));instance->printable=input.printable;
+                if(plate)plates[*plate]->objects_and_instances.emplace_back(int(oi),int(ii));
+                ProjectJson masks=ProjectJson::array();
+                if(editable)for(const auto& m:input.fiber_masks){validate_mask_geometry(m);if(m.enabled)mask_process_patch(m,config);masks.push_back(project_mask_json(m));}
+                records.push_back({{"name",input.name},{"fiber_masks",masks},{"plate_index",plate?ProjectJson(*plate):ProjectJson(nullptr)}});
+            }
+            editing["objects"].push_back({{"default_filament_slot",source.default_filament_slot},{"parts",bindings},{"instances",records}});
+        }
+        model.curr_plate_index=int(std::min(request.scene.active_plate_index,count-1));
+        cancelled();
+        if(request.format==ModelFileFormat::Stl) {
+            // Orca Plater::export_stl (3c8c667dbd): use its CSG path and
+            // positive-only fallback, retaining explicit warning diagnostics.
+            TriangleMesh combined;
+            for(const auto* object:model.objects) {
+                std::vector<csg::CSGPart> csgmesh;
+                csg::model_to_csgmesh(*object,Transform3d::Identity(),std::back_inserter(csgmesh),csg::mpartsPositive|csg::mpartsNegative|csg::mpartsDoSplits);
+                auto range=Slic3r::range(csgmesh);TriangleMesh mesh;
+                if(csg::is_all_positive(range))mesh=TriangleMesh{csg::csgmesh_merge_positive_parts(range)};
+                else if(std::get<2>(csg::check_csgmesh_booleans(range))==range.end()) {
+                    try{mesh=MeshBoolean::cgal::cgal_to_triangle_mesh(*csg::perform_csgmesh_booleans(range));}catch(...){}
+                }
+                if(mesh.empty()) {
+                    result.diagnostics.push_back({"warning","export.boolean",object->name,"Boolean export failed; only positive parts were exported."});
+                    for(const auto* v:object->volumes)if(v->is_model_part()){auto positive=v->mesh();positive.transform(v->get_matrix(),true);mesh.merge(positive);}
+                }
+                for(const auto* instance:object->instances){cancelled();auto copy=mesh;copy.transform(instance->get_matrix(),true);combined.merge(copy);}
+            }
+            if(combined.empty() || !store_stl(staging.string().c_str(),&combined,true))throw std::runtime_error("STL export failed");
+        } else {
+            // Preserve the original secure full-config export boundary.
+            for(const char* key:{"print_host","print_host_webui","printhost_apikey","printhost_cafile","printhost_user","printhost_password","printhost_port"})config.erase(key);
+            mark_full_config_authoritative(config);
+            StoreParams params;const auto path=staging.string();params.path=path.c_str();params.model=&model;params.config=&config;
+            for(auto& plate:plates)params.plate_data_list.push_back(plate.get());
+            params.strategy=SaveStrategy::Silence|SaveStrategy::Zip64|SaveStrategy::SkipAuxiliary;
+            params.proFn=[&](int stage,int current,int total,bool& cancel){cancel=cancellation_requested(callbacks);report_progress(callbacks,float(stage)/14.f,"Exporting project");};
+            if(!store_bbs_3mf(params))throw std::runtime_error("3MF export failed");
+            const auto metadata=editing.dump();
+            if(!mz_zip_add_mem_to_archive_file_in_place(path.c_str(),project_edit_metadata,metadata.data(),metadata.size(),nullptr,0,MZ_DEFAULT_COMPRESSION))
+                throw std::runtime_error("Cannot preserve project editing metadata");
+        }
+        cancelled();
+        if(auto error=Slic3r::rename_file(staging.string(),target.string()))throw std::system_error(error,"Cannot finalize exported file");
+        staging.clear();result.success=true;result.path=target.string();report_progress(callbacks,1.f,"Export complete");
+    }catch(const std::exception& error){result.cancelled=cancellation_requested(callbacks);result.diagnostics.push_back({"error","export.write",request.path,error.what()});}
+    return result;
+}
+
 Config Config::for_project_overrides(const ConfigSnapshot& base, std::string_view plate,
     std::string_view target, std::optional<std::string_view> parent_object)
 {
@@ -3013,12 +3285,29 @@ void Library::Impl::prepare_preset_edit(const std::shared_ptr<ConfigurationState
     const auto edited = dynamic_config(state->config->snapshot());
     const auto changed = edited.diff(before);
     const auto& material_keys = Slic3r::Preset::filament_options();
-    if (std::any_of(changed.begin(), changed.end(), [&material_keys](const auto& key) {
-            return std::find(material_keys.begin(), material_keys.end(), key) != material_keys.end();
+    if (std::any_of(changed.begin(), changed.end(), [&](const auto& key) {
+            return std::find(material_keys.begin(), material_keys.end(), key) != material_keys.end() &&
+                   !state->bundle->project_config.has(key);
         })) {
-        // A flat material vector may change a non-current slot. Keep Orca's
-        // whole split, including that slot's newly selected preset.
+        auto saved = *state->bundle;
+        const auto old_ids = saved.filament_presets;
         prepare(state);
+        // Orca's model splitter materializes independently edited secondary
+        // slots as embedded presets. Preserve the original definition once,
+        // without overwriting the embedded preset's current configuration.
+        for (std::size_t slot = 0; slot < old_ids.size() && slot < state->bundle->filament_presets.size(); ++slot) {
+            const auto& id = state->bundle->filament_presets[slot];
+            const auto* live = state->bundle->filaments.find_preset(id, false, true);
+            const auto* original = saved.filaments.find_preset(old_ids[slot], false, true);
+            if (!original || !live) throw std::runtime_error("Cannot retain the saved material preset");
+            if (!live->is_project_embedded || state->filament_saved_configs.count(id)) continue;
+            const auto prior = state->filament_saved_configs.find(old_ids[slot]);
+            auto baseline = prior == state->filament_saved_configs.end() ? original->config : prior->second;
+            baseline.option<Slic3r::ConfigOptionStrings>("filament_settings_id", true)->values = {id};
+            if (baseline.diff(live->config).empty()) continue;
+            state->filament_saved_configs.emplace(id, std::move(baseline));
+        }
+        prepare(state, false);
         return;
     }
     auto bundle = state->bundle;
@@ -3045,6 +3334,46 @@ void Library::Impl::prepare_preset_edit(const std::shared_ptr<ConfigurationState
     prepare(state, false);
 }
 
+Slic3r::DynamicPrintConfig Library::Impl::restored_config(
+    const ConfigurationState::Impl& state, const Slic3r::DynamicPrintConfig& current,
+    SettingGroup group, std::optional<std::size_t> filament_slot) const
+{
+    if (!state.bundle) return current;
+    const auto& bundle = *state.bundle;
+    auto printer = bundle.printers.get_edited_preset();
+    auto process = bundle.prints.get_edited_preset();
+    std::vector<Slic3r::Preset> materials;
+    for (const auto& id : state.selection.filament_preset_ids) {
+        const auto* preset = bundle.filaments.find_preset(id, false);
+        if (!preset) throw std::runtime_error("The active material preset is missing");
+        materials.push_back(*preset);
+    }
+    if (group == SettingGroup::Process) {
+        process.config = bundle.prints.get_selected_preset().config;
+    } else if (group == SettingGroup::Printer) {
+        printer.config = bundle.printers.get_selected_preset().config;
+    } else {
+        const auto& id = state.selection.filament_preset_ids.at(filament_slot.value());
+        const auto saved = state.filament_saved_configs.find(id);
+        const auto* original = bundle.filaments.get_selected_preset_name() == id
+            ? &bundle.filaments.get_selected_preset() : bundle.filaments.find_preset(id, false);
+        if (!original) throw std::runtime_error("The saved material preset is missing");
+        const auto& values = saved == state.filament_saved_configs.end() ? original->config : saved->second;
+        for (auto& material : materials) if (material.name == id) material.config = values;
+    }
+    const auto* map = current.option<Slic3r::ConfigOptionInts>("filament_map");
+    const auto restored = Slic3r::PresetBundle::construct_full_config(
+        printer, process, bundle.project_config, materials, true,
+        map ? std::optional(map->values) : std::nullopt);
+    auto full = current;
+    const auto& keys = group == SettingGroup::Process ? Slic3r::Preset::print_options()
+                     : group == SettingGroup::Printer ? Slic3r::Preset::printer_options()
+                                                      : Slic3r::Preset::filament_options();
+    full.apply_only(restored, keys, true);
+    full.apply_only(current, bundle.project_config.keys(), true);
+    return full;
+}
+
 const char* version() noexcept
 {
     return Slic3r::core_version();
@@ -3058,8 +3387,28 @@ Library::~Library() = default;
 std::unique_ptr<Library> Library::open(const LibraryOptions& options,
                                        std::vector<ConfigDiagnostic>* diagnostics)
 {
+    return open(options, PresetLoadingMode::Eager, diagnostics);
+}
+
+std::unique_ptr<Library> Library::open(const LibraryOptions& options, PresetLoadingMode mode,
+                                       std::vector<ConfigDiagnostic>* diagnostics)
+{
+    const char* profile_environment = std::getenv("GP_STARTUP_PROFILE");
+    const bool profile_startup = profile_environment != nullptr && std::string_view(profile_environment) == "1";
+    const auto profile_start = std::chrono::steady_clock::now();
+    auto profile_previous = profile_start;
+    const auto profile_phase = [&](const char* phase, const char* detail = "none") {
+        if (!profile_startup) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(now - profile_previous).count();
+        const auto total = std::chrono::duration_cast<std::chrono::microseconds>(now - profile_start).count();
+        std::fprintf(stderr, "[STARTUP DETAIL] function=Library::open phase=%s detail=%s durationUs=%lld totalUs=%lld\n",
+                     phase, detail, static_cast<long long>(duration), static_cast<long long>(total));
+        profile_previous = std::chrono::steady_clock::now();
+    };
     try {
         auto library = std::unique_ptr<Library>(new Library());
+        profile_phase("construct-library");
         library->impl_->resource_directory = locate_resource_directory(options.resource_directory);
         Slic3r::set_resources_dir(library->impl_->resource_directory);
         const fs::path data_directory = fs::temp_directory_path() / "libslicer";
@@ -3070,6 +3419,7 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
         const fs::path working_directory = data_directory / "work";
         fs::create_directories(working_directory);
         Slic3r::set_temporary_dir(working_directory.string());
+        profile_phase("locate-resources-and-directories");
 
         const fs::path profiles_directory = fs::path(library->impl_->resource_directory) / "profiles";
         std::vector<std::string> vendors = options.vendors.empty() ?
@@ -3078,22 +3428,33 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
         if (vendors.empty()) {
             throw std::runtime_error("libslicer contains no vendor preset bundles");
         }
+        profile_phase("discover-vendors");
 
         constexpr const char* filament_library = "OrcaFilamentLibrary";
         const bool has_filament_library = fs::is_regular_file(profiles_directory / "OrcaFilamentLibrary.json");
-        Slic3r::PresetBundle filament_presets;
+        std::unique_ptr<Slic3r::PresetBundle> filament_presets;
         if (has_filament_library) {
             vendors.erase(std::remove(vendors.begin(), vendors.end(), filament_library), vendors.end());
-            filament_presets.load_vendor_configs_from_json(
+        }
+        if (has_filament_library && mode == PresetLoadingMode::Eager) {
+            filament_presets = std::make_unique<Slic3r::PresetBundle>();
+            profile_phase("construct-filament-bundle");
+            filament_presets->load_vendor_configs_from_json(
                 profiles_directory.string(), filament_library, Slic3r::PresetBundle::LoadSystem,
                 Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
         }
+        if (mode == PresetLoadingMode::Eager) profile_phase("load-vendor-json", filament_library);
         for (const std::string& vendor : vendors) {
             auto presets = std::make_unique<Slic3r::PresetBundle>();
+            profile_phase("construct-vendor-bundle", vendor.c_str());
             presets->load_vendor_configs_from_json(
-                profiles_directory.string(), vendor, Slic3r::PresetBundle::LoadSystem,
+                profiles_directory.string(), vendor,
+                mode == PresetLoadingMode::OnDemand
+                    ? Slic3r::PresetBundle::LoadSystem | Slic3r::PresetBundle::LoadPrinterOnly
+                    : Slic3r::PresetBundle::LoadSystem,
                 Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent,
-                has_filament_library ? &filament_presets : nullptr);
+                filament_presets.get());
+            profile_phase(mode == PresetLoadingMode::OnDemand ? "load-printer-json" : "load-vendor-json", vendor.c_str());
 
             for (const auto& [vendor_id, vendor_profile] : presets->vendors) {
                 for (const auto& model : vendor_profile.models) {
@@ -3159,8 +3520,12 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
                     }
                 }
             }
-            library->impl_->load_user_presets(*presets, vendor, diagnostics);
+            profile_phase("build-machine-catalog", vendor.c_str());
+            library->impl_->load_user_presets(*presets, vendor, diagnostics,
+                                               mode == PresetLoadingMode::OnDemand);
             library->impl_->vendor_presets.push_back(std::move(presets));
+            library->impl_->complete_vendors.push_back(mode == PresetLoadingMode::Eager);
+            profile_phase("load-user-presets", vendor.c_str());
         }
         std::sort(library->impl_->machines.begin(), library->impl_->machines.end(),
                   [](const MachineModelOption& left, const MachineModelOption& right) {
@@ -3169,8 +3534,10 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
         if (library->impl_->machines.empty()) {
             throw std::runtime_error("libslicer loaded no FFF machine variants");
         }
+        profile_phase("sort-machine-catalog");
 
         const auto settings = Config::defaults().settings();
+        profile_phase("default-config-settings-schema");
         const auto plate_setting = std::find_if(settings.begin(), settings.end(), [](const SettingItem& item) {
             return item.key == "curr_bed_type";
         });
@@ -3183,6 +3550,7 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options,
                 });
             }
         }
+        profile_phase("build-plate-options");
         return library;
     } catch (const std::exception& error) {
         append_diagnostic(diagnostics, "resources", error.what());
@@ -3252,7 +3620,7 @@ ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selectio
             selection.process_preset_id.empty() && selection.filament_preset_ids.empty() &&
             (project || requested_printer(active->bundle->printers, selection));
         const auto* source_presets = editing_project || keep_compatible || project ? active->bundle.get()
-            : installed_presets(selection.machine_model_id, selection.machine_variant_id);
+            : complete_presets(selection.machine_model_id, selection.machine_variant_id);
         if (source_presets == nullptr) {
             result.diagnostics.push_back({"machine", "Unknown machine model or nozzle variant"});
             return result;
@@ -3506,7 +3874,7 @@ ConfigCreateResult Library::Impl::resolve_config(const ConfigSelection& selectio
 }
 
 void Library::Impl::load_user_presets(Slic3r::PresetBundle& bundle, std::string_view vendor,
-                                      std::vector<ConfigDiagnostic>* diagnostics) const
+                                      std::vector<ConfigDiagnostic>* diagnostics, bool printers_only) const
 {
     if (user_preset_directory.empty() || vendor.empty()) return;
     const auto directory = user_preset_directory / std::string(vendor);
@@ -3514,6 +3882,7 @@ void Library::Impl::load_user_presets(Slic3r::PresetBundle& bundle, std::string_
     for (const auto& [collection, section] : {
         std::pair<Slic3r::PresetCollection*, const char*>{&bundle.printers, PRESET_PRINTER_NAME},
         {&bundle.prints, PRESET_PRINT_NAME}, {&bundle.filaments, PRESET_FILAMENT_NAME}}) {
+        if (printers_only && collection != &bundle.printers) continue;
         try {
             if (fs::is_directory(directory / section))
                 collection->load_presets(directory.string(), section, substitutions,
@@ -3539,6 +3908,48 @@ Slic3r::PresetBundle* Library::Impl::installed_presets(const std::string& model,
     for (const auto& bundle : vendor_presets)
         if (bundle->printers.find_system_preset_by_model_and_variant(model, variant))
             return bundle.get();
+    return nullptr;
+}
+
+Slic3r::PresetBundle* Library::Impl::complete_vendor(std::size_t index) const
+{
+    if (complete_vendors.at(index)) return vendor_presets.at(index).get();
+    const auto started = std::chrono::steady_clock::now();
+    const auto profiles = fs::path(resource_directory) / "profiles";
+    if (!filament_library && fs::is_regular_file(profiles / "OrcaFilamentLibrary.json")) {
+        auto candidate = std::make_unique<Slic3r::PresetBundle>();
+        candidate->load_vendor_configs_from_json(profiles.string(), "OrcaFilamentLibrary",
+            Slic3r::PresetBundle::LoadSystem, Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent);
+        filament_library = std::move(candidate);
+    }
+    const auto vendor = vendor_presets.at(index)->vendors.begin()->first;
+    auto candidate = std::make_unique<Slic3r::PresetBundle>();
+    candidate->load_vendor_configs_from_json(profiles.string(), vendor,
+        Slic3r::PresetBundle::LoadSystem, Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent,
+        filament_library.get());
+    std::vector<ConfigDiagnostic> warnings;
+    load_user_presets(*candidate, vendor, &warnings);
+    for (const auto& warning : warnings)
+        BOOST_LOG_TRIVIAL(warning) << "libslicer " << warning.key << ": " << warning.message;
+    // No active configuration borrows a partial bundle: every seed consumer
+    // completes it before taking its private copy. Publish only a full candidate.
+    vendor_presets[index] = std::move(candidate);
+    complete_vendors[index] = true;
+    if (const char* profile = std::getenv("GP_STARTUP_PROFILE"); profile && std::string_view(profile) == "1") {
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        std::fprintf(stderr, "[STARTUP DETAIL] function=Library::complete_vendor phase=load-full-vendor detail=%s durationUs=%lld totalUs=%lld\n",
+                     vendor.c_str(), static_cast<long long>(us), static_cast<long long>(us));
+    }
+    return vendor_presets[index].get();
+}
+
+Slic3r::PresetBundle* Library::Impl::complete_presets(const std::string& model, const std::string& variant) const
+{
+    const auto* installed = installed_presets(model, variant);
+    if (!installed) return nullptr;
+    for (std::size_t index = 0; index < vendor_presets.size(); ++index)
+        if (vendor_presets[index].get() == installed) return complete_vendor(index);
     return nullptr;
 }
 
@@ -3637,7 +4048,7 @@ std::string switch_option_value(const Slic3r::DynamicPrintConfig& config, const 
     return slot < values.size() ? values[slot] : std::string{};
 }
 
-std::vector<PrinterSwitchReview::Preset> switch_differences(
+std::vector<PrinterSwitchReview::Preset> native_switch_differences(
     Slic3r::PresetBundle& source, const Slic3r::PresetWithVendorProfile& new_printer)
 {
     const auto old_printer = source.printers.get_edited_preset_with_vendor_profile();
@@ -3688,6 +4099,51 @@ std::vector<PrinterSwitchReview::Preset> switch_differences(
     }
     return result;
 }
+// Activate a material in a temporary native bundle. Preserve the live working
+// values while presenting its retained saved definition to Orca's dirty/save code.
+Slic3r::PresetBundle filament_edit_bundle(const Slic3r::PresetBundle& source,
+    const std::map<std::string, Slic3r::DynamicPrintConfig>& saved, const std::string& id)
+{
+    if (std::find(source.filament_presets.begin(), source.filament_presets.end(), id) == source.filament_presets.end())
+        throw std::invalid_argument("The material preset is no longer referenced");
+    const auto* live = source.filaments.find_preset(id, false);
+    if (!live) throw std::invalid_argument("The material preset is missing");
+    const auto current = live->config;
+    auto bundle = source;
+    auto& presets = bundle.filaments;
+    presets.select_preset_by_name(id, true);
+    if (presets.get_selected_preset_name() != id)
+        throw std::invalid_argument("The material preset is missing");
+    if (const auto original = saved.find(id); original != saved.end())
+        presets.get_selected_preset().config = original->second;
+    presets.discard_current_changes();
+    presets.get_edited_preset().config = current;
+    presets.update_dirty();
+    return bundle;
+}
+
+std::vector<PrinterSwitchReview::Preset> switch_differences(Slic3r::PresetBundle& source,
+    const Slic3r::PresetWithVendorProfile& target,
+    const std::map<std::string, Slic3r::DynamicPrintConfig>& saved)
+{
+    auto selected = filament_edit_bundle(source, saved, source.filaments.get_selected_preset_name());
+    auto result = native_switch_differences(selected, target);
+    std::set<std::string> seen{source.filaments.get_selected_preset_name()};
+    for (const auto& id : source.filament_presets) {
+        if (!seen.insert(id).second || !saved.count(id)) continue;
+        auto material = filament_edit_bundle(source, saved, id);
+        for (auto& review : native_switch_differences(material, target)) {
+            if (review.type != SwitchPreset::Filament) continue;
+            // Orca transfers the current material to the target current material.
+            // Secondary identities have no such target; never invent a slot map.
+            review.transfer_allowed = false;
+            review.cancel_switch = true;
+            for (auto& change : review.changes) change.transferable = false;
+            result.push_back(std::move(review));
+        }
+    }
+    return result;
+}
 } // namespace
 
 PrinterSwitchReview Library::review_printer_switch(const ConfigSelection& selection, bool after_save) const
@@ -3695,8 +4151,14 @@ PrinterSwitchReview Library::review_printer_switch(const ConfigSelection& select
     PrinterSwitchReview result;
     result.revision = impl_->active_revision;
     const auto* project = impl_->project_printer(selection);
-    const auto* catalog = project ? impl_->active->bundle.get()
-        : impl_->installed_presets(selection.machine_model_id, selection.machine_variant_id);
+    const Slic3r::PresetBundle* catalog = nullptr;
+    try {
+        catalog = project ? impl_->active->bundle.get()
+            : impl_->complete_presets(selection.machine_model_id, selection.machine_variant_id);
+    } catch (const std::exception& error) {
+        result.diagnostics.push_back({"printer_switch", error.what()});
+        return result;
+    }
     if (!catalog) {
         result.diagnostics.push_back({"machine", "Unknown machine model or nozzle variant"});
         return result;
@@ -3711,7 +4173,7 @@ PrinterSwitchReview Library::review_printer_switch(const ConfigSelection& select
     if (impl_->active->bundle && (after_save || target->name != current.printer_preset_id ||
         selection.machine_model_id != current.machine_model_id || selection.machine_variant_id != current.machine_variant_id)) {
         try {
-            result.presets = switch_differences(*impl_->active->bundle, printers.get_preset_with_vendor_profile(*target));
+            result.presets = switch_differences(*impl_->active->bundle, printers.get_preset_with_vendor_profile(*target), impl_->active->filament_saved_configs);
         } catch (const std::exception& error) {
             result.diagnostics.push_back({"printer_switch", error.what()});
         }
@@ -3721,13 +4183,24 @@ PrinterSwitchReview Library::review_printer_switch(const ConfigSelection& select
 
 PrinterSwitchSaveResult Library::save_printer_switch_preset(
     std::uint64_t expected_revision, PrinterSwitchPreset type, std::string_view save_name,
-    bool validate_only)
+    bool validate_only, std::string_view source_preset_id)
 {
     PrinterSwitchSaveResult result;
     try {
         if (expected_revision != impl_->active_revision || !impl_->active->bundle)
             throw std::runtime_error("The configuration changed before saving the preset");
-        auto& source = switch_collection(*impl_->active->bundle, type);
+        auto next = std::make_shared<ConfigurationState::Impl>(*impl_->active);
+        if (!source_preset_id.empty()) {
+            if (type != SwitchPreset::Filament) {
+                if (switch_collection(*next->bundle, type).get_selected_preset_name() != source_preset_id)
+                    throw std::invalid_argument("The preset is no longer selected");
+            } else {
+                next->bundle = std::make_shared<Slic3r::PresetBundle>(filament_edit_bundle(
+                    *next->bundle, next->filament_saved_configs, std::string(source_preset_id)));
+            }
+        }
+        auto& source = switch_collection(*next->bundle, type);
+        const auto source_name = source.get_selected_preset_name();
         const auto& edited = source.get_edited_preset();
         if (!source.current_is_dirty())
             throw std::invalid_argument("The preset has no unsaved changes");
@@ -3759,7 +4232,6 @@ PrinterSwitchSaveResult Library::save_printer_switch_preset(
             throw std::runtime_error("A writable user preset directory is required");
         if (validate_only) return result;
 
-        auto next = std::make_shared<ConfigurationState::Impl>(*impl_->active);
         auto& bundle = *next->bundle;
         auto& collection = switch_collection(bundle, type);
         if (!project) {
@@ -3795,7 +4267,7 @@ PrinterSwitchSaveResult Library::save_printer_switch_preset(
             std::ifstream written(fs::u8path(saved.file));
             if (ProjectJson::parse(written, nullptr, false).is_discarded())
                 throw std::runtime_error("Could not save user preset: " + name);
-            auto* catalog = impl_->installed_presets(selection.machine_model_id, selection.machine_variant_id);
+            auto* catalog = impl_->complete_presets(selection.machine_model_id, selection.machine_variant_id);
             auto& catalog_collection = switch_collection(*catalog, type);
             auto& installed = catalog_collection.load_preset(saved.file, saved.name, saved.config, false, saved.version);
             installed = saved;
@@ -3804,10 +4276,30 @@ PrinterSwitchSaveResult Library::save_printer_switch_preset(
                     if (child.inherits() == installed.name) child.reload(installed);
             }
         }
+        if (type == SwitchPreset::Filament) {
+            // The native GUI helper updates slot 0. Rebind only references to
+            // the material actually saved, retaining the user's current editor.
+            bundle.filament_presets = impl_->active->bundle->filament_presets;
+            for (auto& id : bundle.filament_presets) if (id == source_name) id = saved.name;
+            next->filament_saved_configs.erase(source_name);
+            next->filament_saved_configs.erase(saved.name);
+            const auto& previous = impl_->active->bundle->filaments;
+            if (previous.get_selected_preset_name() != source_name) {
+                collection.select_preset_by_name(previous.get_selected_preset_name(), true);
+                if (previous.get_selected_preset_name() != saved.name) {
+                    collection.get_edited_preset().config = previous.get_edited_preset().config;
+                    collection.update_dirty();
+                }
+            }
+        }
         // Save selects the new preset in the source immediately, even when
         // a later preset dialog cancels the switch.
         auto full = dynamic_config(next->config->snapshot());
-        full.apply_only(bundle.full_config(false),
+        const auto* map = full.option<Slic3r::ConfigOptionInts>("filament_map");
+        const auto composed = bundle.full_config(true, map ? std::optional(map->values) : std::nullopt);
+        if (type == SwitchPreset::Filament)
+            full.apply_only(composed, Slic3r::Preset::filament_options(), true);
+        full.apply_only(composed,
             {"printer_settings_id", "print_settings_id", "filament_settings_id",
              "inherits_group", "different_settings_to_system"});
         next->config.reset(new Config(serialized_values(full)));
@@ -3843,7 +4335,7 @@ PrinterSwitchResult Library::prepare_printer_switch(
             resolved.selection.printer_preset_id != current.printer_preset_id ||
             resolved.selection.machine_model_id != current.machine_model_id ||
             resolved.selection.machine_variant_id != current.machine_variant_id)
-            ? switch_differences(*source, target->printers.get_edited_preset_with_vendor_profile())
+            ? switch_differences(*source, target->printers.get_edited_preset_with_vendor_profile(), impl_->active->filament_saved_configs)
             : std::vector<PrinterSwitchReview::Preset>{};
         if (changes.size() != decisions.size())
             throw std::invalid_argument("The printer switch decisions are incomplete");
@@ -4036,6 +4528,7 @@ ConfigActivationResult Library::activate_config(
     const bool same_context = next_state->bundle && next_state->selection.machine_model_id == impl_->active->selection.machine_model_id && next_state->selection.machine_variant_id == impl_->active->selection.machine_variant_id;
     if (!same_context) {
         next_state->bundle.reset();next_state->machine.project_local=false;
+        next_state->filament_saved_configs.clear();
         if (const auto* catalog = impl_->installed_presets(next_state->selection.machine_model_id,
                                                            next_state->selection.machine_variant_id))
             next_state->bundle = std::make_shared<Slic3r::PresetBundle>(*catalog);
@@ -4067,10 +4560,13 @@ std::optional<ActiveConfigView> Library::active_config() const
     view.selection.filament_physical_tools.clear();
 
     const Slic3r::DynamicPrintConfig config = dynamic_config(impl_->active->config->snapshot());
+    view.modified_process_keys = config.diff(impl_->restored_config(*impl_->active, config, SettingGroup::Process));
+    view.printer_preset_modified = !config.diff(impl_->restored_config(*impl_->active, config, SettingGroup::Printer)).empty();
     view.filament_slots=project_filament_slots(config,view.selection.filament_preset_ids.size());
     for (std::size_t index = 0; index < view.filament_slots.size(); ++index) {
         auto& slot=view.filament_slots[index];
         slot.preset_id=view.selection.filament_preset_ids[index];
+        slot.preset_modified = !config.diff(impl_->restored_config(*impl_->active, config, SettingGroup::Filament, index)).empty();
         const auto preset=std::find_if(view.compatible_filaments.begin(),view.compatible_filaments.end(),
             [&slot](const PresetOption& option){return option.id==slot.preset_id;});
         slot.preset_name=preset==view.compatible_filaments.end()?slot.preset_id:preset->name;
@@ -4157,6 +4653,68 @@ SettingsResult Library::apply_active_config_patch(
 SettingsResult Library::set_active_config_value(std::string_view key, std::string_view value)
 {
     return apply_active_config_patch({{std::string(key), std::string(value)}});
+}
+
+ConfigActivationResult Library::restore_active_preset(SettingGroup group, std::optional<std::size_t> filament_slot)
+{
+    ConfigActivationResult result;
+    try {
+        if (!impl_->active->config || !impl_->active->bundle)
+            throw std::runtime_error("No slicing preset is active");
+        if (group != SettingGroup::Process && group != SettingGroup::Filament && group != SettingGroup::Printer)
+            throw std::invalid_argument("Unknown preset domain");
+        const auto& ids = impl_->active->selection.filament_preset_ids;
+        if ((group == SettingGroup::Filament && (!filament_slot || *filament_slot >= ids.size())) ||
+            (group != SettingGroup::Filament && filament_slot))
+            throw std::invalid_argument("Choose the material slot whose preset should be restored");
+
+        const auto current = dynamic_config(impl_->active->config->snapshot());
+        const auto full = impl_->restored_config(*impl_->active, current, group, filament_slot);
+        auto next = std::make_shared<ConfigurationState::Impl>(*impl_->active);
+        if (group == SettingGroup::Process) {
+            next->bundle->prints.discard_current_changes();
+        } else if (group == SettingGroup::Printer) {
+            next->bundle->printers.discard_current_changes();
+        } else {
+            const auto& name = ids[*filament_slot];
+            auto rollback = *next->bundle;
+            auto& presets = rollback.filaments;
+            presets.select_preset_by_name(name, true);
+            if (presets.get_selected_preset_name() != name)
+                throw std::runtime_error("The saved material preset is missing");
+            const auto saved = next->filament_saved_configs.find(name);
+            if (saved != next->filament_saved_configs.end())
+                presets.get_selected_preset().config = saved->second;
+            presets.discard_current_changes();
+            auto* live = next->bundle->filaments.find_preset(name, false, true);
+            live->config = presets.get_edited_preset().config;
+            if (next->bundle->filaments.get_selected_preset_name() == name)
+                next->bundle->filaments.discard_current_changes();
+            next->filament_saved_configs.erase(name);
+        }
+        next->config = std::unique_ptr<Config>(new Config(serialized_values(full)));
+        result.diagnostics = next->config->validate();
+        auto cardinality = filament_cardinality_diagnostics(*next->config, ids.size());
+        result.diagnostics.insert(result.diagnostics.end(), cardinality.begin(), cardinality.end());
+        if (!result.diagnostics.empty()) return result;
+        impl_->prepare(next, false);
+        const bool changed = next->config->snapshot().values() != impl_->active->config->snapshot().values();
+        if (!changed) {
+            // A no-op must preserve snapshot identity as well as its revision.
+            result.view = *active_config();
+            result.success = true;
+            return result;
+        }
+        const auto revision = impl_->active_revision + 1;
+        result.view = next->prepared_view;
+        result.view.revision = revision;
+        impl_->active = std::move(next);
+        impl_->active_revision = revision;
+        result.success = true;
+    } catch (const std::exception& error) {
+        result.diagnostics.push_back({"preset", error.what()});
+    }
+    return result;
 }
 
 SettingsResult Library::reset_active_config_value(std::string_view key)
@@ -4424,11 +4982,15 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
         }
         const Slic3r::PresetBundle* seed = nullptr;
         const auto model                 = config.opt_string("printer_model");
-        for (const auto& candidate : impl_->vendor_presets)
-            for (const auto& vendor : candidate->vendors)
-                if (std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
-                                [&](const auto& item) { return item.id == model; }))
-                    seed = candidate.get();
+        for (std::size_t index = 0; index < impl_->vendor_presets.size(); ++index) {
+            const auto& candidate = impl_->vendor_presets[index];
+            const bool matches = std::any_of(candidate->vendors.begin(), candidate->vendors.end(),
+                [&](const auto& vendor) {
+                    return std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
+                        [&](const auto& item) { return item.id == model; });
+                });
+            if (matches) seed = impl_->complete_vendor(index);
+        }
         if (impl_->active->bundle && model == impl_->active->selection.machine_model_id) seed=impl_->active->bundle.get();
         if (request.mode == libslicer::CalibMode::Calib_Flow_Rate) {
             const auto count = config.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size();
@@ -4519,10 +5081,22 @@ SliceResult Library::slice_calibration(const CalibrationTask& task,
 }
 
 SliceResult Library::slice_impl(const SliceRequest& request,
-                                const SliceCallbacks& callbacks,
+                                const SliceCallbacks& caller_callbacks,
                                 const CalibrationTask* calibration,
                                 std::size_t plate_index) const
 {
+    // Native percentages are stage markers and may repeat for each object or
+    // during export. Keep one monotonic, serialized observer for this request,
+    // without reordering native work or estimating elapsed/remaining time.
+    std::mutex progress_mutex;
+    float progress_high_water = 0.0f;
+    SliceCallbacks callbacks = caller_callbacks;
+    callbacks.progress_details = [&](const SliceProgress& progress) {
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        progress_high_water = std::max(progress_high_water, progress.progress);
+        report_progress(caller_callbacks, progress_high_water, progress.stage,
+                        progress.completed_layers, progress.total_layers, progress.detail);
+    };
     SliceResult result;
     std::vector<std::string> generated_temporary_paths;
     const auto discard_generated_temporary = [&generated_temporary_paths]() {
@@ -4788,8 +5362,11 @@ SliceResult Library::slice_impl(const SliceRequest& request,
             if (cancellation_requested(callbacks)) {
                 print.cancel();
             }
+            // Preserve native status/warning delivery. The per-request relay
+            // holds the current percentage for notifications without a value.
             const float engine_progress = status.percent < 0 ? 0.0f : static_cast<float>(status.percent) / 100.0f;
-            report_progress(callbacks, 0.08f + engine_progress * 0.78f, status.text);
+            report_progress(callbacks, 0.08f + engine_progress * 0.78f, status.text,
+                            status.completed_layers, status.total_layers, status.detail);
         });
         print.apply(plate_model, config);
         // The first native apply normalizes the tower before building regions.
@@ -4897,6 +5474,14 @@ SliceResult Library::slice_impl(const SliceRequest& request,
                         message += " " + failure.first + "=" + std::to_string(failure.second);
                     result.diagnostics.push_back({"fiber_outer_contour_rejected", std::move(message), true,
                         "generate_reinforced_perimeters"});
+                }
+                if (!layer->fiber_hole_contour_failures.empty()) {
+                    std::string message = "Some complete fiber hole loops were omitted on layer " +
+                        std::to_string(layer->id() + 1) + "; partial hole contours are disabled. Reasons:";
+                    for (const auto& failure : layer->fiber_hole_contour_failures)
+                        message += " " + failure.first + "=" + std::to_string(failure.second);
+                    result.diagnostics.push_back({"fiber_hole_contour_rejected", std::move(message), true,
+                        "fiber_contour_allow_partial_holes"});
                 }
                 const auto& stats = layer->fiber_infill_statistics;
                 fiber_candidates += stats.candidates;
@@ -5329,7 +5914,7 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
             if (request.mode==ProjectReadMode::Geometry)
                 throw std::invalid_argument("Geometry import requires a captured current configuration");
             state->bundle=impl_->vendor_presets.empty() ? std::make_shared<PresetBundle>()
-                : std::make_shared<PresetBundle>(*impl_->vendor_presets.front());
+                : std::make_shared<PresetBundle>(*impl_->complete_vendor(0));
         }
         auto& bundle=*state->bundle;
         // Plater::load_project -> reset: discard embedded presets locally. The
@@ -5601,7 +6186,20 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
                 const auto prefix=process_name+"-";
                 const auto suffix="("+filename+")";
                 const auto unnumbered=process_name+suffix;
-                for (const auto& catalog:impl_->vendor_presets) {
+                for (std::size_t index=0;index<impl_->vendor_presets.size();++index) {
+                    const auto& partial=impl_->vendor_presets[index];
+                    // Printer-only catalogs omit user processes. Complete only
+                    // catalogs that may contribute a competing saved process.
+                    if (!impl_->complete_vendors[index]) {
+                        if (impl_->user_preset_directory.empty()) continue;
+                        const auto directory=impl_->user_preset_directory /
+                            partial->vendors.begin()->first / PRESET_PRINT_NAME;
+                        boost::system::error_code error;
+                        const bool has_processes=fs::is_directory(directory,error);
+                        if (error) BOOST_LOG_TRIVIAL(warning) << "libslicer user process directory: " << error.message();
+                        if (!has_processes) continue;
+                    }
+                    const auto* catalog=impl_->complete_vendor(index);
                     for (const auto& preset:catalog->prints) {
                         // Only prefilter names here; Orca resolves exact candidates.
                         if (!preset.is_user() || (preset.name!=unnumbered &&
@@ -5783,8 +6381,9 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
                         // Bytes and detached previews outlive the reader's
                         // temporary backup folder.
                         auto preview_callbacks=callbacks;
-                        preview_callbacks.progress=[&](float progress,std::string_view message) {
-                            report_progress(callbacks,.8f+.15f*progress,message);
+                        preview_callbacks.progress_details=[&](const SliceProgress& progress) {
+                            report_progress(callbacks,.8f+.15f*progress.progress,progress.stage,
+                                progress.completed_layers,progress.total_layers,progress.detail);
                         };
                         const auto parsed=load_gcode_preview({path},preview_callbacks);
                         check_cancel();
@@ -5889,6 +6488,12 @@ ProjectReadResult Library::read_project(const ProjectReadRequest& request, const
         }
         if (result.configuration_changed) scene->source_filaments=state->prepared_view.filament_slots;
         else if (context.valid()) scene->source_filaments=context.view().filament_slots;
+        if(load_config && !scene->objects.empty()) {
+            // Extension failure must not reject a valid native Orca project.
+            // The atomic restore retains the native model/material fallback.
+            try { restore_project_edit_metadata(request.path,*scene); }
+            catch(const std::exception& error) { diagnostic("project.editing_metadata_ignored",error.what()); }
+        }
         // These are diagnostics, not a new file-acceptance policy. Native slice
         // validation is responsible for invalid settings and material bindings.
         if (max_slot>int(scene->source_filaments.size()))
@@ -6224,13 +6829,7 @@ ProjectImportResult Library::import_project(const ProjectImportRequest& request,
 
             Slic3r::PresetBundle* preset_bundle = nullptr;
             if (machine != nullptr && variant != nullptr) {
-                for (const auto& candidate : impl_->vendor_presets) {
-                    if (candidate->printers.find_system_preset_by_model_and_variant(
-                            machine->id, variant->id) != nullptr) {
-                        preset_bundle = candidate.get();
-                        break;
-                    }
-                }
+                preset_bundle = impl_->complete_presets(machine->id, variant->id);
             }
 
             if (preset_bundle == nullptr) {

@@ -289,6 +289,8 @@ enum EdgeSide { esLeft = 1, esRight = 2};
       int       Idx;
       bool      IsHole;
       bool      IsOpen;
+      // Only unique minima may survive scanbeam append/insertion operations.
+      bool      BottomPtIsUnique;
       //The 'FirstLeft' field points to another OutRec that contains or is the
       //'parent' of OutRec. It is 'first left' because the ActiveEdgeList (AEL) is
       //parsed left from the current edge (owning OutRec) until the owner OutRec

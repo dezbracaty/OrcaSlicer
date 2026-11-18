@@ -1006,6 +1006,7 @@ static std::vector<std::string> s_Preset_print_options{
     "generate_reinforced_perimeters",
     "outer_reinforced_perimeters_counts",
     "fiber_contour_include_holes",
+    "fiber_contour_allow_partial_holes",
     "fiber_connect_adjacent_rings",
     "fiber_connection_tail_trim_widths",
     "fiber_connection_head_trim_widths",

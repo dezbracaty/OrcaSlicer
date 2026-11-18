@@ -1810,7 +1810,8 @@ static void execute_surface_fill_job(
     const FillExecutionContext& context,
     SurfaceFill                 surface_fill,
     ExtrusionEntitiesPtr&       destination,
-    const FillExecutionPolicy&  policy)
+    const FillExecutionPolicy&  policy,
+    std::shared_ptr<const ExPolygons> resin_protected_core = {})
 {
     if (surface_fill.params.density <= 0) return;
     Layer& layer = context.layer;
@@ -1986,7 +1987,37 @@ static void execute_surface_fill_job(
         }
 
         const size_t micro_fill_begin = destination.size();
-        f->fill_surface_extrusion(&surface_fill.surface, params, destination);
+        if (resin_protected_core && !resin_protected_core->empty() && params.extrusion_role == erResinInfill) {
+            // Native fill envelopes allow bead overlap with a neighboring wall.
+            // Fiber residuals instead have an explicit material boundary. Keep
+            // the original pattern/Flow, then let the same native GapFill see
+            // the actual main entities that remain after that boundary check.
+            FillParams main_params = params;
+            main_params.enable_gap_fill = false;
+            ExtrusionEntityCollection generated;
+            f->fill_surface_extrusion(&surface_fill.surface, main_params, generated.entities);
+            for (auto*& entity : generated.entities) {
+                auto* collection = dynamic_cast<ExtrusionEntityCollection*>(entity);
+                if (!collection) throw RuntimeError("Unexpected native resin fill entity");
+                ContinuousFiberFillStrategy::constrain_resin_paths(collection->entities, *resin_protected_core);
+                const size_t gap_begin = collection->entities.size();
+                if (params.enable_gap_fill)
+                    f->_create_gap_fill(&surface_fill.surface, params, collection);
+                ContinuousFiberFillStrategy::constrain_resin_paths(collection->entities, *resin_protected_core, gap_begin);
+                auto guarded = std::make_unique<ExtrusionResinCollection>(std::move(*collection), resin_protected_core);
+                delete collection;
+                entity = guarded.release();
+            }
+            destination.reserve(destination.size() + generated.entities.size());
+            for (auto* entity : generated.entities) {
+                auto* collection = static_cast<ExtrusionEntityCollection*>(entity);
+                if (collection->empty()) delete collection;
+                else destination.push_back(entity);
+            }
+            generated.entities.clear();
+        } else {
+            f->fill_surface_extrusion(&surface_fill.surface, params, destination);
+        }
         // A merged fill job can contain regions with different reinforcement
         // flags. Keep every such layer unchanged, even for its ordinary paths.
         const bool non_reinforced_layer = std::none_of(layer.regions().begin(), layer.regions().end(),
@@ -2218,7 +2249,8 @@ struct FiberDomainExecutionResult {
 FiberDomainExecutionResult execute_continuous_fiber_domain(
     const FillExecutionContext& context,
     const FiberIslandDomainPlan& domain,
-    LayerFillTransaction& transaction)
+    LayerFillTransaction& transaction,
+    const std::function<void(const char*)>& progress)
 {
     const SurfaceFill& original_job = domain.candidate_job;
     const ContinuousFiberConfig& config = domain.config;
@@ -2249,10 +2281,12 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     };
     const bool concentric=config.concentric_infill();
     FiberValidationResult contour_result;
+    std::set<FiberCandidateId> hole_candidates;
+    if (collect_debug)
+        record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
+                       "original_contour_domain_before_candidate_generation");
     if ((config.contour_enabled && config.contour_count > 0) || concentric) {
-        if (collect_debug)
-            record_regions(original_area, Layer::FiberDiagnosticKind::OriginalContourRegion,
-                           "original_contour_domain_before_candidate_generation");
+        if (progress) progress("Planning fiber contours");
         const auto ring_config=concentric?fiber_ring_reference_config(config):config;
         const size_t display_depths=config.contour_enabled?size_t(config.contour_count):0;
         const double extra_spacing=concentric && config.infill_density<100?
@@ -2260,6 +2294,8 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
         auto plan = FiberPathValidator::plan_contours(planning_area,ring_config,domain_id,collect_debug,
             display_depths,extra_spacing,concentric?config.concentric_corner_stabilization_length_mm:0.0);
         if (concentric) plan.set_display_cutoff(display_depths);
+        for (const auto& node : plan.nodes)
+            if (node.side == FiberContourSide::Hole) hole_candidates.insert(node.id);
         if (config.connect_adjacent_rings)
             FiberPathValidator::plan_open_ring_chains(plan, planning_area, ring_config, collect_debug);
         if (collect_debug) context.layer.fiber_connection_plans.push_back(
@@ -2311,6 +2347,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
 
     FiberValidationResult infill_result;
     if (!concentric && config.infill_enabled && config.infill_density > 0.0) {
+        if (progress) progress("Generating fiber infill");
         SurfaceFill infill_job = original_job;
         // A safety expansion of the clip would introduce an unrequested gap
         // at nominal contact and remove one whole row from an exact-width core.
@@ -2347,6 +2384,7 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
     FiberCoverageRecord coverage;
     coverage.source = domain_id;
     coverage.source_domain = original_area;
+    coverage.resin_overlap_mm = config.resin_overlap_mm;
     coverage.accepted_contour_exclusion = contour_result.resin_exclusion;
     coverage.accepted_infill_exclusion = infill_result.resin_exclusion;
     if (concentric) {
@@ -2442,8 +2480,11 @@ FiberDomainExecutionResult execute_continuous_fiber_domain(
             std::string detail = assignment.detail;
             const auto extent = std::find_if(validation.candidates.begin(), validation.candidates.end(),
                 [&](const auto& candidate) { return candidate.id == assignment.id.parent; });
-            if (extent != validation.candidates.end() && extent->requires_closed_loop)
-                ++context.layer.fiber_outer_contour_failures[fiber_rejection_reason_name(assignment.reason)];
+            if (extent != validation.candidates.end() && extent->requires_closed_loop) {
+                auto& failures = hole_candidates.count(assignment.id.parent) ?
+                    context.layer.fiber_hole_contour_failures : context.layer.fiber_outer_contour_failures;
+                ++failures[fiber_rejection_reason_name(assignment.reason)];
+            }
             if (context.layer.object()->print()->config().fiber_fill_debug.value && assignment.centerline) {
                 context.layer.fiber_fill_diagnostics.push_back({
                     assignment.centerline->polyline.to_polyline(),
@@ -2527,7 +2568,8 @@ FillSurfaceView build_resin_surface_view(
 } // namespace
 
 // friend to Layer
-void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
+void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator,
+                       const std::function<void(const char*)>& progress)
 {
     solid_fill_audit = {};
     solid_fill_audit.enabled = this->object()->solid_fill_audit_enabled();
@@ -2535,6 +2577,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     fiber_fill_diagnostics.clear();
     fiber_connection_plans.clear();
     fiber_outer_contour_failures.clear();
+    fiber_hole_contour_failures.clear();
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");
@@ -2575,7 +2618,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     std::map<FillDomainContributorId, ExPolygons> contributor_exclusions;
     for (const FiberIslandDomainPlan& domain : fiber_domains) {
         FiberDomainExecutionResult fiber_result = execute_continuous_fiber_domain(
-            execution_context, domain, transaction);
+            execution_context, domain, transaction, progress);
         if (fiber_result.accepted_exclusion.empty())
             continue;
         for (const FillDomainContributor* contributor : domain.contributors) {
@@ -2591,6 +2634,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         }
     }
 
+    if (progress) progress("Generating matrix infill");
     if (!fiber_domains.empty() || mask_layer_enabled) {
         // Residual-only contributors have no fiber domain coverage record.
         // Record their native source independently, including intentional void.
@@ -2601,6 +2645,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
                     record.source = {this->object()->id().id, this->id(), contributor.id.region_id, contributor.id.surface_id};
                     record.source_domain = contributor.effective_domain;
                     const auto& source = m_regions[contributor.id.region_id]->region().config();
+                    record.resin_overlap_mm = source.fiber_resin_overlap.value;
                     (source.fiber_resin_fill_density.value > 0 ? record.resin_domain : record.intentional_void) =
                         contributor.effective_domain;
                     transaction.coverage.add(std::move(record));
@@ -2619,12 +2664,14 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
             bbox,
             resolution
         };
+        const auto protected_core = std::make_shared<const ExPolygons>(transaction.coverage.resin_protected_core());
         for (SurfaceFill& resin_fill : resin_fills)
             execute_surface_fill_job(
                 resin_execution_context,
                 resin_fill,
                 transaction.resin_destination(resin_fill.region_id),
-                ordinary_fill_policy);
+                ordinary_fill_policy,
+                protected_core);
     } else {
         for (SurfaceFill& surface_fill : surface_fills)
             execute_surface_fill_job(

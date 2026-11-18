@@ -300,6 +300,14 @@ The suite covers the core (`tests/libslic3r`), public API (`tests/libslicer_api`
 full-model fiber acceptance, and an `add_subdirectory` consumer smoke test. Some
 full-model cases take several minutes. The bracket fixture notes below record
 known resin regression limitations and the outstanding acceptance criteria.
+Shared-ring model acceptance has separate `S0`, `S5` and `benchmark` CTest
+entries. They preserve all 48 functional full slices (including the four outer
+references), geometry replay, repeated timing and consistency assertions, with
+an independent 1800-second budget per entry. Each entry writes its own report;
+a single combined timeout must not misclassify many normal slices as a stuck
+algorithm. The optional final argument to `--ring-model` selects the mode;
+omitting it retains the combined `all` invocation for manual use.
+
 Catch2 tags are also CTest labels:
 
 ```sh
