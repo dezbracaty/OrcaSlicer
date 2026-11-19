@@ -4966,6 +4966,22 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
         }
         auto config = dynamic_config(request.config);
         Slic3r::set_resources_dir(impl_->resource_directory);
+        const auto calibration_seed = [&]() -> const Slic3r::PresetBundle* {
+            const auto model = config.opt_string("printer_model");
+            const Slic3r::PresetBundle* seed = nullptr;
+            for (std::size_t index = 0; index < impl_->vendor_presets.size(); ++index) {
+                const auto& candidate = impl_->vendor_presets[index];
+                const bool matches = std::any_of(candidate->vendors.begin(), candidate->vendors.end(),
+                    [&](const auto& vendor) {
+                        return std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
+                            [&](const auto& item) { return item.id == model; });
+                    });
+                if (matches) seed = impl_->complete_vendor(index);
+            }
+            if (impl_->active->bundle && model == impl_->active->selection.machine_model_id)
+                seed = impl_->active->bundle.get();
+            return seed;
+        };
         if (is_fiber_calibration(request.mode)) {
             auto task = std::unique_ptr<CalibrationTask>(new CalibrationTask());
             auto& native = *task->impl_;
@@ -4975,12 +4991,16 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
             native.fiber_plan = fiber_calibration::prepare(request, config, native.models.front(), samples);
             if (cancellation_requested(callbacks)) { result.cancelled = true; return result; }
             auto plate = orca::describe_plate(native.models.front(), 0);
-            std::vector<std::pair<std::string, std::string>> values;
-            for (const auto& key : config.keys()) values.emplace_back(key, config.option(key)->serialize());
-            plate.config = Config(std::move(values)).snapshot();
+            plate.config = Config(serialized_values(config)).snapshot();
             plate.fiber_samples = std::move(samples);
             native.plates.push_back(std::move(plate));
-            native.fiber_config = std::move(config);
+
+            const auto* seed = calibration_seed();
+            Slic3r::PresetBundle bundle = seed ? *seed : Slic3r::PresetBundle();
+            mark_full_config_authoritative(config);
+            bundle.load_config_model("calibration.3mf", std::move(config));
+            // Match Orca's Plater input and let Print::apply resolve variants.
+            native.fiber_config = bundle.full_config(false, native.fiber_plan->filament_map);
             result.task = std::move(task);
             result.success = true;
             return result;
@@ -5001,18 +5021,7 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
             changed.back() = Slic3r::escape_strings_cstyle(Slic3r::Preset::printer_options());
             config.set_key_value("different_settings_to_system", new Slic3r::ConfigOptionStrings(std::move(changed)));
         }
-        const Slic3r::PresetBundle* seed = nullptr;
-        const auto model                 = config.opt_string("printer_model");
-        for (std::size_t index = 0; index < impl_->vendor_presets.size(); ++index) {
-            const auto& candidate = impl_->vendor_presets[index];
-            const bool matches = std::any_of(candidate->vendors.begin(), candidate->vendors.end(),
-                [&](const auto& vendor) {
-                    return std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
-                        [&](const auto& item) { return item.id == model; });
-                });
-            if (matches) seed = impl_->complete_vendor(index);
-        }
-        if (impl_->active->bundle && model == impl_->active->selection.machine_model_id) seed=impl_->active->bundle.get();
+        const auto* seed = calibration_seed();
         if (request.mode == libslicer::CalibMode::Calib_Flow_Rate) {
             const auto count = config.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size();
             auto* names = config.option<Slic3r::ConfigOptionStrings>("filament_settings_id", true);

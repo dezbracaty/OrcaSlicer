@@ -7568,6 +7568,10 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
         const bool automatic_width = parameter == 2;
         if (automatic_width) {
             REQUIRE(configured.config->set("nozzle_diameter", "0.4,0.8").success);
+            REQUIRE(configured.config->set("nozzle_temperature", "245,300").success);
+            REQUIRE(configured.config->set("nozzle_temperature_initial_layer", "250,300").success);
+            REQUIRE(configured.config->set("filament_flow_ratio", "1.04,0.99").success);
+            REQUIRE(configured.config->set("filament_max_volumetric_speed", "1.2,16").success);
             REQUIRE(configured.config->set("bridge_line_width", "0.4").success);
             REQUIRE(configured.config->set("wall_generator", "classic").success);
             REQUIRE(configured.config->set("min_feature_size", "150%").success);
@@ -7801,12 +7805,29 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
         CHECK(landing_z == Catch::Approx(expected[0]).margin(0.002));
     }
     std::ifstream gcode(result.output.path);
+    REQUIRE(gcode.good());
     std::vector<double> prefeed;
     std::size_t sample_markers = 0, cuts = 0, cutter_commands = 0;
     bool reading_prefeed = false, reading_cut = false;
+    bool fiber_tool_bound = false, fiber_temperature_ready = false;
+    const std::string expected_binding = parameter == 2 ?
+        ";TOOL_BINDING filament=0 physical=1" : ";TOOL_BINDING filament=1 physical=1";
+    const std::string expected_wait = parameter == 2 ? "M109 S245 T1 " : "M109 S235 T1 ";
+    std::map<std::string, std::string> output_config;
     const std::regex extrusion(" E([0-9.]+)");
     const std::string sample_marker = ";CALIBRATION_FIBER_SAMPLE ";
     for (std::string line; std::getline(gcode, line);) {
+        if (line.rfind("; ", 0) == 0) {
+            const auto delimiter = line.find(" = ", 2);
+            if (delimiter != std::string::npos)
+                output_config[line.substr(2, delimiter - 2)] = line.substr(delimiter + 3);
+        }
+        if (line.rfind(";TOOL_BINDING ", 0) == 0) {
+            fiber_tool_bound = line == expected_binding;
+            fiber_temperature_ready = false;
+        }
+        if (fiber_tool_bound && line.rfind("M109 ", 0) == 0)
+            fiber_temperature_ready = line.rfind(expected_wait, 0) == 0;
         if (line.rfind(sample_marker, 0) == 0) {
             std::istringstream marker{line.substr(sample_marker.size())};
             std::size_t sample_id = 0;
@@ -7822,12 +7843,24 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
         }
         if (line == ";FIBER_TAIL_BEGIN") reading_cut = false;
         if (reading_cut && line == "S0") ++cutter_commands;
-        if (line == ";FIBER_PREFEED_BEGIN") reading_prefeed = true;
+        if (line == ";FIBER_PREFEED_BEGIN") {
+            CHECK(fiber_temperature_ready);
+            reading_prefeed = true;
+        }
         if (line == ";FIBER_PREFEED_END") reading_prefeed = false;
         if (reading_prefeed) {
             std::smatch match;
             if (std::regex_search(line, match, extrusion)) prefeed.push_back(std::stod(match[1].str()));
         }
+    }
+    for (const auto* key : {"nozzle_temperature", "nozzle_temperature_initial_layer",
+                          "filament_flow_ratio", "filament_max_volumetric_speed",
+                          "nozzle_diameter", "filament_process_type", "filament_map",
+                          "physical_extruder_map", "zaa_enabled", "wall_generator",
+                          "wall_loops", "outer_wall_filament_id"}) {
+        CAPTURE(key);
+        REQUIRE(output_config.count(key) == 1);
+        CHECK(plate.config.value(key) == output_config.at(key));
     }
     CHECK(sample_markers == sample_count);
     CHECK(cuts == sample_count);
