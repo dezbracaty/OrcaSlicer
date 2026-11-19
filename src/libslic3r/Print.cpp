@@ -19,6 +19,8 @@
 #include "Utils.hpp"
 #include "PrintConfig.hpp"
 #include "ContinuousFiber/ContinuousFiberConfig.hpp"
+#include "ContinuousFiber/FiberCalibrationPlan.hpp"
+#include "ContinuousFiber/FiberPathFinalizer.hpp"
 #include "ContinuousFiber/FiberPathValidator.hpp"
 #include "MaterialType.hpp"
 #include "Model.hpp"
@@ -80,6 +82,7 @@ void Print::clear()
 		delete object;
 	m_objects.clear();
     m_fiber_geometry_coverage_cache.reset();
+    m_fiber_calibration.reset();
     m_fiber_lifecycle_active.store(false);
     m_print_regions.clear();
     m_model.clear_objects();
@@ -554,6 +557,7 @@ std::vector<unsigned int> Print::extruders(bool conside_custom_gcode) const
 {
     std::vector<unsigned int> extruders = this->object_extruders();
     append(extruders, this->support_material_extruders());
+    if (m_fiber_calibration) extruders.push_back(m_fiber_calibration->fiber_slot);
 
     if (conside_custom_gcode) {
         //BBS
@@ -2704,6 +2708,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         }
     }
 
+    if (m_fiber_calibration) append_fiber_calibration_layer();
     normalize_belt_print_origin();
 
 
@@ -3486,8 +3491,87 @@ void Print::finalize_first_layer_convex_hull()
     m_first_layer_convex_hull = Geometry::convex_hull(m_first_layer_convex_hull.points);
 }
 
+void Print::set_fiber_calibration_plan(std::shared_ptr<const FiberCalibrationPlan> plan)
+{
+    if (!plan || plan->trials.empty() || m_fiber_calibration ||
+        plan->filament_map != m_config.filament_map.values)
+        throw SlicingError("Invalid fiber calibration tool mapping");
+    m_fiber_calibration = std::move(plan);
+}
+
+size_t Print::fiber_calibration_sample_id(const FiberFragmentId& id) const
+{
+    if (!m_fiber_calibration || m_objects.size() != 1 ||
+        id.parent.domain.object_id != m_objects.front()->id().id ||
+        id.parent.domain.layer_id != 3 || id.parent.purpose != FiberPathPurpose::Infill ||
+        id.parent.path_ordinal >= m_fiber_calibration->trials.size() || id.fragment_ordinal != 0)
+        return 0;
+    return id.parent.path_ordinal + 1;
+}
+
+void Print::append_fiber_calibration_layer()
+{
+    const FiberCalibrationPlan& plan = *m_fiber_calibration;
+    if (m_objects.size() != 1 || m_objects.front()->instances().size() != 1 ||
+        m_objects.front()->get_shared_object() || m_objects.front()->layer_count() != 3)
+        throw SlicingError("Fiber calibration requires exactly three base layers on one instance");
+
+    PrintObject& object = *m_objects.front();
+    for (const Layer* base : std::as_const(object).layers())
+        if (!base->has_extrusions())
+            throw SlicingError("Fiber calibration base has an empty layer");
+    Layer& base = *object.get_layer(2);
+    if (std::abs(base.print_z - plan.base_top_mm) > 1e-4 ||
+        base.regions().size() != 1 || base.lslices.empty())
+        throw SlicingError("Fiber calibration base does not match the prepared model");
+
+    const auto& region = base.regions().front()->region();
+    const Point shift = object.instances().front().shift;
+    const double print_z = base.print_z + plan.layer_height_mm;
+    const auto resolved = resolve_fiber_tool(m_config, plan.fiber_slot);
+    const auto limits = fiber_machine_limits(m_config, resolved.logical_extruder_id);
+    auto geometry = std::make_shared<FiberGeometryContext>();
+    geometry->config = m_config;
+    geometry->export_arcs = m_config.enable_arc_fitting && !m_config.spiral_mode;
+    geometry->coverage_cache = make_fiber_geometry_coverage_cache();
+
+    auto paths = std::make_unique<ExtrusionEntityCollection>();
+    paths->no_sort = true;
+    for (size_t index = 0; index < plan.trials.size(); ++index) {
+        throw_if_canceled();
+        const auto& trial = plan.trials[index];
+        const std::string name = "Fiber calibration sample " + std::to_string(index + 1);
+        if (limits->maximum_z_mm > 0 &&
+            print_z + m_config.z_offset.value + trial.height_mm > limits->maximum_z_mm + EPSILON)
+            throw SlicingError(name + " exceeds the tool's printable height");
+        auto config = resolve_fiber_calibration_config(m_config, region.config(), plan.fiber_slot,
+            plan.layer_height_mm, trial.height_mm, trial.length_mm, trial.speed_mm_s, trial.extra_prefeed_mm);
+        config.geometry_context = geometry;
+        const auto& flow = config.infill_flow;
+        ExtrusionPath source(erContinuousFiberInfill, flow.mm3_per_mm(), flow.width(), flow.height());
+        const Point p0 = Point::new_scale(trial.start_mm) - shift;
+        const Point p1 = Point::new_scale(trial.end_mm) - shift;
+        source.polyline.points = {Point3(p0), Point3(p1)};
+        const FiberFragmentId id{{{object.id().id, 3, 0, 0}, FiberPathPurpose::Infill, 0, index}, 0};
+        const auto finish = make_independent_fiber_finish_route(source, config, id);
+        auto final = FiberPathFinalizer::finalize(source, base.lslices, config, id, finish);
+        if (!final.prepared)
+            throw SlicingError(name + ": " + (final.detail.empty() ? "invalid fiber execution path" : final.detail));
+        auto path = std::make_unique<ExtrusionFiberPath>(source, erContinuousFiberInfill,
+            std::move(final.prepared), FiberPathPurpose::Infill);
+        paths->entities.push_back(path.get());
+        path.release();
+    }
+    Layer* fiber = object.add_layer(3, plan.layer_height_mm, print_z, base.print_z + plan.layer_height_mm / 2);
+    fiber->add_region(&region)->fills.entities.push_back(paths.get());
+    paths.release();
+    fiber->lower_layer = &base;
+    base.upper_layer = fiber;
+}
+
 bool Print::fiber_printing_enabled() const
 {
+    if (m_fiber_calibration) return true;
     for(const auto* object:m_objects) {
         if(!object->shared_regions())continue;
         for(size_t region=0;region<object->num_printing_regions();++region)
@@ -3498,6 +3582,7 @@ bool Print::fiber_printing_enabled() const
 
 bool Print::fiber_execution_required() const
 {
+    if (m_fiber_calibration) return true;
     if(m_fiber_lifecycle_active.load())return true;
     for(const auto* object:m_objects) {
         if(object->m_fiber_geometry_context || object->m_fiber_fill_rebuild_required.load())return true;

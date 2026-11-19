@@ -6556,6 +6556,9 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
         " physical=" + std::to_string(bound.physical_tool_id) +
         " width=" + std::to_string(path.width) + " height=" + std::to_string(path.height) +
         " e_units_per_mm=" + std::to_string(bound.e_units_per_mm) + "\n";
+    if (const auto sample = m_print->fiber_calibration_sample_id(prepared.id))
+        gcode += ";CALIBRATION_FIBER_SAMPLE " + std::to_string(sample) + " " +
+            std::to_string(m_fiber_path_occurrence) + "\n";
     // BEGIN metadata is authoritative even before the first powered move.
     gcode += ";TYPE:" + std::string(path.display_purpose() == FiberPathPurpose::Contour ?
         "Continuous fiber contour" : "Continuous fiber infill") + "\n";

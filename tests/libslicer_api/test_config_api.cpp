@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cctype>
@@ -7506,4 +7507,300 @@ TEST_CASE("mask intervals preserve deposition when the current layer policy agre
           mask_deposition_signature(*masked.preview, -1e9, true, 3));
     remove_slice(baseline);
     remove_slice(masked);
+}
+
+TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered samples", "[fiber-calibration]")
+{
+    using namespace libslicer;
+    const auto parameter = GENERATE(0u, 1u, 2u, 3u);
+    CAPTURE(parameter);
+    const std::array<double, 4> fixed{1.25, parameter == 2 ? 0. : 1.25, 4, 0.125};
+    const std::array<double, 4> starts{0, 1, 3, 0};
+    const std::array<double, 4> steps{0.5, 0.5, 1, 0.125};
+    LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = Library::open(options);
+    REQUIRE(library);
+    ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    if (parameter == 2) {
+        selection.filament_preset_ids = {"CFSYS CCF", "CFSYS CIRON"};
+        selection.filament_physical_tools = {1, 0};
+    }
+    auto configured = library->create_config(selection);
+    REQUIRE(configured);
+    REQUIRE(configured.config->set("filament_colour", "#F28E2B;#111111").success);
+    REQUIRE(configured.config->set("use_relative_e_distances", "1").success);
+    SliceRequest ordinary;
+    ordinary.config = configured.config->snapshot();
+    ordinary.objects = {fiber_infill_block()};
+    struct TempOutput {
+        std::string path;
+        ~TempOutput() { std::error_code error; std::filesystem::remove(path, error); }
+    };
+    const auto printer_commands = [](const std::string& path) {
+        std::ifstream input(path);
+        REQUIRE(input.good());
+        std::vector<std::string> commands;
+        bool has_calibration_sample = false;
+        for (std::string line; std::getline(input, line);) {
+            has_calibration_sample |= line.rfind(";CALIBRATION_FIBER_SAMPLE ", 0) == 0;
+            if (!line.empty() && line.front() != ';') commands.push_back(line);
+        }
+        CHECK_FALSE(has_calibration_sample);
+        return commands;
+    };
+    std::vector<std::string> ordinary_baseline;
+    if (parameter == 1) {
+        const auto baseline = library->slice(ordinary);
+        TempOutput cleanup{baseline.output.path};
+        REQUIRE(baseline);
+        ordinary_baseline = printer_commands(baseline.output.path);
+    }
+    REQUIRE(configured.config->set("zaa_enabled", "1").success);
+    REQUIRE(configured.config->set("wall_loops", "0").success);
+    if (parameter >= 2) {
+        const bool automatic_width = parameter == 2;
+        if (automatic_width) {
+            REQUIRE(configured.config->set("nozzle_diameter", "0.4,0.8").success);
+            REQUIRE(configured.config->set("bridge_line_width", "0.4").success);
+            REQUIRE(configured.config->set("wall_generator", "classic").success);
+            REQUIRE(configured.config->set("min_feature_size", "150%").success);
+            REQUIRE(configured.config->set("min_bead_width", "150%").success);
+        }
+        REQUIRE(configured.config->set("line_width", automatic_width ? "0" : "0.8").success);
+        REQUIRE(configured.config->set("inner_wall_line_width", automatic_width ? "0" : "0.4").success);
+        REQUIRE(configured.config->set("outer_wall_line_width", automatic_width ? "0" : "0.4").success);
+    }
+    const auto snapshot = configured.config->snapshot();
+    const std::array<const char*, 4> spacings{"", "5", "3.6", "3.2"};
+    const std::array<double, 4> expected_spacings{7.0875, 5.0, 3.6, 3.2};
+    const std::array<double, 4> expected_strokes{0.7875, 0.65, 0.45, 0.4};
+    const double expected_spacing = expected_spacings[parameter];
+    const double expected_stroke = expected_strokes[parameter];
+    const auto form = calibration_parameters(CalibMode::Calib_Fiber_Landing, snapshot,
+        {{"fiber_parameter", std::to_string(parameter)}, {"height", std::to_string(fixed[0])},
+         {"length", std::to_string(fixed[1])}, {"speed", std::to_string(fixed[2])},
+         {"extra", std::to_string(fixed[3])}, {"start", std::to_string(starts[parameter])},
+         {"end", std::to_string(starts[parameter] + 2 * steps[parameter] + 0.001)}, {"step", std::to_string(steps[parameter])},
+         {"trial_spacing", spacings[parameter]}});
+    const auto checked = validate_calibration_parameters(form);
+    for (const auto& d : checked.diagnostics) { UNSCOPED_INFO(d.code + ": " + d.message); }
+    REQUIRE(checked);
+    CHECK(form.fiber_sample_count == 3);
+    const auto preparation = library->prepare_calibration(checked.request);
+    for (const auto& d : preparation.diagnostics) UNSCOPED_INFO(d.message);
+    REQUIRE(preparation);
+    REQUIRE(preparation.task->plates().size() == 1);
+    const auto& plate = preparation.task->plates()[0];
+    CHECK(plate.config.value("zaa_enabled") == "0");
+    CHECK(plate.config.value("wall_loops") == "1");
+    if (parameter == 2) {
+        CHECK(plate.config.value("filament_map") == "2,1");
+        CHECK(plate.config.value("wall_generator") == "arachne");
+        CHECK(configured.config->snapshot().value("wall_generator") == "classic");
+        for (const auto* key : {"min_feature_size", "min_bead_width"})
+            CHECK(configured.config->snapshot().value(key) == "150%");
+        for (const auto* key : {"inner_wall_line_width", "outer_wall_line_width"}) {
+            const auto width = plate.config.value(key);
+            REQUIRE(width.has_value());
+            CHECK(std::stod(*width) == Catch::Approx(0.45));
+        }
+    }
+    CHECK(configured.config->snapshot().value("zaa_enabled") == "1");
+    CHECK(configured.config->snapshot().value("wall_loops") == "0");
+    const auto sample_count = plate.fiber_samples.size();
+    REQUIRE(sample_count == 3);
+    for (std::size_t i = 1; i < plate.fiber_samples.size(); ++i)
+        CHECK(plate.fiber_samples[i].start_mm.y - plate.fiber_samples[i - 1].start_mm.y ==
+            Catch::Approx(expected_spacing).margin(0.001));
+    const auto result = library->slice_calibration(*preparation.task, 0, {});
+    std::ostringstream failure;
+    for (const auto& d : result.diagnostics) failure << d.code << ": " << d.message << '\n';
+    INFO(failure.str());
+    CAPTURE(result.cancelled);
+    REQUIRE(result);
+    REQUIRE(result.preview);
+    TempOutput cleanup{result.output.path};
+    REQUIRE(result.preview->layers.size() == 4);
+    const auto layer_height = std::stod(*snapshot.value("layer_height"));
+    const auto first_layer_z = std::stod(*snapshot.value("initial_layer_print_height")) +
+        std::stod(*snapshot.value("z_offset"));
+    REQUIRE(plate.objects.size() == 1);
+    const auto& volumes = plate.objects[0].geometry.volumes;
+    REQUIRE(volumes.size() == 1);
+    const auto& base = volumes.front();
+    REQUIRE(base.role == SliceVolumeRole::ModelPart);
+    const auto engraving_floor_z = std::stod(*snapshot.value("initial_layer_print_height")) + layer_height;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, int> edge_counts;
+    for (const auto& face : base.triangles)
+        for (const auto& [a, b] : {std::pair{face.vertex_a, face.vertex_b}, std::pair{face.vertex_b, face.vertex_c},
+                                   std::pair{face.vertex_c, face.vertex_a}})
+            ++edge_counts[{std::min(a, b), std::max(a, b)}];
+    CHECK(std::all_of(edge_counts.begin(), edge_counts.end(), [](const auto& edge) { return edge.second == 2; }));
+    std::array<double, 4> maximum_z_error{};
+    std::set<std::uint32_t> base_layers, fiber_layers;
+    std::set<std::uint64_t> occurrences;
+    for (const auto& segment : result.preview->segments) {
+        if (segment.deposition == ToolpathDepositionKind::Thermoplastic) base_layers.insert(segment.layer_index);
+        if (segment.deposition == ToolpathDepositionKind::ContinuousFiberPowered) {
+            fiber_layers.insert(segment.layer_index);
+            occurrences.insert(segment.fiber_occurrence);
+        }
+        if (segment.deposition == ToolpathDepositionKind::Thermoplastic ||
+            segment.deposition == ToolpathDepositionKind::ContinuousFiberPowered) {
+            const auto layer = segment.layer_index;
+            REQUIRE(layer < maximum_z_error.size());
+            const double expected_z = first_layer_z + layer * layer_height;
+            maximum_z_error[layer] = std::max({maximum_z_error[layer], std::abs(segment.start_mm.z - expected_z),
+                std::abs(segment.end_mm.z - expected_z)});
+        }
+    }
+    CHECK(base_layers == std::set<std::uint32_t>{0, 1, 2});
+    CHECK(fiber_layers == std::set<std::uint32_t>{3});
+    REQUIRE(occurrences.size() == sample_count);
+    const std::vector<std::uint64_t> executions(occurrences.begin(), occurrences.end());
+    CHECK(*std::max_element(maximum_z_error.begin(), maximum_z_error.end()) < 0.002);
+    const auto gap_at = [&](double sample_x, double sample_y) {
+        std::array<double, 3> gap;
+        gap.fill(std::numeric_limits<double>::infinity());
+        for (const auto& segment : result.preview->segments) {
+            if (segment.deposition != ToolpathDepositionKind::Thermoplastic || segment.layer_index >= gap.size())
+                continue;
+            const double dx = segment.end_mm.x - segment.start_mm.x;
+            const double dy = segment.end_mm.y - segment.start_mm.y;
+            const double length_squared = dx * dx + dy * dy;
+            if (length_squared == 0) continue;
+            const double x = sample_x - segment.start_mm.x;
+            const double y = sample_y - segment.start_mm.y;
+            const double t = std::clamp((x * dx + y * dy) / length_squared, 0., 1.);
+            const double distance = std::hypot(x - t * dx, y - t * dy) - segment.width_mm / 2;
+            auto& closest = gap[segment.layer_index];
+            closest = std::min(closest, distance);
+        }
+        return gap;
+    };
+    for (std::size_t i = 0; i < sample_count; ++i) {
+        CHECK(plate.fiber_samples[i].value ==
+            Catch::Approx(starts[parameter] + i * steps[parameter]));
+        // Every numeral has a right-hand stroke at mid-height. Sample inside
+        // that stroke to prove that actual deposition leaves the inscription
+        // open on the third layer and solid below it.
+        const auto& trial_start = plate.fiber_samples[i].start_mm;
+        double label_right = std::numeric_limits<double>::lowest();
+        double label_bottom = std::numeric_limits<double>::infinity();
+        double label_top = std::numeric_limits<double>::lowest();
+        for (const auto& vertex : base.vertices) {
+            if (std::abs(vertex.z - engraving_floor_z) >= 0.002 || std::abs(vertex.y - trial_start.y) >= expected_spacing / 2)
+                continue;
+            label_right = std::max(label_right, double(vertex.x));
+            label_bottom = std::min(label_bottom, double(vertex.y));
+            label_top = std::max(label_top, double(vertex.y));
+        }
+        REQUIRE(label_right > trial_start.x - 6);
+        CHECK(label_right < trial_start.x - 4);
+        CHECK(label_top - label_bottom == Catch::Approx(7 * expected_stroke).margin(0.002));
+        const double label_x = label_right - expected_stroke / 2;
+        const auto gap_at_label = gap_at(label_x, trial_start.y);
+        if (i + 1 < sample_count) {
+            const double separator_y = (trial_start.y + plate.fiber_samples[i + 1].start_mm.y) / 2;
+            CHECK(gap_at(label_x, separator_y)[2] < 0.06);
+        }
+        CHECK(gap_at_label[0] < 0.06);
+        CHECK(gap_at_label[1] < 0.06);
+        CHECK(gap_at_label[2] > 0.1);
+        auto expected = fixed;
+        expected[parameter] = starts[parameter] + i * steps[parameter];
+        double landing_x = 0, landing_z = 0;
+        for (const auto& segment : result.preview->segments) {
+            if (segment.fiber_phase != ToolpathFiberPhase::Landing || segment.fiber_occurrence != executions[i])
+                continue;
+            landing_x += segment.end_mm.x - segment.start_mm.x;
+            landing_z += segment.start_mm.z - segment.end_mm.z;
+            CHECK(segment.nominal_speed_mm_s == Catch::Approx(expected[2]).margin(0.01));
+        }
+        CHECK(landing_x == Catch::Approx(expected[0] > 0 ? expected[1] : 0).margin(0.002));
+        CHECK(landing_z == Catch::Approx(expected[0]).margin(0.002));
+    }
+    std::ifstream gcode(result.output.path);
+    std::vector<double> prefeed;
+    std::size_t sample_markers = 0, cuts = 0, cutter_commands = 0;
+    bool reading_prefeed = false, reading_cut = false;
+    const std::regex extrusion(" E([0-9.]+)");
+    const std::string sample_marker = ";CALIBRATION_FIBER_SAMPLE ";
+    for (std::string line; std::getline(gcode, line);) {
+        if (line.rfind(sample_marker, 0) == 0) {
+            std::istringstream marker{line.substr(sample_marker.size())};
+            std::size_t sample_id = 0;
+            std::uint64_t occurrence = 0;
+            REQUIRE(static_cast<bool>(marker >> sample_id >> occurrence));
+            REQUIRE(sample_markers < executions.size());
+            CHECK(sample_id == sample_markers + 1);
+            CHECK(occurrence == executions[sample_markers++]);
+        }
+        if (line == ";FIBER_CUT") {
+            ++cuts;
+            reading_cut = true;
+        }
+        if (line == ";FIBER_TAIL_BEGIN") reading_cut = false;
+        if (reading_cut && line == "S0") ++cutter_commands;
+        if (line == ";FIBER_PREFEED_BEGIN") reading_prefeed = true;
+        if (line == ";FIBER_PREFEED_END") reading_prefeed = false;
+        if (reading_prefeed) {
+            std::smatch match;
+            if (std::regex_search(line, match, extrusion)) prefeed.push_back(std::stod(match[1].str()));
+        }
+    }
+    CHECK(sample_markers == sample_count);
+    CHECK(cuts == sample_count);
+    CHECK(cutter_commands == sample_count);
+    REQUIRE(prefeed.size() == sample_count);
+    for (std::size_t i = 0; i < prefeed.size(); ++i) {
+        const double extra = parameter == 3 ? starts[parameter] + i * steps[parameter] : fixed[3];
+        CHECK(prefeed[i] == Catch::Approx(23 + extra).margin(0.001));
+    }
+    const auto temperature_form = calibration_parameters(CalibMode::Calib_Fiber_Temperature, snapshot);
+    CHECK(temperature_form.fields.empty());
+    CHECK_FALSE(validate_calibration_parameters(temperature_form));
+    CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "step", "0")));
+    if (parameter == 1 || parameter == 2)
+        CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "height", "0")));
+    if (parameter == 2)
+        CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "3.2")));
+    if (parameter == 1) {
+        CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "0")));
+        const auto too_close = validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "3.59"));
+        REQUIRE_FALSE(too_close);
+        REQUIRE_FALSE(too_close.diagnostics.empty());
+        CHECK(too_close.diagnostics.front().message == "Minimum fiber trial spacing: 3.6 mm");
+        CHECK(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "3.6")));
+        CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "400")));
+        CHECK(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "7.0875")));
+        const auto automatic = validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", ""));
+        REQUIRE(automatic);
+        CHECK_FALSE(automatic.request.fiber->sweep.trial_spacing_mm.has_value());
+        const auto oversized = update_calibration_parameters(form, "end", "10000");
+        CHECK_FALSE(validate_calibration_parameters(oversized));
+        std::atomic_bool cancel{false};
+        SliceCallbacks callbacks;
+        callbacks.progress = [&](float progress, std::string_view) { if (progress >= 0.6f) cancel = true; };
+        callbacks.is_cancelled = [&] { return cancel.load(); };
+        const auto aborted = library->slice_calibration(*preparation.task, 0, {}, callbacks);
+        CHECK(aborted.cancelled);
+        CHECK(aborted.output.path.empty());
+        const auto retried = library->slice_calibration(*preparation.task, 0, {});
+        TempOutput retry_cleanup{retried.output.path};
+        REQUIRE(retried);
+        REQUIRE(retried.preview);
+        CHECK(retried.preview->layers.size() == 4);
+        const auto subsequent = library->slice(ordinary);
+        TempOutput subsequent_cleanup{subsequent.output.path};
+        REQUIRE(subsequent);
+        CHECK(printer_commands(subsequent.output.path) == ordinary_baseline);
+    }
 }

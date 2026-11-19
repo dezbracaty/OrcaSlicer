@@ -142,6 +142,8 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
 void validate_continuous_fiber_region_config(const PrintConfig& print_config,
     const PrintRegionConfig& region_config, double layer_height);
 ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const LayerRegion& region);
+ContinuousFiberConfig resolve_fiber_calibration_config(const PrintConfig&, const PrintRegionConfig&,
+    unsigned fiber_slot, double layer_height, double height, double length, double speed, double extra);
 
 } // namespace Slic3r
 

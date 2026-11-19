@@ -739,4 +739,21 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
     return result;
 }
 
+ContinuousFiberConfig resolve_fiber_calibration_config(const PrintConfig& print,
+    const PrintRegionConfig& region, unsigned slot, double layer_height,
+    double height, double length, double speed, double extra)
+{
+    PrintRegionConfig sample = region;
+    sample.generate_reinforced_perimeters.value = false;
+    sample.generate_reinforced_infills.value = true;
+    sample.fiber_infill_layer_interval.value = 1;
+    sample.reinforced_infill_pattern.value = ipRectilinear;
+    sample.reinforced_infill_filament.value = int(slot + 1);
+    sample.fiber_z_hop_height.value = height;
+    sample.fiber_landing_length.value = length;
+    sample.fiber_landing_speed.value = speed;
+    sample.fiber_prefeed_extra_length.value = extra;
+    return resolve_region_fiber_config(print, sample, layer_height, 3);
+}
+
 } // namespace Slic3r

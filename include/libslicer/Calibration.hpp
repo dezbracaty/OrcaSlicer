@@ -21,8 +21,37 @@ enum class CalibMode : int {
     Calib_Input_shaping_damp = 11,
     Calib_Cornering          = 12,
     // SDK entry for Orca's handy model, which has no original CalibMode.
-    Calib_Tolerance_Model = 13
+    Calib_Tolerance_Model = 13,
+    Calib_Fiber_Landing = 14,
+    Calib_Fiber_Temperature = 15
 };
+
+enum class FiberLandingParameter { Height, Length, Speed, ExtraPrefeed };
+struct FiberLandingValues {
+    double height_mm{0}, length_mm{0}, speed_mm_s{0}, extra_prefeed_mm{0};
+};
+struct FiberLandingSweep {
+    FiberLandingParameter parameter{FiberLandingParameter::Length};
+    FiberLandingValues fixed;
+    double start{0}, end{0}, step{0};
+    std::optional<double> trial_spacing_mm; // Center-to-center spacing, or automatic when omitted.
+};
+struct FiberCalibrationInput {
+    std::size_t base_filament_slot{0}, fiber_filament_slot{0};
+    FiberLandingSweep sweep;
+};
+struct FiberCalibrationSample {
+    std::size_t id{0};
+    double value{0};
+    std::string unit;
+    FiberLandingValues landing;
+    ToolpathPoint start_mm, end_mm;
+};
+
+inline bool is_fiber_calibration(CalibMode mode) noexcept
+{
+    return mode == CalibMode::Calib_Fiber_Landing || mode == CalibMode::Calib_Fiber_Temperature;
+}
 
 // Values passed by the original calib_dlg.cpp to Plater. Units and sampling
 // are the original per-mode units; the adapter never rounds or clamps them.
@@ -46,6 +75,7 @@ struct CalibrationRequest
     // Zero-based material slot, resolved through the captured tool mapping.
     // Only Calib_Flow_Rate uses this field; extruder_id keeps its original meaning.
     std::size_t flow_filament_slot{0};
+    std::optional<FiberCalibrationInput> fiber;
 };
 
 // GUI-independent state of the original calib_dlg.cpp parameter forms. Values
@@ -59,6 +89,7 @@ struct CalibrationParameters
     std::vector<SettingItem> fields;
     std::vector<SliceDiagnostic> diagnostics;
     bool can_refine{false};
+    std::size_t fiber_sample_count{0};
 };
 struct CalibrationValidationResult
 {
@@ -119,6 +150,7 @@ struct CalibrationPlate
     ConfigSnapshot config;
     std::vector<CalibrationObject> objects;
     std::vector<CalibrationLayerCode> custom_gcodes;
+    std::vector<FiberCalibrationSample> fiber_samples;
 };
 
 // Owns the source Plater host and all of its prepared plates. Multiple plates
