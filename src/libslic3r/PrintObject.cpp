@@ -1407,6 +1407,8 @@ bool PrintObject::invalidate_state_by_config_options(
             steps.emplace_back(posPrepareInfill);
         } else if (
                opt_key.rfind("fiber_resin_fill_", 0) == 0
+            || opt_key == "fiber_contour_layer_interval"
+            || opt_key == "fiber_infill_layer_interval"
             || opt_key == "fiber_contour_include_holes"
             || opt_key == "fiber_contour_allow_partial_holes"
             || opt_key == "fiber_connect_adjacent_rings"

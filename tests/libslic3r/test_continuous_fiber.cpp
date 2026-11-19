@@ -4730,7 +4730,7 @@ TEST_CASE("CFSYS final export limits only first approaches and restores material
         {"gcode_flavor", "klipper"}, {"toolhead_fiber_protocol_id", ";cfsys-v1"},
         {"fiber_cut_gcode", "M400\nS0\nM400\n"}, {"travel_speed", "350"},
         {"enable_pressure_advance", "1,1"}, {"pressure_advance", "0.05,0"},
-        {"fiber_layer_height_ratio", "1"}, {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
+        {"fiber_contour_layer_interval", "1"}, {"fiber_infill_layer_interval", "1"}, {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
         {"fiber_toolchange_approach_speed", "0"}})
         config.set_deserialize_strict(key, value);
     Model model;
@@ -4922,7 +4922,8 @@ TEST_CASE("resin-only SDK provenance preserves native bridge surface classificat
         {"ensure_vertical_shell_thickness", "ensure_all"}, {"fiber_contour_bend_radius", "0.3"},
         {"fiber_infill_bend_radius", "0.3"}})
         config.set_deserialize_strict(value.first, value.second);
-    config.set_deserialize_strict("fiber_layer_height_ratio", std::to_string(interval));
+    config.set_deserialize_strict("fiber_contour_layer_interval", std::to_string(interval));
+    config.set_deserialize_strict("fiber_infill_layer_interval", std::to_string(interval));
 
     // Keep every native surface attribute, grouping only geometrically equivalent
     // fragments. Runtime model IDs and polygon vertex starting points may differ.
@@ -6868,7 +6869,8 @@ TEST_CASE("fiber writer checks actual intermediate commands and restores its hoo
 TEST_CASE("fiber contexts include layer aliases and invalidate moved cached placements", "[ContinuousFiber][Finalization]")
 {
     auto config=masked_print_config();config.set_deserialize_strict("filament_printable","3,3");
-    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("fiber_contour_layer_interval", "1");
+    config.set_deserialize_strict("fiber_infill_layer_interval", "1");
     config.set_deserialize_strict("top_shell_thickness","0");
     config.set_deserialize_strict("bottom_shell_thickness","0");
     Model model;auto* first=model.add_object();first->add_volume(make_cube(20,20,2));
@@ -6908,7 +6910,8 @@ TEST_CASE("fixed fiber Fill results are reused only for their exact run inputs",
     const bool shared_alias=GENERATE(false,true);
     CAPTURE(scenario,shared_alias);
     auto config=masked_print_config();
-    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("fiber_contour_layer_interval", "1");
+    config.set_deserialize_strict("fiber_infill_layer_interval", "1");
     config.set_deserialize_strict("top_shell_thickness","0");config.set_deserialize_strict("bottom_shell_thickness","0");
     config.set_deserialize_strict("filament_printable","3,3");
     config.set_deserialize_strict("extruder_printable_height","100,100");
@@ -6988,7 +6991,7 @@ TEST_CASE("fixed fiber Fill results are reused only for their exact run inputs",
 TEST_CASE("failed early fiber runs cannot publish or carry results into a restart", "[ContinuousFiber][OrcaIsolation][FiberEarlyExecution]")
 {
     const int failure=GENERATE(0,1,2); // cancellation, successor exception, revoked epoch
-    auto config=masked_print_config();config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    auto config=masked_print_config();config.set_deserialize_strict("fiber_contour_layer_interval","1");
     config.set_deserialize_strict("top_shell_thickness","0");config.set_deserialize_strict("bottom_shell_thickness","0");
     Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,1));
     object->add_instance()->set_offset(Vec3d(60,60,0));
@@ -7125,7 +7128,8 @@ TEST_CASE("disabling fiber rebuilds cached fills and ironing like a fresh resin 
     config.set_deserialize_strict("generate_reinforced_perimeters","1");
     config.set_deserialize_strict("reinforced_perimeters_filament","2");
     config.set_deserialize_strict("fiber_contour_bend_radius","0.3");
-    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("fiber_contour_layer_interval", "1");
+    config.set_deserialize_strict("fiber_infill_layer_interval", "1");
     config.set_deserialize_strict("top_shell_thickness","0");
     config.set_deserialize_strict("bottom_shell_thickness","0");
     Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,2));
@@ -7315,7 +7319,8 @@ TEST_CASE("fiber execution tables preserve automatic and manual resin mappings a
     auto* printable_areas=new ConfigOptionPointsGroups;
     const Vec2ds bed{{0,0},{200,0},{200,200},{0,200}};
     printable_areas->values={bed,bed};config.set_key_value("extruder_printable_area",printable_areas);
-    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("fiber_contour_layer_interval", "1");
+    config.set_deserialize_strict("fiber_infill_layer_interval", "1");
     config.set_deserialize_strict("top_shell_thickness","0");
     config.set_deserialize_strict("bottom_shell_thickness","0");
     const auto sequence=GENERATE(PrintSequence::ByLayer,PrintSequence::ByObject);
@@ -7369,7 +7374,7 @@ TEST_CASE("BBL fiber candidates preserve original solver used material decisions
         {"extruder_ams_count",scenario==0 || scenario==5?"1#1;1#1":"4#1;4#1"},
         {"master_extruder_id",conflicting_master?"2":"1"},
         {"printable_area","0x0,200x0,200x200,0x200"}, {"extruder_printable_height","100,100"},
-        {"fiber_layer_height_ratio","1"}, {"top_shell_thickness","0"}, {"bottom_shell_thickness","0"}
+        {"fiber_contour_layer_interval", "1"}, {"fiber_infill_layer_interval", "1"}, {"top_shell_thickness","0"}, {"bottom_shell_thickness","0"}
     };
     for(const auto& [key,value]:options)config.set_deserialize_strict(key,value);
     config.set_key_value("filament_map_mode",new ConfigOptionEnum<FilamentMapMode>(fmmAutoForFlush));
@@ -7427,7 +7432,7 @@ TEST_CASE("BBL fiber candidates preserve original solver used material decisions
 
 TEST_CASE("a revoked process run cannot recapture a newer execution generation", "[ContinuousFiber][R4][OrcaIsolation]")
 {
-    auto config=masked_print_config();config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    auto config=masked_print_config();config.set_deserialize_strict("fiber_contour_layer_interval","1");
     config.set_deserialize_strict("top_shell_thickness","0");config.set_deserialize_strict("bottom_shell_thickness","0");
     Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,2));
     object->add_instance()->set_offset(Vec3d(60,60,0));Print print;print.apply(model,config);
@@ -7556,7 +7561,8 @@ TEST_CASE("fiber belt normalization protects shared layers without changing ordi
     const bool reinforced=GENERATE(false,true);
     auto config=reinforced?masked_print_config():DynamicPrintConfig::full_print_config();
     if(reinforced) {
-        config.set_deserialize_strict("fiber_layer_height_ratio","1");
+        config.set_deserialize_strict("fiber_contour_layer_interval", "1");
+        config.set_deserialize_strict("fiber_infill_layer_interval", "1");
         config.set_deserialize_strict("top_shell_thickness","0");config.set_deserialize_strict("bottom_shell_thickness","0");
     }
     config.set_key_value("printer_structure",new ConfigOptionEnum<PrinterStructure>(PrinterStructure::psBelt));
@@ -7730,7 +7736,7 @@ TEST_CASE("parallel reference cache misses return independent equivalent bounds"
 
 TEST_CASE("late machine rejection revokes the whole task without changing a manual mapping", "[ContinuousFiber][R4]")
 {
-    auto config=masked_print_config();config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    auto config=masked_print_config();config.set_deserialize_strict("fiber_contour_layer_interval","1");
     config.set_deserialize_strict("top_shell_thickness","0");config.set_deserialize_strict("bottom_shell_thickness","0");
     config.set_deserialize_strict("fiber_z_hop_height","0");
     Model model;auto* object=model.add_object();object->add_volume(make_cube(20,20,2));
@@ -8918,7 +8924,8 @@ TEST_CASE("native linear resin simplification must preserve its hard material bo
 TEST_CASE("partial hole policy changes invalidate cached fiber fills", "[ContinuousFiber][HoleContourPolicy]")
 {
     auto config=masked_print_config();
-    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("fiber_contour_layer_interval", "1");
+    config.set_deserialize_strict("fiber_infill_layer_interval", "1");
     config.set_deserialize_strict("fiber_contour_include_holes","1");
     config.set_deserialize_strict("fiber_contour_allow_partial_holes","1");
     Model model; auto* object=model.add_object();
@@ -8949,7 +8956,8 @@ TEST_CASE("infill progress counts completed work per object and skips cached fil
     config.set_deserialize_strict("generate_reinforced_perimeters",contours?"1":"0");
     config.set_deserialize_strict("reinforced_perimeters_filament","2");
     config.set_deserialize_strict("outer_reinforced_perimeters_counts","1");
-    config.set_deserialize_strict("fiber_layer_height_ratio","1");
+    config.set_deserialize_strict("fiber_contour_layer_interval", "1");
+    config.set_deserialize_strict("fiber_infill_layer_interval", "1");
     Model model;
     for (const double height : {1.,2.}) {
         auto* object=model.add_object();
@@ -9002,4 +9010,167 @@ TEST_CASE("infill progress counts completed work per object and skips cached fil
     REQUIRE_FALSE(counts.empty());
     CHECK(counts.front().first==0);
     CHECK(counts.back().first==counts.back().second);
+}
+
+TEST_CASE("scheduled contour ancestors preserve ring layout without material", "[ContinuousFiber][fiber-intervals]")
+{
+    const bool connected=GENERATE(false,true);
+    const int geometry=GENERATE(0,1,2,3);
+    ExPolygons domain{geometry?rectangle_with_hole(0,0,100,80,30,25,50,55):rectangle(0,0,100,80)};
+    if(geometry==2) {
+        auto hole=rectangle(51.2,25,71.2,55).contour;
+        hole.reverse();domain.front().holes.push_back(std::move(hole));
+    }
+    if(geometry==3) {
+        domain={ExPolygon(Polygon::new_scale({{0,0},{30,0},{30,14.4},{50,14.4},
+            {50,0},{80,0},{80,30},{50,30},{50,15.6},{30,15.6},{30,30},{0,30}}))};
+    }
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.2f,.4f);
+    config.contour_count=5;
+    config.cut_to_contact_length_mm=2;
+    config.connect_adjacent_rings=connected;
+    auto plan=FiberPathValidator::plan_contours(domain,config,{1,1,0,0},false,2,0,0,false,true);
+    REQUIRE(plan.audit_lineage());
+    REQUIRE(plan.validation.audit_assignments().valid());
+    REQUIRE_FALSE(plan.validation.scheduled_footprint.empty());
+    size_t skipped=0,active=0;
+    for(const auto& assignment:plan.validation.assignments) {
+        const auto node=std::find_if(plan.nodes.begin(),plan.nodes.end(),[&](const auto& n){return n.id==assignment.id.parent;});
+        REQUIRE(node!=plan.nodes.end());
+        if(node->depth<2) {
+            CHECK(assignment.kind!=FiberAssignmentKind::AcceptedFiber);
+            CHECK_FALSE(assignment.prepared);
+            CHECK_FALSE(assignment.chain_only);
+            if(assignment.kind==FiberAssignmentKind::ScheduledOff) ++skipped;
+        } else if(assignment.kind==FiberAssignmentKind::AcceptedFiber) {
+            REQUIRE(assignment.prepared);
+            CHECK(assignment.display_purpose==FiberPathPurpose::Infill);
+            ++active;
+        }
+    }
+    CHECK(skipped>=2);
+    CHECK(active>=3);
+    FiberPathValidator::plan_open_ring_chains(plan,domain,config);
+    REQUIRE(plan.validation.audit_assignments().valid());
+    REQUIRE(plan.validation.audit_open_chains());
+    for(const auto& chain:plan.validation.chain_executions)
+        for(const auto& piece:chain.pieces) CHECK(piece.display_purpose==FiberPathPurpose::Infill);
+    ExPolygons emitted;
+    std::vector<std::shared_ptr<const PreparedFiberPath>> envelope_paths;
+    if(plan.validation.chain_executions.empty()) {
+        for(const auto& assignment:plan.validation.assignments)
+            if(assignment.prepared) {
+                append(emitted,assignment.prepared->resin_exclusion);
+                envelope_paths.push_back(assignment.prepared);
+            }
+    } else for(const auto& chain:plan.validation.chain_executions) {
+        append(emitted,chain.prepared->resin_exclusion);
+        envelope_paths.push_back(chain.prepared);
+    }
+    emitted=union_ex(emitted);
+    CHECK(diff_ex(emitted,plan.validation.resin_exclusion).empty());
+    CHECK(diff_ex(plan.validation.resin_exclusion,emitted).empty());
+    FiberCoverageRecord record;
+    record.source={1,1,0,0};
+    record.source_domain=domain;
+    record.accepted_infill_exclusion=emitted;
+    record.resin_domain=ContinuousFiberFillStrategy::build_resin_area(domain,emitted);
+    record.execution_envelope=FiberCoverageEnvelope::from_paths(std::move(envelope_paths));
+    FiberCoverageLedger ledger;
+    ledger.add(std::move(record));
+    CHECK(ledger.audit().unassigned_area_mm2<.00001);
+}
+
+TEST_CASE("scheduled open hole references remain normal leaves", "[ContinuousFiber][fiber-intervals]")
+{
+    ContinuousFiberConfig config;
+    config.contour_flow=Flow(1.f,.13f,.4f);
+    config.contour_count=3;
+    config.contour_allow_partial_holes=true;
+    config.contour_bend_radius_mm=GENERATE(0.,.3);
+    config.contour_boundary_clearance_mm=.05;
+    const auto plan=FiberPathValidator::plan_contours(
+        {rectangle_with_hole(0,0,40,30,4.2,10,11,20)},config,{},false,
+        fiber_contour_depth_limit,0,0,false,true);
+    REQUIRE(plan.audit_lineage());
+    REQUIRE(plan.validation.audit_assignments().valid());
+    CHECK(plan.validation.accepted_count()==0);
+    CHECK(plan.validation.physical_footprint.empty());
+    CHECK(plan.validation.resin_exclusion.empty());
+    size_t leaves=0;
+    for(const auto& stop:plan.stops) if(stop.reason=="open_scheduled_reference_leaf") {
+        ++leaves;
+        REQUIRE(stop.parent);
+        CHECK(std::none_of(plan.nodes.begin(),plan.nodes.end(),[&](const auto& node){return node.parent==stop.parent;}));
+    }
+    CHECK(leaves>0);
+}
+
+TEST_CASE("changing independent fiber periods rebuilds the same paths as a fresh print", "[ContinuousFiber][fiber-intervals]")
+{
+    Model model;
+    auto* object=model.add_object();
+    object->add_volume(make_cube(32,24,1.6),ModelVolumeType::MODEL_PART,false);
+    object->add_instance()->set_offset(Vec3d(100,100,0));
+    auto config=masked_print_config();
+    for(const auto& [key,value]:std::vector<std::pair<std::string,std::string>>{
+        {"generate_reinforced_perimeters","1"},{"reinforced_perimeters_filament","2"},
+        {"outer_reinforced_perimeters_counts","1"},{"fiber_resin_fill_density","40%"},
+        {"top_shell_thickness","0"},{"bottom_shell_thickness","0"},
+        {"fiber_infill_angle_sequence","0,90"},{"reinforced_infill_density","100%"}}) config.set_deserialize_strict(key,value);
+    const auto signature=[](const Print& print) {
+        std::vector<std::array<double,9>> paths;
+        for(const auto* obj:print.objects())for(const auto* layer:obj->layers())for(const auto* region:layer->regions()) {
+            const auto visit=[&](const auto& self,const ExtrusionEntity* entity)->void {
+                if(const auto* collection=dynamic_cast<const ExtrusionEntityCollection*>(entity)) {
+                    for(const auto* child:collection->entities)self(self,child);
+                } else if(const auto* fiber=dynamic_cast<const ExtrusionFiberPath*>(entity)) {
+                    const auto& prepared=*fiber->prepared_path();
+                    for(const auto& span:prepared.spans)for(size_t i=1;i<span.geometry.points.size();++i) {
+                        const auto& a=span.geometry.points[i-1];const auto& b=span.geometry.points[i];
+                        paths.push_back({double(layer->id()),double(fiber->display_purpose()),double(span.kind),
+                            double(a.x()),double(a.y()),double(a.z()),double(b.x()),double(b.y()),double(b.z())});
+                    }
+                }
+            };
+            visit(visit,&region->fills);
+        }
+        std::sort(paths.begin(),paths.end());return paths;
+    };
+    Print reused;reused.set_plate_origin(Vec3d::Zero());reused.is_BBL_printer()=false;
+    reused.apply(model,config);reused.process();
+    const auto every=signature(reused);
+    REQUIRE_FALSE(every.empty());
+    config.set_deserialize_strict("fiber_contour_layer_interval","2");
+    config.set_deserialize_strict("fiber_infill_layer_interval","3");
+    reused.apply(model,config);
+    CHECK_FALSE(reused.fiber_execution_plans());
+    reused.process();
+    const auto changed=signature(reused);
+    REQUIRE_FALSE(changed.empty());
+    CHECK(changed!=every);
+    Print fresh;fresh.set_plate_origin(Vec3d::Zero());fresh.is_BBL_printer()=false;
+    fresh.apply(model,config);fresh.process();
+    CHECK(signature(fresh)==changed);
+    bool horizontal=false,vertical=false;
+    for(const auto& row:changed) {
+        const auto role=FiberPathPurpose(int(row[1]));
+        if(role==FiberPathPurpose::Contour) CHECK(size_t(row[0])%2==0);
+        else {
+            CHECK(size_t(row[0])%3==0);
+            if(FiberMotionKind(int(row[2]))==FiberMotionKind::PoweredDepositing) {
+                const double dx=row[6]-row[3],dy=row[7]-row[4];
+                // At full density, inter-row links are shorter than this scan threshold.
+                if(std::hypot(dx,dy)>scale_(1.)) {
+                    const bool along_x=std::abs(dy)<2,along_y=std::abs(dx)<2;
+                    CHECK((along_x||along_y));
+                    if((size_t(row[0])/3)%2==0) {CHECK(along_x);horizontal=true;}
+                    else {CHECK(along_y);vertical=true;}
+                }
+            }
+        }
+    }
+    CHECK(horizontal);
+    CHECK(vertical);
 }

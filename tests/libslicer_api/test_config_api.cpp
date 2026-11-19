@@ -657,7 +657,7 @@ TEST_CASE("P3 0.125 mm mixed preset shares layers between matrix and fiber", "[l
     const auto defaults = created.config->snapshot();
     CHECK(defaults.value("layer_height") == "0.125");
     CHECK(defaults.value("initial_layer_print_height") == "0.125");
-    CHECK(defaults.value("fiber_layer_height_ratio") == "1");
+    CHECK(defaults.value("fiber_contour_layer_interval") == "1");
     CHECK(defaults.value("fiber_width") == "1");
     CHECK(defaults.value("outer_wall_filament_id") == "5");
     CHECK(defaults.value("reinforced_perimeters_filament") == "6");
@@ -1226,7 +1226,7 @@ TEST_CASE("mixed-capability fiber exports preserve every physical tool ID", "[li
         {"reinforced_perimeters_filament", std::to_string(fiber_tool+1)},
         {"top_shell_layers", "1"}, {"bottom_shell_layers", "1"},
         {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
-        {"fiber_layer_height_ratio", "1"}, {"fiber_minimum_path_length", "2"}
+        {"fiber_contour_layer_interval", "1"}, {"fiber_infill_layer_interval", "1"}, {"fiber_minimum_path_length", "2"}
     }).success);
     libslicer::SliceObjectInput object;
     object.name = "mixed-process-coupon";
@@ -1527,7 +1527,8 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
     const auto* contour_toggle = find_item(items, "generate_reinforced_perimeters");
     const auto* contour_count = find_item(items, "outer_reinforced_perimeters_counts");
     const auto* infill_density = find_item(items, "reinforced_infill_density");
-    const auto* layer_interval = find_item(items, "fiber_layer_height_ratio");
+    const auto* layer_interval = find_item(items, "fiber_contour_layer_interval");
+    const auto* infill_interval = find_item(items, "fiber_infill_layer_interval");
     const auto* fill_debug = find_item(items, "fiber_fill_debug");
     REQUIRE(fill_debug != nullptr);
     CHECK(fill_debug->type == libslicer::SettingType::Boolean);
@@ -1544,22 +1545,25 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
     REQUIRE(contour_count != nullptr);
     REQUIRE(infill_density != nullptr);
     REQUIRE(layer_interval != nullptr);
+    REQUIRE(infill_interval != nullptr);
     REQUIRE(contour_infill_clearance != nullptr);
     CHECK(contour_toggle->enabled);
     CHECK_FALSE(contour_count->enabled);
     CHECK_FALSE(infill_density->enabled);
     CHECK_FALSE(layer_interval->enabled);
+    CHECK_FALSE(infill_interval->enabled);
     CHECK_FALSE(contour_infill_clearance->enabled);
 
     const auto contour_enabled = config.set("generate_reinforced_perimeters", "1");
     REQUIRE(contour_enabled.success);
     CHECK(find_item(contour_enabled.changed_items, "generate_reinforced_perimeters") != nullptr);
     CHECK(find_item(contour_enabled.changed_items, "outer_reinforced_perimeters_counts") != nullptr);
-    CHECK(find_item(contour_enabled.changed_items, "fiber_layer_height_ratio") != nullptr);
+    CHECK(find_item(contour_enabled.changed_items, "fiber_contour_layer_interval") != nullptr);
 
     items = config.settings();
     CHECK(find_item(items, "outer_reinforced_perimeters_counts")->enabled);
-    CHECK(find_item(items, "fiber_layer_height_ratio")->enabled);
+    CHECK(find_item(items, "fiber_contour_layer_interval")->enabled);
+    CHECK_FALSE(find_item(items, "fiber_infill_layer_interval")->enabled);
     CHECK(find_item(items, "fiber_fill_debug")->enabled);
     REQUIRE(config.set("fiber_fill_debug", "1").success);
     const auto debug_snapshot = config.snapshot();
@@ -1576,6 +1580,7 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
 
     items = config.settings();
     CHECK(find_item(items, "reinforced_infill_density")->enabled);
+    CHECK(find_item(items, "fiber_infill_layer_interval")->enabled);
     CHECK(find_item(items, "fiber_contour_infill_clearance")->enabled);
 }
 
@@ -2998,7 +3003,7 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
         {"reinforced_infill_pattern", "rectilinear"},
         {"reinforced_perimeters_filament", "2"},
         {"reinforced_infill_filament", "2"},
-        {"fiber_layer_height_ratio", "1"},
+        {"fiber_contour_layer_interval", "1"}, {"fiber_infill_layer_interval", "1"},
         {"fiber_minimum_path_length", "2"},
         {"fiber_contour_infill_clearance", "0"},
         {"fiber_resin_overlap", "0.05"},
@@ -4440,7 +4445,7 @@ TEST_CASE("fiber infill angle sequence controls deposited G-code on successive f
         {"reinforced_infill_density","100%"},
         {"sparse_infill_density","100%"},
         {"top_shell_layers","0"}, {"bottom_shell_layers","0"},
-        {"fiber_layer_height_ratio",std::to_string(interval)}};
+        {"fiber_contour_layer_interval", std::to_string(interval)}, {"fiber_infill_layer_interval", std::to_string(interval)}};
     if (!use_default)
         overrides.emplace_back("fiber_infill_angle_sequence","0,45,90,135");
     REQUIRE(library->activate_config(selection,overrides).success);
@@ -4625,7 +4630,7 @@ TEST_CASE("independent resin infill preserves fiber and ordinary layers", "[libs
         {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"},
         {"top_shell_layers", "2"}, {"bottom_shell_layers", "2"},
         {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "0"},
-        {"fiber_contour_bend_radius", "0"}, {"fiber_layer_height_ratio", "2"},
+        {"fiber_contour_bend_radius", "0"}, {"fiber_contour_layer_interval", "2"}, {"fiber_infill_layer_interval", "2"},
         {"sparse_infill_density", "15%"}, {"sparse_infill_pattern", "grid"},
         {"fiber_resin_fill_pattern", "rectilinear"},
         {"fiber_resin_fill_density", "30%"}, {"fiber_resin_fill_line_width", "0.5"},
@@ -4833,12 +4838,14 @@ void remove_slice(const libslicer::SliceResult& result)
 using MaskDepositionSignature = std::vector<std::array<double, 20>>;
 MaskDepositionSignature mask_deposition_signature(const libslicer::ToolpathPreview& preview,
                                                  double minimum_x = -std::numeric_limits<double>::infinity(),
-                                                 bool fiber_only = false)
+                                                 bool fiber_only = false,
+                                                 std::optional<unsigned> layer = std::nullopt)
 {
     MaskDepositionSignature result;
     for (const auto& segment : preview.segments)
         if ((segment.deposition == libslicer::ToolpathDepositionKind::Thermoplastic || depositing_fiber(segment)) &&
             (!fiber_only || depositing_fiber(segment)) &&
+            (!layer || segment.layer_index == *layer) &&
             segment.start_mm.x >= minimum_x && segment.end_mm.x >= minimum_x)
             result.push_back({segment.start_mm.x, segment.start_mm.y, segment.start_mm.z,
                               segment.end_mm.x, segment.end_mm.y, segment.end_mm.z,
@@ -5167,9 +5174,11 @@ TEST_CASE("fiber mask scope is atomic and independent of inactive fiber presenta
 {
     auto config = libslicer::Config::defaults();
     const auto items = config.settings(libslicer::ConfigScope::FiberMask);
-    REQUIRE(items.size() == 42);
+    REQUIRE(items.size() == 44);
     std::set<std::string> keys;
     for (const auto& item : items) keys.insert(item.key);
+    CHECK(keys.count("fiber_contour_layer_interval") == 1);
+    CHECK(keys.count("fiber_infill_layer_interval") == 1);
     CHECK_FALSE(keys.count("fiber_mask_process"));
     CHECK_FALSE(keys.count("layer_height"));
     auto density = std::find_if(items.begin(), items.end(), [](const auto& item) {
@@ -5247,7 +5256,7 @@ TEST_CASE("masked App layer 23 survives planning reserve and machine rounding ar
         {"fiber_corner_stabilization_length", "5"}, {"fiber_infill_acceleration", "500"},
         {"fiber_infill_angle_sequence", "0"}, {"fiber_infill_bend_radius", "0"},
         {"fiber_infill_feed_ratio", "1"}, {"fiber_infill_max_speed", "10"},
-        {"fiber_infill_min_speed", "10"}, {"fiber_layer_height_ratio", "1"},
+        {"fiber_infill_min_speed", "10"}, {"fiber_contour_layer_interval", "1"}, {"fiber_infill_layer_interval", "1"},
         {"fiber_minimum_effective_length", "0"}, {"fiber_minimum_path_length", "1"},
         {"fiber_resin_fill_acceleration", "100%"}, {"fiber_resin_fill_align_to_model", "0"},
         {"fiber_resin_fill_anchor", "400%"}, {"fiber_resin_fill_anchor_max", "20"},
@@ -5526,7 +5535,7 @@ TEST_CASE("masked skipped fiber layers retain their own residual resin", "[libsl
     auto request = mask_request(*library);
     auto mask = box_mask();
     mask.settings = {{"generate_reinforced_infills", "1"}, {"reinforced_infill_filament", "2"},
-        {"reinforced_infill_density", "50%"}, {"fiber_layer_height_ratio", "2"},
+        {"reinforced_infill_density", "50%"}, {"fiber_contour_layer_interval", "2"}, {"fiber_infill_layer_interval", "2"},
         {"fiber_resin_fill_density", "50%"}, {"fiber_resin_fill_speed", "17"}};
     request.objects[0].fiber_masks = {mask};
     const auto result = library->slice(request);
@@ -5655,7 +5664,7 @@ TEST_CASE("empty same-value and restored masks preserve connected body fiber and
         {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "1"},
         {"reinforced_perimeters_filament", "2"}, {"reinforced_infill_filament", "2"},
         {"reinforced_infill_density", "40%"}, {"fiber_resin_fill_density", "40%"},
-        {"fiber_layer_height_ratio", std::to_string(interval)}}).success);
+        {"fiber_contour_layer_interval", std::to_string(interval)}, {"fiber_infill_layer_interval", std::to_string(interval)}}).success);
     auto request = mask_request(*library);
     const auto baseline = library->slice(request);
     require_slice(baseline);
@@ -5691,7 +5700,7 @@ TEST_CASE("resin-only mask changes local residual use while preserving connected
         // native bridge-support classification changing at a modifier interface.
         {"top_shell_layers", "0"},
         {"reinforced_infill_density", "40%"}, {"fiber_resin_fill_density", "0%"},
-        {"fiber_layer_height_ratio", std::to_string(interval)}}).success);
+        {"fiber_contour_layer_interval", std::to_string(interval)}, {"fiber_infill_layer_interval", std::to_string(interval)}}).success);
     auto request = mask_request(*library);
     const auto baseline = library->slice(request);
     require_slice(baseline);
@@ -5850,7 +5859,7 @@ TEST_CASE("wipe tower exclusions preserve model tools and prime a single ordinar
         {"reinforced_perimeters_filament", "6"},
         {"top_shell_layers", std::to_string(shell_layers)}, {"bottom_shell_layers", std::to_string(shell_layers)},
         {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
-        {"fiber_layer_height_ratio", "1"}, {"fiber_minimum_path_length", "2"}
+        {"fiber_contour_layer_interval", "1"}, {"fiber_infill_layer_interval", "1"}, {"fiber_minimum_path_length", "2"}
     }).success);
     if (machine_hooks)
         REQUIRE(created.config->apply_patch({
@@ -7283,4 +7292,218 @@ TEST_CASE("editable P3 project retains six physical material bindings", "[libsli
     REQUIRE(reopened.scene->objects.front().instances.front().fiber_masks.size()==1);
     CHECK(reopened.scene->objects.front().instances.front().fiber_masks.front().enabled);
     std::filesystem::remove(request.path);std::filesystem::remove(fixture);
+}
+
+TEST_CASE("fiber role intervals are independent validated settings", "[libslicer_api][config][fiber-intervals]")
+{
+    auto config=libslicer::Config::defaults();
+    CHECK_FALSE(config.set("fiber_layer_height_ratio","2").success);
+    for(const char* key:{"fiber_contour_layer_interval","fiber_infill_layer_interval"}) {
+        CHECK(config.snapshot().value(key)=="1");
+        for(const char* bad:{"0","-1","1.5","2layers","nan","2147483648"}) {
+            CHECK_FALSE(config.set(key,bad).success);
+            CHECK(config.snapshot().value(key)=="1");
+        }
+    }
+    REQUIRE(config.set("fiber_contour_layer_interval","2").success);
+    REQUIRE(config.set("fiber_infill_layer_interval","3").success);
+    REQUIRE(config.reset("fiber_contour_layer_interval").success);
+    CHECK(config.snapshot().value("fiber_contour_layer_interval")=="1");
+    CHECK(config.snapshot().value("fiber_infill_layer_interval")=="3");
+    auto local=libslicer::Config::for_overrides(config.snapshot(),libslicer::ConfigScope::FiberMask);
+    REQUIRE(local.set("fiber_contour_layer_interval","4").success);
+    auto restored=libslicer::Config::for_overrides(config.snapshot(),libslicer::ConfigScope::FiberMask);
+    REQUIRE(restored.load_overrides(local.serialize_overrides()).success);
+    CHECK(restored.snapshot().value("fiber_contour_layer_interval")=="4");
+    CHECK(restored.snapshot().value("fiber_infill_layer_interval")=="3");
+}
+
+TEST_CASE("separate fiber intervals control real deposited roles", "[libslicer_api][fiber][fiber-intervals][slice]")
+{
+    using Role=libslicer::ToolpathExtrusionRole;
+    const auto periods=GENERATE(std::make_pair(1,1),std::make_pair(2,1),std::make_pair(1,2),
+        std::make_pair(2,3),std::make_pair(2,2),std::make_pair(3,2));
+    const std::string pattern=GENERATE(std::string("rectilinear"),std::string("concentric"));
+    CAPTURE(periods.first,periods.second,pattern);
+    auto library=mask_library();
+    REQUIRE(library->apply_active_config_patch({
+        {"generate_reinforced_perimeters","1"},{"generate_reinforced_infills","1"},
+        {"reinforced_infill_pattern",pattern},{"reinforced_infill_density","50%"},
+        {"fiber_resin_fill_density","40%"},{"fiber_finish_extension_length","0.5"},
+        {"fiber_finish_overlap_length","0.5"},
+        {"fiber_contour_layer_interval",std::to_string(periods.first)},
+        {"fiber_infill_layer_interval",std::to_string(periods.second)}}).success);
+    auto request=mask_request(*library);
+    auto baseline_request=request;
+    REQUIRE(library->apply_active_config_patch({{"fiber_contour_layer_interval","1"},
+        {"fiber_infill_layer_interval","1"}}).success);
+    baseline_request.config=*library->active_config_snapshot();
+    const auto baseline=library->slice(baseline_request);
+    require_slice(baseline);
+    std::set<unsigned> expected_contours,expected_infills;
+    for(const auto& segment:baseline.preview->segments) if(depositing_fiber(segment)) {
+        if(segment.extrusion_role==Role::ContinuousFiberContour && segment.layer_index%unsigned(periods.first)==0)
+            expected_contours.insert(segment.layer_index);
+        if(segment.extrusion_role==Role::ContinuousFiberInfill && segment.layer_index%unsigned(periods.second)==0)
+            expected_infills.insert(segment.layer_index);
+    }
+    const auto result=library->slice(request);
+    require_slice(result);
+    const auto imported=library->load_gcode_preview({result.output.path});
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview);
+    for(const auto* preview:{result.preview.get(),imported.preview.get()}) {
+        std::set<unsigned> contour_layers,infill_layers,resin_layers;
+        size_t finishes=0;
+        std::map<std::uint64_t,std::set<Role>> occurrence_roles;
+        for(const auto& segment:preview->segments) if(depositing_fiber(segment))
+            occurrence_roles[segment.fiber_occurrence].insert(segment.extrusion_role);
+        for(const auto& segment:preview->segments) {
+            if(segment.fiber_phase==libslicer::ToolpathFiberPhase::Finish) {
+                ++finishes;
+                // Non-depositing finish moves have a travel role. Their occurrence
+                // identifies the actual fiber source(s), including mixed ring chains.
+                const auto source=occurrence_roles.find(segment.fiber_occurrence);
+                REQUIRE(source!=occurrence_roles.end());
+                for(const auto role:source->second)
+                    CHECK(segment.layer_index%unsigned(role==Role::ContinuousFiberContour?
+                        periods.first:periods.second)==0);
+            }
+            if(depositing_fiber(segment)) {
+                const bool contour=segment.extrusion_role==Role::ContinuousFiberContour;
+                REQUIRE((contour || segment.extrusion_role==Role::ContinuousFiberInfill));
+                CHECK(segment.layer_index%unsigned(contour?periods.first:periods.second)==0);
+                (contour?contour_layers:infill_layers).insert(segment.layer_index);
+            } else if(segment.extrusion_role==Role::ResinInfill &&
+                segment.deposition==libslicer::ToolpathDepositionKind::Thermoplastic)
+                resin_layers.insert(segment.layer_index);
+        }
+        CHECK(finishes>0);
+        CHECK(contour_layers==expected_contours);
+        CHECK(infill_layers==expected_infills);
+        CHECK_FALSE(contour_layers.empty());
+        CHECK_FALSE(infill_layers.empty());
+        CHECK_FALSE(resin_layers.empty());
+        if(periods.first!=periods.second) CHECK(contour_layers!=infill_layers);
+    }
+    remove_slice(result);
+    remove_slice(baseline);
+}
+
+TEST_CASE("local fiber periods do not change surrounding role schedules", "[libslicer_api][fiber-mask][fiber-intervals][slice]")
+{
+    using Role=libslicer::ToolpathExtrusionRole;
+    auto library=mask_library();
+    REQUIRE(library->apply_active_config_patch({{"generate_reinforced_perimeters","1"},
+        {"generate_reinforced_infills","1"},{"reinforced_infill_density","40%"},
+        {"fiber_resin_fill_density","40%"},{"fiber_contour_layer_interval","1"},
+        {"fiber_infill_layer_interval","1"}}).success);
+    auto request=mask_request(*library);
+    auto mask=box_mask();
+    mask.settings={{"fiber_contour_layer_interval","2"},{"fiber_infill_layer_interval","3"}};
+    request.objects[0].fiber_masks={mask};
+    const auto result=library->slice(request);
+    require_slice(result);
+    const auto imported=library->load_gcode_preview({result.output.path});
+    REQUIRE(imported.success);REQUIRE(imported.preview);
+    for(const auto* preview:{result.preview.get(),imported.preview.get()}) {
+        std::set<unsigned> surrounding_contours;
+        size_t local_contours=0,local_infills=0;
+        const auto inside=[](const auto& p){return p.x>116.5 && p.x<143.5 && p.y>108.5 && p.y<131.5;};
+        const auto outside=[](const auto& p){return p.x<115.5 || p.x>144.5 || p.y<107.5 || p.y>132.5;};
+        for(const auto& segment:preview->segments) if(depositing_fiber(segment)) {
+            const bool contour=segment.extrusion_role==Role::ContinuousFiberContour;
+            if(inside(segment.start_mm) && inside(segment.end_mm)) {
+                CHECK(segment.layer_index%unsigned(contour?2:3)==0);
+                ++(contour?local_contours:local_infills);
+            }
+            if(contour && outside(segment.start_mm) && outside(segment.end_mm))
+                surrounding_contours.insert(segment.layer_index);
+        }
+        CHECK(local_contours>0);CHECK(local_infills>0);
+        CHECK(std::any_of(surrounding_contours.begin(),surrounding_contours.end(),[](unsigned layer){return layer%2!=0;}));
+    }
+    remove_slice(result);
+}
+
+TEST_CASE("skipped contours do not reserve rectilinear infill space", "[libslicer_api][fiber-intervals][slice]")
+{
+    auto library = mask_library();
+    REQUIRE(library->apply_active_config_patch({
+        {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "1"},
+        {"fiber_contour_layer_interval", "2"}, {"fiber_infill_layer_interval", "1"},
+        {"reinforced_infill_pattern", "rectilinear"}, {"reinforced_infill_density", "80%"},
+        {"fiber_infill_angle_sequence", "0"}, {"fiber_contour_infill_clearance", "1.5"},
+        {"fiber_resin_fill_density", "40%"}}).success);
+    const auto scheduled = library->slice(mask_request(*library));
+    require_slice(scheduled);
+
+    REQUIRE(library->apply_active_config_patch({{"generate_reinforced_perimeters", "0"}}).success);
+    const auto infill_only = library->slice(mask_request(*library));
+    require_slice(infill_only);
+
+    using Role = libslicer::ToolpathExtrusionRole;
+    CHECK(std::any_of(scheduled.preview->segments.begin(), scheduled.preview->segments.end(), [](const auto& segment) {
+        return segment.layer_index == 2 && segment.extrusion_role == Role::ContinuousFiberContour &&
+               depositing_fiber(segment);
+    }));
+    REQUIRE_FALSE(mask_deposition_signature(*infill_only.preview, -1e9, true, 3).empty());
+    check_mask_deposition(mask_deposition_signature(*scheduled.preview, -1e9, false, 3),
+                          mask_deposition_signature(*infill_only.preview, -1e9, false, 3));
+    remove_slice(scheduled);
+    remove_slice(infill_only);
+}
+
+TEST_CASE("mask intervals preserve deposition when the current layer policy agrees", "[libslicer_api][fiber-mask][fiber-intervals][slice]")
+{
+    auto library = mask_library();
+    REQUIRE(library->apply_active_config_patch({
+        {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "1"},
+        {"fiber_contour_layer_interval", "2"}, {"fiber_infill_layer_interval", "3"},
+        {"reinforced_infill_pattern", "rectilinear"}, {"reinforced_infill_density", "40%"},
+        {"fiber_infill_angle_sequence", "0"}, {"fiber_resin_fill_density", "40%"},
+        {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
+        {"sparse_infill_density", "15%"}}).success);
+    auto request = mask_request(*library);
+    const auto baseline = library->slice(request);
+    require_slice(baseline);
+
+    auto mask = box_mask();
+    mask.settings = {{"fiber_infill_layer_interval", "6"}};
+    request.objects[0].fiber_masks = {mask};
+    const auto masked = library->slice(request);
+    require_slice(masked);
+
+    const auto idle_layer = mask_deposition_signature(*baseline.preview, -1e9, false, 1);
+    REQUIRE_FALSE(idle_layer.empty());
+    check_mask_deposition(mask_deposition_signature(*masked.preview, -1e9, false, 1), idle_layer);
+
+    using Role = libslicer::ToolpathExtrusionRole;
+    const auto fiber_paths = [](const libslicer::ToolpathPreview& preview, unsigned layer, Role role) {
+        std::set<std::uint64_t> occurrences;
+        double length = 0;
+        for (const auto& segment : preview.segments) {
+            if (segment.layer_index == layer && segment.extrusion_role == role && depositing_fiber(segment)) {
+                occurrences.insert(segment.fiber_occurrence);
+                length += segment.deposited_path_length_mm;
+            }
+        }
+        return std::make_pair(occurrences.size(), length);
+    };
+    for (const auto& [layer, role] : {std::pair{2u, Role::ContinuousFiberContour},
+                                     std::pair{6u, Role::ContinuousFiberContour},
+                                     std::pair{6u, Role::ContinuousFiberInfill}}) {
+        CAPTURE(layer, static_cast<int>(role));
+        const auto [expected_count, expected_length] = fiber_paths(*baseline.preview, layer, role);
+        const auto [actual_count, actual_length] = fiber_paths(*masked.preview, layer, role);
+        REQUIRE(expected_count > 0);
+        if (role == Role::ContinuousFiberContour) REQUIRE(expected_count == 1);
+        CHECK(actual_count == expected_count);
+        // A merged native region can place the seam elsewhere on the same ring.
+        CHECK(actual_length == Catch::Approx(expected_length).margin(0.01));
+    }
+    CHECK(mask_deposition_signature(*baseline.preview, -1e9, true, 3) !=
+          mask_deposition_signature(*masked.preview, -1e9, true, 3));
+    remove_slice(baseline);
+    remove_slice(masked);
 }

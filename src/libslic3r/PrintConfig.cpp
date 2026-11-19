@@ -1067,8 +1067,17 @@ void PrintConfigDef::init_fff_params()
     def->min = 0.000001;
     def->set_default_value(new ConfigOptionFloat(0.8));
 
-    def = this->add("fiber_layer_height_ratio", coInt);
-    def->label = L("Continuous fiber layer interval");
+    def = this->add("fiber_contour_layer_interval", coInt);
+    def->label = L("Fiber contour layer interval");
+    def->tooltip = L("Lay fiber contours once every N model layers. 1 means every layer; 2 skips one layer between contour layers.");
+    def->category = L("Continuous fiber");
+    def->sidetext = L("layers");
+    def->min = 1;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("fiber_infill_layer_interval", coInt);
+    def->label = L("Fiber infill layer interval");
+    def->tooltip = L("Lay fiber infill once every N model layers, independently of fiber contours. 1 means every layer; 2 skips one layer between infill layers.");
     def->category = L("Continuous fiber");
     def->sidetext = L("layers");
     def->min = 1;

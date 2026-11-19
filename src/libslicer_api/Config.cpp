@@ -268,7 +268,11 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
         item.visible = item.enabled = contour_enabled || infill_enabled;
     } else if (item.key == "fiber_finish_overlap_length") {
         item.visible = item.enabled = contour_enabled || concentric;
-    } else if (key_is(item.key, {"fiber_width", "fiber_layer_height_ratio",
+    } else if (item.key == "fiber_contour_layer_interval") {
+        item.enabled = contour_enabled;
+    } else if (item.key == "fiber_infill_layer_interval") {
+        item.enabled = infill_enabled;
+    } else if (key_is(item.key, {"fiber_width",
                                  "fiber_toolchange_approach_speed",
                                  "fiber_fill_debug",
                                  "fiber_minimum_path_length",
@@ -540,6 +544,12 @@ SettingsResult Config::apply_patch(ConfigScope scope,
             }
             if (key == "fiber_infill_angle_sequence")
                 Slic3r::parse_fiber_infill_angle_sequence(serialized_value);
+            if (key_is(key, {"fiber_contour_layer_interval", "fiber_infill_layer_interval"})) {
+                std::istringstream input(serialized_value);
+                int interval = 0;
+                if (!(input >> interval) || !(input >> std::ws).eof() || interval < 1)
+                    return failure(key, "Fiber layer intervals must be positive integers");
+            }
             candidate.set_deserialize_strict(key, serialized_value);
             if (key == "wipe_tower_position_mode") {
                 explicit_tower_mode = true;
