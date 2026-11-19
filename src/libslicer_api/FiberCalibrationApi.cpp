@@ -19,6 +19,7 @@ namespace {
 using namespace Slic3r;
 constexpr const char* heater_gate = "Fiber heater waiting is not verified for this machine";
 constexpr double label_height_in_strokes = 7;
+constexpr double minimum_trial_spacing_mm = 2;
 constexpr std::array<const char*, 2> wall_width_keys{"inner_wall_line_width", "outer_wall_line_width"};
 constexpr std::array<const char*, 4> keys{"height", "length", "speed", "extra"};
 constexpr std::array<const char*, 4> labels{"Fiber landing height", "Fiber landing length", "Fiber landing speed", "Fiber extra prefeed"};
@@ -78,7 +79,7 @@ std::string numeric_label(int64_t ticks)
     return label;
 }
 
-int glyph_width(char glyph) { return glyph == '.' ? 1 : 4; }
+int glyph_width(char glyph) { return glyph == '.' ? 2 : 4; }
 
 double label_width(const std::string& label, double stroke)
 {
@@ -89,8 +90,8 @@ double label_width(const std::string& label, double stroke)
 
 void append_label(Polygons& strokes, const std::string& label, const Vec2d& right_center, double stroke)
 {
-    // Seven-segment numerals with strokes sized for the base nozzle. The
-    // decimal point uses a single square of the same printable width.
+    // Seven-segment numerals with strokes sized for the base nozzle. Give
+    // the decimal point a short printable bead instead of a square island.
     constexpr std::array<unsigned, 10> digits{0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f};
     constexpr std::array<std::array<int, 4>, 7> segments{{
         {0, 6, 4, 7}, {3, 3, 4, 7}, {3, 0, 4, 4}, {0, 0, 4, 1},
@@ -106,7 +107,7 @@ void append_label(Polygons& strokes, const std::string& label, const Vec2d& righ
         strokes.push_back(std::move(shape));
     };
     for (char glyph : label) {
-        if (glyph == '.') rectangle({0, 0, 1, 1});
+        if (glyph == '.') rectangle({0, 0, glyph_width(glyph), 1});
         else {
             const auto mask = digits[glyph - '0'];
             for (std::size_t i = 0; i < segments.size(); ++i)
@@ -121,6 +122,7 @@ struct Layout {
     std::vector<FiberCalibrationSample> samples;
     std::array<Vec2d, 5> corners;
     std::vector<std::string> labels;
+    std::vector<double> label_column_offsets_mm;
     std::array<double, wall_width_keys.size()> wall_widths_mm{};
     double label_stroke_mm = 0;
 };
@@ -177,22 +179,27 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
     }
     const double base_line_width = *std::max_element(result.wall_widths_mm.begin(), result.wall_widths_mm.end());
     result.label_stroke_mm = std::max(0.7, 1.75 * base_line_width);
-    const double fiber_spacing = 3 * fiber_width;
     const double spacing = sweep.trial_spacing_mm.value_or(
-        std::max(fiber_spacing, (label_height_in_strokes + 2) * result.label_stroke_mm));
+        std::max(3 * fiber_width, (label_height_in_strokes + 2) * result.label_stroke_mm));
+    std::size_t label_columns = 1;
     if (sweep.trial_spacing_mm) {
         if (!std::isfinite(spacing) || spacing <= 0)
             throw std::invalid_argument("Fiber trial spacing must be positive");
-        // Fit the engraving into the requested pitch with one base extrusion
-        // of separation and a stroke at least as wide as a base extrusion.
-        const double minimum = std::max(fiber_spacing, (label_height_in_strokes + 1) * base_line_width);
+        // The manual pitch has a 2 mm floor. Wider strands must still have
+        // separate physical footprints after XY scaling.
+        const double minimum = std::max(minimum_trial_spacing_mm, fiber_width + 2 * SCALING_FACTOR);
         if (spacing + SCALING_FACTOR < minimum) {
             std::ostringstream message;
             message.imbue(std::locale::classic());
             message << "Minimum fiber trial spacing: " << std::ceil((minimum - SCALING_FACTOR) * 1000) / 1000 << " mm";
             throw std::invalid_argument(message.str());
         }
-        const double available_stroke = (spacing - base_line_width) / label_height_in_strokes;
+        // Keep every label centered on its trial. When several labels cannot
+        // fit in one column at printable stroke width, alternate their X positions.
+        const double single_column_pitch = (label_height_in_strokes + 1) * base_line_width;
+        label_columns = std::size_t(std::clamp(
+            std::ceil((single_column_pitch - SCALING_FACTOR) / spacing), 1.0, double(count)));
+        const double available_stroke = (double(label_columns) * spacing - base_line_width) / label_height_in_strokes;
         result.label_stroke_mm = std::clamp(available_stroke, base_line_width, result.label_stroke_mm);
     }
     const double margin = std::max({5.0, 2 * fiber_width, 5.5 * result.label_stroke_mm});
@@ -205,7 +212,9 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
     plan.filament_map = print.filament_map.values;
     plan.layer_height_mm = h;
     plan.base_top_mm = initial_h + 2 * h;
-    double max_landing = 0, widest_label = 0;
+    double max_landing = 0;
+    auto& column_offsets = result.label_column_offsets_mm;
+    column_offsets.resize(label_columns);
     for (int64_t i = 0; i < count; ++i) {
         const auto ticks = first + i * step;
         const double value = double(ticks) / 1000;
@@ -219,15 +228,24 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
             throw std::invalid_argument("Fiber calibration height exceeds the fiber tool limits");
         if (landing.height_mm > 0) max_landing = std::max(max_landing, landing.length_mm);
         result.labels.push_back(numeric_label(ticks));
-        widest_label = std::max(widest_label, label_width(result.labels.back(), result.label_stroke_mm));
+        auto& column_width = column_offsets[std::size_t(i) % label_columns];
+        column_width = std::max(column_width, label_width(result.labels.back(), result.label_stroke_mm));
         result.samples.push_back({std::size_t(i + 1), value, units[parameter], landing, {}, {}});
     }
 
     const double line_length = std::max({20., config.opt_float("fiber_minimum_path_length") + 2,
         max_landing + config.opt_float("fiber_start_stabilization_length") + config.opt_float("fiber_minimum_effective_length") +
             print.fiber_cut_to_contact_length.value + 5});
-    const double engraving_extension = widest_label + margin;
-    const double length = line_length + 2 * margin + engraving_extension + config.opt_float("fiber_finish_extension_length");
+    double labels_width = 0;
+    for (std::size_t column = 0; column < label_columns; ++column) {
+        auto& offset = column_offsets[column];
+        const double width = offset;
+        if (column > 0) labels_width += base_line_width;
+        offset = labels_width;
+        labels_width += width;
+    }
+    const double label_extension = labels_width + margin;
+    const double length = line_length + 2 * margin + label_extension + config.opt_float("fiber_finish_extension_length");
     if (!(length + 2 < hi.x() - lo.x())) throw std::invalid_argument("Fiber calibration samples are too long for the build plate");
     const Vec2d start = (lo + hi - Vec2d(length, width)) / 2;
     const Vec2d stop = start + Vec2d(length, width);
@@ -241,7 +259,7 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
                       Vec2d(start.x(), stop.y()), start + Vec2d(0, 3)};
     for (std::size_t i = 0; i < result.samples.size(); ++i) {
         auto& sample = result.samples[i];
-        const Vec2d a = start + Vec2d(margin + engraving_extension, margin + spacing * double(i));
+        const Vec2d a = start + Vec2d(margin + label_extension, margin + spacing * double(i));
         const Vec2d b = a + Vec2d(line_length, 0);
         const auto& landing = sample.landing;
         plan.trials.push_back({a, b, landing.height_mm, landing.length_mm, landing.speed_mm_s, landing.extra_prefeed_mm});
@@ -254,18 +272,28 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
 TriangleMesh base_mesh(const Layout& layout)
 {
     Polygons strokes;
-    const double margin = layout.plan->trials.front().start_mm.y() - layout.corners[0].y();
+    const Vec2d& first_start = layout.plan->trials.front().start_mm;
+    const double margin = first_start.y() - layout.corners[0].y();
+    const auto& columns = layout.label_column_offsets_mm;
     for (std::size_t i = 0; i < layout.labels.size(); ++i) {
         const Vec2d& start = layout.plan->trials[i].start_mm;
-        append_label(strokes, layout.labels[i], start - Vec2d(margin, 0), layout.label_stroke_mm);
+        append_label(strokes, layout.labels[i], start - Vec2d(margin + columns[i % columns.size()], 0),
+            layout.label_stroke_mm);
     }
-    Polygon outline;
-    for (const auto& corner : layout.corners) outline.points.push_back(Point::new_scale(corner));
-    const ExPolygons base{ExPolygon(outline)};
+    Points corners;
+    for (const auto& corner : layout.corners) corners.push_back(Point::new_scale(corner));
+    const Point split_bottom = Point::new_scale(Vec2d(first_start.x() - margin / 2, layout.corners[0].y()));
+    const Point split_top(split_bottom.x(), corners[2].y());
+    // Subdivide both outer edges at the step so the foundation and the raised
+    // platform share exactly the same vertices along their joined walls.
+    const Polygon outline({corners[0], split_bottom, corners[1], corners[2], split_top, corners[3], corners[4]});
+    const Polygon left({corners[0], split_bottom, split_top, corners[3], corners[4]});
+    const Polygon right({split_bottom, corners[1], corners[2], split_top});
     const auto labels = union_ex(strokes);
-    const auto engraved_top = diff_ex(base, labels);
-    const double top = layout.plan->base_top_mm;
-    const double floor = top - layout.plan->layer_height_mm;
+    const auto exposed_base = diff_ex(ExPolygons{ExPolygon(left)}, labels);
+    const double platform_top = layout.plan->base_top_mm;
+    const double label_top = platform_top - layout.plan->layer_height_mm;
+    const double base_top = label_top - layout.plan->layer_height_mm;
 
     indexed_triangle_set mesh;
     const auto append_vertices = [&](const Points& points, double z) {
@@ -298,15 +326,16 @@ TriangleMesh base_mesh(const Layout& layout)
             mesh.indices.emplace_back(a, b + count, a + count);
         }
     };
-    append_cap(base, 0, false);
-    append_cap(engraved_top, top, true);
-    append_cap(labels, floor, true);
-    append_wall(outline, 0, top);
+    append_cap(ExPolygons{ExPolygon(outline)}, 0, false);
+    append_wall(outline, 0, base_top);
+    append_cap(exposed_base, base_top, true);
+    append_cap(labels, label_top, true);
     for (const auto& label : labels) {
-        // Reversing the Z order orients the cavity walls toward the cutout.
-        append_wall(label.contour, top, floor);
-        for (const auto& hole : label.holes) append_wall(hole, top, floor);
+        append_wall(label.contour, base_top, label_top);
+        for (const auto& hole : label.holes) append_wall(hole, base_top, label_top);
     }
+    append_wall(right, base_top, platform_top);
+    append_cap(ExPolygons{ExPolygon(right)}, platform_top, true);
     its_merge_vertices(mesh);
     return TriangleMesh(std::move(mesh));
 }
@@ -415,12 +444,12 @@ std::shared_ptr<const FiberCalibrationPlan> prepare(const CalibrationRequest& re
     for (const auto* key : {"generate_reinforced_perimeters", "generate_reinforced_infills", "enable_support",
                             "infill_combination", "spiral_mode", "zaa_enabled"})
         config.set_deserialize_strict(key, "0");
-    // Keep variable-width walls in the one-bead regions between engravings.
+    // Keep variable-width walls in the one-bead strokes of raised labels.
     config.set_deserialize_strict("wall_generator", "arachne");
     const auto& nozzles = config.option<ConfigOptionFloats>("nozzle_diameter")->values;
     const double min_nozzle = *std::min_element(nozzles.begin(), nozzles.end());
     const double wall_width = *std::max_element(prepared.wall_widths_mm.begin(), prepared.wall_widths_mm.end());
-    // A Classic profile may carry unused Arachne thresholds that erase the separator.
+    // A Classic profile may carry unused Arachne thresholds that erase the label strokes.
     const auto& defaults = PrintObjectConfig::defaults();
     const double width_ratio = std::min(1.0, wall_width / min_nozzle);
     auto* min_feature = config.option<ConfigOptionPercent>("min_feature_size");

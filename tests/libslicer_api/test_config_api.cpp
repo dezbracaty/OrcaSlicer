@@ -7578,21 +7578,24 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
         REQUIRE(configured.config->set("outer_wall_line_width", automatic_width ? "0" : "0.4").success);
     }
     const auto snapshot = configured.config->snapshot();
-    const std::array<const char*, 4> spacings{"", "5", "3.6", "3.2"};
-    const std::array<double, 4> expected_spacings{7.0875, 5.0, 3.6, 3.2};
-    const std::array<double, 4> expected_strokes{0.7875, 0.65, 0.45, 0.4};
+    const std::array<const char*, 4> spacings{"", "2", "3.6", "3.2"};
+    const std::array<double, 4> expected_spacings{7.0875, 2.0, 3.6, 3.2};
+    const std::array<double, 4> expected_strokes{0.7875, (4.0 - 0.45) / 7.0, 0.45, 0.4};
+    const bool staggered = parameter == 1;
+    const std::size_t expected_count = staggered ? 5 : 3;
+    const std::size_t label_columns = staggered ? 2 : 1;
     const double expected_spacing = expected_spacings[parameter];
     const double expected_stroke = expected_strokes[parameter];
     const auto form = calibration_parameters(CalibMode::Calib_Fiber_Landing, snapshot,
         {{"fiber_parameter", std::to_string(parameter)}, {"height", std::to_string(fixed[0])},
          {"length", std::to_string(fixed[1])}, {"speed", std::to_string(fixed[2])},
          {"extra", std::to_string(fixed[3])}, {"start", std::to_string(starts[parameter])},
-         {"end", std::to_string(starts[parameter] + 2 * steps[parameter] + 0.001)}, {"step", std::to_string(steps[parameter])},
+         {"end", std::to_string(starts[parameter] + (expected_count - 1) * steps[parameter] + 0.001)}, {"step", std::to_string(steps[parameter])},
          {"trial_spacing", spacings[parameter]}});
     const auto checked = validate_calibration_parameters(form);
     for (const auto& d : checked.diagnostics) { UNSCOPED_INFO(d.code + ": " + d.message); }
     REQUIRE(checked);
-    CHECK(form.fiber_sample_count == 3);
+    CHECK(form.fiber_sample_count == expected_count);
     const auto preparation = library->prepare_calibration(checked.request);
     for (const auto& d : preparation.diagnostics) UNSCOPED_INFO(d.message);
     REQUIRE(preparation);
@@ -7615,7 +7618,7 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
     CHECK(configured.config->snapshot().value("zaa_enabled") == "1");
     CHECK(configured.config->snapshot().value("wall_loops") == "0");
     const auto sample_count = plate.fiber_samples.size();
-    REQUIRE(sample_count == 3);
+    REQUIRE(sample_count == expected_count);
     for (std::size_t i = 1; i < plate.fiber_samples.size(); ++i)
         CHECK(plate.fiber_samples[i].start_mm.y - plate.fiber_samples[i - 1].start_mm.y ==
             Catch::Approx(expected_spacing).margin(0.001));
@@ -7636,24 +7639,62 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
     REQUIRE(volumes.size() == 1);
     const auto& base = volumes.front();
     REQUIRE(base.role == SliceVolumeRole::ModelPart);
-    const auto engraving_floor_z = std::stod(*snapshot.value("initial_layer_print_height")) + layer_height;
-    std::map<std::pair<std::uint32_t, std::uint32_t>, int> edge_counts;
+    const double label_top_z = std::stod(*snapshot.value("initial_layer_print_height")) + layer_height;
+    const double platform_top_z = label_top_z + layer_height;
+    const auto& first_start = plate.fiber_samples.front().start_mm;
+    const auto near = [](double a, double b) { return std::abs(a - b) < 0.002; };
+    double right = std::numeric_limits<double>::lowest();
+    double bottom = std::numeric_limits<double>::infinity();
+    double top = std::numeric_limits<double>::lowest();
+    for (const auto& point : base.vertices) {
+        if (!near(point.z, 0)) continue;
+        right = std::max(right, double(point.x));
+        bottom = std::min(bottom, double(point.y));
+        top = std::max(top, double(point.y));
+    }
+    const double margin = first_start.y - bottom;
+    const double left = first_start.x - margin / 2;
+    std::set<std::pair<double, double>> platform_corners;
+    for (const auto& point : base.vertices) {
+        if (near(point.z, platform_top_z)) {
+            CHECK((near(point.x, left) || near(point.x, right)));
+            CHECK((near(point.y, bottom) || near(point.y, top)));
+            platform_corners.emplace(point.x, point.y);
+        }
+    }
+    CHECK(platform_corners.size() == 4);
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::array<int, 2>> edge_counts;
     for (const auto& face : base.triangles)
         for (const auto& [a, b] : {std::pair{face.vertex_a, face.vertex_b}, std::pair{face.vertex_b, face.vertex_c},
                                    std::pair{face.vertex_c, face.vertex_a}})
-            ++edge_counts[{std::min(a, b), std::max(a, b)}];
-    CHECK(std::all_of(edge_counts.begin(), edge_counts.end(), [](const auto& edge) { return edge.second == 2; }));
+            ++edge_counts[{std::min(a, b), std::max(a, b)}][a > b];
+    CHECK(std::all_of(edge_counts.begin(), edge_counts.end(),
+        [](const auto& edge) { return edge.second == std::array<int, 2>{1, 1}; }));
     std::array<double, 4> maximum_z_error{};
     std::set<std::uint32_t> base_layers, fiber_layers;
     std::set<std::uint64_t> occurrences;
+    std::map<std::uint64_t, ToolpathPoint> passive_ends;
+    const auto inside_platform = [&](const ToolpathPoint& point) {
+        return point.x >= left - 0.002 && point.x <= right + 0.002 &&
+            point.y >= bottom - 0.002 && point.y <= top + 0.002;
+    };
     for (const auto& segment : result.preview->segments) {
-        if (segment.deposition == ToolpathDepositionKind::Thermoplastic) base_layers.insert(segment.layer_index);
-        if (segment.deposition == ToolpathDepositionKind::ContinuousFiberPowered) {
-            fiber_layers.insert(segment.layer_index);
-            occurrences.insert(segment.fiber_occurrence);
+        if (segment.deposition == ToolpathDepositionKind::Thermoplastic) {
+            base_layers.insert(segment.layer_index);
+            if (segment.layer_index == 2)
+                CHECK((inside_platform(segment.start_mm) && inside_platform(segment.end_mm)));
         }
-        if (segment.deposition == ToolpathDepositionKind::Thermoplastic ||
-            segment.deposition == ToolpathDepositionKind::ContinuousFiberPowered) {
+        const bool powered = segment.deposition == ToolpathDepositionKind::ContinuousFiberPowered;
+        const bool passive = segment.deposition == ToolpathDepositionKind::ContinuousFiberPassive;
+        const bool tail = passive && segment.fiber_phase == ToolpathFiberPhase::Tail;
+        if (powered || passive) {
+            fiber_layers.insert(segment.layer_index);
+            CHECK((inside_platform(segment.start_mm) && inside_platform(segment.end_mm)));
+        }
+        if (powered) occurrences.insert(segment.fiber_occurrence);
+        if (tail) passive_ends[segment.fiber_occurrence] = segment.end_mm;
+        // Preview can mark descending landing motion as passive deposition.
+        if (segment.deposition == ToolpathDepositionKind::Thermoplastic || powered || tail) {
             const auto layer = segment.layer_index;
             REQUIRE(layer < maximum_z_error.size());
             const double expected_z = first_layer_z + layer * layer_height;
@@ -7664,6 +7705,7 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
     CHECK(base_layers == std::set<std::uint32_t>{0, 1, 2});
     CHECK(fiber_layers == std::set<std::uint32_t>{3});
     REQUIRE(occurrences.size() == sample_count);
+    REQUIRE(passive_ends.size() == sample_count);
     const std::vector<std::uint64_t> executions(occurrences.begin(), occurrences.end());
     CHECK(*std::max_element(maximum_z_error.begin(), maximum_z_error.end()) < 0.002);
     const auto gap_at = [&](double sample_x, double sample_y) {
@@ -7688,32 +7730,63 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
     for (std::size_t i = 0; i < sample_count; ++i) {
         CHECK(plate.fiber_samples[i].value ==
             Catch::Approx(starts[parameter] + i * steps[parameter]));
-        // Every numeral has a right-hand stroke at mid-height. Sample inside
-        // that stroke to prove that actual deposition leaves the inscription
-        // open on the third layer and solid below it.
         const auto& trial_start = plate.fiber_samples[i].start_mm;
+        const auto& trial_end = plate.fiber_samples[i].end_mm;
+        REQUIRE(passive_ends.count(executions[i]) == 1);
+        const auto& passive_end = passive_ends.at(executions[i]);
+        CHECK(near(passive_end.x, trial_end.x));
+        CHECK(near(passive_end.y, trial_end.y));
+        // The right-hand stroke must be printed on the second layer, with
+        // only the foundation below it and open space above it.
         double label_right = std::numeric_limits<double>::lowest();
         double label_bottom = std::numeric_limits<double>::infinity();
         double label_top = std::numeric_limits<double>::lowest();
+        const bool outer_column = staggered && i % 2 == 1;
+        const double column_right = trial_start.x - margin - (outer_column ? 4 * expected_stroke + 0.45 : 0);
+        const double column_left = staggered ? column_right - (outer_column ? 12 : 4) * expected_stroke :
+            std::numeric_limits<double>::lowest();
         for (const auto& vertex : base.vertices) {
-            if (std::abs(vertex.z - engraving_floor_z) >= 0.002 || std::abs(vertex.y - trial_start.y) >= expected_spacing / 2)
+            if (!near(vertex.z, label_top_z) || vertex.x < column_left - 0.002 || vertex.x > column_right + 0.002 ||
+                std::abs(vertex.y - trial_start.y) >= label_columns * expected_spacing / 2)
                 continue;
             label_right = std::max(label_right, double(vertex.x));
             label_bottom = std::min(label_bottom, double(vertex.y));
             label_top = std::max(label_top, double(vertex.y));
         }
-        REQUIRE(label_right > trial_start.x - 6);
-        CHECK(label_right < trial_start.x - 4);
+        CHECK(near(label_right, column_right));
         CHECK(label_top - label_bottom == Catch::Approx(7 * expected_stroke).margin(0.002));
         const double label_x = label_right - expected_stroke / 2;
         const auto gap_at_label = gap_at(label_x, trial_start.y);
-        if (i + 1 < sample_count) {
-            const double separator_y = (trial_start.y + plate.fiber_samples[i + 1].start_mm.y) / 2;
-            CHECK(gap_at(label_x, separator_y)[2] < 0.06);
-        }
         CHECK(gap_at_label[0] < 0.06);
         CHECK(gap_at_label[1] < 0.06);
         CHECK(gap_at_label[2] > 0.1);
+        if (outer_column) {
+            // 1.5 and 2.5 each have a decimal point between two four-stroke digits.
+            const auto dot_gap = gap_at(label_right - 6 * expected_stroke, trial_start.y - 3 * expected_stroke);
+            CHECK(dot_gap[0] < 0.06);
+            CHECK(dot_gap[1] < 0.06);
+            CHECK(dot_gap[2] > 0.1);
+        }
+        for (double x : {double(trial_start.x), double(trial_end.x)}) {
+            const auto gap = gap_at(x, trial_start.y);
+            CHECK(gap[0] < 0.06);
+            CHECK(gap[1] < 0.06);
+            CHECK(gap[2] < 0.06);
+        }
+        if (i + label_columns < sample_count) {
+            const double separator_y = (trial_start.y + plate.fiber_samples[i + label_columns].start_mm.y) / 2;
+            const auto label_gap = gap_at(label_x, separator_y);
+            CHECK(label_gap[0] < 0.06);
+            CHECK(label_gap[1] > 0.1);
+            CHECK(label_gap[2] > 0.1);
+        }
+        if (i + 1 < sample_count) {
+            const double separator_y = (trial_start.y + plate.fiber_samples[i + 1].start_mm.y) / 2;
+            const auto platform_gap = gap_at((trial_start.x + trial_end.x) / 2, separator_y);
+            CHECK(platform_gap[0] < 0.06);
+            CHECK(platform_gap[1] < 0.06);
+            CHECK(platform_gap[2] < 0.06);
+        }
         auto expected = fixed;
         expected[parameter] = starts[parameter] + i * steps[parameter];
         double landing_x = 0, landing_z = 0;
@@ -7770,15 +7843,20 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
     CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "step", "0")));
     if (parameter == 1 || parameter == 2)
         CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "height", "0")));
-    if (parameter == 2)
-        CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "3.2")));
     if (parameter == 1) {
         CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "0")));
-        const auto too_close = validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "3.59"));
+        const auto too_close = validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "1.999"));
         REQUIRE_FALSE(too_close);
         REQUIRE_FALSE(too_close.diagnostics.empty());
-        CHECK(too_close.diagnostics.front().message == "Minimum fiber trial spacing: 3.6 mm");
+        CHECK(too_close.diagnostics.front().message == "Minimum fiber trial spacing: 2 mm");
+        CHECK(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "2")));
+        CHECK(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "3")));
         CHECK(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "3.6")));
+        REQUIRE(configured.config->set("fiber_width", "2.1").success);
+        auto wide_fiber_form = form;
+        wide_fiber_form.config = configured.config->snapshot();
+        CHECK_FALSE(validate_calibration_parameters(wide_fiber_form));
+        CHECK(validate_calibration_parameters(update_calibration_parameters(wide_fiber_form, "trial_spacing", "2.2")));
         CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "400")));
         CHECK(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "7.0875")));
         const auto automatic = validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", ""));
