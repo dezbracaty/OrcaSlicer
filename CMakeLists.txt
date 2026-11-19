@@ -186,7 +186,6 @@ find_package(ZLIB REQUIRED)
 find_package(EXPAT REQUIRED)
 find_package(PNG REQUIRED)
 find_package(Freetype REQUIRED)
-find_package(cereal REQUIRED)
 find_package(NLopt 1.4 REQUIRED)
 find_package(libnoise REQUIRED)
 
@@ -219,12 +218,14 @@ target_link_libraries(boost_libs INTERFACE
     Boost::thread
 )
 
-if (NOT TARGET cereal::cereal)
-    set_target_properties(cereal PROPERTIES IMPORTED_GLOBAL TRUE)
-    add_library(cereal::cereal ALIAS cereal)
-else ()
-    set_target_properties(cereal::cereal PROPERTIES IMPORTED_GLOBAL TRUE)
-endif ()
+if(NOT TARGET cereal::cereal)
+    find_package(cereal REQUIRED)
+    if(TARGET cereal::cereal)
+        set_target_properties(cereal::cereal PROPERTIES IMPORTED_GLOBAL TRUE)
+    else()
+        add_library(cereal::cereal ALIAS cereal)
+    endif()
+endif()
 
 function(slic3r_remap_configs targets from_Cfg to_Cfg)
     if(MSVC)
