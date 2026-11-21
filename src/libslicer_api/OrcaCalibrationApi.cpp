@@ -364,6 +364,7 @@ void refresh_parameters(CalibrationParameters& p)
 CalibrationParameters calibration_parameters(CalibMode mode, const ConfigSnapshot& config,
     const std::vector<std::pair<std::string, std::string>>& values)
 {
+    if (is_fiber_calibration(mode)) return fiber_calibration::parameters(mode, config, values);
     // Original dialog defaults, not CalibrationRequest's transport zero values.
     switch (mode) {
     case CalibMode::Calib_PA_Line: case CalibMode::Calib_PA_Pattern: case CalibMode::Calib_PA_Tower:
@@ -436,6 +437,16 @@ CalibrationParameters calibration_parameters(CalibMode mode, const ConfigSnapsho
 
 CalibrationParameters update_calibration_parameters(CalibrationParameters p, std::string_view key, std::string_view value, bool focus_out)
 {
+    if (is_fiber_calibration(p.mode)) {
+        std::vector<std::pair<std::string, std::string>> values;
+        bool found = false;
+        for (const auto& f : p.fields) {
+            found |= f.key == key;
+            values.emplace_back(f.key, f.key == key ? std::string(value) : f.value);
+        }
+        if (!found) throw std::invalid_argument("Unknown fiber calibration field");
+        return fiber_calibration::parameters(p.mode, p.config, values);
+    }
     p.diagnostics.clear();
     if (key == "next_pass") {
         if (!p.can_refine) throw std::invalid_argument("This flow pass has no refinement pass");
@@ -471,6 +482,7 @@ CalibrationParameters update_calibration_parameters(CalibrationParameters p, std
 
 CalibrationValidationResult validate_calibration_parameters(const CalibrationParameters& p)
 {
+    if (is_fiber_calibration(p.mode)) return fiber_calibration::validate(p);
     CalibrationValidationResult result;
     std::string option_key;
     try {

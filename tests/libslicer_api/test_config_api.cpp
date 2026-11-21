@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cctype>
@@ -657,7 +658,7 @@ TEST_CASE("P3 0.125 mm mixed preset shares layers between matrix and fiber", "[l
     const auto defaults = created.config->snapshot();
     CHECK(defaults.value("layer_height") == "0.125");
     CHECK(defaults.value("initial_layer_print_height") == "0.125");
-    CHECK(defaults.value("fiber_layer_height_ratio") == "1");
+    CHECK(defaults.value("fiber_contour_layer_interval") == "1");
     CHECK(defaults.value("fiber_width") == "1");
     CHECK(defaults.value("outer_wall_filament_id") == "5");
     CHECK(defaults.value("reinforced_perimeters_filament") == "6");
@@ -1226,7 +1227,7 @@ TEST_CASE("mixed-capability fiber exports preserve every physical tool ID", "[li
         {"reinforced_perimeters_filament", std::to_string(fiber_tool+1)},
         {"top_shell_layers", "1"}, {"bottom_shell_layers", "1"},
         {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
-        {"fiber_layer_height_ratio", "1"}, {"fiber_minimum_path_length", "2"}
+        {"fiber_contour_layer_interval", "1"}, {"fiber_infill_layer_interval", "1"}, {"fiber_minimum_path_length", "2"}
     }).success);
     libslicer::SliceObjectInput object;
     object.name = "mixed-process-coupon";
@@ -1527,7 +1528,8 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
     const auto* contour_toggle = find_item(items, "generate_reinforced_perimeters");
     const auto* contour_count = find_item(items, "outer_reinforced_perimeters_counts");
     const auto* infill_density = find_item(items, "reinforced_infill_density");
-    const auto* layer_interval = find_item(items, "fiber_layer_height_ratio");
+    const auto* layer_interval = find_item(items, "fiber_contour_layer_interval");
+    const auto* infill_interval = find_item(items, "fiber_infill_layer_interval");
     const auto* fill_debug = find_item(items, "fiber_fill_debug");
     REQUIRE(fill_debug != nullptr);
     CHECK(fill_debug->type == libslicer::SettingType::Boolean);
@@ -1544,22 +1546,25 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
     REQUIRE(contour_count != nullptr);
     REQUIRE(infill_density != nullptr);
     REQUIRE(layer_interval != nullptr);
+    REQUIRE(infill_interval != nullptr);
     REQUIRE(contour_infill_clearance != nullptr);
     CHECK(contour_toggle->enabled);
     CHECK_FALSE(contour_count->enabled);
     CHECK_FALSE(infill_density->enabled);
     CHECK_FALSE(layer_interval->enabled);
+    CHECK_FALSE(infill_interval->enabled);
     CHECK_FALSE(contour_infill_clearance->enabled);
 
     const auto contour_enabled = config.set("generate_reinforced_perimeters", "1");
     REQUIRE(contour_enabled.success);
     CHECK(find_item(contour_enabled.changed_items, "generate_reinforced_perimeters") != nullptr);
     CHECK(find_item(contour_enabled.changed_items, "outer_reinforced_perimeters_counts") != nullptr);
-    CHECK(find_item(contour_enabled.changed_items, "fiber_layer_height_ratio") != nullptr);
+    CHECK(find_item(contour_enabled.changed_items, "fiber_contour_layer_interval") != nullptr);
 
     items = config.settings();
     CHECK(find_item(items, "outer_reinforced_perimeters_counts")->enabled);
-    CHECK(find_item(items, "fiber_layer_height_ratio")->enabled);
+    CHECK(find_item(items, "fiber_contour_layer_interval")->enabled);
+    CHECK_FALSE(find_item(items, "fiber_infill_layer_interval")->enabled);
     CHECK(find_item(items, "fiber_fill_debug")->enabled);
     REQUIRE(config.set("fiber_fill_debug", "1").success);
     const auto debug_snapshot = config.snapshot();
@@ -1576,6 +1581,7 @@ TEST_CASE("continuous fiber settings expose their UI dependencies", "[libslicer_
 
     items = config.settings();
     CHECK(find_item(items, "reinforced_infill_density")->enabled);
+    CHECK(find_item(items, "fiber_infill_layer_interval")->enabled);
     CHECK(find_item(items, "fiber_contour_infill_clearance")->enabled);
 }
 
@@ -2998,7 +3004,7 @@ TEST_CASE("continuous fiber composite fill survives an end-to-end slice", "[libs
         {"reinforced_infill_pattern", "rectilinear"},
         {"reinforced_perimeters_filament", "2"},
         {"reinforced_infill_filament", "2"},
-        {"fiber_layer_height_ratio", "1"},
+        {"fiber_contour_layer_interval", "1"}, {"fiber_infill_layer_interval", "1"},
         {"fiber_minimum_path_length", "2"},
         {"fiber_contour_infill_clearance", "0"},
         {"fiber_resin_overlap", "0.05"},
@@ -4440,7 +4446,7 @@ TEST_CASE("fiber infill angle sequence controls deposited G-code on successive f
         {"reinforced_infill_density","100%"},
         {"sparse_infill_density","100%"},
         {"top_shell_layers","0"}, {"bottom_shell_layers","0"},
-        {"fiber_layer_height_ratio",std::to_string(interval)}};
+        {"fiber_contour_layer_interval", std::to_string(interval)}, {"fiber_infill_layer_interval", std::to_string(interval)}};
     if (!use_default)
         overrides.emplace_back("fiber_infill_angle_sequence","0,45,90,135");
     REQUIRE(library->activate_config(selection,overrides).success);
@@ -4625,7 +4631,7 @@ TEST_CASE("independent resin infill preserves fiber and ordinary layers", "[libs
         {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"},
         {"top_shell_layers", "2"}, {"bottom_shell_layers", "2"},
         {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "0"},
-        {"fiber_contour_bend_radius", "0"}, {"fiber_layer_height_ratio", "2"},
+        {"fiber_contour_bend_radius", "0"}, {"fiber_contour_layer_interval", "2"}, {"fiber_infill_layer_interval", "2"},
         {"sparse_infill_density", "15%"}, {"sparse_infill_pattern", "grid"},
         {"fiber_resin_fill_pattern", "rectilinear"},
         {"fiber_resin_fill_density", "30%"}, {"fiber_resin_fill_line_width", "0.5"},
@@ -4833,12 +4839,14 @@ void remove_slice(const libslicer::SliceResult& result)
 using MaskDepositionSignature = std::vector<std::array<double, 20>>;
 MaskDepositionSignature mask_deposition_signature(const libslicer::ToolpathPreview& preview,
                                                  double minimum_x = -std::numeric_limits<double>::infinity(),
-                                                 bool fiber_only = false)
+                                                 bool fiber_only = false,
+                                                 std::optional<unsigned> layer = std::nullopt)
 {
     MaskDepositionSignature result;
     for (const auto& segment : preview.segments)
         if ((segment.deposition == libslicer::ToolpathDepositionKind::Thermoplastic || depositing_fiber(segment)) &&
             (!fiber_only || depositing_fiber(segment)) &&
+            (!layer || segment.layer_index == *layer) &&
             segment.start_mm.x >= minimum_x && segment.end_mm.x >= minimum_x)
             result.push_back({segment.start_mm.x, segment.start_mm.y, segment.start_mm.z,
                               segment.end_mm.x, segment.end_mm.y, segment.end_mm.z,
@@ -5167,9 +5175,11 @@ TEST_CASE("fiber mask scope is atomic and independent of inactive fiber presenta
 {
     auto config = libslicer::Config::defaults();
     const auto items = config.settings(libslicer::ConfigScope::FiberMask);
-    REQUIRE(items.size() == 42);
+    REQUIRE(items.size() == 44);
     std::set<std::string> keys;
     for (const auto& item : items) keys.insert(item.key);
+    CHECK(keys.count("fiber_contour_layer_interval") == 1);
+    CHECK(keys.count("fiber_infill_layer_interval") == 1);
     CHECK_FALSE(keys.count("fiber_mask_process"));
     CHECK_FALSE(keys.count("layer_height"));
     auto density = std::find_if(items.begin(), items.end(), [](const auto& item) {
@@ -5247,7 +5257,7 @@ TEST_CASE("masked App layer 23 survives planning reserve and machine rounding ar
         {"fiber_corner_stabilization_length", "5"}, {"fiber_infill_acceleration", "500"},
         {"fiber_infill_angle_sequence", "0"}, {"fiber_infill_bend_radius", "0"},
         {"fiber_infill_feed_ratio", "1"}, {"fiber_infill_max_speed", "10"},
-        {"fiber_infill_min_speed", "10"}, {"fiber_layer_height_ratio", "1"},
+        {"fiber_infill_min_speed", "10"}, {"fiber_contour_layer_interval", "1"}, {"fiber_infill_layer_interval", "1"},
         {"fiber_minimum_effective_length", "0"}, {"fiber_minimum_path_length", "1"},
         {"fiber_resin_fill_acceleration", "100%"}, {"fiber_resin_fill_align_to_model", "0"},
         {"fiber_resin_fill_anchor", "400%"}, {"fiber_resin_fill_anchor_max", "20"},
@@ -5526,7 +5536,7 @@ TEST_CASE("masked skipped fiber layers retain their own residual resin", "[libsl
     auto request = mask_request(*library);
     auto mask = box_mask();
     mask.settings = {{"generate_reinforced_infills", "1"}, {"reinforced_infill_filament", "2"},
-        {"reinforced_infill_density", "50%"}, {"fiber_layer_height_ratio", "2"},
+        {"reinforced_infill_density", "50%"}, {"fiber_contour_layer_interval", "2"}, {"fiber_infill_layer_interval", "2"},
         {"fiber_resin_fill_density", "50%"}, {"fiber_resin_fill_speed", "17"}};
     request.objects[0].fiber_masks = {mask};
     const auto result = library->slice(request);
@@ -5655,7 +5665,7 @@ TEST_CASE("empty same-value and restored masks preserve connected body fiber and
         {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "1"},
         {"reinforced_perimeters_filament", "2"}, {"reinforced_infill_filament", "2"},
         {"reinforced_infill_density", "40%"}, {"fiber_resin_fill_density", "40%"},
-        {"fiber_layer_height_ratio", std::to_string(interval)}}).success);
+        {"fiber_contour_layer_interval", std::to_string(interval)}, {"fiber_infill_layer_interval", std::to_string(interval)}}).success);
     auto request = mask_request(*library);
     const auto baseline = library->slice(request);
     require_slice(baseline);
@@ -5691,7 +5701,7 @@ TEST_CASE("resin-only mask changes local residual use while preserving connected
         // native bridge-support classification changing at a modifier interface.
         {"top_shell_layers", "0"},
         {"reinforced_infill_density", "40%"}, {"fiber_resin_fill_density", "0%"},
-        {"fiber_layer_height_ratio", std::to_string(interval)}}).success);
+        {"fiber_contour_layer_interval", std::to_string(interval)}, {"fiber_infill_layer_interval", std::to_string(interval)}}).success);
     auto request = mask_request(*library);
     const auto baseline = library->slice(request);
     require_slice(baseline);
@@ -5850,7 +5860,7 @@ TEST_CASE("wipe tower exclusions preserve model tools and prime a single ordinar
         {"reinforced_perimeters_filament", "6"},
         {"top_shell_layers", std::to_string(shell_layers)}, {"bottom_shell_layers", std::to_string(shell_layers)},
         {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
-        {"fiber_layer_height_ratio", "1"}, {"fiber_minimum_path_length", "2"}
+        {"fiber_contour_layer_interval", "1"}, {"fiber_infill_layer_interval", "1"}, {"fiber_minimum_path_length", "2"}
     }).success);
     if (machine_hooks)
         REQUIRE(created.config->apply_patch({
@@ -7283,4 +7293,625 @@ TEST_CASE("editable P3 project retains six physical material bindings", "[libsli
     REQUIRE(reopened.scene->objects.front().instances.front().fiber_masks.size()==1);
     CHECK(reopened.scene->objects.front().instances.front().fiber_masks.front().enabled);
     std::filesystem::remove(request.path);std::filesystem::remove(fixture);
+}
+
+TEST_CASE("fiber role intervals are independent validated settings", "[libslicer_api][config][fiber-intervals]")
+{
+    auto config=libslicer::Config::defaults();
+    CHECK_FALSE(config.set("fiber_layer_height_ratio","2").success);
+    for(const char* key:{"fiber_contour_layer_interval","fiber_infill_layer_interval"}) {
+        CHECK(config.snapshot().value(key)=="1");
+        for(const char* bad:{"0","-1","1.5","2layers","nan","2147483648"}) {
+            CHECK_FALSE(config.set(key,bad).success);
+            CHECK(config.snapshot().value(key)=="1");
+        }
+    }
+    REQUIRE(config.set("fiber_contour_layer_interval","2").success);
+    REQUIRE(config.set("fiber_infill_layer_interval","3").success);
+    REQUIRE(config.reset("fiber_contour_layer_interval").success);
+    CHECK(config.snapshot().value("fiber_contour_layer_interval")=="1");
+    CHECK(config.snapshot().value("fiber_infill_layer_interval")=="3");
+    auto local=libslicer::Config::for_overrides(config.snapshot(),libslicer::ConfigScope::FiberMask);
+    REQUIRE(local.set("fiber_contour_layer_interval","4").success);
+    auto restored=libslicer::Config::for_overrides(config.snapshot(),libslicer::ConfigScope::FiberMask);
+    REQUIRE(restored.load_overrides(local.serialize_overrides()).success);
+    CHECK(restored.snapshot().value("fiber_contour_layer_interval")=="4");
+    CHECK(restored.snapshot().value("fiber_infill_layer_interval")=="3");
+}
+
+TEST_CASE("separate fiber intervals control real deposited roles", "[libslicer_api][fiber][fiber-intervals][slice]")
+{
+    using Role=libslicer::ToolpathExtrusionRole;
+    const auto periods=GENERATE(std::make_pair(1,1),std::make_pair(2,1),std::make_pair(1,2),
+        std::make_pair(2,3),std::make_pair(2,2),std::make_pair(3,2));
+    const std::string pattern=GENERATE(std::string("rectilinear"),std::string("concentric"));
+    CAPTURE(periods.first,periods.second,pattern);
+    auto library=mask_library();
+    REQUIRE(library->apply_active_config_patch({
+        {"generate_reinforced_perimeters","1"},{"generate_reinforced_infills","1"},
+        {"reinforced_infill_pattern",pattern},{"reinforced_infill_density","50%"},
+        {"fiber_resin_fill_density","40%"},{"fiber_finish_extension_length","0.5"},
+        {"fiber_finish_overlap_length","0.5"},
+        {"fiber_contour_layer_interval",std::to_string(periods.first)},
+        {"fiber_infill_layer_interval",std::to_string(periods.second)}}).success);
+    auto request=mask_request(*library);
+    auto baseline_request=request;
+    REQUIRE(library->apply_active_config_patch({{"fiber_contour_layer_interval","1"},
+        {"fiber_infill_layer_interval","1"}}).success);
+    baseline_request.config=*library->active_config_snapshot();
+    const auto baseline=library->slice(baseline_request);
+    require_slice(baseline);
+    std::set<unsigned> expected_contours,expected_infills;
+    for(const auto& segment:baseline.preview->segments) if(depositing_fiber(segment)) {
+        if(segment.extrusion_role==Role::ContinuousFiberContour && segment.layer_index%unsigned(periods.first)==0)
+            expected_contours.insert(segment.layer_index);
+        if(segment.extrusion_role==Role::ContinuousFiberInfill && segment.layer_index%unsigned(periods.second)==0)
+            expected_infills.insert(segment.layer_index);
+    }
+    const auto result=library->slice(request);
+    require_slice(result);
+    const auto imported=library->load_gcode_preview({result.output.path});
+    REQUIRE(imported.success);
+    REQUIRE(imported.preview);
+    for(const auto* preview:{result.preview.get(),imported.preview.get()}) {
+        std::set<unsigned> contour_layers,infill_layers,resin_layers;
+        size_t finishes=0;
+        std::map<std::uint64_t,std::set<Role>> occurrence_roles;
+        for(const auto& segment:preview->segments) if(depositing_fiber(segment))
+            occurrence_roles[segment.fiber_occurrence].insert(segment.extrusion_role);
+        for(const auto& segment:preview->segments) {
+            if(segment.fiber_phase==libslicer::ToolpathFiberPhase::Finish) {
+                ++finishes;
+                // Non-depositing finish moves have a travel role. Their occurrence
+                // identifies the actual fiber source(s), including mixed ring chains.
+                const auto source=occurrence_roles.find(segment.fiber_occurrence);
+                REQUIRE(source!=occurrence_roles.end());
+                for(const auto role:source->second)
+                    CHECK(segment.layer_index%unsigned(role==Role::ContinuousFiberContour?
+                        periods.first:periods.second)==0);
+            }
+            if(depositing_fiber(segment)) {
+                const bool contour=segment.extrusion_role==Role::ContinuousFiberContour;
+                REQUIRE((contour || segment.extrusion_role==Role::ContinuousFiberInfill));
+                CHECK(segment.layer_index%unsigned(contour?periods.first:periods.second)==0);
+                (contour?contour_layers:infill_layers).insert(segment.layer_index);
+            } else if(segment.extrusion_role==Role::ResinInfill &&
+                segment.deposition==libslicer::ToolpathDepositionKind::Thermoplastic)
+                resin_layers.insert(segment.layer_index);
+        }
+        CHECK(finishes>0);
+        CHECK(contour_layers==expected_contours);
+        CHECK(infill_layers==expected_infills);
+        CHECK_FALSE(contour_layers.empty());
+        CHECK_FALSE(infill_layers.empty());
+        CHECK_FALSE(resin_layers.empty());
+        if(periods.first!=periods.second) CHECK(contour_layers!=infill_layers);
+    }
+    remove_slice(result);
+    remove_slice(baseline);
+}
+
+TEST_CASE("local fiber periods do not change surrounding role schedules", "[libslicer_api][fiber-mask][fiber-intervals][slice]")
+{
+    using Role=libslicer::ToolpathExtrusionRole;
+    auto library=mask_library();
+    REQUIRE(library->apply_active_config_patch({{"generate_reinforced_perimeters","1"},
+        {"generate_reinforced_infills","1"},{"reinforced_infill_density","40%"},
+        {"fiber_resin_fill_density","40%"},{"fiber_contour_layer_interval","1"},
+        {"fiber_infill_layer_interval","1"}}).success);
+    auto request=mask_request(*library);
+    auto mask=box_mask();
+    mask.settings={{"fiber_contour_layer_interval","2"},{"fiber_infill_layer_interval","3"}};
+    request.objects[0].fiber_masks={mask};
+    const auto result=library->slice(request);
+    require_slice(result);
+    const auto imported=library->load_gcode_preview({result.output.path});
+    REQUIRE(imported.success);REQUIRE(imported.preview);
+    for(const auto* preview:{result.preview.get(),imported.preview.get()}) {
+        std::set<unsigned> surrounding_contours;
+        size_t local_contours=0,local_infills=0;
+        const auto inside=[](const auto& p){return p.x>116.5 && p.x<143.5 && p.y>108.5 && p.y<131.5;};
+        const auto outside=[](const auto& p){return p.x<115.5 || p.x>144.5 || p.y<107.5 || p.y>132.5;};
+        for(const auto& segment:preview->segments) if(depositing_fiber(segment)) {
+            const bool contour=segment.extrusion_role==Role::ContinuousFiberContour;
+            if(inside(segment.start_mm) && inside(segment.end_mm)) {
+                CHECK(segment.layer_index%unsigned(contour?2:3)==0);
+                ++(contour?local_contours:local_infills);
+            }
+            if(contour && outside(segment.start_mm) && outside(segment.end_mm))
+                surrounding_contours.insert(segment.layer_index);
+        }
+        CHECK(local_contours>0);CHECK(local_infills>0);
+        CHECK(std::any_of(surrounding_contours.begin(),surrounding_contours.end(),[](unsigned layer){return layer%2!=0;}));
+    }
+    remove_slice(result);
+}
+
+TEST_CASE("skipped contours do not reserve rectilinear infill space", "[libslicer_api][fiber-intervals][slice]")
+{
+    auto library = mask_library();
+    REQUIRE(library->apply_active_config_patch({
+        {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "1"},
+        {"fiber_contour_layer_interval", "2"}, {"fiber_infill_layer_interval", "1"},
+        {"reinforced_infill_pattern", "rectilinear"}, {"reinforced_infill_density", "80%"},
+        {"fiber_infill_angle_sequence", "0"}, {"fiber_contour_infill_clearance", "1.5"},
+        {"fiber_resin_fill_density", "40%"}}).success);
+    const auto scheduled = library->slice(mask_request(*library));
+    require_slice(scheduled);
+
+    REQUIRE(library->apply_active_config_patch({{"generate_reinforced_perimeters", "0"}}).success);
+    const auto infill_only = library->slice(mask_request(*library));
+    require_slice(infill_only);
+
+    using Role = libslicer::ToolpathExtrusionRole;
+    CHECK(std::any_of(scheduled.preview->segments.begin(), scheduled.preview->segments.end(), [](const auto& segment) {
+        return segment.layer_index == 2 && segment.extrusion_role == Role::ContinuousFiberContour &&
+               depositing_fiber(segment);
+    }));
+    REQUIRE_FALSE(mask_deposition_signature(*infill_only.preview, -1e9, true, 3).empty());
+    check_mask_deposition(mask_deposition_signature(*scheduled.preview, -1e9, false, 3),
+                          mask_deposition_signature(*infill_only.preview, -1e9, false, 3));
+    remove_slice(scheduled);
+    remove_slice(infill_only);
+}
+
+TEST_CASE("mask intervals preserve deposition when the current layer policy agrees", "[libslicer_api][fiber-mask][fiber-intervals][slice]")
+{
+    auto library = mask_library();
+    REQUIRE(library->apply_active_config_patch({
+        {"generate_reinforced_perimeters", "1"}, {"generate_reinforced_infills", "1"},
+        {"fiber_contour_layer_interval", "2"}, {"fiber_infill_layer_interval", "3"},
+        {"reinforced_infill_pattern", "rectilinear"}, {"reinforced_infill_density", "40%"},
+        {"fiber_infill_angle_sequence", "0"}, {"fiber_resin_fill_density", "40%"},
+        {"top_shell_thickness", "0"}, {"bottom_shell_thickness", "0"},
+        {"sparse_infill_density", "15%"}}).success);
+    auto request = mask_request(*library);
+    const auto baseline = library->slice(request);
+    require_slice(baseline);
+
+    auto mask = box_mask();
+    mask.settings = {{"fiber_infill_layer_interval", "6"}};
+    request.objects[0].fiber_masks = {mask};
+    const auto masked = library->slice(request);
+    require_slice(masked);
+
+    const auto idle_layer = mask_deposition_signature(*baseline.preview, -1e9, false, 1);
+    REQUIRE_FALSE(idle_layer.empty());
+    check_mask_deposition(mask_deposition_signature(*masked.preview, -1e9, false, 1), idle_layer);
+
+    using Role = libslicer::ToolpathExtrusionRole;
+    const auto fiber_paths = [](const libslicer::ToolpathPreview& preview, unsigned layer, Role role) {
+        std::set<std::uint64_t> occurrences;
+        double length = 0;
+        for (const auto& segment : preview.segments) {
+            if (segment.layer_index == layer && segment.extrusion_role == role && depositing_fiber(segment)) {
+                occurrences.insert(segment.fiber_occurrence);
+                length += segment.deposited_path_length_mm;
+            }
+        }
+        return std::make_pair(occurrences.size(), length);
+    };
+    for (const auto& [layer, role] : {std::pair{2u, Role::ContinuousFiberContour},
+                                     std::pair{6u, Role::ContinuousFiberContour},
+                                     std::pair{6u, Role::ContinuousFiberInfill}}) {
+        CAPTURE(layer, static_cast<int>(role));
+        const auto [expected_count, expected_length] = fiber_paths(*baseline.preview, layer, role);
+        const auto [actual_count, actual_length] = fiber_paths(*masked.preview, layer, role);
+        REQUIRE(expected_count > 0);
+        if (role == Role::ContinuousFiberContour) REQUIRE(expected_count == 1);
+        CHECK(actual_count == expected_count);
+        // A merged native region can place the seam elsewhere on the same ring.
+        CHECK(actual_length == Catch::Approx(expected_length).margin(0.01));
+    }
+    CHECK(mask_deposition_signature(*baseline.preview, -1e9, true, 3) !=
+          mask_deposition_signature(*masked.preview, -1e9, true, 3));
+    remove_slice(baseline);
+    remove_slice(masked);
+}
+
+TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered samples", "[fiber-calibration]")
+{
+    using namespace libslicer;
+    const auto parameter = GENERATE(0u, 1u, 2u, 3u);
+    CAPTURE(parameter);
+    const std::array<double, 4> fixed{1.25, parameter == 2 ? 0. : 1.25, 4, 0.125};
+    const std::array<double, 4> starts{0, 1, 3, 0};
+    const std::array<double, 4> steps{0.5, 0.5, 1, 0.125};
+    LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = Library::open(options);
+    REQUIRE(library);
+    ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    selection.filament_preset_ids = {"CFSYS CIRON", "CFSYS CCF"};
+    selection.filament_physical_tools = {0, 1};
+    if (parameter == 2) {
+        selection.filament_preset_ids = {"CFSYS CCF", "CFSYS CIRON"};
+        selection.filament_physical_tools = {1, 0};
+    }
+    auto configured = library->create_config(selection);
+    REQUIRE(configured);
+    REQUIRE(configured.config->set("filament_colour", "#F28E2B;#111111").success);
+    REQUIRE(configured.config->set("use_relative_e_distances", "1").success);
+    SliceRequest ordinary;
+    ordinary.config = configured.config->snapshot();
+    ordinary.objects = {fiber_infill_block()};
+    struct TempOutput {
+        std::string path;
+        ~TempOutput() { std::error_code error; std::filesystem::remove(path, error); }
+    };
+    const auto printer_commands = [](const std::string& path) {
+        std::ifstream input(path);
+        REQUIRE(input.good());
+        std::vector<std::string> commands;
+        bool has_calibration_sample = false;
+        for (std::string line; std::getline(input, line);) {
+            has_calibration_sample |= line.rfind(";CALIBRATION_FIBER_SAMPLE ", 0) == 0;
+            if (!line.empty() && line.front() != ';') commands.push_back(line);
+        }
+        CHECK_FALSE(has_calibration_sample);
+        return commands;
+    };
+    std::vector<std::string> ordinary_baseline;
+    if (parameter == 1) {
+        const auto baseline = library->slice(ordinary);
+        TempOutput cleanup{baseline.output.path};
+        REQUIRE(baseline);
+        ordinary_baseline = printer_commands(baseline.output.path);
+    }
+    REQUIRE(configured.config->set("zaa_enabled", "1").success);
+    REQUIRE(configured.config->set("wall_loops", "0").success);
+    if (parameter >= 2) {
+        const bool automatic_width = parameter == 2;
+        if (automatic_width) {
+            REQUIRE(configured.config->set("nozzle_diameter", "0.4,0.8").success);
+            REQUIRE(configured.config->set("nozzle_temperature", "245,300").success);
+            REQUIRE(configured.config->set("nozzle_temperature_initial_layer", "250,300").success);
+            REQUIRE(configured.config->set("filament_flow_ratio", "1.04,0.99").success);
+            REQUIRE(configured.config->set("filament_max_volumetric_speed", "1.2,16").success);
+            REQUIRE(configured.config->set("bridge_line_width", "0.4").success);
+            REQUIRE(configured.config->set("wall_generator", "classic").success);
+            REQUIRE(configured.config->set("min_feature_size", "150%").success);
+            REQUIRE(configured.config->set("min_bead_width", "150%").success);
+        }
+        REQUIRE(configured.config->set("line_width", automatic_width ? "0" : "0.8").success);
+        REQUIRE(configured.config->set("inner_wall_line_width", automatic_width ? "0" : "0.4").success);
+        REQUIRE(configured.config->set("outer_wall_line_width", automatic_width ? "0" : "0.4").success);
+    }
+    const auto snapshot = configured.config->snapshot();
+    const std::array<const char*, 4> spacings{"", "2", "3.6", "3.2"};
+    const std::array<double, 4> expected_spacings{7.0875, 2.0, 3.6, 3.2};
+    const std::array<double, 4> expected_strokes{0.7875, (4.0 - 0.45) / 7.0, 0.45, 0.4};
+    const bool staggered = parameter == 1;
+    const std::size_t expected_count = staggered ? 5 : 3;
+    const std::size_t label_columns = staggered ? 2 : 1;
+    const double expected_spacing = expected_spacings[parameter];
+    const double expected_stroke = expected_strokes[parameter];
+    const auto form = calibration_parameters(CalibMode::Calib_Fiber_Landing, snapshot,
+        {{"fiber_parameter", std::to_string(parameter)}, {"height", std::to_string(fixed[0])},
+         {"length", std::to_string(fixed[1])}, {"speed", std::to_string(fixed[2])},
+         {"extra", std::to_string(fixed[3])}, {"start", std::to_string(starts[parameter])},
+         {"end", std::to_string(starts[parameter] + (expected_count - 1) * steps[parameter] + 0.001)}, {"step", std::to_string(steps[parameter])},
+         {"trial_spacing", spacings[parameter]}});
+    const auto checked = validate_calibration_parameters(form);
+    for (const auto& d : checked.diagnostics) { UNSCOPED_INFO(d.code + ": " + d.message); }
+    REQUIRE(checked);
+    CHECK(form.fiber_sample_count == expected_count);
+    const auto preparation = library->prepare_calibration(checked.request);
+    for (const auto& d : preparation.diagnostics) UNSCOPED_INFO(d.message);
+    REQUIRE(preparation);
+    REQUIRE(preparation.task->plates().size() == 1);
+    const auto& plate = preparation.task->plates()[0];
+    CHECK(plate.config.value("zaa_enabled") == "0");
+    CHECK(plate.config.value("wall_loops") == "1");
+    if (parameter == 2) {
+        CHECK(plate.config.value("filament_map") == "2,1");
+        CHECK(plate.config.value("wall_generator") == "arachne");
+        CHECK(configured.config->snapshot().value("wall_generator") == "classic");
+        for (const auto* key : {"min_feature_size", "min_bead_width"})
+            CHECK(configured.config->snapshot().value(key) == "150%");
+        for (const auto* key : {"inner_wall_line_width", "outer_wall_line_width"}) {
+            const auto width = plate.config.value(key);
+            REQUIRE(width.has_value());
+            CHECK(std::stod(*width) == Catch::Approx(0.45));
+        }
+    }
+    CHECK(configured.config->snapshot().value("zaa_enabled") == "1");
+    CHECK(configured.config->snapshot().value("wall_loops") == "0");
+    const auto sample_count = plate.fiber_samples.size();
+    REQUIRE(sample_count == expected_count);
+    for (std::size_t i = 1; i < plate.fiber_samples.size(); ++i)
+        CHECK(plate.fiber_samples[i].start_mm.y - plate.fiber_samples[i - 1].start_mm.y ==
+            Catch::Approx(expected_spacing).margin(0.001));
+    const auto result = library->slice_calibration(*preparation.task, 0, {});
+    std::ostringstream failure;
+    for (const auto& d : result.diagnostics) failure << d.code << ": " << d.message << '\n';
+    INFO(failure.str());
+    CAPTURE(result.cancelled);
+    REQUIRE(result);
+    REQUIRE(result.preview);
+    TempOutput cleanup{result.output.path};
+    REQUIRE(result.preview->layers.size() == 4);
+    const auto layer_height = std::stod(*snapshot.value("layer_height"));
+    const auto first_layer_z = std::stod(*snapshot.value("initial_layer_print_height")) +
+        std::stod(*snapshot.value("z_offset"));
+    REQUIRE(plate.objects.size() == 1);
+    const auto& volumes = plate.objects[0].geometry.volumes;
+    REQUIRE(volumes.size() == 1);
+    const auto& base = volumes.front();
+    REQUIRE(base.role == SliceVolumeRole::ModelPart);
+    const double label_top_z = std::stod(*snapshot.value("initial_layer_print_height")) + layer_height;
+    const double platform_top_z = label_top_z + layer_height;
+    const auto& first_start = plate.fiber_samples.front().start_mm;
+    const auto near = [](double a, double b) { return std::abs(a - b) < 0.002; };
+    double right = std::numeric_limits<double>::lowest();
+    double bottom = std::numeric_limits<double>::infinity();
+    double top = std::numeric_limits<double>::lowest();
+    for (const auto& point : base.vertices) {
+        if (!near(point.z, 0)) continue;
+        right = std::max(right, double(point.x));
+        bottom = std::min(bottom, double(point.y));
+        top = std::max(top, double(point.y));
+    }
+    const double margin = first_start.y - bottom;
+    const double left = first_start.x - margin / 2;
+    std::set<std::pair<double, double>> platform_corners;
+    for (const auto& point : base.vertices) {
+        if (near(point.z, platform_top_z)) {
+            CHECK((near(point.x, left) || near(point.x, right)));
+            CHECK((near(point.y, bottom) || near(point.y, top)));
+            platform_corners.emplace(point.x, point.y);
+        }
+    }
+    CHECK(platform_corners.size() == 4);
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::array<int, 2>> edge_counts;
+    for (const auto& face : base.triangles)
+        for (const auto& [a, b] : {std::pair{face.vertex_a, face.vertex_b}, std::pair{face.vertex_b, face.vertex_c},
+                                   std::pair{face.vertex_c, face.vertex_a}})
+            ++edge_counts[{std::min(a, b), std::max(a, b)}][a > b];
+    CHECK(std::all_of(edge_counts.begin(), edge_counts.end(),
+        [](const auto& edge) { return edge.second == std::array<int, 2>{1, 1}; }));
+    std::array<double, 4> maximum_z_error{};
+    std::set<std::uint32_t> base_layers, fiber_layers;
+    std::set<std::uint64_t> occurrences;
+    std::map<std::uint64_t, ToolpathPoint> passive_ends;
+    const auto inside_platform = [&](const ToolpathPoint& point) {
+        return point.x >= left - 0.002 && point.x <= right + 0.002 &&
+            point.y >= bottom - 0.002 && point.y <= top + 0.002;
+    };
+    for (const auto& segment : result.preview->segments) {
+        if (segment.deposition == ToolpathDepositionKind::Thermoplastic) {
+            base_layers.insert(segment.layer_index);
+            if (segment.layer_index == 2)
+                CHECK((inside_platform(segment.start_mm) && inside_platform(segment.end_mm)));
+        }
+        const bool powered = segment.deposition == ToolpathDepositionKind::ContinuousFiberPowered;
+        const bool passive = segment.deposition == ToolpathDepositionKind::ContinuousFiberPassive;
+        const bool tail = passive && segment.fiber_phase == ToolpathFiberPhase::Tail;
+        if (powered || passive) {
+            fiber_layers.insert(segment.layer_index);
+            CHECK((inside_platform(segment.start_mm) && inside_platform(segment.end_mm)));
+        }
+        if (powered) occurrences.insert(segment.fiber_occurrence);
+        if (tail) passive_ends[segment.fiber_occurrence] = segment.end_mm;
+        // Preview can mark descending landing motion as passive deposition.
+        if (segment.deposition == ToolpathDepositionKind::Thermoplastic || powered || tail) {
+            const auto layer = segment.layer_index;
+            REQUIRE(layer < maximum_z_error.size());
+            const double expected_z = first_layer_z + layer * layer_height;
+            maximum_z_error[layer] = std::max({maximum_z_error[layer], std::abs(segment.start_mm.z - expected_z),
+                std::abs(segment.end_mm.z - expected_z)});
+        }
+    }
+    CHECK(base_layers == std::set<std::uint32_t>{0, 1, 2});
+    CHECK(fiber_layers == std::set<std::uint32_t>{3});
+    REQUIRE(occurrences.size() == sample_count);
+    REQUIRE(passive_ends.size() == sample_count);
+    const std::vector<std::uint64_t> executions(occurrences.begin(), occurrences.end());
+    CHECK(*std::max_element(maximum_z_error.begin(), maximum_z_error.end()) < 0.002);
+    const auto gap_at = [&](double sample_x, double sample_y) {
+        std::array<double, 3> gap;
+        gap.fill(std::numeric_limits<double>::infinity());
+        for (const auto& segment : result.preview->segments) {
+            if (segment.deposition != ToolpathDepositionKind::Thermoplastic || segment.layer_index >= gap.size())
+                continue;
+            const double dx = segment.end_mm.x - segment.start_mm.x;
+            const double dy = segment.end_mm.y - segment.start_mm.y;
+            const double length_squared = dx * dx + dy * dy;
+            if (length_squared == 0) continue;
+            const double x = sample_x - segment.start_mm.x;
+            const double y = sample_y - segment.start_mm.y;
+            const double t = std::clamp((x * dx + y * dy) / length_squared, 0., 1.);
+            const double distance = std::hypot(x - t * dx, y - t * dy) - segment.width_mm / 2;
+            auto& closest = gap[segment.layer_index];
+            closest = std::min(closest, distance);
+        }
+        return gap;
+    };
+    for (std::size_t i = 0; i < sample_count; ++i) {
+        CHECK(plate.fiber_samples[i].value ==
+            Catch::Approx(starts[parameter] + i * steps[parameter]));
+        const auto& trial_start = plate.fiber_samples[i].start_mm;
+        const auto& trial_end = plate.fiber_samples[i].end_mm;
+        REQUIRE(passive_ends.count(executions[i]) == 1);
+        const auto& passive_end = passive_ends.at(executions[i]);
+        CHECK(near(passive_end.x, trial_end.x));
+        CHECK(near(passive_end.y, trial_end.y));
+        // The right-hand stroke must be printed on the second layer, with
+        // only the foundation below it and open space above it.
+        double label_right = std::numeric_limits<double>::lowest();
+        double label_bottom = std::numeric_limits<double>::infinity();
+        double label_top = std::numeric_limits<double>::lowest();
+        const bool outer_column = staggered && i % 2 == 1;
+        const double column_right = trial_start.x - margin - (outer_column ? 4 * expected_stroke + 0.45 : 0);
+        const double column_left = staggered ? column_right - (outer_column ? 12 : 4) * expected_stroke :
+            std::numeric_limits<double>::lowest();
+        for (const auto& vertex : base.vertices) {
+            if (!near(vertex.z, label_top_z) || vertex.x < column_left - 0.002 || vertex.x > column_right + 0.002 ||
+                std::abs(vertex.y - trial_start.y) >= label_columns * expected_spacing / 2)
+                continue;
+            label_right = std::max(label_right, double(vertex.x));
+            label_bottom = std::min(label_bottom, double(vertex.y));
+            label_top = std::max(label_top, double(vertex.y));
+        }
+        CHECK(near(label_right, column_right));
+        CHECK(label_top - label_bottom == Catch::Approx(7 * expected_stroke).margin(0.002));
+        const double label_x = label_right - expected_stroke / 2;
+        const auto gap_at_label = gap_at(label_x, trial_start.y);
+        CHECK(gap_at_label[0] < 0.06);
+        CHECK(gap_at_label[1] < 0.06);
+        CHECK(gap_at_label[2] > 0.1);
+        if (outer_column) {
+            // 1.5 and 2.5 each have a decimal point between two four-stroke digits.
+            const auto dot_gap = gap_at(label_right - 6 * expected_stroke, trial_start.y - 3 * expected_stroke);
+            CHECK(dot_gap[0] < 0.06);
+            CHECK(dot_gap[1] < 0.06);
+            CHECK(dot_gap[2] > 0.1);
+        }
+        for (double x : {double(trial_start.x), double(trial_end.x)}) {
+            const auto gap = gap_at(x, trial_start.y);
+            CHECK(gap[0] < 0.06);
+            CHECK(gap[1] < 0.06);
+            CHECK(gap[2] < 0.06);
+        }
+        if (i + label_columns < sample_count) {
+            const double separator_y = (trial_start.y + plate.fiber_samples[i + label_columns].start_mm.y) / 2;
+            const auto label_gap = gap_at(label_x, separator_y);
+            CHECK(label_gap[0] < 0.06);
+            CHECK(label_gap[1] > 0.1);
+            CHECK(label_gap[2] > 0.1);
+        }
+        if (i + 1 < sample_count) {
+            const double separator_y = (trial_start.y + plate.fiber_samples[i + 1].start_mm.y) / 2;
+            const auto platform_gap = gap_at((trial_start.x + trial_end.x) / 2, separator_y);
+            CHECK(platform_gap[0] < 0.06);
+            CHECK(platform_gap[1] < 0.06);
+            CHECK(platform_gap[2] < 0.06);
+        }
+        auto expected = fixed;
+        expected[parameter] = starts[parameter] + i * steps[parameter];
+        double landing_x = 0, landing_z = 0;
+        for (const auto& segment : result.preview->segments) {
+            if (segment.fiber_phase != ToolpathFiberPhase::Landing || segment.fiber_occurrence != executions[i])
+                continue;
+            landing_x += segment.end_mm.x - segment.start_mm.x;
+            landing_z += segment.start_mm.z - segment.end_mm.z;
+            CHECK(segment.nominal_speed_mm_s == Catch::Approx(expected[2]).margin(0.01));
+        }
+        CHECK(landing_x == Catch::Approx(expected[0] > 0 ? expected[1] : 0).margin(0.002));
+        CHECK(landing_z == Catch::Approx(expected[0]).margin(0.002));
+    }
+    std::ifstream gcode(result.output.path);
+    REQUIRE(gcode.good());
+    std::vector<double> prefeed;
+    std::size_t sample_markers = 0, cuts = 0, cutter_commands = 0;
+    bool reading_prefeed = false, reading_cut = false;
+    bool fiber_tool_bound = false, fiber_temperature_ready = false;
+    const std::string expected_binding = parameter == 2 ?
+        ";TOOL_BINDING filament=0 physical=1" : ";TOOL_BINDING filament=1 physical=1";
+    const std::string expected_wait = parameter == 2 ? "M109 S245 T1 " : "M109 S235 T1 ";
+    std::map<std::string, std::string> output_config;
+    const std::regex extrusion(" E([0-9.]+)");
+    const std::string sample_marker = ";CALIBRATION_FIBER_SAMPLE ";
+    for (std::string line; std::getline(gcode, line);) {
+        if (line.rfind("; ", 0) == 0) {
+            const auto delimiter = line.find(" = ", 2);
+            if (delimiter != std::string::npos)
+                output_config[line.substr(2, delimiter - 2)] = line.substr(delimiter + 3);
+        }
+        if (line.rfind(";TOOL_BINDING ", 0) == 0) {
+            fiber_tool_bound = line == expected_binding;
+            fiber_temperature_ready = false;
+        }
+        if (fiber_tool_bound && line.rfind("M109 ", 0) == 0)
+            fiber_temperature_ready = line.rfind(expected_wait, 0) == 0;
+        if (line.rfind(sample_marker, 0) == 0) {
+            std::istringstream marker{line.substr(sample_marker.size())};
+            std::size_t sample_id = 0;
+            std::uint64_t occurrence = 0;
+            REQUIRE(static_cast<bool>(marker >> sample_id >> occurrence));
+            REQUIRE(sample_markers < executions.size());
+            CHECK(sample_id == sample_markers + 1);
+            CHECK(occurrence == executions[sample_markers++]);
+        }
+        if (line == ";FIBER_CUT") {
+            ++cuts;
+            reading_cut = true;
+        }
+        if (line == ";FIBER_TAIL_BEGIN") reading_cut = false;
+        if (reading_cut && line == "S0") ++cutter_commands;
+        if (line == ";FIBER_PREFEED_BEGIN") {
+            CHECK(fiber_temperature_ready);
+            reading_prefeed = true;
+        }
+        if (line == ";FIBER_PREFEED_END") reading_prefeed = false;
+        if (reading_prefeed) {
+            std::smatch match;
+            if (std::regex_search(line, match, extrusion)) prefeed.push_back(std::stod(match[1].str()));
+        }
+    }
+    for (const auto* key : {"nozzle_temperature", "nozzle_temperature_initial_layer",
+                          "filament_flow_ratio", "filament_max_volumetric_speed",
+                          "nozzle_diameter", "filament_process_type", "filament_map",
+                          "physical_extruder_map", "zaa_enabled", "wall_generator",
+                          "wall_loops", "outer_wall_filament_id"}) {
+        CAPTURE(key);
+        REQUIRE(output_config.count(key) == 1);
+        CHECK(plate.config.value(key) == output_config.at(key));
+    }
+    CHECK(sample_markers == sample_count);
+    CHECK(cuts == sample_count);
+    CHECK(cutter_commands == sample_count);
+    REQUIRE(prefeed.size() == sample_count);
+    for (std::size_t i = 0; i < prefeed.size(); ++i) {
+        const double extra = parameter == 3 ? starts[parameter] + i * steps[parameter] : fixed[3];
+        CHECK(prefeed[i] == Catch::Approx(23 + extra).margin(0.001));
+    }
+    const auto temperature_form = calibration_parameters(CalibMode::Calib_Fiber_Temperature, snapshot);
+    CHECK(temperature_form.fields.empty());
+    CHECK_FALSE(validate_calibration_parameters(temperature_form));
+    CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "step", "0")));
+    if (parameter == 1 || parameter == 2)
+        CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "height", "0")));
+    if (parameter == 1) {
+        CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "0")));
+        const auto too_close = validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "1.999"));
+        REQUIRE_FALSE(too_close);
+        REQUIRE_FALSE(too_close.diagnostics.empty());
+        CHECK(too_close.diagnostics.front().message == "Minimum fiber trial spacing: 2 mm");
+        CHECK(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "2")));
+        CHECK(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "3")));
+        CHECK(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "3.6")));
+        REQUIRE(configured.config->set("fiber_width", "2.1").success);
+        auto wide_fiber_form = form;
+        wide_fiber_form.config = configured.config->snapshot();
+        CHECK_FALSE(validate_calibration_parameters(wide_fiber_form));
+        CHECK(validate_calibration_parameters(update_calibration_parameters(wide_fiber_form, "trial_spacing", "2.2")));
+        CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "400")));
+        CHECK(validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", "7.0875")));
+        const auto automatic = validate_calibration_parameters(update_calibration_parameters(form, "trial_spacing", ""));
+        REQUIRE(automatic);
+        CHECK_FALSE(automatic.request.fiber->sweep.trial_spacing_mm.has_value());
+        const auto oversized = update_calibration_parameters(form, "end", "10000");
+        CHECK_FALSE(validate_calibration_parameters(oversized));
+        std::atomic_bool cancel{false};
+        SliceCallbacks callbacks;
+        callbacks.progress = [&](float progress, std::string_view) { if (progress >= 0.6f) cancel = true; };
+        callbacks.is_cancelled = [&] { return cancel.load(); };
+        const auto aborted = library->slice_calibration(*preparation.task, 0, {}, callbacks);
+        CHECK(aborted.cancelled);
+        CHECK(aborted.output.path.empty());
+        const auto retried = library->slice_calibration(*preparation.task, 0, {});
+        TempOutput retry_cleanup{retried.output.path};
+        REQUIRE(retried);
+        REQUIRE(retried.preview);
+        CHECK(retried.preview->layers.size() == 4);
+        const auto subsequent = library->slice(ordinary);
+        TempOutput subsequent_cleanup{subsequent.output.path};
+        REQUIRE(subsequent);
+        CHECK(printer_commands(subsequent.output.path) == ordinary_baseline);
+    }
 }

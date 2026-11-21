@@ -31,6 +31,7 @@
 #include "calib.hpp"
 
 namespace Slic3r {
+struct FiberCalibrationPlan;
 
 class GCode;
 class Layer;
@@ -1169,6 +1170,8 @@ public:
     // Region/state-only query: never traverse extrusion entities or clone configuration.
     // Remains true through fiber-disable cleanup and canceled/incomplete fiber runs.
     bool fiber_execution_required() const;
+    void set_fiber_calibration_plan(std::shared_ptr<const FiberCalibrationPlan> plan);
+    size_t fiber_calibration_sample_id(const FiberFragmentId& id) const;
     void prepare_fiber_geometry_contexts();
     std::vector<int> fiber_locked_filament_map() const;
     std::vector<int> certified_fiber_filament_map() const;
@@ -1281,6 +1284,8 @@ private:
 
     PrintConfig                             m_config;
     std::atomic_bool m_fiber_lifecycle_active {false};
+    std::shared_ptr<const FiberCalibrationPlan> m_fiber_calibration;
+    void append_fiber_calibration_layer();
     std::vector<int> m_fiber_locked_filament_map;
     mutable std::mutex m_fiber_execution_mutex;
     uint64_t m_fiber_geometry_generation {0}, m_fiber_execution_generation {0};

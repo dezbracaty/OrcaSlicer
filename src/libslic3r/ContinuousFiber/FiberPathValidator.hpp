@@ -25,6 +25,7 @@ void audit_fiber_execution_connections(const std::map<FiberFragmentId,CompiledFi
 
 enum class FiberAssignmentKind : uint8_t {
     AcceptedFiber,
+    ScheduledOff,
     Rejected,
     IntentionalVoid
 };
@@ -128,6 +129,8 @@ struct FiberValidationResult {
     ExPolygons resin_exclusion;
     ExPolygons outside_domain;
     ExPolygons contour_to_infill_keepout;
+    // Planning references only. Never material coverage or executable paths.
+    ExPolygons scheduled_footprint;
     ExtrusionRole output_role { erNone };
     // When published, contains every accepted execution exactly once, including
     // untouched single sources. Empty means the original assignments are used.
@@ -174,7 +177,8 @@ public:
         const ExPolygons& original_area, const ContinuousFiberConfig& config,
         const FiberDomainId& domain_id, bool collect_debug = false,
         size_t fill_start_depth = fiber_contour_depth_limit, double extra_spacing_mm = 0.0,
-        double infill_stabilization_length_mm = 0.0);
+        double infill_stabilization_length_mm = 0.0,
+        bool contour_scheduled = true, bool infill_scheduled = true);
 
     static FiberValidationResult validate_infill(
         const FiberInfillCandidates& candidates, const ExPolygons& allowed_domain,
@@ -198,7 +202,8 @@ private:
         const ExPolygons* physical_centerline_domain, bool collect_debug,
         bool outer_contour = false, const std::vector<ContourArc>* source_arcs = nullptr,
         double bend_stabilization_length_mm = 0.0,
-        std::vector<FiberFragmentId>* policy_rejected = nullptr);
+        std::vector<FiberFragmentId>* policy_rejected = nullptr,
+        bool scheduled = true, std::optional<FiberPathPurpose> display_purpose = std::nullopt);
 };
 
 } // namespace Slic3r

@@ -19,7 +19,6 @@ struct FiberPolicyKey {
     bool contour_include_holes { true };
     bool contour_allow_partial_holes { false };
     bool infill_enabled { false };
-    int layer_interval { 1 };
     int contour_count { 0 };
     InfillPattern infill_pattern { ipRectilinear };
     double infill_density { 0.0 };
@@ -80,7 +79,8 @@ struct FiberPolicyKey {
     {
         return std::tie(
             connect_adjacent_rings, connection_tail_trim_widths, connection_head_trim_widths,
-            contour_enabled, contour_include_holes, contour_allow_partial_holes, infill_enabled, layer_interval, contour_count,
+            contour_enabled, contour_include_holes, contour_allow_partial_holes, infill_enabled,
+            contour_count,
             infill_pattern, infill_density, infill_direction, fixed_direction,
             contour_width, contour_spacing, contour_height, contour_nozzle,
             infill_width, infill_spacing, infill_height, infill_nozzle,
@@ -102,17 +102,22 @@ struct FiberPolicyKey {
 inline FiberPolicyKey fiber_policy_key(
     const ContinuousFiberConfig& source,
     double infill_direction,
-    bool fixed_direction)
+    bool fixed_direction,
+    size_t layer_id = 0)
 {
+    const bool contour_scheduled = source.contour_active_on_layer(layer_id);
     // Only an all-contour display may share the pure 100-contour policy.
     // Other cutoffs must survive grouping: a merged domain uses one owner's
     // configuration for both planning and its contour/infill display labels.
     const bool reference=(source.concentric_infill() && source.infill_density==100 &&
-        source.concentric_corner_stabilization_length_mm==0 && source.contour_enabled &&
+        source.concentric_corner_stabilization_length_mm==0 && contour_scheduled &&
         source.contour_count==fiber_contour_depth_limit) ||
-        (source.contour_enabled && source.contour_count==fiber_contour_depth_limit && !source.infill_enabled);
+        (contour_scheduled && source.contour_count==fiber_contour_depth_limit && !source.infill_enabled);
     ContinuousFiberConfig config=reference?fiber_ring_reference_config(source):source;
-    if (reference || source.concentric_infill()) {infill_direction=0;fixed_direction=false;}
+    if (!source.infill_enabled || source.concentric_infill()) {
+        infill_direction = 0;
+        fixed_direction = false;
+    }
     if (source.concentric_infill() && !reference) {
         const auto ring=fiber_ring_reference_config(source);
         config=ring;
@@ -130,11 +135,10 @@ inline FiberPolicyKey fiber_policy_key(
         config.connect_adjacent_rings,
         config.connect_adjacent_rings ? config.connection_tail_trim_widths : 0.0,
         config.connect_adjacent_rings ? config.connection_head_trim_widths : 0.0,
-        config.contour_enabled,
+        contour_scheduled,
         config.contour_include_holes,
         config.contour_include_holes && config.contour_allow_partial_holes,
         config.infill_enabled,
-        config.layer_interval,
         config.contour_count,
         config.infill_pattern,
         config.infill_density,

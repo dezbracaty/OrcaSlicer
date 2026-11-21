@@ -3,6 +3,7 @@ add_library(libslicer_api_objects OBJECT
     Library.cpp
     Plater.cpp
     OrcaCalibrationApi.cpp
+    FiberCalibrationApi.cpp
 )
 
 # Reuse these exact production objects in the isolated reference-test runtime.

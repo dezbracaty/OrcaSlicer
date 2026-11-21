@@ -14,9 +14,9 @@
 
 namespace Slic3r {
 
-const std::array<std::string_view, 43>& fiber_mask_parameter_keys()
+const std::array<std::string_view, 44>& fiber_mask_parameter_keys()
 {
-    static constexpr std::array<std::string_view, 43> keys{{
+    static constexpr std::array<std::string_view, 44> keys{{
         "generate_reinforced_perimeters",
         "fiber_contour_include_holes",
         "fiber_contour_allow_partial_holes",
@@ -36,7 +36,8 @@ const std::array<std::string_view, 43>& fiber_mask_parameter_keys()
         "fiber_corner_stabilization_length",
         "fiber_concentric_corner_stabilization_length",
         "fiber_width",
-        "fiber_layer_height_ratio",
+        "fiber_contour_layer_interval",
+        "fiber_infill_layer_interval",
         "fiber_minimum_path_length",
         "fiber_minimum_effective_length",
         "fiber_contour_infill_clearance",
@@ -393,8 +394,37 @@ bool continuous_fiber_enabled(const PrintRegionConfig& config)
 
 bool continuous_fiber_active_on_layer(const PrintRegionConfig& config, size_t layer_id)
 {
-    return continuous_fiber_enabled(config) && config.fiber_layer_height_ratio.value > 0 &&
-        layer_id % size_t(config.fiber_layer_height_ratio.value) == 0;
+    ContinuousFiberConfig schedule;
+    schedule.contour_enabled = config.generate_reinforced_perimeters.value;
+    schedule.infill_enabled = config.generate_reinforced_infills.value;
+    schedule.contour_layer_interval = config.fiber_contour_layer_interval.value;
+    schedule.infill_layer_interval = config.fiber_infill_layer_interval.value;
+    return schedule.active_on_layer(layer_id);
+}
+
+namespace {
+bool fiber_role_active(bool enabled, int interval, size_t layer_id)
+{
+    if (interval < 1) throw std::invalid_argument("Fiber layer intervals must be positive integers");
+    return enabled && layer_id % size_t(interval) == 0;
+}
+}
+
+bool ContinuousFiberConfig::contour_active_on_layer(size_t layer_id) const
+{
+    return fiber_role_active(contour_enabled, contour_layer_interval, layer_id);
+}
+
+bool ContinuousFiberConfig::infill_active_on_layer(size_t layer_id) const
+{
+    return fiber_role_active(infill_enabled, infill_layer_interval, layer_id);
+}
+
+bool ContinuousFiberConfig::active_on_layer(size_t layer_id) const
+{
+    const bool contour = contour_active_on_layer(layer_id);
+    const bool infill = infill_active_on_layer(layer_id);
+    return contour || infill;
 }
 
 std::vector<double> parse_fiber_infill_angle_sequence(std::string_view serialized)
@@ -430,7 +460,7 @@ std::optional<double> fiber_infill_angle_for_layer(std::string_view serialized,
     size_t layer_id, size_t layer_interval)
 {
     if (layer_interval==0)
-        throw std::invalid_argument("fiber_layer_height_ratio must be positive");
+        throw std::invalid_argument("fiber_infill_layer_interval must be positive");
     const auto angles=parse_fiber_infill_angle_sequence(serialized);
     const size_t fiber_layer=layer_id/layer_interval;
     return Geometry::deg2rad(std::fmod(angles[fiber_layer%angles.size()],180.0));
@@ -502,7 +532,7 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
     for (const auto& [name, value] : common) check(value, name);
     check(config.corner_transition_length_mm, "fiber_corner_transition_length", true);
     check(config.speed_sampling_length_mm, "fiber_speed_sampling_length", true);
-    if (config.layer_interval <= 0 || config.adhesion_dwell_ms < 0)
+    if (config.contour_layer_interval <= 0 || config.infill_layer_interval <= 0 || config.adhesion_dwell_ms < 0)
         throw std::invalid_argument("Invalid continuous fiber layer interval or adhesion dwell");
     if (config.cut_to_contact_length_mm + config.prefeed_extra_length_mm > 0)
         check(config.prefeed_speed_mm_s, "fiber_prefeed_speed", true);
@@ -590,7 +620,16 @@ static ContinuousFiberConfig resolve_region_fiber_config(
     ContinuousFiberConfig result;
     result.contour_enabled = source.generate_reinforced_perimeters.value;
     result.infill_enabled = source.generate_reinforced_infills.value;
-    result.layer_interval = std::max(1, source.fiber_layer_height_ratio.value);
+    result.contour_layer_interval = source.fiber_contour_layer_interval.value;
+    result.infill_layer_interval = source.fiber_infill_layer_interval.value;
+    if (result.contour_layer_interval < 1 || result.infill_layer_interval < 1)
+        throw std::invalid_argument("Fiber layer intervals must be positive integers");
+    const bool contour_scheduled = result.contour_active_on_layer(layer_id);
+    result.infill_enabled = result.infill_active_on_layer(layer_id);
+    const bool concentric = result.infill_enabled && fiber_concentric_uses_contour_process(source);
+    // Concentric infill still needs the configured contour band to locate its inner rings.
+    if (!concentric)
+        result.contour_enabled = contour_scheduled;
     result.minimum_path_length_mm = source.fiber_minimum_path_length.value;
     result.minimum_effective_length_mm = source.fiber_minimum_effective_length.value;
     result.resin_overlap_mm = source.fiber_resin_overlap.value;
@@ -610,8 +649,7 @@ static ContinuousFiberConfig resolve_region_fiber_config(
     result.tail_speed_step_length_mm = source.fiber_tail_speed_step_length.value;
     result.finish_motion_speed_mm_s = source.fiber_finish_motion_speed.value;
     result.finish_extension_length_mm = source.fiber_finish_extension_length.value;
-    const bool concentric=fiber_concentric_uses_contour_process(source);
-    if (result.contour_enabled && result.infill_enabled && !concentric)
+    if (contour_scheduled && result.infill_enabled && !concentric)
         result.contour_infill_clearance_mm = source.fiber_contour_infill_clearance.value;
 
     if (print_config.fiber_cut_gcode.value.find_first_not_of(" \t\r\n") == std::string::npos)
@@ -667,7 +705,7 @@ static ContinuousFiberConfig resolve_region_fiber_config(
             throw std::runtime_error("Continuous fiber infill supports only rectilinear and concentric patterns");
         if (result.infill_pattern==ipRectilinear)
             result.rectilinear_angle_radians=fiber_infill_angle_for_layer(
-                source.fiber_infill_angle_sequence.value,layer_id,size_t(result.layer_interval));
+                source.fiber_infill_angle_sequence.value,layer_id,size_t(result.infill_layer_interval));
         if (!std::isfinite(source.reinforced_infill_density.value))
             throw std::runtime_error("reinforced_infill_density must be finite");
         result.infill_density = std::clamp(source.reinforced_infill_density.value, 0.0, 100.0);
@@ -699,6 +737,23 @@ ContinuousFiberConfig resolve_continuous_fiber_config(const Layer& layer, const 
         layer.height, layer.id());
     result.geometry_context=layer.object()->fiber_geometry_context();
     return result;
+}
+
+ContinuousFiberConfig resolve_fiber_calibration_config(const PrintConfig& print,
+    const PrintRegionConfig& region, unsigned slot, double layer_height,
+    double height, double length, double speed, double extra)
+{
+    PrintRegionConfig sample = region;
+    sample.generate_reinforced_perimeters.value = false;
+    sample.generate_reinforced_infills.value = true;
+    sample.fiber_infill_layer_interval.value = 1;
+    sample.reinforced_infill_pattern.value = ipRectilinear;
+    sample.reinforced_infill_filament.value = int(slot + 1);
+    sample.fiber_z_hop_height.value = height;
+    sample.fiber_landing_length.value = length;
+    sample.fiber_landing_speed.value = speed;
+    sample.fiber_prefeed_extra_length.value = extra;
+    return resolve_region_fiber_config(print, sample, layer_height, 3);
 }
 
 } // namespace Slic3r

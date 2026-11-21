@@ -513,6 +513,8 @@ FiberAssignmentAudit FiberValidationResult::audit_assignments() const
              assignment.reason == FiberRejectionReason::None) ||
             (assignment.kind == FiberAssignmentKind::Rejected && !assignment.prepared &&
              assignment.reason != FiberRejectionReason::None) ||
+            (assignment.kind == FiberAssignmentKind::ScheduledOff && !assignment.prepared &&
+             !assignment.chain_only && assignment.centerline && assignment.reason == FiberRejectionReason::None) ||
             (assignment.kind == FiberAssignmentKind::IntentionalVoid && !assignment.prepared);
         if (!interval_valid || !state_valid || expected.find(assignment.id.parent) == expected.end())
             ++audit.invalid_assignment_count;
@@ -550,6 +552,9 @@ FiberAssignmentAudit FiberValidationResult::audit_assignments() const
                     fragment->prepared->entry.start != last->geometry.points.back())
                     ++audit.invalid_assignment_count;
             }
+            for (const auto* fragment : fragments) if (fragment->kind == FiberAssignmentKind::ScheduledOff &&
+                (!fragment->centerline || !fragment->centerline->is_closed()))
+                ++audit.invalid_assignment_count;
         }
         std::sort(fragments.begin(), fragments.end(), [](const auto* lhs, const auto* rhs) {
             if (lhs->source_begin_mm != rhs->source_begin_mm)
@@ -611,7 +616,8 @@ FiberValidationResult FiberPathValidator::validate_impl(
     size_t job_ordinal, const ExPolygons* planned_centerline_domain, const ExPolygons* geometry_domain,
     const ExPolygons* physical_centerline_domain, bool collect_debug, bool outer_contour,
     const std::vector<ContourArc>* source_arcs, double bend_stabilization_length_mm,
-    std::vector<FiberFragmentId>* policy_rejected)
+    std::vector<FiberFragmentId>* policy_rejected, bool scheduled,
+    std::optional<FiberPathPurpose> display_purpose)
 {
     FiberValidationResult result;
     result.output_role = output_role;
@@ -819,6 +825,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
             assignment.source_begin_mm = source_station_mm(interval.begin_scaled, source_length_mm);
             assignment.source_end_mm = source_station_mm(interval.end_scaled, source_length_mm);
             assignment.kind = interval.kind;
+            assignment.display_purpose = display_purpose;
             assignment.reason = interval.reason;
             assignment.contour_issues = rounding_issues;
             assignment.detail = stability_detail;
@@ -884,7 +891,14 @@ FiberValidationResult FiberPathValidator::validate_impl(
                     diff_pl(Polylines{check_view(assignment.centerline->polyline)},*physical_centerline_domain).empty() ?
                     FiberRejectionReason::OccupiedContourRegion : FiberRejectionReason::UnavailableContourRegion;
             }
-            if (assignment.kind == FiberAssignmentKind::AcceptedFiber) {
+            bool allocated = false;
+            if (assignment.kind == FiberAssignmentKind::AcceptedFiber && !scheduled) {
+                assignment.kind = FiberAssignmentKind::ScheduledOff;
+                assignment.source_arcs = trim_arcs(reference_arcs,assignment.source_begin_mm,assignment.source_end_mm);
+                const auto line = check_view(assignment.centerline->polyline);
+                append(result.scheduled_footprint, fiber_contour_coverage(line,0.5*path.width));
+                allocated = true;
+            } else if (assignment.kind == FiberAssignmentKind::AcceptedFiber) {
                 // Rounded geometry is immutable here. Preserve its arc stations;
                 // command preparation handles process splits within its own budget.
                 const auto arcs=trim_arcs(reference_arcs,assignment.source_begin_mm,assignment.source_end_mm);
@@ -928,15 +942,17 @@ FiberValidationResult FiberPathValidator::validate_impl(
                 } else {
                     assignment.prepared=finalized.prepared;
                     append_coverage(result,*assignment.prepared);
-                    if (allocates_contour && !pending.empty()) {
-                        remaining_domain=diff_ex(*planned_centerline_domain,
-                            fiber_material_offset(result.physical_footprint,0.5*path.width));
-                        remaining_partition=offset_ex(remaining_domain,float(scale_(
-                            0.5*ContourRoundingOptions{}.geometry_tolerance_mm)));
-                        final_domain=&remaining_domain;
-                        ++allocation_revision;
-                    }
+                    allocated = true;
                 }
+            }
+            if (allocated && allocates_contour && !pending.empty()) {
+                const auto occupied = result.scheduled_footprint.empty() ? result.physical_footprint :
+                    union_ex(result.physical_footprint,result.scheduled_footprint);
+                remaining_domain=diff_ex(*planned_centerline_domain,fiber_material_offset(occupied,0.5*path.width));
+                remaining_partition=offset_ex(remaining_domain,float(scale_(
+                    0.5*ContourRoundingOptions{}.geometry_tolerance_mm)));
+                final_domain=&remaining_domain;
+                ++allocation_revision;
             }
             result.assignments.emplace_back(std::move(assignment));
         }
@@ -967,6 +983,7 @@ FiberValidationResult FiberPathValidator::validate_impl(
     result.resin_exclusion = union_ex(result.resin_exclusion);
     result.outside_domain = union_ex(result.outside_domain);
     result.contour_to_infill_keepout = union_ex(result.contour_to_infill_keepout);
+    result.scheduled_footprint = union_ex(result.scheduled_footprint);
     const FiberAssignmentAudit audit = result.audit_assignments();
     if (!audit.valid()) {
         std::ostringstream message;
@@ -1070,8 +1087,28 @@ std::optional<Polygon> accepted_cycle(const FiberValidationResult& result, const
     return polygon;
 }
 
+// A scheduled-off ancestor owns layout geometry, never an execution or material.
+std::optional<Polygon> reference_cycle(const FiberValidationResult& result, const FiberCandidateId& id)
+{
+    if (auto cycle = accepted_cycle(result,id)) return cycle;
+    const FiberFragmentAssignment* reference = nullptr;
+    for (const auto& assignment : result.assignments) if (assignment.id.parent == id) {
+        if (reference || assignment.kind != FiberAssignmentKind::ScheduledOff || assignment.prepared ||
+            assignment.chain_only || !assignment.centerline || !assignment.centerline->is_closed())
+            return std::nullopt;
+        reference = &assignment;
+    }
+    if (!reference) return std::nullopt;
+    Points points=check_view(reference->centerline->polyline).points;
+    if (points.size()<4 || points.front()!=points.back()) return std::nullopt;
+    points.pop_back();
+    Polygon polygon(std::move(points));polygon.make_counter_clockwise();
+    return polygon;
+}
+
 void merge_validation(FiberValidationResult& into, FiberValidationResult&& from)
 {
+    append(into.scheduled_footprint, from.scheduled_footprint);
     append(into.physical_footprint, from.physical_footprint);
     append(into.resin_exclusion, from.resin_exclusion);
     append(into.outside_domain, from.outside_domain);
@@ -1137,7 +1174,7 @@ bool FiberContourPlanResult::audit_lineage() const
             if (node.depth != 0) return false;
         } else {
             const auto found = visited.find(*node.parent);
-            if (found == visited.end() || !accepted_cycle(validation, *node.parent)) return false;
+            if (found == visited.end() || !reference_cycle(validation, *node.parent)) return false;
             const auto& parent = *found->second;
             if (parent.depth + 1 != node.depth || parent.side != node.side ||
                 parent.region_id != node.region_id || parent.boundary_id != node.boundary_id ||
@@ -1183,6 +1220,7 @@ FiberContourPlanResult plan_ring_stage(
     FiberContourPlanResult plan;
     auto& result = plan.validation;
     result.output_role = stage.output_role;
+    ExPolygons layout_occupancy;
 
     struct Branch {
         ExPolygons material;
@@ -1247,10 +1285,10 @@ FiberContourPlanResult plan_ring_stage(
                     // reselect after every committed sibling's coverage.
                     ExPolygons remaining;
                     if (!provisional) remaining=diff_ex(branch_material, band ?
-                        continuous_fiber_detail::hole_query_occupancy(result.physical_footprint, *band) :
-                        result.physical_footprint);
+                        continuous_fiber_detail::hole_query_occupancy(layout_occupancy, *band) :
+                        layout_occupancy);
                     else {
-                        const auto occupied = union_ex(result.physical_footprint, branch.provisional_footprint);
+                        const auto occupied = union_ex(layout_occupancy, branch.provisional_footprint);
                         remaining=diff_ex(branch_material, band ?
                             continuous_fiber_detail::hole_query_occupancy(occupied, *band) : occupied);
                     }
@@ -1340,7 +1378,7 @@ FiberContourPlanResult plan_ring_stage(
                         accepted.outside_domain.clear();
                         accepted.contour_to_infill_keepout.clear();
                     }
-                    const auto cycle = accepted_cycle(accepted, id);
+                    const auto cycle = reference_cycle(accepted, id);
                     const bool staged = !provisional_footprint.empty();
                     if (cycle && depth + 1 < stage.max_depth && (!staged || depth+1<stage.fill_start_depth)) {
                         const ExPolygons enclosed{ExPolygon(*cycle)};
@@ -1350,19 +1388,27 @@ FiberContourPlanResult plan_ring_stage(
                             if (spaced) child=fiber_material_offset(child,-stage.extra_spacing_mm);
                             next.push_back({std::move(child),{},id,branch.region,branch.boundary});
                         } else {
-                            auto frontier=union_ex(enclosed,staged?provisional_footprint:accepted.physical_footprint);
+                            const auto reference_occupancy=accepted.scheduled_footprint.empty() ? accepted.physical_footprint :
+                                union_ex(accepted.physical_footprint,accepted.scheduled_footprint);
+                            auto frontier=union_ex(enclosed,staged?provisional_footprint:reference_occupancy);
                             if (spaced) frontier=fiber_material_offset(frontier,stage.extra_spacing_mm);
                             next.push_back({{},std::move(frontier),id,branch.region,branch.boundary,
                                 staged?union_ex(branch.provisional_footprint,provisional_footprint):ExPolygons{}});
                         }
                     } else {
+                        const bool scheduled_reference=std::any_of(accepted.assignments.begin(),accepted.assignments.end(),
+                            [](const auto& assignment){return assignment.kind==FiberAssignmentKind::ScheduledOff;});
                         plan.stops.push_back({id, depth + 1, side, cycle ? "depth_limit" :
-                            (accepted.accepted_count() ? "open_deposition_leaf" : "candidate_rejected")});
+                            (scheduled_reference ? "open_scheduled_reference_leaf" :
+                                accepted.accepted_count() ? "open_deposition_leaf" : "candidate_rejected")});
                     }
-                    coverage_changed = !accepted.physical_footprint.empty();
+                    coverage_changed = !accepted.physical_footprint.empty() || !accepted.scheduled_footprint.empty();
                     merge_validation(result, std::move(accepted));
-                    if (coverage_changed)
+                    if (coverage_changed) {
                         result.physical_footprint = union_ex(result.physical_footprint);
+                        layout_occupancy = result.scheduled_footprint.empty() ? result.physical_footprint :
+                            union_ex(result.physical_footprint,result.scheduled_footprint);
+                    }
                 }
             }
             current = std::move(next);
@@ -1371,6 +1417,7 @@ FiberContourPlanResult plan_ring_stage(
     result.resin_exclusion = union_ex(result.resin_exclusion);
     result.outside_domain = union_ex(result.outside_domain);
     result.contour_to_infill_keepout = union_ex(result.contour_to_infill_keepout);
+    result.scheduled_footprint = union_ex(result.scheduled_footprint);
     if (!plan.audit_lineage()) throw std::runtime_error("Continuous fiber contour lineage audit failed");
     return plan;
 }
@@ -1380,7 +1427,7 @@ FiberContourPlanResult plan_ring_stage(
 FiberContourPlanResult FiberPathValidator::plan_contours(
     const ExPolygons& original_area, const ContinuousFiberConfig& config,
     const FiberDomainId& domain_id, bool collect_debug,size_t fill_start_depth,double extra_spacing_mm,
-    double infill_stabilization_length_mm)
+    double infill_stabilization_length_mm, bool contour_scheduled, bool infill_scheduled)
 {
     const double width = config.contour_flow.width();
     const double clearance = config.contour_boundary_clearance_mm;
@@ -1402,10 +1449,12 @@ FiberContourPlanResult FiberPathValidator::plan_contours(
     const auto validate_candidate = [&](ExtrusionPath& path, size_t job_ordinal, size_t depth,
         const ExPolygons* available, const ExPolygons* geometry_domain,
         const ExPolygons* physical_partition, bool requires_closed_loop, bool provisional) {
+        const auto role = depth < fill_start_depth ? FiberPathPurpose::Contour : FiberPathPurpose::Infill;
+        const bool scheduled = role == FiberPathPurpose::Contour ? contour_scheduled : infill_scheduled;
         auto accepted = validate_impl({&path}, original_area, config, FiberPathPurpose::Contour,
             erContinuousFiberContour, domain_id, job_ordinal, available, geometry_domain,
             physical_partition, collect_debug, requires_closed_loop, nullptr,
-            depth>=fill_start_depth?infill_stabilization_length_mm:0.0);
+            depth>=fill_start_depth?infill_stabilization_length_mm:0.0,nullptr,scheduled,role);
         for (const auto& assignment : accepted.assignments)
             if (assignment.reason == FiberRejectionReason::IntervalMappingFailure ||
                 assignment.reason == FiberRejectionReason::InvalidParameter ||

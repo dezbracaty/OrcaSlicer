@@ -4949,7 +4949,9 @@ std::vector<CalibMode> Library::calibration_modes() const
             libslicer::CalibMode::Calib_Input_shaping_freq,
             libslicer::CalibMode::Calib_Input_shaping_damp,
             libslicer::CalibMode::Calib_Cornering,
-            libslicer::CalibMode::Calib_Tolerance_Model};
+            libslicer::CalibMode::Calib_Tolerance_Model,
+            libslicer::CalibMode::Calib_Fiber_Landing,
+            libslicer::CalibMode::Calib_Fiber_Temperature};
 }
 
 CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& request, const SliceCallbacks& callbacks) const
@@ -4964,6 +4966,45 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
         }
         auto config = dynamic_config(request.config);
         Slic3r::set_resources_dir(impl_->resource_directory);
+        const auto calibration_seed = [&]() -> const Slic3r::PresetBundle* {
+            const auto model = config.opt_string("printer_model");
+            const Slic3r::PresetBundle* seed = nullptr;
+            for (std::size_t index = 0; index < impl_->vendor_presets.size(); ++index) {
+                const auto& candidate = impl_->vendor_presets[index];
+                const bool matches = std::any_of(candidate->vendors.begin(), candidate->vendors.end(),
+                    [&](const auto& vendor) {
+                        return std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
+                            [&](const auto& item) { return item.id == model; });
+                    });
+                if (matches) seed = impl_->complete_vendor(index);
+            }
+            if (impl_->active->bundle && model == impl_->active->selection.machine_model_id)
+                seed = impl_->active->bundle.get();
+            return seed;
+        };
+        if (is_fiber_calibration(request.mode)) {
+            auto task = std::unique_ptr<CalibrationTask>(new CalibrationTask());
+            auto& native = *task->impl_;
+            native.request = request;
+            native.models.emplace_back();
+            std::vector<FiberCalibrationSample> samples;
+            native.fiber_plan = fiber_calibration::prepare(request, config, native.models.front(), samples);
+            if (cancellation_requested(callbacks)) { result.cancelled = true; return result; }
+            auto plate = orca::describe_plate(native.models.front(), 0);
+            plate.config = Config(serialized_values(config)).snapshot();
+            plate.fiber_samples = std::move(samples);
+            native.plates.push_back(std::move(plate));
+
+            const auto* seed = calibration_seed();
+            Slic3r::PresetBundle bundle = seed ? *seed : Slic3r::PresetBundle();
+            mark_full_config_authoritative(config);
+            bundle.load_config_model("calibration.3mf", std::move(config));
+            // Match Orca's Plater input and let Print::apply resolve variants.
+            native.fiber_config = bundle.full_config(false, native.fiber_plan->filament_map);
+            result.task = std::move(task);
+            result.success = true;
+            return result;
+        }
         const auto params                = orca::dialog_parameters(request, config);
         // Flow selects a particular material; the embedded-preset loader needs
         // complete per-variant identity metadata before splitting that material.
@@ -4980,18 +5021,7 @@ CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& 
             changed.back() = Slic3r::escape_strings_cstyle(Slic3r::Preset::printer_options());
             config.set_key_value("different_settings_to_system", new Slic3r::ConfigOptionStrings(std::move(changed)));
         }
-        const Slic3r::PresetBundle* seed = nullptr;
-        const auto model                 = config.opt_string("printer_model");
-        for (std::size_t index = 0; index < impl_->vendor_presets.size(); ++index) {
-            const auto& candidate = impl_->vendor_presets[index];
-            const bool matches = std::any_of(candidate->vendors.begin(), candidate->vendors.end(),
-                [&](const auto& vendor) {
-                    return std::any_of(vendor.second.models.begin(), vendor.second.models.end(),
-                        [&](const auto& item) { return item.id == model; });
-                });
-            if (matches) seed = impl_->complete_vendor(index);
-        }
-        if (impl_->active->bundle && model == impl_->active->selection.machine_model_id) seed=impl_->active->bundle.get();
+        const auto* seed = calibration_seed();
         if (request.mode == libslicer::CalibMode::Calib_Flow_Rate) {
             const auto count = config.option<Slic3r::ConfigOptionFloats>("filament_diameter")->size();
             auto* names = config.option<Slic3r::ConfigOptionStrings>("filament_settings_id", true);
@@ -5118,8 +5148,10 @@ SliceResult Library::slice_impl(const SliceRequest& request,
         // Keep the original native values: serializing a float-derived layer
         // height and parsing it back can move a layer across a calibration
         // boundary (for example floor(z - 0.4) in the retraction tower).
-        Slic3r::DynamicPrintConfig config = calibration
-            ? calibration->impl_->host->full_config() : dynamic_config(request.config);
+        const bool fiber_calibration = calibration && bool(calibration->impl_->fiber_plan);
+        const bool original_calibration = calibration && !fiber_calibration;
+        Slic3r::DynamicPrintConfig config = original_calibration ? calibration->impl_->host->full_config() :
+            fiber_calibration ? *calibration->impl_->fiber_config : dynamic_config(request.config);
         if (!calibration) normalize_filament_identity(config);
         Slic3r::Model plate_model;
         if (!calibration) apply_plate_semantics(plate_model, config, request.project_semantics);
@@ -5357,7 +5389,7 @@ SliceResult Library::slice_impl(const SliceRequest& request,
         const auto* printer_model = config.option<Slic3r::ConfigOptionString>("printer_model");
         print.is_BBL_printer() = printer_model != nullptr &&
             printer_model->value.rfind("Bambu Lab", 0) == 0;
-        if (calibration) print.is_BBL_printer()=calibration->impl_->host->presets().is_bbl_vendor();
+        if (original_calibration) print.is_BBL_printer()=calibration->impl_->host->presets().is_bbl_vendor();
         print.set_status_callback([&](const Slic3r::PrintBase::SlicingStatus& status) {
             if (cancellation_requested(callbacks)) {
                 print.cancel();
@@ -5409,7 +5441,8 @@ SliceResult Library::slice_impl(const SliceRequest& request,
                 tower_placement_failed = true;
             }
         }
-        if (calibration) print.set_calib_params(calibration->impl_->params);
+        if (original_calibration) print.set_calib_params(calibration->impl_->params);
+        if (fiber_calibration) print.set_fiber_calibration_plan(calibration->impl_->fiber_plan);
         validate_effective_mask_regions(print, mask_volume_ids);
 
         Slic3r::StringObjectException warning;
@@ -5751,6 +5784,23 @@ SliceResult Library::slice_impl(const SliceRequest& request,
         if (belt_support_debug_preview)
             result.preview = std::move(belt_support_debug_preview);
 
+        if (fiber_calibration) {
+            const auto count = calibration->impl_->fiber_plan->trials.size();
+            const auto check_cancelled = [&] {
+                if (cancellation_requested(callbacks)) throw Slic3r::CanceledException();
+            };
+            const auto occurrences = libslicer::fiber_calibration::read_executions(result.output.path, count, check_cancelled);
+            if (result.preview) {
+                std::set<std::uint64_t> deposits;
+                for (const auto& move : result.preview->segments)
+                    if (move.deposition == ToolpathDepositionKind::ContinuousFiberPowered && move.deposited_path_length_mm > 0)
+                        deposits.insert(move.fiber_occurrence);
+                for (const auto occurrence : occurrences)
+                    if (!deposits.count(occurrence))
+                        throw std::runtime_error("Fiber calibration preview lacks a sample's deposition path");
+            }
+            check_cancelled();
+        }
         result.success = true;
         generated_temporary_paths.clear();
         report_progress(callbacks, 1.0f, "Slicing completed");

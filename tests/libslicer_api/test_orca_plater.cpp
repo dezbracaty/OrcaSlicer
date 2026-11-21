@@ -533,7 +533,12 @@ TEST_CASE("calibration transport uses original dialog rules without product limi
 {
     auto library     = open_library();
     const auto modes = library->calibration_modes();
-    REQUIRE(modes.size() == 12);
+    using M = libslicer::CalibMode;
+    const std::vector<M> expected{M::Calib_PA_Line, M::Calib_PA_Pattern, M::Calib_PA_Tower,
+        M::Calib_Flow_Rate, M::Calib_Temp_Tower, M::Calib_Vol_speed_Tower, M::Calib_VFA_Tower,
+        M::Calib_Retraction_tower, M::Calib_Input_shaping_freq, M::Calib_Input_shaping_damp,
+        M::Calib_Cornering, M::Calib_Tolerance_Model, M::Calib_Fiber_Landing, M::Calib_Fiber_Temperature};
+    REQUIRE(modes == expected);
     CHECK(std::find(modes.begin(), modes.end(), libslicer::CalibMode::Calib_Auto_PA_Line) == modes.end());
     CHECK(std::find(modes.begin(), modes.end(), libslicer::CalibMode::Calib_None) == modes.end());
     auto config = base_config();
