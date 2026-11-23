@@ -9,15 +9,23 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <iterator>
 #include <locale>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <boost/nowide/fstream.hpp>
 
 namespace libslicer::fiber_calibration {
 namespace {
 using namespace Slic3r;
 constexpr const char* heater_gate = "Fiber heater waiting is not verified for this machine";
+constexpr const char* temperature_sweep_error =
+    "Fiber temperature calibration requires descending temperatures and at least two test values";
+constexpr const char* base_slot_error = "Select a thermoplastic outer wall material for fiber temperature calibration";
+// Leave room for the wait band within the supported Alpha500 T1 temperature limits.
+constexpr int minimum_temperature_c = 21;
+constexpr int maximum_temperature_c = 399;
 constexpr double label_height_in_strokes = 7;
 constexpr double minimum_trial_spacing_mm = 2;
 constexpr std::array<const char*, 2> wall_width_keys{"inner_wall_line_width", "outer_wall_line_width"};
@@ -67,6 +75,42 @@ double parse_number(const std::string& text)
 }
 
 double read_number(const std::string& text) { return double(grid(parse_number(text))) / 1000; }
+
+int read_temperature(const std::string& text)
+{
+    int value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value <= 0)
+        throw std::invalid_argument("Fiber temperatures and step must be positive integers");
+    return value;
+}
+
+std::size_t temperature_base_slot(const DynamicPrintConfig& config)
+{
+    const auto& materials = config.option<ConfigOptionStrings>("filament_process_type")->values;
+    const int wall_material = config.opt_int("outer_wall_filament_id");
+    if (wall_material > 0) {
+        const auto slot = std::size_t(wall_material - 1);
+        if (slot < materials.size() && materials[slot] == "thermoplastic") return slot;
+        throw std::invalid_argument(base_slot_error);
+    }
+    // The normal default material for an unassigned object is its first slot.
+    if (!materials.empty() && materials[0] == "thermoplastic") return 0;
+    const auto base = std::find(materials.begin(), materials.end(), "thermoplastic");
+    if (base != materials.end() && std::find(std::next(base), materials.end(), "thermoplastic") == materials.end())
+        return std::size_t(base - materials.begin());
+    throw std::invalid_argument(base_slot_error);
+}
+
+std::pair<int, int> default_temperature_range(const DynamicPrintConfig& config, std::size_t material_slot)
+{
+    const auto* low = config.option<ConfigOptionInts>("nozzle_temperature_range_low");
+    const auto* high = config.option<ConfigOptionInts>("nozzle_temperature_range_high");
+    if (material_slot >= low->values.size() || material_slot >= high->values.size())
+        return {0, 0};
+    return {std::max(minimum_temperature_c, low->values[material_slot]),
+        std::min(maximum_temperature_c, high->values[material_slot])};
+}
 
 std::string numeric_label(int64_t ticks)
 {
@@ -130,12 +174,11 @@ struct Layout {
 Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& config)
 {
     const auto& sweep = input.sweep;
+    const auto& temperature = input.temperature;
+    if (temperature && config.opt_string("printer_model") != "CFSYS Alpha500 Printer")
+        throw std::invalid_argument(heater_gate);
     const auto parameter = static_cast<std::size_t>(sweep.parameter);
     if (parameter >= keys.size()) throw std::invalid_argument("Invalid fiber landing parameter");
-    const auto first = grid(sweep.start), last = grid(sweep.end), step = grid(sweep.step);
-    if (last <= first || step == 0 || (last - first) < step)
-        throw std::invalid_argument("Fiber calibration requires at least two values and a positive step");
-    const auto count = (last - first) / step + 1;
     const auto& types = config.option<ConfigOptionStrings>("filament_process_type")->values;
     if (input.base_filament_slot >= types.size() || input.fiber_filament_slot >= types.size() ||
         types[input.base_filament_slot] != "thermoplastic" || types[input.fiber_filament_slot] != "continuous_fiber")
@@ -151,6 +194,36 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
     validate_material_tool_bindings(print);
     validate_fiber_cut_event(print.fiber_cut_gcode.value, fiber_machine_protocol(print));
     const auto tool = resolve_fiber_tool(print, unsigned(input.fiber_filament_slot));
+    int64_t first, step, count;
+    FiberLandingValues fixed = sweep.fixed;
+    if (temperature) {
+        if (fiber_machine_protocol(print) != FiberMachineProtocol::Cfsys || tool.physical_tool_id != 1)
+            throw std::invalid_argument(heater_gate);
+        if (input.base_filament_slot != temperature_base_slot(config))
+            throw std::invalid_argument(base_slot_error);
+        if (temperature->start_c < minimum_temperature_c || temperature->start_c > maximum_temperature_c ||
+            temperature->end_c < minimum_temperature_c || temperature->end_c > maximum_temperature_c)
+            throw std::invalid_argument("Fiber heater temperature limits: " + std::to_string(minimum_temperature_c) +
+                "–" + std::to_string(maximum_temperature_c) + " °C");
+        const int delta = temperature->start_c - temperature->end_c;
+        if (temperature->step_c <= 0 || delta < temperature->step_c)
+            throw std::invalid_argument(temperature_sweep_error);
+        first = int64_t(temperature->start_c) * 1000;
+        step = -int64_t(temperature->step_c) * 1000;
+        count = delta / temperature->step_c + 1;
+        for (std::size_t i = 0; i < members.size(); ++i) {
+            fixed.*members[i] = config.opt_float(config_keys[i]);
+            if (!std::isfinite(fixed.*members[i]) || fixed.*members[i] < 0)
+                throw std::invalid_argument("Invalid fiber calibration value");
+        }
+    } else {
+        first = grid(sweep.start);
+        const auto last = grid(sweep.end);
+        step = grid(sweep.step);
+        if (step == 0 || last - first < step)
+            throw std::invalid_argument("Fiber calibration requires at least two values and a positive step");
+        count = (last - first) / step + 1;
+    }
     const auto base_logical = print.filament_map.get_at(input.base_filament_slot) - 1;
     if (base_logical < 0 || print.physical_extruder_map.get_at(base_logical) == int(tool.physical_tool_id))
         throw std::invalid_argument("Fiber calibration needs separate base and fiber tools");
@@ -179,10 +252,11 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
     }
     const double base_line_width = *std::max_element(result.wall_widths_mm.begin(), result.wall_widths_mm.end());
     result.label_stroke_mm = std::max(0.7, 1.75 * base_line_width);
-    const double spacing = sweep.trial_spacing_mm.value_or(
+    const auto trial_spacing = temperature ? std::nullopt : sweep.trial_spacing_mm;
+    const double spacing = trial_spacing.value_or(
         std::max(3 * fiber_width, (label_height_in_strokes + 2) * result.label_stroke_mm));
     std::size_t label_columns = 1;
-    if (sweep.trial_spacing_mm) {
+    if (trial_spacing) {
         if (!std::isfinite(spacing) || spacing <= 0)
             throw std::invalid_argument("Fiber trial spacing must be positive");
         // The manual pitch has a 2 mm floor. Wider strands must still have
@@ -212,16 +286,22 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
     plan.filament_map = print.filament_map.values;
     plan.layer_height_mm = h;
     plan.base_top_mm = initial_h + 2 * h;
+    if (temperature)
+        // Keep adjacent temperature bands disjoint even with a 1 °C step.
+        plan.temperature = FiberCalibrationPlan::TemperatureControl{
+            tool.physical_tool_id, "extruder1", std::min(10, 4 * temperature->step_c)};
     double max_landing = 0;
     auto& column_offsets = result.label_column_offsets_mm;
     column_offsets.resize(label_columns);
     for (int64_t i = 0; i < count; ++i) {
         const auto ticks = first + i * step;
         const double value = double(ticks) / 1000;
-        auto landing = sweep.fixed;
-        landing.*members[parameter] = value;
-        for (const auto member : members) (void)grid(landing.*member);
-        if (((parameter == 1 || parameter == 2) && landing.height_mm <= 0) ||
+        auto landing = fixed;
+        if (!temperature) {
+            landing.*members[parameter] = value;
+            for (const auto member : members) (void)grid(landing.*member);
+        }
+        if ((!temperature && (parameter == 1 || parameter == 2) && landing.height_mm <= 0) ||
             (landing.height_mm > 0 && landing.speed_mm_s <= 0))
             throw std::invalid_argument("Landing length or speed calibration requires positive height and descent speed");
         if (fiber_limits->maximum_z_mm > 0 && plan.base_top_mm + h + print.z_offset.value + landing.height_mm > fiber_limits->maximum_z_mm)
@@ -230,7 +310,7 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
         result.labels.push_back(numeric_label(ticks));
         auto& column_width = column_offsets[std::size_t(i) % label_columns];
         column_width = std::max(column_width, label_width(result.labels.back(), result.label_stroke_mm));
-        result.samples.push_back({std::size_t(i + 1), value, units[parameter], landing, {}, {}});
+        result.samples.push_back({std::size_t(i + 1), value, temperature ? "°C" : units[parameter], landing, {}, {}});
     }
 
     const double line_length = std::max({20., config.opt_float("fiber_minimum_path_length") + 2,
@@ -262,7 +342,8 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
         const Vec2d a = start + Vec2d(margin + label_extension, margin + spacing * double(i));
         const Vec2d b = a + Vec2d(line_length, 0);
         const auto& landing = sample.landing;
-        plan.trials.push_back({a, b, landing.height_mm, landing.length_mm, landing.speed_mm_s, landing.extra_prefeed_mm});
+        plan.trials.push_back({a, b, landing.height_mm, landing.length_mm, landing.speed_mm_s,
+            landing.extra_prefeed_mm, temperature ? int(sample.value) : 0});
         sample.start_mm = {float(a.x()), float(a.y()), float(plan.base_top_mm + h)};
         sample.end_mm = {float(b.x()), float(b.y()), float(plan.base_top_mm + h)};
     }
@@ -347,10 +428,7 @@ CalibrationParameters parameters(CalibMode mode, const ConfigSnapshot& snapshot,
     CalibrationParameters form;
     form.mode = mode;
     form.config = snapshot;
-    if (mode == CalibMode::Calib_Fiber_Temperature) {
-        form.diagnostics.push_back({"fiber_calibration", heater_gate, false});
-        return form;
-    }
+    const bool temperature = mode == CalibMode::Calib_Fiber_Temperature;
     auto config = native_config(snapshot);
     const auto add = [&](const char* key, const char* name, std::string value,
                          SettingType type, const char* unit = "") -> SettingItem& {
@@ -368,34 +446,60 @@ CalibrationParameters parameters(CalibMode mode, const ConfigSnapshot& snapshot,
         if (!f.enum_items.empty()) f.value = f.default_value = f.enum_items.front().value;
         f.enabled = f.enum_items.size() > 1;
     };
-    material_field("base_filament_slot", "Base material", "thermoplastic");
-    material_field("fiber_filament_slot", "Fiber material", "continuous_fiber");
-    auto& choice = add("fiber_parameter", "Fiber landing parameter", "1", SettingType::Enum);
-    for (std::size_t i = 0; i < keys.size(); ++i) choice.enum_items.push_back({std::to_string(i), labels[i]});
-    add("start", "Start value", "1", SettingType::Float);
-    add("end", "End value", "3", SettingType::Float);
-    add("step", "Step", "0.5", SettingType::Float);
-    auto& spacing = add("trial_spacing", "Fiber trial spacing", "", SettingType::Float, "mm");
-    spacing.nullable = true;
-    for (std::size_t i = 0; i < keys.size(); ++i)
-        add(keys[i], labels[i], config.option(config_keys[i])->serialize(), SettingType::Float, units[i]);
+    if (!temperature) material_field("base_filament_slot", "Base material", "thermoplastic");
+    material_field("fiber_filament_slot", temperature ? "Fiber calibration material" : "Fiber material", "continuous_fiber");
+    if (temperature) {
+        auto slot_text = form.fields.front().value;
+        for (const auto& [key, value] : values)
+            if (key == "fiber_filament_slot") slot_text = value;
+        int low = 0, high = 0;
+        if (!slot_text.empty()) {
+            const auto slot = index(slot_text);
+            if (slot < materials.size() && materials[slot] == "continuous_fiber")
+                std::tie(low, high) = default_temperature_range(config, slot);
+        }
+        add("start", "Start temperature", high > low ? std::to_string(high) : "", SettingType::Integer, "°C");
+        add("end", "End temperature", high > low ? std::to_string(low) : "", SettingType::Integer, "°C");
+        add("step", "Temperature step", std::to_string(high > low ? std::min(5, high - low) : 5),
+            SettingType::Integer, "°C");
+        try { form.fiber_base_filament_slot = temperature_base_slot(config); }
+        catch (const std::invalid_argument&) { /* The form validator reports the missing base material. */ }
+    } else {
+        auto& choice = add("fiber_parameter", "Fiber landing parameter", "1", SettingType::Enum);
+        for (std::size_t i = 0; i < keys.size(); ++i) choice.enum_items.push_back({std::to_string(i), labels[i]});
+        add("start", "Start value", "1", SettingType::Float);
+        add("end", "End value", "3", SettingType::Float);
+        add("step", "Step", "0.5", SettingType::Float);
+        auto& spacing = add("trial_spacing", "Fiber trial spacing", "", SettingType::Float, "mm");
+        spacing.nullable = true;
+        for (std::size_t i = 0; i < keys.size(); ++i)
+            add(keys[i], labels[i], config.option(config_keys[i])->serialize(), SettingType::Float, units[i]);
+    }
     for (const auto& field_value : values) {
         const auto it = std::find_if(form.fields.begin(), form.fields.end(), [&](const auto& f) { return f.key == field_value.first; });
         if (it == form.fields.end()) throw std::invalid_argument("Unknown fiber calibration field: " + field_value.first);
         it->value = field_value.second;
     }
-    auto selection = std::find_if(form.fields.begin(), form.fields.end(), [](const auto& f) { return f.key == "fiber_parameter"; });
-    const auto selected = index(selection->value);
-    if (selected >= keys.size()) throw std::invalid_argument("Invalid fiber landing parameter");
-    for (auto& f : form.fields) {
-        if (f.key == "start" || f.key == "end" || f.key == "step") f.unit = units[selected];
-        if (f.key == keys[selected]) f.visible = false;
+    if (!temperature) {
+        auto selection = std::find_if(form.fields.begin(), form.fields.end(), [](const auto& f) { return f.key == "fiber_parameter"; });
+        const auto selected = index(selection->value);
+        if (selected >= keys.size()) throw std::invalid_argument("Invalid fiber landing parameter");
+        for (auto& f : form.fields) {
+            if (f.key == "start" || f.key == "end" || f.key == "step") f.unit = units[selected];
+            if (f.key == keys[selected]) f.visible = false;
+        }
     }
     const auto checked = validate(form);
     form.diagnostics = checked.diagnostics;
     if (checked) {
-        const auto& sweep = checked.request.fiber->sweep;
-        form.fiber_sample_count = std::size_t((grid(sweep.end) - grid(sweep.start)) / grid(sweep.step) + 1);
+        const auto& fiber = *checked.request.fiber;
+        if (fiber.temperature) {
+            const auto& sweep = *fiber.temperature;
+            form.fiber_sample_count = std::size_t((sweep.start_c - sweep.end_c) / sweep.step_c + 1);
+        } else {
+            const auto& sweep = fiber.sweep;
+            form.fiber_sample_count = std::size_t((grid(sweep.end) - grid(sweep.start)) / grid(sweep.step) + 1);
+        }
     }
     return form;
 }
@@ -404,25 +508,35 @@ CalibrationValidationResult validate(const CalibrationParameters& form)
 {
     CalibrationValidationResult result;
     try {
-        if (form.mode == CalibMode::Calib_Fiber_Temperature) throw std::invalid_argument(heater_gate);
         const auto get = [&](std::string_view key) -> const std::string& {
             const auto found = std::find_if(form.fields.begin(), form.fields.end(), [&](const auto& f) { return f.key == key; });
             if (found == form.fields.end()) throw std::invalid_argument("Missing fiber calibration field");
             return found->value;
         };
-        FiberLandingSweep sweep;
-        const auto selected = index(get("fiber_parameter"));
-        if (selected >= keys.size()) throw std::invalid_argument("Invalid fiber landing parameter");
-        sweep.parameter = static_cast<FiberLandingParameter>(selected);
-        sweep.start = read_number(get("start"));
-        sweep.end = read_number(get("end"));
-        sweep.step = read_number(get("step"));
-        const auto& spacing = get("trial_spacing");
-        if (!spacing.empty()) sweep.trial_spacing_mm = parse_number(spacing);
-        for (std::size_t i = 0; i < keys.size(); ++i)
-            if (i != selected) sweep.fixed.*members[i] = read_number(get(keys[i]));
-        FiberCalibrationInput input{index(get("base_filament_slot")), index(get("fiber_filament_slot")), sweep};
-        (void)layout(input, native_config(form.config));
+        const auto config = native_config(form.config);
+        if (get("fiber_filament_slot").empty())
+            throw std::invalid_argument("No continuous fiber material is available for calibration");
+        FiberCalibrationInput input;
+        input.fiber_filament_slot = index(get("fiber_filament_slot"));
+        if (form.mode == CalibMode::Calib_Fiber_Temperature) {
+            input.base_filament_slot = temperature_base_slot(config);
+            input.temperature = FiberTemperatureSweep{read_temperature(get("start")),
+                read_temperature(get("end")), read_temperature(get("step"))};
+        } else {
+            input.base_filament_slot = index(get("base_filament_slot"));
+            auto& sweep = input.sweep;
+            const auto selected = index(get("fiber_parameter"));
+            if (selected >= keys.size()) throw std::invalid_argument("Invalid fiber landing parameter");
+            sweep.parameter = static_cast<FiberLandingParameter>(selected);
+            sweep.start = read_number(get("start"));
+            sweep.end = read_number(get("end"));
+            sweep.step = read_number(get("step"));
+            const auto& spacing = get("trial_spacing");
+            if (!spacing.empty()) sweep.trial_spacing_mm = parse_number(spacing);
+            for (std::size_t i = 0; i < keys.size(); ++i)
+                if (i != selected) sweep.fixed.*members[i] = read_number(get(keys[i]));
+        }
+        (void)layout(input, config);
         result.request.mode = form.mode;
         result.request.config = form.config;
         result.request.fiber = input;
@@ -434,8 +548,8 @@ CalibrationValidationResult validate(const CalibrationParameters& form)
 std::shared_ptr<const FiberCalibrationPlan> prepare(const CalibrationRequest& request,
     DynamicPrintConfig& config, Model& model, std::vector<FiberCalibrationSample>& samples)
 {
-    if (request.mode == CalibMode::Calib_Fiber_Temperature) throw std::invalid_argument(heater_gate);
-    if (!request.fiber) throw std::invalid_argument("Fiber calibration needs a sweep and material slots");
+    if (!request.fiber || request.fiber->temperature.has_value() != (request.mode == CalibMode::Calib_Fiber_Temperature))
+        throw std::invalid_argument("Fiber calibration needs a sweep and material slots");
     auto prepared = layout(*request.fiber, config);
     // PrintRegion resolves automatic widths by filament slot. Preserve the
     // selected nozzle's widths when its logical tool and slot differ.

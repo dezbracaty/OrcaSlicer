@@ -1172,6 +1172,7 @@ public:
     bool fiber_execution_required() const;
     void set_fiber_calibration_plan(std::shared_ptr<const FiberCalibrationPlan> plan);
     size_t fiber_calibration_sample_id(const FiberFragmentId& id) const;
+    const FiberCalibrationPlan* fiber_calibration_plan() const { return m_fiber_calibration.get(); }
     void prepare_fiber_geometry_contexts();
     std::vector<int> fiber_locked_filament_map() const;
     std::vector<int> certified_fiber_filament_map() const;

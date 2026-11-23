@@ -12,6 +12,7 @@
 #include "GCode.hpp"
 #include "ContinuousFiber/ContinuousFiberFillStrategy.hpp"
 #include "ContinuousFiber/ContinuousFiberConfig.hpp"
+#include "ContinuousFiber/FiberCalibrationPlan.hpp"
 #include "Exception.hpp"
 #include "ExtrusionEntity.hpp"
 #include "EdgeGrid.hpp"
@@ -6546,7 +6547,27 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
     m_wipe.reset_path();
     m_multi_flow_segment_path_pa_set = false;
     m_multi_flow_segment_path_average_mm3_per_mm = 0;
-    std::string gcode = ";FIBER_BEGIN v=3 occurrence=" + std::to_string(++m_fiber_path_occurrence) +
+    const auto sample = m_print->fiber_calibration_sample_id(prepared.id);
+    std::string gcode;
+    if (sample) {
+        const auto& plan = *m_print->fiber_calibration_plan();
+        if (plan.temperature) {
+            const auto& heater = *plan.temperature;
+            if (bound.physical_tool_id != heater.physical_tool)
+                throw FiberExecutionError("Fiber calibration heater differs from the selected physical tool");
+            const auto target = plan.trials[sample - 1].temperature_c;
+            const double tolerance = heater.tolerance_tenths_c / 10.;
+            // Finish executing the preceding trial before its heater target changes.
+            gcode += "M400\n";
+            gcode += m_writer.set_temperature(unsigned(target), false, int(bound.logical_filament_id));
+            std::ostringstream wait;
+            wait.imbue(std::locale::classic());
+            wait << std::fixed << std::setprecision(1) << "TEMPERATURE_WAIT SENSOR=" << heater.sensor
+                 << " MINIMUM=" << target - tolerance << " MAXIMUM=" << target + tolerance << '\n';
+            gcode += wait.str();
+        }
+    }
+    gcode += ";FIBER_BEGIN v=3 occurrence=" + std::to_string(++m_fiber_path_occurrence) +
         " object=" + std::to_string(prepared.id.parent.domain.object_id) +
         " layer=" + std::to_string(prepared.id.parent.domain.layer_id) +
         " component=" + std::to_string(prepared.id.parent.domain.component_id) +
@@ -6556,7 +6577,7 @@ std::string GCode::extrude_fiber(const ExtrusionFiberPath& path, const std::stri
         " physical=" + std::to_string(bound.physical_tool_id) +
         " width=" + std::to_string(path.width) + " height=" + std::to_string(path.height) +
         " e_units_per_mm=" + std::to_string(bound.e_units_per_mm) + "\n";
-    if (const auto sample = m_print->fiber_calibration_sample_id(prepared.id))
+    if (sample)
         gcode += ";CALIBRATION_FIBER_SAMPLE " + std::to_string(sample) + " " +
             std::to_string(m_fiber_path_occurrence) + "\n";
     // BEGIN metadata is authoritative even before the first powered move.

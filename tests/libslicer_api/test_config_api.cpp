@@ -7870,9 +7870,6 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
         const double extra = parameter == 3 ? starts[parameter] + i * steps[parameter] : fixed[3];
         CHECK(prefeed[i] == Catch::Approx(23 + extra).margin(0.001));
     }
-    const auto temperature_form = calibration_parameters(CalibMode::Calib_Fiber_Temperature, snapshot);
-    CHECK(temperature_form.fields.empty());
-    CHECK_FALSE(validate_calibration_parameters(temperature_form));
     CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "step", "0")));
     if (parameter == 1 || parameter == 2)
         CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "height", "0")));
@@ -7914,4 +7911,93 @@ TEST_CASE("Fiber landing calibration emits a separate fourth layer of ordered sa
         REQUIRE(subsequent);
         CHECK(printer_commands(subsequent.output.path) == ordinary_baseline);
     }
+}
+
+TEST_CASE("Fiber temperature calibration uses the requested temperatures on the bound heater", "[fiber-calibration]")
+{
+    using namespace libslicer;
+    LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"CFSYS"};
+    auto library = Library::open(options);
+    REQUIRE(library);
+    ConfigSelection selection;
+    selection.machine_model_id = "CFSYS Alpha500 Printer";
+    selection.machine_variant_id = "0.4";
+    selection.process_preset_id = "CCF&CIRON @CFSYS";
+    // A logical material index of zero must still heat physical T1.
+    selection.filament_preset_ids = {"CFSYS CCF", "CFSYS CIRON"};
+    selection.filament_physical_tools = {1, 0};
+    auto configured = library->create_config(selection);
+    REQUIRE(configured);
+    // Project snapshots carry one display color per material slot.
+    REQUIRE(configured.config->set("filament_colour", "#111111;#F28E2B").success);
+    REQUIRE(configured.config->set("use_relative_e_distances", "1").success);
+    REQUIRE(configured.config->set("outer_wall_filament_id", "2").success);
+    REQUIRE(configured.config->set("fiber_landing_speed", "4").success);
+    const auto snapshot = configured.config->snapshot();
+    const auto form = calibration_parameters(CalibMode::Calib_Fiber_Temperature, snapshot,
+        {{"start", "262"}, {"end", "259"}, {"step", "2"}});
+    REQUIRE(form.fields.size() == 4);
+    CHECK(form.fields[0].key == "fiber_filament_slot");
+    CHECK(form.fields[1].key == "start");
+    CHECK(form.fields[2].key == "end");
+    CHECK(form.fields[3].key == "step");
+    CHECK(form.fiber_sample_count == 2);
+    CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "step", "0")));
+    CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "start", "262.1")));
+    CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "end", "268")));
+    CHECK_FALSE(validate_calibration_parameters(update_calibration_parameters(form, "start", "400")));
+
+    const auto checked = validate_calibration_parameters(form);
+    for (const auto& diagnostic : checked.diagnostics) UNSCOPED_INFO(diagnostic.message);
+    REQUIRE(checked);
+    const auto preparation = library->prepare_calibration(checked.request);
+    for (const auto& diagnostic : preparation.diagnostics) UNSCOPED_INFO(diagnostic.message);
+    REQUIRE(preparation);
+    REQUIRE(preparation.task->plates().size() == 1);
+    const auto& samples = preparation.task->plates().front().fiber_samples;
+    const std::array<int, 2> targets{262, 260};
+    REQUIRE(samples.size() == targets.size());
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        CHECK(samples[i].value == targets[i]);
+        CHECK(samples[i].unit == "°C");
+        CHECK(samples[i].landing.speed_mm_s == 4.);
+    }
+
+    const auto result = library->slice_calibration(*preparation.task, 0, {});
+    struct TempOutput {
+        std::string path;
+        ~TempOutput() { std::error_code error; std::filesystem::remove(path, error); }
+    } cleanup{result.output.path};
+    for (const auto& diagnostic : result.diagnostics) UNSCOPED_INFO(diagnostic.message);
+    REQUIRE(result);
+    REQUIRE(result.preview);
+    CHECK(result.preview->layers.size() == 4);
+    std::ifstream output{result.output.path};
+    REQUIRE(output.good());
+    std::size_t waits = 0, samples_emitted = 0, cuts = 0;
+    std::string previous, before_previous;
+    for (std::string line; std::getline(output, line);) {
+        if (line.rfind("TEMPERATURE_WAIT SENSOR=", 0) == 0) {
+            REQUIRE(waits < targets.size());
+            const auto target = targets[waits];
+            REQUIRE(cuts == waits);
+            CHECK(before_previous == "M400");
+            CHECK(previous.rfind("M104 S" + std::to_string(target) + " T1 ", 0) == 0);
+            CHECK(line == "TEMPERATURE_WAIT SENSOR=extruder1 MINIMUM=" + std::to_string(target - 1) +
+                ".2 MAXIMUM=" + std::to_string(target) + ".8");
+            ++waits;
+        }
+        if (line.rfind(";CALIBRATION_FIBER_SAMPLE ", 0) == 0)
+            CHECK(++samples_emitted == waits);
+        if (line.rfind(";FIBER_CUT", 0) == 0)
+            ++cuts;
+        before_previous = std::move(previous);
+        previous = std::move(line);
+    }
+    CHECK(waits == targets.size());
+    CHECK(samples_emitted == targets.size());
+    CHECK(cuts == targets.size());
+    CHECK(configured.config->snapshot().value("nozzle_temperature") == snapshot.value("nozzle_temperature"));
 }

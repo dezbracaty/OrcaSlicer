@@ -36,9 +36,13 @@ struct FiberLandingSweep {
     double start{0}, end{0}, step{0};
     std::optional<double> trial_spacing_mm; // Center-to-center spacing, or automatic when omitted.
 };
+struct FiberTemperatureSweep {
+    int start_c{0}, end_c{0}, step_c{0};
+};
 struct FiberCalibrationInput {
     std::size_t base_filament_slot{0}, fiber_filament_slot{0};
     FiberLandingSweep sweep;
+    std::optional<FiberTemperatureSweep> temperature;
 };
 struct FiberCalibrationSample {
     std::size_t id{0};
@@ -90,6 +94,7 @@ struct CalibrationParameters
     std::vector<SliceDiagnostic> diagnostics;
     bool can_refine{false};
     std::size_t fiber_sample_count{0};
+    std::optional<std::size_t> fiber_base_filament_slot;
 };
 struct CalibrationValidationResult
 {
