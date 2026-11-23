@@ -7,6 +7,7 @@
 #include <libslic3r/AppConfig.hpp>
 #include <libslic3r/ParameterUtils.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/CustomGCode.hpp>
 #include <libslic3r/BuildVolume.hpp>
 #include <libslic3r/ClipperUtils.hpp>
 #include <libslic3r/Print.hpp>
@@ -3089,6 +3090,151 @@ std::string encode_project_plate_semantics(const ProjectPlate& plate) {
     return ProjectJson{{"version",1},{"scope","plate"},{"native_plate_index",plate.native_plate_index},{"settings",settings_json(plate.settings,false)},{"custom_gcode_mode",plate.custom_gcode_mode},{"custom_gcodes",code}}.dump();
 }
 
+namespace {
+bool filament_setting_applies(const Slic3r::DynamicPrintConfig& full, std::size_t slot,
+    std::string_view key)
+{
+    return key != "filament_fiber_feed_correction" ||
+        option_value_at(full, "filament_process_type", slot) == "continuous_fiber";
+}
+
+bool filament_setting_read_only(std::string_view key)
+{
+    return key == "filament_colour" || key == "filament_exclude_from_wipe_tower" ||
+        key == "filament_printable" || key == "filament_extruder_variant" || tool_owned_setting(key);
+}
+
+std::optional<std::size_t> filament_setting_index(const Slic3r::DynamicPrintConfig& full,
+    const std::string& key, std::size_t size, std::size_t count, std::size_t slot)
+{
+    if (size == count)
+        return slot;
+    if (!Slic3r::filament_options_with_variant.count(key))
+        return std::nullopt;
+
+    const auto* ids = full.option<Slic3r::ConfigOptionInts>("filament_self_index");
+    const auto* variants = full.option<Slic3r::ConfigOptionStrings>("filament_extruder_variant");
+    const auto* mapping = full.option<Slic3r::ConfigOptionInts>("filament_map");
+    const auto* types = full.option<Slic3r::ConfigOptionEnumsGeneric>("extruder_type");
+    const auto* volumes = full.option<Slic3r::ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    if (!ids || !variants || ids->size() != size || variants->size() != size ||
+        !mapping || slot >= mapping->size() || !types || !volumes)
+        return std::nullopt;
+    const int tool = mapping->values[slot];
+    const auto* nozzles = full.option<Slic3r::ConfigOptionFloats>("nozzle_diameter");
+    if (!nozzles || tool <= 0 || std::size_t(tool) > nozzles->size() ||
+        types->empty() || volumes->empty())
+        return std::nullopt;
+    const int index = full.get_index_for_extruder(static_cast<int>(slot + 1), "filament_self_index",
+        static_cast<Slic3r::ExtruderType>(types->get_at(tool - 1)),
+        static_cast<Slic3r::NozzleVolumeType>(volumes->get_at(tool - 1)), "filament_extruder_variant");
+    if (index < 0 || std::size_t(index) >= size || ids->values[index] != static_cast<int>(slot + 1))
+        return std::nullopt;
+    return static_cast<std::size_t>(index);
+}
+} // namespace
+
+std::vector<FilamentSlotSetting> filament_slot_settings(
+    const ConfigSnapshot& configuration, std::size_t slot_index)
+{
+    std::vector<FilamentSlotSetting> result;
+    if (!configuration.valid()) return result;
+    const auto full = dynamic_config(configuration);
+    const auto* diameters = full.option<Slic3r::ConfigOptionFloats>("filament_diameter");
+    if (!diameters || slot_index >= diameters->size()) return result;
+    const auto append = [&](const std::string& key) {
+        if (!filament_setting_applies(full, slot_index, key)) return;
+        FilamentSlotSetting row;
+        row.key = key;
+        const auto* option = full.option(key);
+        if (const auto* values = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(option)) {
+            const auto index = filament_setting_index(full, key, values->size(), diameters->size(), slot_index);
+            if (index) {
+                auto entries = values->vserialize();
+                if (*index < entries.size()) {
+                    row.scope = filament_setting_read_only(key) ? FilamentSettingScope::ReadOnly
+                                                                : FilamentSettingScope::Slot;
+                    row.value = std::move(entries[*index]);
+                    row.inherited = values->nullable() && values->is_nil(*index);
+                }
+            }
+        } else if (option) {
+            row.scope = FilamentSettingScope::Shared;
+            row.value = option->serialize();
+        }
+        result.push_back(std::move(row));
+    };
+    append("filament_colour");
+    for (const auto& key : Slic3r::Preset::filament_options())
+        append(key);
+    return result;
+}
+
+std::string remove_project_filament_references(
+    std::string_view payload, std::string_view scope, std::size_t removed_slot)
+{
+    auto document = semantic_json(payload, std::string(scope).c_str());
+    if (document.empty()) return std::string(payload);
+    const int removed = static_cast<int>(removed_slot + 1);
+    const bool plate = scope == "plate";
+    const auto parsed = plate ? effective_plate_settings(document) : semantic_settings(document);
+    auto& settings = document["settings"];
+    for (const auto* key : {"support_filament", "support_interface_filament", "brim_filament_id"}) {
+        if (const auto* value = parsed.option<Slic3r::ConfigOptionInt>(key)) {
+            if (value->value == removed) settings.erase(key);
+            else if (value->value > removed) settings[key] = std::to_string(value->value - 1);
+        }
+    }
+    if (plate) {
+        if (const auto* map = parsed.option<Slic3r::ConfigOptionInts>("filament_map");
+            map && removed_slot < map->size()) {
+            auto values = map->values;
+            values.erase(values.begin() + removed_slot);
+            settings["filament_map"] = Slic3r::ConfigOptionInts(std::move(values)).serialize();
+        }
+        const auto remap_order = [removed](std::vector<int>& order) {
+            order.erase(std::remove(order.begin(), order.end(), removed), order.end());
+            for (auto& slot : order)
+                if (slot > removed) --slot;
+        };
+        if (const auto* first = parsed.option<Slic3r::ConfigOptionInts>("first_layer_print_sequence");
+            first && !first->values.empty() && first->values.front() != 0) {
+            auto order = first->values;
+            remap_order(order);
+            settings["first_layer_print_sequence"] = Slic3r::ConfigOptionInts(std::move(order)).serialize();
+        }
+        const auto* other = parsed.option<Slic3r::ConfigOptionInts>("other_layers_print_sequence");
+        const auto* count = parsed.option<Slic3r::ConfigOptionInt>("other_layers_print_sequence_nums");
+        if (other && count && count->value > 0 &&
+            other->size() % std::size_t(count->value) == 0 &&
+            other->size() / std::size_t(count->value) >= 3) {
+            auto sequences = Slic3r::get_other_layers_print_sequence(count->value, other->values);
+            for (auto& entry : sequences) remap_order(entry.second);
+            int segment_count = 0;
+            std::vector<int> values;
+            Slic3r::get_other_layers_print_sequence(sequences, segment_count, values);
+            settings["other_layers_print_sequence"] = Slic3r::ConfigOptionInts(std::move(values)).serialize();
+            settings["other_layers_print_sequence_nums"] = std::to_string(segment_count);
+        }
+        if (auto commands = document.find("custom_gcodes"); commands != document.end() && commands->is_array()) {
+            for (auto command = commands->begin(); command != commands->end();) {
+                const auto type = command->value("type", -1);
+                if (type != Slic3r::CustomGCode::ToolChange && type != Slic3r::CustomGCode::ColorChange) {
+                    ++command;
+                    continue;
+                }
+                const int slot = command->value("filament_slot", 0);
+                if (slot == removed) command = commands->erase(command);
+                else {
+                    if (slot > removed) (*command)["filament_slot"] = slot - 1;
+                    ++command;
+                }
+            }
+        }
+    }
+    return document.dump();
+}
+
 std::string synchronize_project_model_materials(
     std::string_view payload, std::string_view scope, std::size_t count)
 {
@@ -4655,6 +4801,78 @@ SettingsResult Library::set_active_config_value(std::string_view key, std::strin
     return apply_active_config_patch({{std::string(key), std::string(value)}});
 }
 
+SettingsResult Library::apply_active_filament_patch(std::size_t slot_index,
+    std::uint64_t expected_revision, const std::vector<std::pair<std::string, std::string>>& patch)
+{
+    if (!impl_->active->config || expected_revision != impl_->active_revision)
+        return settings_failure("revision", "The configuration changed. Reopen the filament editor.");
+    const auto count = impl_->active->selection.filament_preset_ids.size();
+    if (slot_index >= count)
+        return settings_failure("filament", "Filament slot is unavailable");
+    const auto full = dynamic_config(impl_->active->config->snapshot());
+    const auto& keys = Slic3r::Preset::filament_options();
+    std::vector<std::pair<std::string, std::string>> full_patch;
+    for (const auto& [key, value] : patch) {
+        const auto* before = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(full.option(key));
+        if (!before || std::find(keys.begin(), keys.end(), key) == keys.end() ||
+            filament_setting_read_only(key) || !filament_setting_applies(full, slot_index, key))
+            return settings_failure(key, "This setting cannot be edited for this filament slot");
+        const auto index = filament_setting_index(full, key, before->size(), count, slot_index);
+        if (!index)
+            return settings_failure(key, "The effective filament value could not be determined");
+        try {
+            auto updated = std::unique_ptr<Slic3r::ConfigOptionVectorBase>(
+                static_cast<Slic3r::ConfigOptionVectorBase*>(before->clone()));
+            if (auto* strings = dynamic_cast<Slic3r::ConfigOptionStrings*>(updated.get())) {
+                strings->values[*index] = value;
+            } else {
+                auto element = std::unique_ptr<Slic3r::ConfigOptionVectorBase>(
+                    static_cast<Slic3r::ConfigOptionVectorBase*>(before->clone()));
+                if (!element->deserialize(value) || element->size() != 1)
+                    return settings_failure(key, "Enter one valid value for the filament slot");
+                const bool unset = element->nullable() && element->is_nil(0);
+                if (unset) {
+                    const auto& inherited_keys = Slic3r::print_config_def.extruder_retract_keys();
+                    const auto inherited = std::find_if(inherited_keys.begin(), inherited_keys.end(),
+                        [&key](const std::string& printer_key) { return key == "filament_" + printer_key; });
+                    if (inherited == inherited_keys.end())
+                        return settings_failure(key, "This filament setting requires an explicit value");
+                }
+                const auto* definition = Slic3r::print_config_def.get(key);
+                const auto type = before->type();
+                if ((type == Slic3r::coInts || type == Slic3r::coFloats ||
+                     type == Slic3r::coPercents || type == Slic3r::coFloatsOrPercents) &&
+                    !unset) {
+                    std::istringstream input(value);
+                    input.imbue(std::locale::classic());
+                    double number = 0;
+                    if (!(input >> number) || !std::isfinite(number) ||
+                        number < definition->min || number > definition->max)
+                        return settings_failure(key, "Configuration value is outside the allowed range");
+                    if (type == Slic3r::coPercents || type == Slic3r::coFloatsOrPercents) {
+                        input >> std::ws;
+                        if (input.peek() == '%') input.get();
+                    }
+                    if (!(input >> std::ws).eof() ||
+                        (type == Slic3r::coInts && std::trunc(number) != number))
+                        return settings_failure(key, "Enter one valid value for the filament slot");
+                }
+                updated->set_at(element.get(), *index, 0);
+            }
+            if (*updated != *before)
+                full_patch.emplace_back(key, updated->serialize());
+        } catch (const std::exception& error) {
+            return settings_failure(key, error.what());
+        }
+    }
+    if (full_patch.empty()) {
+        SettingsResult result;
+        result.success = true;
+        return result;
+    }
+    return apply_active_config_patch(full_patch);
+}
+
 ConfigActivationResult Library::restore_active_preset(SettingGroup group, std::optional<std::size_t> filament_slot)
 {
     ConfigActivationResult result;
@@ -4899,6 +5117,74 @@ ConfigActivationResult Library::add_active_filament(std::size_t physical_tool, s
     selection.filament_preset_ids.push_back(requested);
     selection.filament_physical_tools.push_back(unsigned(physical_tool));
     return activate_config(selection);
+}
+
+ConfigurationState Library::prepare_filament_removal(std::size_t slot_index,
+    std::uint64_t expected_revision, std::vector<ConfigDiagnostic>& diagnostics)
+{
+    diagnostics.clear();
+    try {
+        if (expected_revision != impl_->active_revision)
+            throw std::invalid_argument("The active configuration changed");
+        const auto view = active_config();
+        if (!view || !impl_->active->bundle || slot_index >= view->filament_slots.size())
+            throw std::invalid_argument("Filament slot is unavailable");
+        const auto& variant = impl_->active->machine.variant;
+        const auto& capacities = variant.toolhead_filament_capacity;
+        const auto tool = view->filament_slots[slot_index].physical_tool_index;
+        const auto slots_on_tool = std::count_if(view->filament_slots.begin(), view->filament_slots.end(),
+            [tool](const FilamentSlotInfo& slot) { return slot.physical_tool_index == tool; });
+        const auto old_size = view->filament_slots.size();
+        if (capacities.empty() ? !variant.variable_filament_slots || old_size <= 1 :
+            tool >= capacities.size() || slots_on_tool <= 1)
+            throw std::invalid_argument("This material slot is required by the printer");
+
+        auto next = std::make_shared<ConfigurationState::Impl>(*impl_->active);
+        auto full = dynamic_config(impl_->active->config->snapshot());
+        auto& bundle = *next->bundle;
+        bundle.project_config.apply_only(full, {"filament_colour", "filament_multi_colour",
+            "filament_colour_type", "filament_map", "flush_volumes_matrix", "flush_volumes_vector", "flush_multiplier"});
+        if (auto* flush = bundle.project_config.option<Slic3r::ConfigOptionFloats>("flush_volumes_vector");
+            flush && flush->size() == old_size * 2) {
+            const auto first = flush->values.begin() + 2 * slot_index;
+            flush->values.erase(first, first + 2);
+        }
+        bundle.update_num_filaments(static_cast<unsigned>(slot_index));
+
+        for (const auto& key : Slic3r::Preset::filament_options()) {
+            auto* values = dynamic_cast<Slic3r::ConfigOptionVectorBase*>(full.option(key));
+            if (!values || values->size() != old_size) continue;
+            const auto before = std::unique_ptr<Slic3r::ConfigOption>(values->clone());
+            for (auto index = slot_index; index + 1 < old_size; ++index)
+                values->set_at(before.get(), index, index + 1);
+            values->resize(old_size - 1);
+        }
+        full.apply_only(bundle.project_config, {"filament_colour", "filament_multi_colour",
+            "filament_colour_type", "filament_map", "flush_volumes_matrix", "flush_volumes_vector", "flush_multiplier"});
+        full.opt<Slic3r::ConfigOptionStrings>("filament_settings_id", true)->values = bundle.filament_presets;
+        for (const auto* key : {"support_filament", "support_interface_filament", "brim_filament_id"}) {
+            if (auto* slot = full.option<Slic3r::ConfigOptionInt>(key)) {
+                if (slot->value == int(slot_index + 1)) slot->value = 0;
+                else if (slot->value > int(slot_index + 1)) --slot->value;
+            }
+        }
+        next->config.reset(new Config(serialized_values(full)));
+        diagnostics = next->config->validate();
+        auto cardinality = filament_cardinality_diagnostics(*next->config, old_size - 1);
+        diagnostics.insert(diagnostics.end(), cardinality.begin(), cardinality.end());
+        if (!diagnostics.empty()) return {};
+        Slic3r::validate_material_tool_bindings(tool_config(full));
+        impl_->prepare(next);
+        ConfigurationState result;
+        result.impl_ = std::move(next);
+        result.captured_revision_ = expected_revision;
+        result.capture_origin_ = impl_->capture_origin;
+        result.filament_color_cursor_ = impl_->filament_color_cursor;
+        return result;
+    } catch (const std::exception& error) {
+        diagnostics.push_back({"filament", error.what()});
+        return {};
+    }
 }
 
 SettingsResult Library::set_active_filament_color(std::size_t slot_index, Rgba8 color)

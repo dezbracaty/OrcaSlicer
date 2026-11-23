@@ -751,7 +751,20 @@ LIBSLICER_API ProjectPlate decode_project_plate_semantics(std::string_view);
 LIBSLICER_API SettingsResult edit_project_override(const ConfigSnapshot& base,
     std::string_view plate, std::string& target, std::optional<std::string_view> parent_object,
     std::string_view key, std::optional<std::string_view> value);
-// Apply Orca's object-list cleanup for support slots beyond the new palette.
+enum class FilamentSettingScope { Slot, Shared, ReadOnly, Unavailable };
+
+struct FilamentSlotSetting {
+    std::string key;
+    FilamentSettingScope scope{FilamentSettingScope::Unavailable};
+    std::string value;
+    bool inherited{false};
+};
+
+// Read the active material values without falling back to another slot.
+LIBSLICER_API std::vector<FilamentSlotSetting> filament_slot_settings(
+    const ConfigSnapshot& configuration, std::size_t slot_index);
+LIBSLICER_API std::string remove_project_filament_references(
+    std::string_view payload, std::string_view scope, std::size_t removed_slot);
 LIBSLICER_API std::string synchronize_project_model_materials(
     std::string_view semantics, std::string_view scope, std::size_t filament_count);
 // Call only when the machine/material domain changes, before publishing the
@@ -798,6 +811,8 @@ public:
     std::optional<ConfigSnapshot> active_config_snapshot() const;
     SettingsResult apply_active_config_patch(
         const std::vector<std::pair<std::string, std::string>>& patch);
+    SettingsResult apply_active_filament_patch(std::size_t slot_index, std::uint64_t expected_revision,
+        const std::vector<std::pair<std::string, std::string>>& patch);
     SettingsResult set_active_config_value(std::string_view key, std::string_view value);
     SettingsResult reset_active_config_value(std::string_view key);
     // Discard edits to the selected native preset. Filament requires an explicit
@@ -809,6 +824,8 @@ public:
         std::size_t slot_index, std::string_view preset_id);
     ConfigActivationResult resize_active_filament_slots(std::size_t slot_count);
     ConfigActivationResult add_active_filament(std::size_t physical_tool, std::string_view preset_id = {});
+    ConfigurationState prepare_filament_removal(std::size_t slot_index,
+        std::uint64_t expected_revision, std::vector<ConfigDiagnostic>& diagnostics);
     SettingsResult set_active_filament_color(std::size_t slot_index, Rgba8 color);
     std::vector<ConfigDiagnostic> validate_active_config() const;
     SliceResult slice(const SliceRequest& request, const SliceCallbacks& callbacks = {}) const;
