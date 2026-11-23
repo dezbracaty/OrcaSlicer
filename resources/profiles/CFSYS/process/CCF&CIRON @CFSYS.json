@@ -8,7 +8,7 @@
   "fiber_prefeed_extra_length": "0.35",
   "fiber_z_hop_height": "1.0",
   "fiber_landing_length": "0.2",
-  "fiber_landing_speed": "30",
+  "fiber_landing_speed": "12",
   "fiber_infill_max_speed": "10",
   "fiber_infill_bend_radius": "0.5",
   "fiber_contour_bend_radius": "0.3",
