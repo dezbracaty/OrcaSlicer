@@ -1055,6 +1055,7 @@ static std::vector<std::string> s_Preset_print_options{
     "fiber_infill_max_speed",
     "fiber_contour_feed_ratio",
     "fiber_infill_feed_ratio",
+    "fiber_infill_turn_feed_multiplier",
     "fiber_contour_min_speed",
     "fiber_infill_min_speed",
     "fiber_corner_transition_length",

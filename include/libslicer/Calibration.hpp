@@ -23,7 +23,9 @@ enum class CalibMode : int {
     // SDK entry for Orca's handy model, which has no original CalibMode.
     Calib_Tolerance_Model = 13,
     Calib_Fiber_Landing = 14,
-    Calib_Fiber_Temperature = 15
+    Calib_Fiber_Temperature = 15,
+    Calib_Fiber_Turn_Radius = 16,
+    Calib_Fiber_Turn_Flow = 17
 };
 
 enum class FiberLandingParameter { Height, Length, Speed, ExtraPrefeed };
@@ -39,10 +41,18 @@ struct FiberLandingSweep {
 struct FiberTemperatureSweep {
     int start_c{0}, end_c{0}, step_c{0};
 };
+struct FiberTurnSweep {
+    // Descending radius in mm, or ascending commanded feed in percent.
+    double start{0}, end{0}, step{0};
+    double radius_mm{0}; // Fixed radius for the feed sweep.
+    std::optional<double> pitch_mm; // Parallel-leg center distance for the feed sweep.
+    double group_spacing_mm{3}; // Clearance between radius groups' fiber footprints.
+};
 struct FiberCalibrationInput {
     std::size_t base_filament_slot{0}, fiber_filament_slot{0};
     FiberLandingSweep sweep;
     std::optional<FiberTemperatureSweep> temperature;
+    std::optional<FiberTurnSweep> turn;
 };
 struct FiberCalibrationSample {
     std::size_t id{0};
@@ -50,11 +60,18 @@ struct FiberCalibrationSample {
     std::string unit;
     FiberLandingValues landing;
     ToolpathPoint start_mm, end_mm;
+    std::optional<double> process_value; // For turn results, in the native preset unit.
 };
+
+inline bool is_fiber_turn_calibration(CalibMode mode) noexcept
+{
+    return mode == CalibMode::Calib_Fiber_Turn_Radius || mode == CalibMode::Calib_Fiber_Turn_Flow;
+}
 
 inline bool is_fiber_calibration(CalibMode mode) noexcept
 {
-    return mode == CalibMode::Calib_Fiber_Landing || mode == CalibMode::Calib_Fiber_Temperature;
+    return mode == CalibMode::Calib_Fiber_Landing || mode == CalibMode::Calib_Fiber_Temperature ||
+           is_fiber_turn_calibration(mode);
 }
 
 // Values passed by the original calib_dlg.cpp to Plater. Units and sampling

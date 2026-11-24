@@ -260,7 +260,7 @@ void apply_dynamic_presentation(SettingItem& item, const Slic3r::DynamicPrintCon
             config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
     } else if (item.key == "fiber_concentric_corner_stabilization_length") {
         item.visible = item.enabled = concentric;
-    } else if (item.key == "fiber_infill_bend_radius") {
+    } else if (key_is(item.key, {"fiber_infill_bend_radius", "fiber_infill_turn_feed_multiplier"})) {
         item.enabled = infill_enabled && config.opt_enum<Slic3r::InfillPattern>("reinforced_infill_pattern") == Slic3r::ipRectilinear;
     } else if (item.key == "fiber_contour_infill_clearance") {
         item.enabled = contour_enabled && infill_enabled && !concentric;

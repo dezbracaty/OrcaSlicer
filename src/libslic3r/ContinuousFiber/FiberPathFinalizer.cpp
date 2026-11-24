@@ -411,6 +411,8 @@ void plan_edges(FiberPathDraft& prepared, const Polyline3& depositing, const Con
             if (planned.points.back()!=part.points.front())
                 throw std::invalid_argument("Fiber planned primitive has a gap");
             auto record=part.fitting_result.front();
+            const bool powered_infill_arc = !contour && span.kind == FiberMotionKind::PoweredDepositing &&
+                record.path_type != EMovePathType::Linear_move;
             record.start_point_index=planned.points.size()-1;
             record.end_point_index=planned.points.size();
             planned.points.push_back(part.points.back());
@@ -425,7 +427,8 @@ void plan_edges(FiberPathDraft& prepared, const Polyline3& depositing, const Con
                 speed=config.tail_min_speed_mm_s+(config.tail_max_speed_mm_s-config.tail_min_speed_mm_s)*double(cell)/double(cells-1);
                 speed=std::min(speed,tail_limits.limit(global[i-1],global[i]));
             }
-            edges.push_back({speed,span.actively_feeds_fiber()?ratio:0.0});
+            const double feed = powered_infill_arc ? ratio * config.infill_turn_feed_multiplier : ratio;
+            edges.push_back({speed,span.actively_feeds_fiber()?feed:0.0});
             if(!origins.empty()) {
                 const double middle=(global[i-1]+global[i])*0.5;
                 const auto owner=std::find_if(origins.begin(),origins.end(),[&](const auto& piece){

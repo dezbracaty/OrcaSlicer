@@ -5237,7 +5237,9 @@ std::vector<CalibMode> Library::calibration_modes() const
             libslicer::CalibMode::Calib_Cornering,
             libslicer::CalibMode::Calib_Tolerance_Model,
             libslicer::CalibMode::Calib_Fiber_Landing,
-            libslicer::CalibMode::Calib_Fiber_Temperature};
+            libslicer::CalibMode::Calib_Fiber_Temperature,
+            libslicer::CalibMode::Calib_Fiber_Turn_Radius,
+            libslicer::CalibMode::Calib_Fiber_Turn_Flow};
 }
 
 CalibrationPrepareResult Library::prepare_calibration(const CalibrationRequest& request, const SliceCallbacks& callbacks) const

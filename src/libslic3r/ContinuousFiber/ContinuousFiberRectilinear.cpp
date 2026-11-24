@@ -49,6 +49,26 @@ ReturnShape make_return(double radius, double pitch)
     return shape;
 }
 
+template<class Append, class Transform>
+void append_rounded_return(const ReturnShape& shape, Append append_point, Transform world,
+    const double& station, double sweep, std::vector<ContourArc>& arcs)
+{
+    for (size_t k = 0; k < shape.arc_indices.size(); ++k) {
+        const auto [first, last] = shape.arc_indices[k];
+        append_point(shape.samples[first]);
+        ContourArc arc;
+        arc.center_mm = world(Vec2d(0, k == 0 ? shape.radius : shape.pitch - shape.radius));
+        arc.start_mm = world(shape.samples[first]);
+        arc.end_mm = world(shape.samples[last]);
+        arc.radius_mm = shape.radius;
+        arc.sweep_radians = arc.source_sweep_radians = sweep;
+        arc.begin_mm = station;
+        for (size_t i = first + 1; i <= last; ++i) append_point(shape.samples[i]);
+        arc.end_distance_mm = station;
+        arcs.push_back(arc);
+    }
+}
+
 // At a fixed transverse coordinate y, contact occurs at
 // t = boundary_x(y) - return_x(y). Each edge/quarter-circle pair produces one
 // continuous interval of forbidden translations. Its extrema are endpoints
@@ -288,6 +308,44 @@ BoundaryReturns boundary_returns(const ExPolygons& domain, const std::vector<Row
 }
 } // namespace
 
+FiberInfillPath ContinuousFiberFillStrategy::rectilinear_calibration_return(
+    const Vec2d& start_mm, double leg_mm, double radius_mm, double pitch_mm)
+{
+    const auto shape = make_return(radius_mm, pitch_mm);
+    const Vec2d tangent = start_mm + Vec2d(leg_mm, 0);
+    const auto world = [&](const Vec2d& point) -> Vec2d { return tangent + point; };
+    FiberInfillPath path;
+    double station = 0;
+    const auto append_point = [&](const Vec2d& local) {
+        const Point3 next(scaled(world(local)));
+        if (!path.geometry.points.empty()) {
+            if (path.geometry.points.back() == next) return;
+            station += unscale<double>((next - path.geometry.points.back()).cast<double>().norm());
+        }
+        path.geometry.points.push_back(next);
+    };
+    append_point(Vec2d(-leg_mm, 0));
+    append_rounded_return(shape, append_point, world, station, PI / 2, path.arcs);
+    append_point(Vec2d(-leg_mm, pitch_mm));
+    continuous_fiber_detail::bind_contour_arcs(path.geometry, path.arcs);
+    return path;
+}
+
+FiberInfillPath ContinuousFiberFillStrategy::calibration_semicircle(
+    const Vec2d& start_mm, double leg_mm, double radius_mm)
+{
+    const Vec2d entry = start_mm + Vec2d(leg_mm, 0);
+    const Vec2d across(0, 2 * radius_mm);
+    const Vec2d exit = entry + across;
+    const Vec2d end = start_mm + across;
+    FiberInfillPath path;
+    path.geometry.points = {Point3(scaled(start_mm)), Point3(scaled(entry)),
+        Point3(scaled(exit)), Point3(scaled(end))};
+    path.arcs.push_back({entry + Vec2d(0, radius_mm), entry, exit, radius_mm, PI});
+    continuous_fiber_detail::bind_contour_arcs(path.geometry, path.arcs);
+    return path;
+}
+
 FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
     const ExPolygons& material, const ContinuousFiberConfig& config,
     double rotation_radians, const Point& grid_origin)
@@ -508,17 +566,8 @@ FiberInfillCandidates ContinuousFiberFillStrategy::generate_rectilinear(
                     return {link.position + link.direction * p.x(), rows[visits[j].row].y + step * p.y()};
                 };
                 const auto world = [&](const Vec2d& p) -> Vec2d { return frame * local_point(p); };
-                for (size_t k = 0; k < 2; ++k) {
-                    const auto indices = shape->arc_indices[k];
-                    append_point(local_point(shape->samples[indices.first]));
-                    ContourArc arc;
-                    arc.center_mm = world({0, k == 0 ? radius : pitch - radius});
-                    arc.start_mm = world(shape->samples[indices.first]); arc.end_mm = world(shape->samples[indices.second]);
-                    arc.radius_mm = radius; arc.sweep_radians = arc.source_sweep_radians = -link.direction * step * PI / 2;
-                    arc.begin_mm = station;
-                    for (size_t i = indices.first + 1; i <= indices.second; ++i) append_point(local_point(shape->samples[i]));
-                    arc.end_distance_mm = station; path.arcs.push_back(arc);
-                }
+                append_rounded_return(*shape, [&](const Vec2d& p) { append_point(local_point(p)); },
+                    world, station, -link.direction * step * PI / 2, path.arcs);
             }
             const auto& tail = rows[visits[after_last_visit - 1].row].scans[visits[after_last_visit - 1].scan];
             append_point({after_last_visit == first_visit + 1 || links[after_last_visit - 2].direction < 0 ?

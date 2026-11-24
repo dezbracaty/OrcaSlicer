@@ -14,9 +14,9 @@
 
 namespace Slic3r {
 
-const std::array<std::string_view, 44>& fiber_mask_parameter_keys()
+const std::array<std::string_view, 45>& fiber_mask_parameter_keys()
 {
-    static constexpr std::array<std::string_view, 44> keys{{
+    static constexpr std::array<std::string_view, 45> keys{{
         "generate_reinforced_perimeters",
         "fiber_contour_include_holes",
         "fiber_contour_allow_partial_holes",
@@ -48,6 +48,7 @@ const std::array<std::string_view, 44>& fiber_mask_parameter_keys()
         "fiber_infill_min_speed",
         "fiber_contour_feed_ratio",
         "fiber_infill_feed_ratio",
+        "fiber_infill_turn_feed_multiplier",
         "fiber_contour_acceleration",
         "fiber_infill_acceleration",
         "fiber_resin_fill_pattern",
@@ -554,6 +555,8 @@ void validate_fiber_process_config(const ContinuousFiberConfig& config, FiberPat
     check(maximum, contour ? "fiber_contour_max_speed" : "fiber_infill_max_speed", true);
     if (minimum > maximum) throw std::invalid_argument("Continuous fiber minimum speed exceeds maximum speed");
     check(contour ? config.contour_feed_ratio : config.infill_feed_ratio, "fiber feed ratio", true);
+    if (!contour)
+        check(config.infill_turn_feed_multiplier, "fiber_infill_turn_feed_multiplier", true);
     check(contour ? config.contour_feed_correction : config.infill_feed_correction, "fiber feed correction", true);
     check(contour ? config.contour_acceleration_mm_s2 : config.infill_acceleration_mm_s2, "fiber acceleration", true);
     if (is_rectilinear_fiber_infill(config, purpose) && finish_strategy != FiberFinishStrategy::TangentExtension)
@@ -604,6 +607,7 @@ ContinuousFiberConfig fiber_ring_reference_config(const ContinuousFiberConfig& c
     result.infill_max_speed_mm_s=defaults.infill_max_speed_mm_s;
     result.infill_acceleration_mm_s2=defaults.infill_acceleration_mm_s2;
     result.infill_feed_ratio=defaults.infill_feed_ratio;
+    result.infill_turn_feed_multiplier=defaults.infill_turn_feed_multiplier;
     result.infill_feed_correction=defaults.infill_feed_correction;
     result.infill_bend_radius_mm=defaults.infill_bend_radius_mm;
     result.corner_stabilization_length_mm=defaults.corner_stabilization_length_mm;
@@ -716,6 +720,7 @@ static ContinuousFiberConfig resolve_region_fiber_config(
             result.infill_max_speed_mm_s = source.fiber_infill_max_speed.value;
             result.infill_acceleration_mm_s2 = source.fiber_infill_acceleration.value;
             result.infill_feed_ratio = source.fiber_infill_feed_ratio.value;
+            result.infill_turn_feed_multiplier = source.fiber_infill_turn_feed_multiplier.value;
             result.infill_feed_correction = correction_for(result.infill_material);
             validate_fiber_process_config(result, FiberPathPurpose::Infill, FiberFinishStrategy::TangentExtension);
             result.infill_flow = flow_for(result.infill_material);

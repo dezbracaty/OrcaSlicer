@@ -1145,6 +1145,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,                fiber_contour_acceleration))
     ((ConfigOptionFloat,                fiber_contour_feed_ratio))
     ((ConfigOptionFloat,                fiber_infill_feed_ratio))
+    ((ConfigOptionFloat,                fiber_infill_turn_feed_multiplier))
     ((ConfigOptionFloat,                fiber_contour_min_speed))
     ((ConfigOptionFloat,                fiber_infill_min_speed))
     ((ConfigOptionFloat,                fiber_corner_transition_length))

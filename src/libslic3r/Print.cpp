@@ -19,6 +19,7 @@
 #include "Utils.hpp"
 #include "PrintConfig.hpp"
 #include "ContinuousFiber/ContinuousFiberConfig.hpp"
+#include "ContinuousFiber/ContinuousFiberFillStrategy.hpp"
 #include "ContinuousFiber/FiberCalibrationPlan.hpp"
 #include "ContinuousFiber/FiberPathFinalizer.hpp"
 #include "ContinuousFiber/FiberPathValidator.hpp"
@@ -3550,11 +3551,24 @@ void Print::append_fiber_calibration_layer()
         const auto& flow = config.infill_flow;
         ExtrusionPath source(erContinuousFiberInfill, flow.mm3_per_mm(), flow.width(), flow.height());
         const Point p0 = Point::new_scale(trial.start_mm) - shift;
-        const Point p1 = Point::new_scale(trial.end_mm) - shift;
-        source.polyline.points = {Point3(p0), Point3(p1)};
+        std::vector<ContourArc> arcs;
+        if (trial.turn) {
+            const auto& turn = *trial.turn;
+            config.infill_turn_feed_multiplier = turn.feed_multiplier;
+            const Vec2d start = p0.cast<double>() * SCALING_FACTOR;
+            auto path = turn.return_pitch_mm ?
+                ContinuousFiberFillStrategy::rectilinear_calibration_return(
+                    start, turn.leg_length_mm, turn.radius_mm, *turn.return_pitch_mm) :
+                ContinuousFiberFillStrategy::calibration_semicircle(start, turn.leg_length_mm, turn.radius_mm);
+            source.polyline = std::move(path.geometry);
+            arcs = std::move(path.arcs);
+        } else {
+            const Point p1 = Point::new_scale(trial.end_mm) - shift;
+            source.polyline.points = {Point3(p0), Point3(p1)};
+        }
         const FiberFragmentId id{{{object.id().id, 3, 0, 0}, FiberPathPurpose::Infill, 0, index}, 0};
         const auto finish = make_independent_fiber_finish_route(source, config, id);
-        auto final = FiberPathFinalizer::finalize(source, base.lslices, config, id, finish);
+        auto final = FiberPathFinalizer::finalize(source, base.lslices, config, id, finish, arcs);
         if (!final.prepared)
             throw SlicingError(name + ": " + (final.detail.empty() ? "invalid fiber execution path" : final.detail));
         auto path = std::make_unique<ExtrusionFiberPath>(source, erContinuousFiberInfill,

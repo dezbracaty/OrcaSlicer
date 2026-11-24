@@ -169,12 +169,32 @@ struct Layout {
     std::vector<double> label_column_offsets_mm;
     std::array<double, wall_width_keys.size()> wall_widths_mm{};
     double label_stroke_mm = 0;
+    double finish_reserve_mm = 0;
 };
 
-Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& config)
+struct TurnRange {
+    int64_t first, step, count;
+};
+
+TurnRange turn_range(const FiberTurnSweep& sweep, bool flow)
+{
+    const int64_t first = grid(sweep.start);
+    const int64_t last = grid(sweep.end);
+    const int64_t step = grid(sweep.step);
+    const int64_t span = flow ? last - first : first - last;
+    if (!first || !last || !step || span < step)
+        throw std::invalid_argument(flow ? "Use ascending positive percentages and at least two test values" :
+            "Use descending positive radii and at least two test values");
+    return {first, flow ? step : -step, span / step + 1};
+}
+
+Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& config, CalibMode mode)
 {
     const auto& sweep = input.sweep;
     const auto& temperature = input.temperature;
+    const auto& turn = input.turn;
+    const bool turn_flow = mode == CalibMode::Calib_Fiber_Turn_Flow;
+    const bool turn_radius = mode == CalibMode::Calib_Fiber_Turn_Radius;
     if (temperature && config.opt_string("printer_model") != "CFSYS Alpha500 Printer")
         throw std::invalid_argument(heater_gate);
     const auto parameter = static_cast<std::size_t>(sweep.parameter);
@@ -211,11 +231,11 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
         first = int64_t(temperature->start_c) * 1000;
         step = -int64_t(temperature->step_c) * 1000;
         count = delta / temperature->step_c + 1;
-        for (std::size_t i = 0; i < members.size(); ++i) {
-            fixed.*members[i] = config.opt_float(config_keys[i]);
-            if (!std::isfinite(fixed.*members[i]) || fixed.*members[i] < 0)
-                throw std::invalid_argument("Invalid fiber calibration value");
-        }
+    } else if (turn) {
+        const auto range = turn_range(*turn, turn_flow);
+        first = range.first;
+        step = range.step;
+        count = range.count;
     } else {
         first = grid(sweep.start);
         const auto last = grid(sweep.end);
@@ -223,6 +243,13 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
         if (step == 0 || last - first < step)
             throw std::invalid_argument("Fiber calibration requires at least two values and a positive step");
         count = (last - first) / step + 1;
+    }
+    if (temperature || turn) {
+        for (std::size_t i = 0; i < members.size(); ++i) {
+            fixed.*members[i] = config.opt_float(config_keys[i]);
+            if (!std::isfinite(fixed.*members[i]) || fixed.*members[i] < 0)
+                throw std::invalid_argument("Invalid fiber calibration value");
+        }
     }
     const auto base_logical = print.filament_map.get_at(input.base_filament_slot) - 1;
     if (base_logical < 0 || print.physical_extruder_map.get_at(base_logical) == int(tool.physical_tool_id))
@@ -252,9 +279,32 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
     }
     const double base_line_width = *std::max_element(result.wall_widths_mm.begin(), result.wall_widths_mm.end());
     result.label_stroke_mm = std::max(0.7, 1.75 * base_line_width);
-    const auto trial_spacing = temperature ? std::nullopt : sweep.trial_spacing_mm;
+    double max_radius = 0, min_radius = 0, pitch = 0;
+    if (turn) {
+        max_radius = turn_flow ? double(grid(turn->radius_mm)) / 1000 : double(first) / 1000;
+        if (max_radius <= 0)
+            throw std::invalid_argument("Fiber turn radius must be positive");
+        if (turn_flow) {
+            const double min_pitch = std::max(2 * max_radius, fiber_width);
+            pitch = turn->pitch_mm.value_or(std::ceil(min_pitch * 1000) / 1000);
+            if (!std::isfinite(pitch) || pitch < min_pitch)
+                throw std::invalid_argument("Fiber turn pitch must fit both the bend diameter and fiber width");
+        } else {
+            min_radius = double(first + (count - 1) * step) / 1000;
+            if (!std::isfinite(turn->group_spacing_mm) || turn->group_spacing_mm < 0)
+                throw std::invalid_argument("Fiber radius group spacing must be non-negative");
+        }
+    }
+    const double finish_length = config.opt_float("fiber_finish_extension_length");
+    const double minimum_path = config.opt_float("fiber_minimum_path_length");
+    const double start_stabilization = config.opt_float("fiber_start_stabilization_length");
+    const double cut_budget = print.fiber_cut_to_contact_length.value + config.opt_float("fiber_minimum_effective_length");
+    const double turn_leg = turn ? std::max({20., minimum_path / 2 + 2,
+        std::max((fixed.height_mm > 0 ? fixed.length_mm : 0) + start_stabilization, cut_budget) +
+            config.opt_float("fiber_corner_stabilization_length") + 5}) : 0;
+    const auto trial_spacing = temperature || turn ? std::nullopt : sweep.trial_spacing_mm;
     const double spacing = trial_spacing.value_or(
-        std::max(3 * fiber_width, (label_height_in_strokes + 2) * result.label_stroke_mm));
+        std::max(3 * fiber_width, (label_height_in_strokes + 2) * result.label_stroke_mm) + pitch);
     std::size_t label_columns = 1;
     if (trial_spacing) {
         if (!std::isfinite(spacing) || spacing <= 0)
@@ -276,8 +326,17 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
         const double available_stroke = (double(label_columns) * spacing - base_line_width) / label_height_in_strokes;
         result.label_stroke_mm = std::clamp(available_stroke, base_line_width, result.label_stroke_mm);
     }
+    if (turn_radius) {
+        const double minimum_label_pitch = 2 * min_radius + fiber_width + turn->group_spacing_mm;
+        label_columns = std::size_t(std::clamp(
+            std::ceil((label_height_in_strokes * result.label_stroke_mm + base_line_width) /
+                minimum_label_pitch), 1., double(count)));
+    }
     const double margin = std::max({5.0, 2 * fiber_width, 5.5 * result.label_stroke_mm});
-    const double width = 2 * margin + spacing * double(count - 1);
+    const double width = 2 * margin + (turn_radius ?
+        (max_radius + min_radius) * double(count) +
+            (fiber_width + turn->group_spacing_mm) * double(count - 1) :
+        spacing * double(count - 1) + pitch);
     if (!(width + 2 < hi.y() - lo.y())) throw std::invalid_argument("Fiber calibration samples do not fit the build plate");
     result.plan = std::make_shared<FiberCalibrationPlan>();
     auto& plan = *result.plan;
@@ -297,11 +356,11 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
         const auto ticks = first + i * step;
         const double value = double(ticks) / 1000;
         auto landing = fixed;
-        if (!temperature) {
+        if (!temperature && !turn) {
             landing.*members[parameter] = value;
             for (const auto member : members) (void)grid(landing.*member);
         }
-        if ((!temperature && (parameter == 1 || parameter == 2) && landing.height_mm <= 0) ||
+        if ((!temperature && !turn && (parameter == 1 || parameter == 2) && landing.height_mm <= 0) ||
             (landing.height_mm > 0 && landing.speed_mm_s <= 0))
             throw std::invalid_argument("Landing length or speed calibration requires positive height and descent speed");
         if (fiber_limits->maximum_z_mm > 0 && plan.base_top_mm + h + print.z_offset.value + landing.height_mm > fiber_limits->maximum_z_mm)
@@ -310,12 +369,15 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
         result.labels.push_back(numeric_label(ticks));
         auto& column_width = column_offsets[std::size_t(i) % label_columns];
         column_width = std::max(column_width, label_width(result.labels.back(), result.label_stroke_mm));
-        result.samples.push_back({std::size_t(i + 1), value, temperature ? "°C" : units[parameter], landing, {}, {}});
+        result.samples.push_back({std::size_t(i + 1), value,
+            temperature ? "°C" : turn ? (turn_flow ? "%" : "mm") : units[parameter], landing, {}, {},
+            turn ? std::optional<double>{turn_flow ? value / 100 : value} : std::nullopt});
     }
 
-    const double line_length = std::max({20., config.opt_float("fiber_minimum_path_length") + 2,
-        max_landing + config.opt_float("fiber_start_stabilization_length") + config.opt_float("fiber_minimum_effective_length") +
-            print.fiber_cut_to_contact_length.value + 5});
+    const double line_length = turn ? turn_leg :
+        std::max({20., minimum_path + 2, max_landing + start_stabilization + cut_budget + 5});
+    if (turn)
+        result.finish_reserve_mm = finish_length;
     double labels_width = 0;
     for (std::size_t column = 0; column < label_columns; ++column) {
         auto& offset = column_offsets[column];
@@ -325,7 +387,7 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
         labels_width += width;
     }
     const double label_extension = labels_width + margin;
-    const double length = line_length + 2 * margin + label_extension + config.opt_float("fiber_finish_extension_length");
+    const double length = line_length + 2 * margin + label_extension + finish_length + max_radius;
     if (!(length + 2 < hi.x() - lo.x())) throw std::invalid_argument("Fiber calibration samples are too long for the build plate");
     const Vec2d start = (lo + hi - Vec2d(length, width)) / 2;
     const Vec2d stop = start + Vec2d(length, width);
@@ -337,15 +399,30 @@ Layout layout(const FiberCalibrationInput& input, const DynamicPrintConfig& conf
         throw std::invalid_argument("Fiber calibration model does not fit the shared printable area");
     result.corners = {start + Vec2d(3, 0), Vec2d(stop.x(), start.y()), stop,
                       Vec2d(start.x(), stop.y()), start + Vec2d(0, 3)};
+    const double configured_turn_feed = config.opt_float("fiber_infill_turn_feed_multiplier");
+    double sample_y = margin;
     for (std::size_t i = 0; i < result.samples.size(); ++i) {
         auto& sample = result.samples[i];
-        const Vec2d a = start + Vec2d(margin + label_extension, margin + spacing * double(i));
-        const Vec2d b = a + Vec2d(line_length, 0);
+        const Vec2d a = start + Vec2d(margin + label_extension + result.finish_reserve_mm,
+            turn_radius ? sample_y : margin + spacing * double(i));
         const auto& landing = sample.landing;
-        plan.trials.push_back({a, b, landing.height_mm, landing.length_mm, landing.speed_mm_s,
-            landing.extra_prefeed_mm, temperature ? int(sample.value) : 0});
+        std::optional<FiberCalibrationPlan::Turn> turn_trial;
+        if (turn)
+            turn_trial = FiberCalibrationPlan::Turn{turn_flow ? max_radius : sample.value, line_length,
+                turn_flow ? *sample.process_value : configured_turn_feed,
+                turn_flow ? std::optional<double>{pitch} : std::nullopt};
+        Vec2d end = a + Vec2d(line_length, 0);
+        if (turn_flow) end = a + Vec2d(0, pitch);
+        if (turn_radius) {
+            const double diameter = 2 * sample.value;
+            end = a + Vec2d(0, diameter);
+            // The requested gap is edge-to-edge between different radius groups.
+            sample_y += diameter + fiber_width + turn->group_spacing_mm;
+        }
+        plan.trials.push_back({a, end, landing.height_mm, landing.length_mm, landing.speed_mm_s,
+            landing.extra_prefeed_mm, temperature ? int(sample.value) : 0, turn_trial});
         sample.start_mm = {float(a.x()), float(a.y()), float(plan.base_top_mm + h)};
-        sample.end_mm = {float(b.x()), float(b.y()), float(plan.base_top_mm + h)};
+        sample.end_mm = {float(end.x()), float(end.y()), float(plan.base_top_mm + h)};
     }
     return result;
 }
@@ -358,20 +435,22 @@ TriangleMesh base_mesh(const Layout& layout)
     const auto& columns = layout.label_column_offsets_mm;
     for (std::size_t i = 0; i < layout.labels.size(); ++i) {
         const Vec2d& start = layout.plan->trials[i].start_mm;
-        append_label(strokes, layout.labels[i], start - Vec2d(margin + columns[i % columns.size()], 0),
-            layout.label_stroke_mm);
+        const Vec2d position = start - Vec2d(margin + layout.finish_reserve_mm + columns[i % columns.size()], 0);
+        append_label(strokes, layout.labels[i], position, layout.label_stroke_mm);
     }
     Points corners;
     for (const auto& corner : layout.corners) corners.push_back(Point::new_scale(corner));
-    const Point split_bottom = Point::new_scale(Vec2d(first_start.x() - margin / 2, layout.corners[0].y()));
+    const Point split_bottom = Point::new_scale(
+        Vec2d(first_start.x() - layout.finish_reserve_mm - margin / 2, layout.corners[0].y()));
     const Point split_top(split_bottom.x(), corners[2].y());
-    // Subdivide both outer edges at the step so the foundation and the raised
-    // platform share exactly the same vertices along their joined walls.
+    // Match the platform vertices on the foundation's outer edges.
     const Polygon outline({corners[0], split_bottom, corners[1], corners[2], split_top, corners[3], corners[4]});
-    const Polygon left({corners[0], split_bottom, split_top, corners[3], corners[4]});
-    const Polygon right({split_bottom, corners[1], corners[2], split_top});
+    const Polygon platform({split_bottom, corners[1], corners[2], split_top});
+    const ExPolygons foundation_top{ExPolygon(Polygon({corners[0], split_bottom, split_top, corners[3], corners[4]}))};
     const auto labels = union_ex(strokes);
-    const auto exposed_base = diff_ex(ExPolygons{ExPolygon(left)}, labels);
+    if (!diff_ex(labels, foundation_top).empty())
+        throw std::invalid_argument("Fiber calibration labels must fit entirely on the foundation");
+    const auto exposed_base = diff_ex(foundation_top, labels);
     const double platform_top = layout.plan->base_top_mm;
     const double label_top = platform_top - layout.plan->layer_height_mm;
     const double base_top = label_top - layout.plan->layer_height_mm;
@@ -415,8 +494,8 @@ TriangleMesh base_mesh(const Layout& layout)
         append_wall(label.contour, base_top, label_top);
         for (const auto& hole : label.holes) append_wall(hole, base_top, label_top);
     }
-    append_wall(right, base_top, platform_top);
-    append_cap(ExPolygons{ExPolygon(right)}, platform_top, true);
+    append_wall(platform, base_top, platform_top);
+    append_cap(ExPolygons{ExPolygon(platform)}, platform_top, true);
     its_merge_vertices(mesh);
     return TriangleMesh(std::move(mesh));
 }
@@ -429,6 +508,8 @@ CalibrationParameters parameters(CalibMode mode, const ConfigSnapshot& snapshot,
     form.mode = mode;
     form.config = snapshot;
     const bool temperature = mode == CalibMode::Calib_Fiber_Temperature;
+    const bool turn = is_fiber_turn_calibration(mode);
+    const bool turn_flow = mode == CalibMode::Calib_Fiber_Turn_Flow;
     auto config = native_config(snapshot);
     const auto add = [&](const char* key, const char* name, std::string value,
                          SettingType type, const char* unit = "") -> SettingItem& {
@@ -464,6 +545,24 @@ CalibrationParameters parameters(CalibMode mode, const ConfigSnapshot& snapshot,
             SettingType::Integer, "°C");
         try { form.fiber_base_filament_slot = temperature_base_slot(config); }
         catch (const std::invalid_argument&) { /* The form validator reports the missing base material. */ }
+    } else if (turn) {
+        const char* unit = turn_flow ? "%" : "mm";
+        const double width = config.opt_float("fiber_width");
+        const int64_t end_radius = width > 0 && width <= 2e6 ?
+            std::max<int64_t>(400, int64_t(std::ceil(width * 500))) : 500;
+        add("start", "Start value", turn_flow ? "90" :
+            numeric_label(std::max<int64_t>(1000, end_radius + 200)), SettingType::Float, unit);
+        add("end", "End value", turn_flow ? "110" : numeric_label(end_radius), SettingType::Float, unit);
+        add("step", "Step", turn_flow ? "5" : "0.1", SettingType::Float, unit);
+        if (turn_flow) {
+            const double radius = config.opt_float("fiber_infill_bend_radius");
+            const std::string initial_radius = radius > 0 && radius <= 1e6 ?
+                numeric_label(std::max<int64_t>(1, std::llround(radius * 1000))) : "0.5";
+            add("fixed_radius", "Fixed bend radius", initial_radius, SettingType::Float, "mm");
+            add("turn_pitch", "Parallel-leg center distance", "", SettingType::Float, "mm").nullable = true;
+        } else {
+            add("group_spacing", "Radius group spacing", "3", SettingType::Float, "mm");
+        }
     } else {
         auto& choice = add("fiber_parameter", "Fiber landing parameter", "1", SettingType::Enum);
         for (std::size_t i = 0; i < keys.size(); ++i) choice.enum_items.push_back({std::to_string(i), labels[i]});
@@ -480,7 +579,7 @@ CalibrationParameters parameters(CalibMode mode, const ConfigSnapshot& snapshot,
         if (it == form.fields.end()) throw std::invalid_argument("Unknown fiber calibration field: " + field_value.first);
         it->value = field_value.second;
     }
-    if (!temperature) {
+    if (!temperature && !turn) {
         auto selection = std::find_if(form.fields.begin(), form.fields.end(), [](const auto& f) { return f.key == "fiber_parameter"; });
         const auto selected = index(selection->value);
         if (selected >= keys.size()) throw std::invalid_argument("Invalid fiber landing parameter");
@@ -496,6 +595,8 @@ CalibrationParameters parameters(CalibMode mode, const ConfigSnapshot& snapshot,
         if (fiber.temperature) {
             const auto& sweep = *fiber.temperature;
             form.fiber_sample_count = std::size_t((sweep.start_c - sweep.end_c) / sweep.step_c + 1);
+        } else if (fiber.turn) {
+            form.fiber_sample_count = std::size_t(turn_range(*fiber.turn, turn_flow).count);
         } else {
             const auto& sweep = fiber.sweep;
             form.fiber_sample_count = std::size_t((grid(sweep.end) - grid(sweep.start)) / grid(sweep.step) + 1);
@@ -524,6 +625,19 @@ CalibrationValidationResult validate(const CalibrationParameters& form)
                 read_temperature(get("end")), read_temperature(get("step"))};
         } else {
             input.base_filament_slot = index(get("base_filament_slot"));
+        }
+        if (is_fiber_turn_calibration(form.mode)) {
+            auto& turn = input.turn.emplace();
+            turn.start = read_number(get("start"));
+            turn.end = read_number(get("end"));
+            turn.step = read_number(get("step"));
+            if (form.mode == CalibMode::Calib_Fiber_Turn_Flow) {
+                turn.radius_mm = read_number(get("fixed_radius"));
+                if (!get("turn_pitch").empty()) turn.pitch_mm = read_number(get("turn_pitch"));
+            } else {
+                turn.group_spacing_mm = read_number(get("group_spacing"));
+            }
+        } else if (!input.temperature) {
             auto& sweep = input.sweep;
             const auto selected = index(get("fiber_parameter"));
             if (selected >= keys.size()) throw std::invalid_argument("Invalid fiber landing parameter");
@@ -536,7 +650,7 @@ CalibrationValidationResult validate(const CalibrationParameters& form)
             for (std::size_t i = 0; i < keys.size(); ++i)
                 if (i != selected) sweep.fixed.*members[i] = read_number(get(keys[i]));
         }
-        (void)layout(input, config);
+        (void)layout(input, config, form.mode);
         result.request.mode = form.mode;
         result.request.config = form.config;
         result.request.fiber = input;
@@ -548,9 +662,11 @@ CalibrationValidationResult validate(const CalibrationParameters& form)
 std::shared_ptr<const FiberCalibrationPlan> prepare(const CalibrationRequest& request,
     DynamicPrintConfig& config, Model& model, std::vector<FiberCalibrationSample>& samples)
 {
-    if (!request.fiber || request.fiber->temperature.has_value() != (request.mode == CalibMode::Calib_Fiber_Temperature))
+    if (!request.fiber ||
+        request.fiber->temperature.has_value() != (request.mode == CalibMode::Calib_Fiber_Temperature) ||
+        request.fiber->turn.has_value() != is_fiber_turn_calibration(request.mode))
         throw std::invalid_argument("Fiber calibration needs a sweep and material slots");
-    auto prepared = layout(*request.fiber, config);
+    auto prepared = layout(*request.fiber, config, request.mode);
     // PrintRegion resolves automatic widths by filament slot. Preserve the
     // selected nozzle's widths when its logical tool and slot differ.
     for (std::size_t i = 0; i < wall_width_keys.size(); ++i)

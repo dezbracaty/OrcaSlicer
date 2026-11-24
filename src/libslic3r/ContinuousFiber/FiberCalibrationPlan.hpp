@@ -6,10 +6,15 @@
 
 namespace Slic3r {
 struct FiberCalibrationPlan {
+    struct Turn {
+        double radius_mm, leg_length_mm, feed_multiplier;
+        std::optional<double> return_pitch_mm;
+    };
     struct Trial {
         Vec2d start_mm, end_mm;
         double height_mm, length_mm, speed_mm_s, extra_prefeed_mm;
         int temperature_c{0};
+        std::optional<Turn> turn;
     };
     struct TemperatureControl {
         unsigned physical_tool;

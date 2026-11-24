@@ -19,7 +19,7 @@ class LayerRegion;
 struct FiberPolicyBoundary;
 struct FiberGeometryContext;
 
-const std::array<std::string_view, 44>& fiber_mask_parameter_keys();
+const std::array<std::string_view, 45>& fiber_mask_parameter_keys();
 bool is_fiber_mask_parameter(std::string_view key);
 bool is_fiber_execution_parameter(std::string_view key);
 
@@ -64,6 +64,7 @@ struct ContinuousFiberConfig {
     // Independent line-feed model; Flow is geometry only.
     double contour_feed_ratio { 1.0 };
     double infill_feed_ratio { 1.0 };
+    double infill_turn_feed_multiplier { 1.0 };
     double contour_feed_correction { 1.0 };
     double infill_feed_correction { 1.0 };
     double contour_boundary_clearance_mm { 0.0 };

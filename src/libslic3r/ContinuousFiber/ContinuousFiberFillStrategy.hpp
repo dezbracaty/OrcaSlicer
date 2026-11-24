@@ -170,6 +170,10 @@ public:
         const ExPolygons& material, const ContinuousFiberConfig& config,
         double rotation_radians, const Point& grid_origin);
 
+    static FiberInfillPath rectilinear_calibration_return(
+        const Vec2d& start_mm, double leg_mm, double radius_mm, double pitch_mm);
+    static FiberInfillPath calibration_semicircle(const Vec2d& start_mm, double leg_mm, double radius_mm);
+
     // Clearance has already been applied to remaining_material. A hole
     // frontier encloses the original hole and previously accepted rings.
     static FiberContourCandidates generate_contour_level(

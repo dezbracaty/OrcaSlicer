@@ -1378,6 +1378,13 @@ void PrintConfigDef::init_fff_params()
     def->min = 0.000001;
     def->set_default_value(new ConfigOptionFloat(3.0));
 
+    def = this->add("fiber_infill_turn_feed_multiplier", coFloat);
+    def->label = L("Fiber turn feed multiplier");
+    def->tooltip = L("Multiply the commanded fiber feed on actively depositing rounded turns in rectilinear fiber infill. 1.0 uses the straight-line feed.");
+    def->category = L("Continuous fiber");
+    def->min = 0.000001;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
     def = this->add("fiber_infill_min_speed", coFloat);
     def->label = L("Fiber infill minimum speed");
     def->category = L("Continuous fiber");
