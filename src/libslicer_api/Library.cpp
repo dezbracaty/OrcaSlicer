@@ -2434,6 +2434,11 @@ PlaneCutResult cut_mesh_with_plane(const PlaneCutRequest& request)
     return result;
 }
 
+struct SavedFilamentPreset {
+    std::string source_preset_id;
+    Slic3r::DynamicPrintConfig config;
+};
+
 class ConfigurationState::Impl {
 public:
     std::unique_ptr<Config> config;
@@ -2442,7 +2447,7 @@ public:
     std::shared_ptr<Slic3r::PresetBundle> bundle;
     // Saved definitions for embedded presets edited through the flat multi-slot
     // API. The bundle always owns their current working values. No Qt/App state.
-    std::map<std::string, Slic3r::DynamicPrintConfig> filament_saved_configs;
+    std::map<std::string, SavedFilamentPreset> filament_saved_configs;
     ProjectMachine machine;
     ActiveConfigView prepared_view;
     std::string resource_directory;
@@ -2476,6 +2481,7 @@ public:
     mutable std::vector<bool> complete_vendors;
     mutable std::unique_ptr<Slic3r::PresetBundle> filament_library;
     fs::path user_preset_directory;
+    fs::path user_selection_path;
     void load_user_presets(Slic3r::PresetBundle&, std::string_view vendor,
                            std::vector<ConfigDiagnostic>* diagnostics,
                            bool printers_only = false) const;
@@ -3132,6 +3138,37 @@ std::optional<std::size_t> filament_setting_index(const Slic3r::DynamicPrintConf
         return std::nullopt;
     return static_cast<std::size_t>(index);
 }
+
+std::vector<std::string> modified_preset_keys(const Slic3r::DynamicPrintConfig& current,
+    const Slic3r::DynamicPrintConfig& saved)
+{
+    auto keys = current.diff(saved);
+    keys.erase(std::remove_if(keys.begin(), keys.end(), [&](const auto& key) {
+        // Compare at the precision of the serialized configuration used by the editor.
+        return current.opt_serialize(key) == saved.opt_serialize(key);
+    }), keys.end());
+    return keys;
+}
+
+std::vector<std::string> modified_filament_keys(const Slic3r::DynamicPrintConfig& current,
+    const Slic3r::DynamicPrintConfig& saved, std::size_t count, std::size_t slot)
+{
+    auto keys = modified_preset_keys(current, saved);
+    keys.erase(std::remove_if(keys.begin(), keys.end(), [&](const auto& key) {
+        if (!filament_setting_applies(current, slot, key)) return true;
+        const auto* edited = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(current.option(key));
+        const auto* baseline = dynamic_cast<const Slic3r::ConfigOptionVectorBase*>(saved.option(key));
+        if (!edited || !baseline) return false;
+        const auto current_index = filament_setting_index(current, key, edited->size(), count, slot);
+        const auto saved_index = filament_setting_index(saved, key, baseline->size(), count, slot);
+        if (!current_index || !saved_index) return true;
+        const auto current_values = edited->vserialize();
+        const auto saved_values = baseline->vserialize();
+        return *current_index >= current_values.size() || *saved_index >= saved_values.size()
+            || current_values[*current_index] == saved_values[*saved_index];
+    }), keys.end());
+    return keys;
+}
 } // namespace
 
 std::vector<FilamentSlotSetting> filament_slot_settings(
@@ -3448,9 +3485,10 @@ void Library::Impl::prepare_preset_edit(const std::shared_ptr<ConfigurationState
             if (!original || !live) throw std::runtime_error("Cannot retain the saved material preset");
             if (!live->is_project_embedded || state->filament_saved_configs.count(id)) continue;
             const auto prior = state->filament_saved_configs.find(old_ids[slot]);
-            auto baseline = prior == state->filament_saved_configs.end() ? original->config : prior->second;
-            baseline.option<Slic3r::ConfigOptionStrings>("filament_settings_id", true)->values = {id};
-            if (baseline.diff(live->config).empty()) continue;
+            auto baseline = prior == state->filament_saved_configs.end()
+                ? SavedFilamentPreset{original->name, original->config} : prior->second;
+            baseline.config.option<Slic3r::ConfigOptionStrings>("filament_settings_id", true)->values = {id};
+            if (baseline.config.diff(live->config).empty()) continue;
             state->filament_saved_configs.emplace(id, std::move(baseline));
         }
         prepare(state, false);
@@ -3504,7 +3542,7 @@ Slic3r::DynamicPrintConfig Library::Impl::restored_config(
         const auto* original = bundle.filaments.get_selected_preset_name() == id
             ? &bundle.filaments.get_selected_preset() : bundle.filaments.find_preset(id, false);
         if (!original) throw std::runtime_error("The saved material preset is missing");
-        const auto& values = saved == state.filament_saved_configs.end() ? original->config : saved->second;
+        const auto& values = saved == state.filament_saved_configs.end() ? original->config : saved->second.config;
         for (auto& material : materials) if (material.name == id) material.config = values;
     }
     const auto* map = current.option<Slic3r::ConfigOptionInts>("filament_map");
@@ -3561,7 +3599,13 @@ std::unique_ptr<Library> Library::open(const LibraryOptions& options, PresetLoad
         fs::create_directories(data_directory);
         Slic3r::set_data_dir(data_directory.string());
         if (!options.user_preset_directory.empty())
-            library->impl_->user_preset_directory = fs::absolute(options.user_preset_directory);
+            library->impl_->user_preset_directory = fs::absolute(fs::u8path(options.user_preset_directory));
+        if (!options.config_directory.empty()) {
+            const auto config_directory = fs::absolute(fs::u8path(options.config_directory));
+            library->impl_->user_selection_path = config_directory / "selection.conf";
+            if (library->impl_->user_preset_directory.empty())
+                library->impl_->user_preset_directory = config_directory / "user";
+        }
         const fs::path working_directory = data_directory / "work";
         fs::create_directories(working_directory);
         Slic3r::set_temporary_dir(working_directory.string());
@@ -3733,6 +3777,59 @@ const Slic3r::Preset* requested_printer(const Slic3r::PrinterPresetCollection& p
     const auto* preset = printers.find_preset(selection.printer_preset_id, false);
     return preset && preset->is_visible && preset->config.opt_string("printer_model") == selection.machine_model_id &&
         preset->config.opt_string("printer_variant") == selection.machine_variant_id ? preset : nullptr;
+}
+
+// These are the Orca PresetBundle per-printer project defaults. Persist the
+// native option strings so the normal slicer parser applies them on restore.
+constexpr std::array remembered_printer_keys{
+    "curr_bed_type", "filament_colour", "filament_multi_colour", "filament_colour_type",
+    "flush_volumes_matrix", "flush_volumes_vector", "flush_multiplier"
+};
+
+ProjectJson read_user_selections(const fs::path& path)
+{
+    if (path.empty() || !fs::exists(path))
+        return ProjectJson::object();
+    std::ifstream file(path);
+    if (!file)
+        throw std::runtime_error("Cannot open saved slicing selections");
+    auto data = ProjectJson::parse(file);
+    if (!data.is_object())
+        throw std::invalid_argument("Invalid saved slicing selections");
+    return data;
+}
+
+const ProjectJson* remembered_printer(const ProjectJson& data, const ConfigSelection& selection)
+{
+    const auto printers = data.find("printers");
+    if (printers == data.end() || !printers->is_object())
+        return nullptr;
+    const auto model = printers->find(selection.machine_model_id);
+    if (model == printers->end() || !model->is_object())
+        return nullptr;
+    const auto variant = model->find(selection.machine_variant_id);
+    if (variant == model->end() || !variant->is_object())
+        return nullptr;
+    const auto preset = variant->find(selection.printer_preset_id);
+    return preset == variant->end() || !preset->is_object() ? nullptr : &*preset;
+}
+
+void write_user_selections(const fs::path& path, const ProjectJson& data)
+{
+    fs::create_directories(path.parent_path());
+    static std::atomic_uint64_t sequence{0};
+    const auto staging = path.parent_path() / ("selection.writing-" +
+        std::to_string(Slic3r::get_current_pid()) + "-" + std::to_string(++sequence));
+    struct Cleanup {
+        const fs::path& path;
+        ~Cleanup() { std::error_code error; fs::remove(path, error); }
+    } cleanup{staging};
+    std::ofstream file(staging, std::ios::binary | std::ios::trunc);
+    file << data.dump(2) << '\n';
+    file.close();
+    if (!file)
+        throw std::runtime_error("Cannot write slicing selections");
+    fs::rename(staging, path);
 }
 } // namespace
 
@@ -4031,7 +4128,7 @@ void Library::Impl::load_user_presets(Slic3r::PresetBundle& bundle, std::string_
         if (printers_only && collection != &bundle.printers) continue;
         try {
             if (fs::is_directory(directory / section))
-                collection->load_presets(directory.string(), section, substitutions,
+                collection->load_presets(directory.u8string(), section, substitutions,
                     Slic3r::ForwardCompatibilitySubstitutionRule::EnableSilent, nullptr, {}, true);
         } catch (const std::runtime_error& error) {
             append_diagnostic(diagnostics, "user_presets", error.what());
@@ -4248,7 +4345,7 @@ std::vector<PrinterSwitchReview::Preset> native_switch_differences(
 // Activate a material in a temporary native bundle. Preserve the live working
 // values while presenting its retained saved definition to Orca's dirty/save code.
 Slic3r::PresetBundle filament_edit_bundle(const Slic3r::PresetBundle& source,
-    const std::map<std::string, Slic3r::DynamicPrintConfig>& saved, const std::string& id)
+    const std::map<std::string, SavedFilamentPreset>& saved, const std::string& id)
 {
     if (std::find(source.filament_presets.begin(), source.filament_presets.end(), id) == source.filament_presets.end())
         throw std::invalid_argument("The material preset is no longer referenced");
@@ -4261,7 +4358,7 @@ Slic3r::PresetBundle filament_edit_bundle(const Slic3r::PresetBundle& source,
     if (presets.get_selected_preset_name() != id)
         throw std::invalid_argument("The material preset is missing");
     if (const auto original = saved.find(id); original != saved.end())
-        presets.get_selected_preset().config = original->second;
+        presets.get_selected_preset().config = original->second.config;
     presets.discard_current_changes();
     presets.get_edited_preset().config = current;
     presets.update_dirty();
@@ -4270,10 +4367,12 @@ Slic3r::PresetBundle filament_edit_bundle(const Slic3r::PresetBundle& source,
 
 std::vector<PrinterSwitchReview::Preset> switch_differences(Slic3r::PresetBundle& source,
     const Slic3r::PresetWithVendorProfile& target,
-    const std::map<std::string, Slic3r::DynamicPrintConfig>& saved)
+    const std::map<std::string, SavedFilamentPreset>& saved)
 {
     auto selected = filament_edit_bundle(source, saved, source.filaments.get_selected_preset_name());
     auto result = native_switch_differences(selected, target);
+    for (auto& review : result)
+        if (review.type == SwitchPreset::Filament && saved.count(review.name)) review.save_as = true;
     std::set<std::string> seen{source.filaments.get_selected_preset_name()};
     for (const auto& id : source.filament_presets) {
         if (!seen.insert(id).second || !saved.count(id)) continue;
@@ -4284,6 +4383,7 @@ std::vector<PrinterSwitchReview::Preset> switch_differences(Slic3r::PresetBundle
             // Secondary identities have no such target; never invent a slot map.
             review.transfer_allowed = false;
             review.cancel_switch = true;
+            review.save_as = true;
             for (auto& change : review.changes) change.transferable = false;
             result.push_back(std::move(review));
         }
@@ -4331,10 +4431,37 @@ PrinterSwitchSaveResult Library::save_printer_switch_preset(
     std::uint64_t expected_revision, PrinterSwitchPreset type, std::string_view save_name,
     bool validate_only, std::string_view source_preset_id)
 {
+    return save_preset_impl(expected_revision, type, save_name, validate_only, source_preset_id,
+        std::nullopt, std::nullopt, true);
+}
+
+PrinterSwitchSaveResult Library::save_preset(std::uint64_t expected_revision, PrinterSwitchPreset type,
+    PresetSaveMode mode, std::string_view name, std::optional<std::size_t> filament_slot,
+    bool validate_only, bool overwrite_confirmed)
+{
+    return save_preset_impl(expected_revision, type, name, validate_only, {}, mode, filament_slot,
+        overwrite_confirmed);
+}
+
+PrinterSwitchSaveResult Library::save_preset_impl(std::uint64_t expected_revision, PrinterSwitchPreset type,
+    std::string_view save_name, bool validate_only, std::string_view source_preset_id,
+    std::optional<PresetSaveMode> mode, std::optional<std::size_t> filament_slot, bool overwrite_confirmed)
+{
     PrinterSwitchSaveResult result;
+    struct Cleanup {
+        fs::path directory;
+        ~Cleanup() { std::error_code error; if (!directory.empty()) fs::remove_all(directory, error); }
+    } staging;
     try {
         if (expected_revision != impl_->active_revision || !impl_->active->bundle)
             throw std::runtime_error("The configuration changed before saving the preset");
+        if (mode && ((type == SwitchPreset::Filament) != filament_slot.has_value()))
+            throw std::invalid_argument("Choose the material slot whose preset should be saved");
+        if (filament_slot) {
+            const auto& ids = impl_->active->selection.filament_preset_ids;
+            if (*filament_slot >= ids.size()) throw std::invalid_argument("Filament slot is unavailable");
+            source_preset_id = ids[*filament_slot];
+        }
         auto next = std::make_shared<ConfigurationState::Impl>(*impl_->active);
         if (!source_preset_id.empty()) {
             if (type != SwitchPreset::Filament) {
@@ -4348,13 +4475,20 @@ PrinterSwitchSaveResult Library::save_printer_switch_preset(
         auto& source = switch_collection(*next->bundle, type);
         const auto source_name = source.get_selected_preset_name();
         const auto& edited = source.get_edited_preset();
-        if (!source.current_is_dirty())
+        const auto baseline = next->filament_saved_configs.find(source_name);
+        const bool temporary_filament = type == SwitchPreset::Filament && edited.is_project_embedded &&
+            baseline != next->filament_saved_configs.end();
+        const bool save_as = mode ? *mode == PresetSaveMode::SaveAs : !edited.can_overwrite() || temporary_filament;
+        const auto* current = mode == PresetSaveMode::Current && temporary_filament
+            ? source.find_preset(baseline->second.source_preset_id, false, true) : &source.get_selected_preset();
+        if (mode == PresetSaveMode::Current && (!current || !current->is_user()))
+            throw std::invalid_argument("Only a user preset can be saved in place");
+        if ((!mode || !save_as) && !source.current_is_dirty())
             throw std::invalid_argument("The preset has no unsaved changes");
-        const bool save_as = !edited.can_overwrite();
-        const std::string name = save_as ? std::string(save_name) : edited.name;
-        const auto* matched = save_as ? source.find_preset(name, false, true) : &source.get_selected_preset();
+        const std::string name = save_as ? std::string(save_name) : current->name;
+        const auto* matched = save_as ? source.find_preset(name, false, true) : current;
         const auto* collision = matched && matched->name == name ? matched : nullptr;
-        const bool project = !save_as && source.get_selected_preset().is_project_embedded;
+        const bool project = !save_as && current->is_project_embedded;
         if (!project && (name.empty() || name.front() == ' ' || name.back() == ' ' ||
             name.find_first_of("<>[]:\"/\\|?*\r\n\t") != std::string::npos ||
             name.find(Slic3r::PresetCollection::get_suffix_modified()) != std::string::npos ||
@@ -4364,9 +4498,11 @@ PrinterSwitchSaveResult Library::save_printer_switch_preset(
             throw std::invalid_argument("Invalid preset name");
         if (matched && !matched->can_overwrite())
             throw std::invalid_argument("Overwriting a system profile is not allowed");
+        if (mode && save_as && name == source_name)
+            throw std::invalid_argument("Choose a different name for the new preset");
         if (save_as && collision && collision->is_project_embedded)
             throw std::invalid_argument("A preset with this name already exists");
-        if (collision && name != source.get_selected_preset_name())
+        if (save_as && collision && name != source_name)
             result.overwrite_warning = collision->is_compatible
                 ? "Saving will overwrite this user preset."
                 : "Saving will overwrite this user preset, which is incompatible with the current printer.";
@@ -4376,58 +4512,83 @@ PrinterSwitchSaveResult Library::save_printer_switch_preset(
             throw std::runtime_error("The project printer has no installed base for a user preset");
         if (!project && impl_->user_preset_directory.empty())
             throw std::runtime_error("A writable user preset directory is required");
-        if (validate_only) return result;
-
         auto& bundle = *next->bundle;
         auto& collection = switch_collection(bundle, type);
+        fs::path user_directory, staged_file, destination_file;
+        const char* section = type == SwitchPreset::Printer ? PRESET_PRINTER_NAME
+            : type == SwitchPreset::Process ? PRESET_PRINT_NAME : PRESET_FILAMENT_NAME;
         if (!project) {
-            const auto user_directory = impl_->user_preset_directory / vendor;
-            const char* section = type == SwitchPreset::Printer ? PRESET_PRINTER_NAME
-                : type == SwitchPreset::Process ? PRESET_PRINT_NAME : PRESET_FILAMENT_NAME;
+            user_directory = impl_->user_preset_directory / vendor;
+            const auto profiles = fs::weakly_canonical(fs::u8path(impl_->resource_directory) / "profiles");
+            for (const auto& target : {user_directory / section, user_directory / section / "base"})
+                for (auto directory = fs::weakly_canonical(target);
+                     directory.has_relative_path(); directory = directory.parent_path())
+                    if (directory == profiles || (fs::exists(directory) && fs::exists(profiles) && fs::equivalent(directory, profiles)))
+                        throw std::invalid_argument("System profile files are read-only");
+            if (validate_only) return result;
+            if (!result.overwrite_warning.empty() && !overwrite_confirmed)
+                throw std::invalid_argument("Confirm overwriting the existing user preset");
             fs::create_directories(user_directory);
-            collection.update_user_presets_directory(user_directory.string(), section);
-            if (!collision) {
-                const auto bare_name = Slic3r::get_preset_bare_name(name);
-                if (fs::exists(collection.path_from_name(bare_name)) ||
-                    fs::exists(collection.path_from_name(bare_name, true)))
-                    throw std::invalid_argument("A preset with this name already exists");
-            } else {
+            collection.update_user_presets_directory(user_directory.u8string(), section);
+            const auto bare_name = Slic3r::get_preset_bare_name(name);
+            const auto regular_path = fs::u8path(collection.path_from_name(bare_name));
+            const auto base_path = fs::u8path(collection.path_from_name(bare_name, true));
+            if (!collision && (fs::exists(regular_path) || fs::exists(base_path) ||
+                fs::is_symlink(regular_path) || fs::is_symlink(base_path)))
+                throw std::invalid_argument("A preset with this name already exists");
+            // Orca writes JSON and its sidecar directly. Use a private directory
+            // so a failed save leaves the existing preset available.
+            static std::atomic_uint64_t sequence{0};
+            auto temporary = user_directory / (".preset-writing-" + std::to_string(Slic3r::get_current_pid()) + "-" +
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(++sequence));
+            if (!fs::create_directory(temporary)) throw std::runtime_error("Could not stage the user preset");
+            staging.directory = std::move(temporary);
+            collection.update_user_presets_directory(staging.directory.u8string(), section);
+            if (collision) {
                 auto* existing = collection.find_preset(name, false, true);
-                const auto path = fs::u8path(collection.path_for_preset(*existing));
-                if (fs::is_regular_file(path)) {
-                    // Orca's writer does not report a failed stream open.
-                    if (!std::ofstream(path, std::ios::app))
-                        throw std::runtime_error("Could not save user preset: " + name);
-                    existing->file = path.u8string();
-                }
+                existing->file = collection.path_for_preset(*existing);
             }
         }
+        if (validate_only) return result;
+        if (mode && save_as && !collision && type == SwitchPreset::Filament && edited.is_system) {
+            auto* compatible = collection.get_edited_preset().config.option<Slic3r::ConfigOptionStrings>("compatible_printers");
+            if (compatible && compatible->values.empty())
+                compatible->values.push_back(bundle.printers.get_selected_preset_base().name);
+        }
         bundle.save_changes_for_preset(name, collection.type(), {}, project);
-        const auto& saved = collection.get_selected_preset();
+        auto& saved = collection.get_selected_preset();
         if (project) {
             if (saved.name != name || !saved.is_project_embedded || collection.current_is_dirty())
                 throw std::runtime_error("Could not save project preset: " + name);
         } else {
-            if (saved.name != name || !saved.is_user() || !fs::is_regular_file(saved.file))
+            staged_file = fs::u8path(saved.file);
+            if (saved.name != name || !saved.is_user() || !fs::is_regular_file(staged_file))
                 throw std::runtime_error("Could not save user preset: " + name);
-            std::ifstream written(fs::u8path(saved.file));
+            std::ifstream written(staged_file);
             if (ProjectJson::parse(written, nullptr, false).is_discarded())
                 throw std::runtime_error("Could not save user preset: " + name);
-            auto* catalog = impl_->complete_presets(selection.machine_model_id, selection.machine_variant_id);
-            auto& catalog_collection = switch_collection(*catalog, type);
-            auto& installed = catalog_collection.load_preset(saved.file, saved.name, saved.config, false, saved.version);
-            installed = saved;
-            if (installed.inherits().empty()) {
-                for (auto& child : catalog_collection)
-                    if (child.inherits() == installed.name) child.reload(installed);
-            }
+            collection.update_user_presets_directory(user_directory.u8string(), section);
+            saved.file = collection.path_for_preset(saved);
+            collection.get_edited_preset().file = saved.file;
+            destination_file = fs::u8path(saved.file);
         }
         if (type == SwitchPreset::Filament) {
             // The native GUI helper updates slot 0. Rebind only references to
             // the material actually saved, retaining the user's current editor.
             bundle.filament_presets = impl_->active->bundle->filament_presets;
-            for (auto& id : bundle.filament_presets) if (id == source_name) id = saved.name;
-            next->filament_saved_configs.erase(source_name);
+            if (filament_slot) {
+                bundle.filament_presets[*filament_slot] = saved.name;
+            } else {
+                for (auto& id : bundle.filament_presets) if (id == source_name) id = saved.name;
+            }
+            if (name != source_name &&
+                std::find(bundle.filament_presets.begin(), bundle.filament_presets.end(), source_name) != bundle.filament_presets.end()) {
+                auto* live = collection.find_preset(source_name, false, true);
+                const auto* before = impl_->active->bundle->filaments.find_preset(source_name, false, true);
+                if (live && before) live->config = before->config;
+            } else {
+                next->filament_saved_configs.erase(source_name);
+            }
             next->filament_saved_configs.erase(saved.name);
             const auto& previous = impl_->active->bundle->filaments;
             if (previous.get_selected_preset_name() != source_name) {
@@ -4443,13 +4604,32 @@ PrinterSwitchSaveResult Library::save_printer_switch_preset(
         auto full = dynamic_config(next->config->snapshot());
         const auto* map = full.option<Slic3r::ConfigOptionInts>("filament_map");
         const auto composed = bundle.full_config(true, map ? std::optional(map->values) : std::nullopt);
-        if (type == SwitchPreset::Filament)
+        if (type == SwitchPreset::Filament && !mode)
             full.apply_only(composed, Slic3r::Preset::filament_options(), true);
         full.apply_only(composed,
             {"printer_settings_id", "print_settings_id", "filament_settings_id",
              "inherits_group", "different_settings_to_system"});
         next->config.reset(new Config(serialized_values(full)));
         impl_->prepare(next, false);
+        if (!project) {
+            auto* catalog = impl_->complete_presets(selection.machine_model_id, selection.machine_variant_id);
+            auto& catalog_collection = switch_collection(*catalog, type);
+            fs::create_directories(destination_file.parent_path());
+            if (!collision && fs::exists(destination_file))
+                throw std::invalid_argument("A preset with this name already exists");
+            auto staged_info = staged_file;
+            auto destination_info = destination_file;
+            staged_info.replace_extension(".info");
+            destination_info.replace_extension(".info");
+            if (fs::is_regular_file(staged_info)) fs::rename(staged_info, destination_info);
+            fs::rename(staged_file, destination_file);
+            auto& installed = catalog_collection.load_preset(saved.file, saved.name, saved.config, false, saved.version);
+            installed = saved;
+            if (installed.inherits().empty()) {
+                for (auto& child : catalog_collection)
+                    if (child.inherits() == installed.name) child.reload(installed);
+            }
+        }
         result.view = next->prepared_view;
         result.view.revision = ++impl_->active_revision;
         impl_->active = std::move(next);
@@ -4462,15 +4642,55 @@ PrinterSwitchSaveResult Library::save_printer_switch_preset(
 PrinterSwitchResult Library::prepare_printer_switch(
     const ConfigSelection& selection, std::uint64_t expected_revision,
     const std::vector<PrinterSwitchDecision>& decisions,
-    const std::vector<std::pair<std::string, std::string>>& remembered_project_settings)
+    const std::vector<std::pair<std::string, std::string>>& project_overrides)
 {
     PrinterSwitchResult result;
     try {
         if (expected_revision != impl_->active_revision)
             throw std::runtime_error("The configuration changed before the printer switch");
 
+        ConfigSelection effective = selection;
+        std::vector<std::pair<std::string, std::string>> remembered_settings;
+        if (!impl_->user_selection_path.empty() && !impl_->project_printer(selection)) {
+            if (effective.printer_preset_id.empty()) {
+                if (const auto* bundle = impl_->installed_presets(effective.machine_model_id, effective.machine_variant_id)) {
+                    if (const auto* printer = requested_printer(bundle->printers, effective))
+                        effective.printer_preset_id = printer->name;
+                }
+            }
+            try {
+                const auto saved = read_user_selections(impl_->user_selection_path);
+                if (const auto* memory = remembered_printer(saved, effective)) {
+                    if (effective.process_preset_id.empty())
+                        effective.process_preset_id = memory->value("process", std::string{});
+                    if (effective.filament_preset_ids.empty() && effective.filament_physical_tools.empty()) {
+                        effective.filament_preset_ids = memory->value("filament", std::vector<std::string>{});
+                        effective.filament_physical_tools = memory->value("physical_tools", std::vector<unsigned>{});
+                    }
+                    const auto settings = memory->find("settings");
+                    if (settings != memory->end() && settings->is_object()) {
+                        for (const auto* key : remembered_printer_keys) {
+                            const auto field = settings->find(key);
+                            if (field != settings->end() && field->is_string())
+                                remembered_settings.emplace_back(key, field->get<std::string>());
+                        }
+                    }
+                }
+            } catch (const std::exception&) {
+                // Startup reports storage diagnostics. A switch can still use
+                // the installed presets if there is no usable history.
+                effective = selection;
+                remembered_settings.clear();
+            }
+        }
         std::shared_ptr<Slic3r::PresetBundle> target;
-        auto resolved = impl_->resolve_config(selection, &target);
+        auto resolved = impl_->resolve_config(effective, &target);
+        if (!resolved && (effective.process_preset_id != selection.process_preset_id ||
+                          effective.filament_preset_ids != selection.filament_preset_ids ||
+                          effective.filament_physical_tools != selection.filament_physical_tools)) {
+            remembered_settings.clear();
+            resolved = impl_->resolve_config(selection, &target);
+        }
         if (!resolved) {
             result.diagnostics = std::move(resolved.diagnostics);
             return result;
@@ -4535,10 +4755,10 @@ PrinterSwitchResult Library::prepare_printer_switch(
             project.option<Slic3r::ConfigOptionStrings>("filament_colour_type")->values.assign(colors.size(), "1");
         }
         bool restored_multi_color = false;
-        for (const auto& [key, value] : remembered_project_settings) {
-            if (key != "curr_bed_type" && key != "filament_colour" && key != "filament_multi_colour" &&
-                key != "filament_colour_type" && key != "flush_volumes_matrix" &&
-                key != "flush_volumes_vector" && key != "flush_multiplier")
+        remembered_settings.insert(remembered_settings.end(), project_overrides.begin(), project_overrides.end());
+        for (const auto& [key, value] : remembered_settings) {
+            if (std::none_of(remembered_printer_keys.begin(), remembered_printer_keys.end(),
+                             [&](const char* known) { return key == known; }))
                 throw std::invalid_argument("Unexpected remembered printer setting: " + key);
             // A malformed stored field should not discard the other memory.
             // Parse it separately so a failed vector parse cannot alter the
@@ -4590,6 +4810,101 @@ PrinterSwitchResult Library::prepare_printer_switch(
         result.diagnostics.push_back({"printer_switch", error.what()});
     }
     return result;
+}
+
+PrinterSwitchResult Library::prepare_startup_configuration(const ConfigSelection& fallback)
+{
+    std::vector<ConfigDiagnostic> diagnostics;
+    try {
+        const auto saved = read_user_selections(impl_->user_selection_path);
+        if (const auto active = saved.find("active"); active != saved.end()) {
+            ConfigSelection selection;
+            selection.machine_model_id = active->at("model").get<std::string>();
+            selection.machine_variant_id = active->at("variant").get<std::string>();
+            selection.printer_preset_id = active->at("machine").get<std::string>();
+            auto candidate = prepare_printer_switch(selection, impl_->active_revision, {});
+            if (candidate)
+                return candidate;
+            diagnostics = std::move(candidate.diagnostics);
+            if (!selection.printer_preset_id.empty()) {
+                selection.printer_preset_id.clear();
+                candidate = prepare_printer_switch(selection, impl_->active_revision, {});
+                if (candidate) {
+                    candidate.diagnostics = std::move(diagnostics);
+                    return candidate;
+                }
+            }
+        }
+    } catch (const std::exception& error) {
+        diagnostics.push_back({"user_selection", error.what()});
+    }
+    auto candidate = prepare_printer_switch(fallback, impl_->active_revision, {});
+    candidate.diagnostics.insert(candidate.diagnostics.end(), diagnostics.begin(), diagnostics.end());
+    return candidate;
+}
+
+SelectionSaveResult Library::save_user_selection(const ConfigurationState& current,
+                                                const SelectionSaveOptions& options)
+{
+    if (impl_->user_selection_path.empty())
+        return {true, {}};
+    try {
+        if (!current.valid() || current.capture_origin_.lock() != impl_->capture_origin ||
+            current.impl_ != impl_->active || current.captured_revision_ != impl_->active_revision)
+            throw std::invalid_argument("Only the current committed slicing selection can be saved");
+        if (options.previous && options.previous->valid() &&
+            options.previous->capture_origin_.lock() != impl_->capture_origin)
+            throw std::invalid_argument("The previous slicing selection belongs to a different library");
+        if (current.machine().project_local && (!options.previous || !options.previous->valid() ||
+                                                options.previous->machine().project_local))
+            return {true, {}};
+
+        ProjectJson previous = ProjectJson::object();
+        try {
+            previous = read_user_selections(impl_->user_selection_path);
+        } catch (const ProjectJson::exception&) {
+            // A committed edit can replace a file that could not be parsed.
+        } catch (const std::invalid_argument&) {
+        }
+        auto saved = previous;
+        if (!saved.contains("printers") || !saved["printers"].is_object())
+            saved["printers"] = ProjectJson::object();
+        const auto remember = [&](const ConfigurationState& state, bool palette, bool active) {
+            if (!state.valid() || state.machine().project_local)
+                return;
+            const auto& selection = state.view().selection;
+            if (selection.printer_preset_id.empty())
+                return;
+            auto& record = saved["printers"][selection.machine_model_id][selection.machine_variant_id][selection.printer_preset_id];
+            if (!record.is_object())
+                record = ProjectJson::object();
+            record["process"] = selection.process_preset_id;
+            record["filament"] = selection.filament_preset_ids;
+            record["physical_tools"] = selection.filament_physical_tools;
+            auto& settings = record["settings"];
+            if (!settings.is_object())
+                settings = ProjectJson::object();
+            const auto config = state.snapshot();
+            for (const auto* key : remembered_printer_keys) {
+                if (!palette && std::string_view(key).find("filament_") == 0)
+                    continue;
+                if (const auto value = config.value(key))
+                    settings[key] = *value;
+            }
+            if (active) {
+                saved["active"] = {{"model", selection.machine_model_id}, {"variant", selection.machine_variant_id},
+                                   {"machine", selection.printer_preset_id}};
+            }
+        };
+        if (options.previous)
+            remember(*options.previous, options.remember_previous_palette, false);
+        remember(current, options.remember_current_palette, true);
+        if (saved != previous)
+            write_user_selections(impl_->user_selection_path, saved);
+        return {true, {}};
+    } catch (const std::exception& error) {
+        return {false, {{"user_selection", error.what()}}};
+    }
 }
 
 ConfigActivationResult Library::activate_config(
@@ -4706,13 +5021,20 @@ std::optional<ActiveConfigView> Library::active_config() const
     view.selection.filament_physical_tools.clear();
 
     const Slic3r::DynamicPrintConfig config = dynamic_config(impl_->active->config->snapshot());
-    view.modified_process_keys = config.diff(impl_->restored_config(*impl_->active, config, SettingGroup::Process));
-    view.printer_preset_modified = !config.diff(impl_->restored_config(*impl_->active, config, SettingGroup::Printer)).empty();
+    view.modified_process_keys = modified_preset_keys(config,
+        impl_->restored_config(*impl_->active, config, SettingGroup::Process));
+    view.modified_printer_keys = modified_preset_keys(config,
+        impl_->restored_config(*impl_->active, config, SettingGroup::Printer));
+    view.printer_preset_modified = !view.modified_printer_keys.empty();
     view.filament_slots=project_filament_slots(config,view.selection.filament_preset_ids.size());
+    view.modified_filament_keys.reserve(view.filament_slots.size());
     for (std::size_t index = 0; index < view.filament_slots.size(); ++index) {
         auto& slot=view.filament_slots[index];
         slot.preset_id=view.selection.filament_preset_ids[index];
-        slot.preset_modified = !config.diff(impl_->restored_config(*impl_->active, config, SettingGroup::Filament, index)).empty();
+        view.modified_filament_keys.push_back(modified_filament_keys(config,
+            impl_->restored_config(*impl_->active, config, SettingGroup::Filament, index),
+            view.filament_slots.size(), index));
+        slot.preset_modified = !view.modified_filament_keys.back().empty();
         const auto preset=std::find_if(view.compatible_filaments.begin(),view.compatible_filaments.end(),
             [&slot](const PresetOption& option){return option.id==slot.preset_id;});
         slot.preset_name=preset==view.compatible_filaments.end()?slot.preset_id:preset->name;
@@ -4902,7 +5224,7 @@ ConfigActivationResult Library::restore_active_preset(SettingGroup group, std::o
                 throw std::runtime_error("The saved material preset is missing");
             const auto saved = next->filament_saved_configs.find(name);
             if (saved != next->filament_saved_configs.end())
-                presets.get_selected_preset().config = saved->second;
+                presets.get_selected_preset().config = saved->second.config;
             presets.discard_current_changes();
             auto* live = next->bundle->filaments.find_preset(name, false, true);
             live->config = presets.get_edited_preset().config;

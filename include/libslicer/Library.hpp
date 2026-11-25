@@ -102,6 +102,9 @@ struct LibraryOptions
     std::vector<std::string> vendors;
     // Optional writable root for Orca user presets, separate from slice work files.
     std::string user_preset_directory;
+    // Writable selection state. An empty path disables selection persistence.
+    // User presets default to the user subdirectory when no override is supplied.
+    std::string config_directory;
 };
 
 // OnDemand retains the complete system/user printer catalog, but loads a
@@ -158,6 +161,9 @@ struct ActiveConfigView
     std::vector<FilamentSlotInfo> filament_slots;
     std::vector<std::string> modified_process_keys;
     bool printer_preset_modified{false};
+    std::vector<std::string> modified_printer_keys;
+    // Indexed by logical filament slot, matching filament_slots.
+    std::vector<std::vector<std::string>> modified_filament_keys;
     bool valid() const noexcept { return revision != 0; }
 };
 
@@ -171,6 +177,7 @@ struct ConfigActivationResult
 };
 
 enum class PrinterSwitchPreset { Printer, Process, Filament };
+enum class PresetSaveMode { Current, SaveAs };
 enum class PrinterSwitchAction { Transfer, Discard, Cancel };
 
 struct PrinterSwitchChange
@@ -739,6 +746,16 @@ struct PrinterSwitchResult {
     std::vector<ConfigDiagnostic> diagnostics;
     explicit operator bool() const noexcept { return configuration.valid(); }
 };
+struct SelectionSaveOptions {
+    std::optional<ConfigurationState> previous;
+    bool remember_current_palette{true};
+    bool remember_previous_palette{true};
+};
+struct SelectionSaveResult {
+    bool success{false};
+    std::vector<ConfigDiagnostic> diagnostics;
+    explicit operator bool() const noexcept { return success; }
+};
 LIBSLICER_API std::string encode_project_object_semantics(const ProjectObject&);
 LIBSLICER_API std::string encode_project_part_semantics(const ProjectPart&);
 LIBSLICER_API std::string encode_project_part_annotations(const ProjectPart&);
@@ -803,10 +820,21 @@ public:
     PrinterSwitchSaveResult save_printer_switch_preset(
         std::uint64_t expected_revision, PrinterSwitchPreset type, std::string_view save_name,
         bool validate_only = false, std::string_view source_preset_id = {});
+    // Save changes to the selected user preset, or save a copy under a new name.
+    // A filament request targets one slot. Validation never writes or changes the active configuration.
+    PrinterSwitchSaveResult save_preset(std::uint64_t expected_revision, PrinterSwitchPreset type,
+        PresetSaveMode mode, std::string_view name, std::optional<std::size_t> filament_slot = {},
+        bool validate_only = false, bool overwrite_confirmed = false);
     PrinterSwitchResult prepare_printer_switch(
         const ConfigSelection& target, std::uint64_t expected_revision,
         const std::vector<PrinterSwitchDecision>& decisions,
-        const std::vector<std::pair<std::string, std::string>>& remembered_project_settings = {});
+        const std::vector<std::pair<std::string, std::string>>& project_overrides = {});
+    // Prepares a candidate without installing it or writing user selections.
+    PrinterSwitchResult prepare_startup_configuration(const ConfigSelection& fallback);
+    // Call after the host commits the edit. The previous installed snapshot,
+    // when supplied, updates that printer's memory in the same write.
+    SelectionSaveResult save_user_selection(
+        const ConfigurationState& current, const SelectionSaveOptions& options = {});
     std::optional<ActiveConfigView> active_config() const;
     std::optional<ConfigSnapshot> active_config_snapshot() const;
     SettingsResult apply_active_config_patch(
@@ -856,6 +884,9 @@ public:
 
 private:
     Library();
+    PrinterSwitchSaveResult save_preset_impl(std::uint64_t expected_revision, PrinterSwitchPreset type,
+        std::string_view name, bool validate_only, std::string_view source_preset_id,
+        std::optional<PresetSaveMode> mode, std::optional<std::size_t> filament_slot, bool overwrite_confirmed);
     SliceResult slice_impl(const SliceRequest& request, const SliceCallbacks& callbacks,
         const CalibrationTask* calibration, std::size_t plate_index) const;
 

@@ -23,6 +23,7 @@
 #endif /* L */
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -55,6 +56,16 @@ using boost::property_tree::ptree;
 namespace Slic3r {
 
 namespace {
+
+boost::filesystem::path preset_path_from_utf8(const std::string& path)
+{
+    return boost::filesystem::path(std::filesystem::u8path(path).native());
+}
+
+std::string preset_path_to_utf8(const boost::filesystem::path& path)
+{
+    return std::filesystem::path(path.native()).u8string();
+}
 
 struct ParsedName {
     PresetOrigin::Kind kind { PresetOrigin::Kind::User };
@@ -624,9 +635,9 @@ void Preset::save_info(std::string file)
     if (this->is_project_embedded || this->is_from_bundle())
         return;
     if (file.empty()) {
-        fs::path idx_file(this->file);
+        auto idx_file = preset_path_from_utf8(this->file);
         idx_file.replace_extension(".info");
-        file = idx_file.string();
+        file = preset_path_to_utf8(idx_file);
     }
 
     boost::nowide::ofstream c;
@@ -651,7 +662,7 @@ void Preset::remove_files(bool cloud_already_deleted)
     }
     // Erase the preset file.
     boost::nowide::remove(this->file.c_str());
-    fs::path idx_path(this->file);
+    auto idx_path = preset_path_from_utf8(this->file);
     idx_path.replace_extension(".info");
     if (fs::exists(idx_path)) {
         if (!this->setting_id.empty() && !cloud_already_deleted) {
@@ -660,7 +671,7 @@ void Preset::remove_files(bool cloud_already_deleted)
             this->save_info(idx_path.string());
         } else {
             // Local-only preset or cloud already confirmed deletion - safe to delete .info immediately
-            boost::nowide::remove(idx_path.string().c_str());
+            boost::nowide::remove(preset_path_to_utf8(idx_path).c_str());
         }
     }
 }
@@ -685,7 +696,7 @@ void Preset::save(DynamicPrintConfig* parent_config)
     else
         from_str = std::string("Default");
 
-    boost::filesystem::create_directories(fs::path(this->file).parent_path());
+    boost::filesystem::create_directories(preset_path_from_utf8(this->file).parent_path());
     const std::string bare_name = get_preset_bare_name(this->name);
 
     //BBS: only save difference if it has parent
@@ -738,9 +749,9 @@ void Preset::save(DynamicPrintConfig* parent_config)
 
     // Bundle presets are synced via bundle_id and don't need individual .info files.
     if (! this->is_from_bundle()) {
-        fs::path idx_file(this->file);
+        auto idx_file = preset_path_from_utf8(this->file);
         idx_file.replace_extension(".info");
-        this->save_info(idx_file.string());
+        this->save_info(preset_path_to_utf8(idx_file));
     }
 }
 
@@ -1643,18 +1654,18 @@ void PresetCollection::load_presets(
 {
     // Don't use boost::filesystem::canonical() on Windows, it is broken in regard to reparse points,
     // see https://github.com/prusa3d/PrusaSlicer/issues/732
-    boost::filesystem::path dir = boost::filesystem::absolute(boost::filesystem::path(dir_path) / subdir).make_preferred();
+    boost::filesystem::path dir = boost::filesystem::absolute(preset_path_from_utf8(dir_path) / subdir).make_preferred();
     const PresetOrigin resolved_origin = detect_origin_from_path(dir, load_origin);
 
     // Load custom roots first
     if (fs::exists(dir / "base")) {
-        load_presets(dir.string(), "base", substitutions, substitution_rule, nullptr, resolved_origin, read_only);
+        load_presets(preset_path_to_utf8(dir), "base", substitutions, substitution_rule, nullptr, resolved_origin, read_only);
     }
 
     //BBS: add config related logs
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" enter, load presets from %1%, current type %2%")%dir %Preset::get_type_string(m_type);
     //BBS do not parse folder if not exists
-    m_dir_path = dir.string();
+    m_dir_path = preset_path_to_utf8(dir);
     if (!fs::exists(dir)) {
         if (!read_only) fs::create_directory(dir);
         return;
@@ -1662,7 +1673,7 @@ void PresetCollection::load_presets(
 
     const auto remove_invalid_preset = [read_only](const Preset& preset) {
         if (read_only) return;
-        fs::path file_path(preset.file);
+        auto file_path = preset_path_from_utf8(preset.file);
         fs::remove(file_path);
         file_path.replace_extension(".info");
         fs::remove(file_path);
@@ -1680,7 +1691,7 @@ void PresetCollection::load_presets(
     //BBS: change to json format
     for (auto &dir_entry : boost::filesystem::directory_iterator(dir))
     {
-        std::string file_name = dir_entry.path().filename().string();
+        std::string file_name = preset_path_to_utf8(dir_entry.path().filename());
         //if (Slic3r::is_ini_file(dir_entry)) {
         if (Slic3r::is_json_file(file_name)) {
             // Remove the .ini suffix.
@@ -1695,13 +1706,13 @@ void PresetCollection::load_presets(
             try {
                 Preset preset(m_type, canonical_name, false);
                 preset.bundle_id = resolved_origin.bundle_id;
-                preset.file = dir_entry.path().string();
+                preset.file = preset_path_to_utf8(dir_entry.path());
                 // Load the preset file, apply preset values on top of defaults.
                 try {
-                    fs::path idx_path(preset.file);
+                    auto idx_path = dir_entry.path();
                     idx_path.replace_extension(".info");
                     if (fs::exists(idx_path)) {
-                        preset.load_info(idx_path.string());
+                        preset.load_info(preset_path_to_utf8(idx_path));
                     }
                     DynamicPrintConfig config;
                     //BBS: change to json format
@@ -2145,23 +2156,23 @@ int PresetCollection::get_user_presets(PresetBundle *preset_bundle, std::vector<
 //BBS: update user presets directory
 void PresetCollection::update_user_presets_directory(const std::string& dir_path, const std::string& type)
 {
-    boost::filesystem::path dir = boost::filesystem::absolute(boost::filesystem::path(dir_path) / type).make_preferred();
+    boost::filesystem::path dir = boost::filesystem::absolute(preset_path_from_utf8(dir_path) / type).make_preferred();
 
     if (!fs::exists(dir))
         fs::create_directory(dir);
 
-    m_dir_path = dir.string();
+    m_dir_path = preset_path_to_utf8(dir);
 }
 
 //BBS: save user presets to local
 void PresetCollection::save_user_presets(const std::string& dir_path, const std::string& type, std::map<std::string, std::string>& need_to_delete_list)
 {
-    boost::filesystem::path dir = boost::filesystem::absolute(boost::filesystem::path(dir_path) / type).make_preferred();
+    boost::filesystem::path dir = boost::filesystem::absolute(preset_path_from_utf8(dir_path) / type).make_preferred();
 
     if (!fs::exists(dir))
         fs::create_directory(dir);
 
-    m_dir_path = dir.string();
+    m_dir_path = preset_path_to_utf8(dir);
 
     std::vector<std::string> delete_name_list;
     //std::map<std::string, Preset*>::iterator it;
@@ -3911,10 +3922,9 @@ std::string PresetCollection::path_from_name(const std::string &new_name, bool d
      //BBS: change to json format
     //std::string file_name = boost::iends_with(new_name, ".ini") ? new_name : (new_name + ".ini");
     std::string file_name = boost::iends_with(new_name, ".json") ? new_name : (new_name + ".json");
-    if (detach)
-        return (boost::filesystem::path(m_dir_path) / "base" / file_name).make_preferred().string();
-    else
-        return (boost::filesystem::path(m_dir_path) / file_name).make_preferred().string();
+    auto directory = preset_path_from_utf8(m_dir_path);
+    if (detach) directory /= "base";
+    return preset_path_to_utf8((directory / preset_path_from_utf8(file_name)).make_preferred());
 }
 
 std::string PresetCollection::path_for_preset(const Preset &preset) const

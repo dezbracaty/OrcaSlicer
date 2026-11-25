@@ -976,6 +976,115 @@ TEST_CASE("native preset rollback preserves other presets and P3 project state",
     CHECK(library->configuration_revision() == revision);
 }
 
+TEST_CASE("standalone presets persist without changing system profiles or other material slots", "[libslicer_api][preset-save]")
+{
+    namespace fs = std::filesystem;
+    using Domain = libslicer::PrinterSwitchPreset;
+    using Mode = libslicer::PresetSaveMode;
+    const auto directory = fs::temp_directory_path() /
+        ("libslicer-preset-save-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct Cleanup { fs::path path; ~Cleanup() { std::error_code error; fs::remove_all(path, error); } } cleanup{directory};
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.vendors = {"P3"};
+    options.config_directory = directory.string();
+    auto library = libslicer::Library::open(options);
+    REQUIRE(library);
+    libslicer::ConfigSelection selection;
+    selection.machine_model_id = "P3";
+    selection.machine_variant_id = "0.4";
+    selection.filament_preset_ids.assign(6, "Generic PLA @P3");
+    REQUIRE(library->activate_config(selection).success);
+    const auto initial = library->active_config()->selection;
+    const auto system_path = fs::u8path(options.resource_directory) / "profiles" / "P3" / "process" /
+        (initial.process_preset_id + ".json");
+    const auto file_contents = [](const fs::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+    const auto system_contents = file_contents(system_path);
+    REQUIRE_FALSE(system_contents.empty());
+
+    const auto save = [&](Domain domain, Mode mode, std::string_view name = {},
+                          std::optional<std::size_t> slot = {}, bool validation = false, bool overwrite = false) {
+        auto result = library->save_preset(library->configuration_revision(), domain, mode, name, slot, validation, overwrite);
+        for (const auto& issue : result.diagnostics) UNSCOPED_INFO(issue.message);
+        return result;
+    };
+    CHECK_FALSE(save(Domain::Process, Mode::Current));
+    CHECK_FALSE(save(Domain::Process, Mode::SaveAs, initial.process_preset_id));
+    CHECK(save(Domain::Printer, Mode::SaveAs, "My Printer", {}, true).diagnostics.empty());
+    CHECK_FALSE(fs::exists(directory / "user"));
+    REQUIRE(save(Domain::Printer, Mode::SaveAs, "My Printer"));
+    CHECK(library->active_config()->selection.printer_preset_id == "My Printer");
+
+    REQUIRE(library->set_active_config_value("outer_wall_speed", "87"));
+    REQUIRE(save(Domain::Process, Mode::SaveAs, "My Process"));
+    REQUIRE(library->set_active_config_value("outer_wall_speed", "91"));
+    REQUIRE(save(Domain::Process, Mode::Current));
+    CHECK_FALSE(save(Domain::Process, Mode::Current));
+    REQUIRE(save(Domain::Process, Mode::SaveAs, "Copied Process"));
+    CHECK(library->active_config()->selection.process_preset_id == "Copied Process");
+    const auto revision = library->configuration_revision();
+    auto collision = save(Domain::Process, Mode::SaveAs, "My Process", {}, true);
+    CHECK(collision.diagnostics.empty());
+    CHECK_FALSE(collision.overwrite_warning.empty());
+    CHECK_FALSE(save(Domain::Process, Mode::SaveAs, "My Process"));
+    CHECK(library->configuration_revision() == revision);
+    REQUIRE(save(Domain::Process, Mode::SaveAs, "My Process", {}, false, true));
+    CHECK_FALSE(library->save_preset(revision, Domain::Process, Mode::SaveAs, "Stale Copy"));
+    const auto process_dir = directory / "user" / "P3" / "process";
+    const auto process_json = process_dir / "My Process.json";
+    const auto process_info = process_dir / "My Process.info";
+    const auto info_backup = process_dir / "info-backup";
+    const auto saved_contents = file_contents(process_json);
+    REQUIRE_FALSE(saved_contents.empty());
+    fs::rename(process_info, info_backup);
+    REQUIRE(fs::create_directory(process_info));
+    REQUIRE(library->set_active_config_value("outer_wall_speed", "92"));
+    const auto failed_revision = library->configuration_revision();
+    CHECK_FALSE(save(Domain::Process, Mode::Current));
+    CHECK(library->configuration_revision() == failed_revision);
+    CHECK(file_contents(process_json) == saved_contents);
+    REQUIRE(fs::remove(process_info));
+    fs::rename(info_backup, process_info);
+    REQUIRE(library->restore_active_preset(libslicer::SettingGroup::Process));
+
+    const auto before = library->active_config()->selection.filament_preset_ids;
+    REQUIRE(before.size() > 1);
+    REQUIRE(before[1] == before[0]);
+    CHECK_FALSE(save(Domain::Filament, Mode::SaveAs, "My PLA"));
+    REQUIRE(save(Domain::Filament, Mode::SaveAs, "My PLA", 1));
+    auto expected_ids = before;
+    expected_ids[1] = "My PLA";
+    CHECK(library->active_config()->selection.filament_preset_ids == expected_ids);
+    REQUIRE(library->apply_active_filament_patch(1, library->configuration_revision(),
+        {{"filament_max_volumetric_speed", "10"}}));
+    REQUIRE(save(Domain::Filament, Mode::Current, {}, 1));
+    CHECK(library->active_config()->selection.filament_preset_ids == expected_ids);
+    CHECK_FALSE(library->active_config()->filament_slots[1].preset_modified);
+    REQUIRE(library->apply_active_filament_patch(2, library->configuration_revision(),
+        {{"filament_max_volumetric_speed", "11"}}));
+    const auto material_values = library->active_config_snapshot()->value("filament_max_volumetric_speed");
+    const std::string filament_copy = u8"\u7528\u6237\u8017\u6750";
+    REQUIRE(save(Domain::Filament, Mode::SaveAs, filament_copy, 2));
+    expected_ids[2] = filament_copy;
+    CHECK(library->active_config()->selection.filament_preset_ids == expected_ids);
+    CHECK(library->active_config_snapshot()->value("filament_max_volumetric_speed") == material_values);
+    CHECK_FALSE(library->active_config()->filament_slots[2].preset_modified);
+    REQUIRE(library->save_user_selection(library->capture_configuration()));
+    CHECK(file_contents(system_path) == system_contents);
+
+    library = libslicer::Library::open(options, libslicer::PresetLoadingMode::OnDemand);
+    REQUIRE(library);
+    const auto restored = library->prepare_startup_configuration(selection);
+    REQUIRE(restored);
+    CHECK(restored.configuration.view().selection.printer_preset_id == "My Printer");
+    CHECK(restored.configuration.view().selection.process_preset_id == "My Process");
+    CHECK(restored.configuration.view().selection.filament_preset_ids == expected_ids);
+    CHECK(restored.configuration.snapshot().value("outer_wall_speed") == "91");
+}
+
 TEST_CASE("native rollback restores the saved user preset and clears dirty review", "[libslicer_api][preset-restore]")
 {
     libslicer::LibraryOptions options;
@@ -3362,13 +3471,90 @@ nlohmann::json startup_catalog(const libslicer::Library& library)
 }
 }
 
+TEST_CASE("printer selection memory survives reopening the library", "[libslicer_api][user-selection]")
+{
+    namespace fs = std::filesystem;
+    const auto directory = fs::temp_directory_path() /
+        ("libslicer-selection-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct Cleanup {
+        fs::path path;
+        ~Cleanup() { std::error_code error; fs::remove_all(path, error); }
+    } cleanup{directory};
+    libslicer::LibraryOptions options;
+    options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
+    options.config_directory = directory.string();
+    options.vendors = {"P3", "Flashforge"};
+    const auto open = [&] { return libslicer::Library::open(options, libslicer::PresetLoadingMode::OnDemand); };
+
+    libslicer::ConfigSelection p3;
+    p3.machine_model_id = "P3";
+    p3.machine_variant_id = "0.4";
+    libslicer::ConfigSelection ad5x;
+    ad5x.machine_model_id = "Flashforge AD5X";
+    ad5x.machine_variant_id = "0.4";
+
+    auto library = open();
+    REQUIRE(library);
+    auto startup = library->prepare_startup_configuration(p3);
+    REQUIRE(startup);
+    CHECK_FALSE(library->active_config());
+    CHECK_FALSE(fs::exists(directory));
+    REQUIRE(library->install_configuration(startup.configuration, library->configuration_revision()));
+    REQUIRE(library->set_active_filament_color(0, {0x12, 0x34, 0x56, 0xff}));
+    const auto personal = library->capture_configuration();
+    REQUIRE(personal.view().selection.filament_physical_tools.size() > 1);
+    REQUIRE(library->save_user_selection(personal));
+
+    // An imported project palette can be active without replacing personal colors.
+    REQUIRE(library->set_active_filament_color(0, {0xAA, 0xBB, 0xCC, 0xff}));
+    const auto target = library->prepare_printer_switch(ad5x, library->configuration_revision(), {});
+    REQUIRE(target);
+    const auto installed = library->install_configuration(target.configuration, library->configuration_revision());
+    REQUIRE(installed);
+    libslicer::SelectionSaveOptions save;
+    save.previous = installed.previous;
+    save.remember_previous_palette = false;
+    CHECK_FALSE(library->save_user_selection(personal));
+    REQUIRE(library->save_user_selection(library->capture_configuration(), save));
+
+    library = open();
+    REQUIRE(library);
+    startup = library->prepare_startup_configuration(p3);
+    REQUIRE(startup);
+    CHECK(startup.configuration.view().selection.machine_model_id == ad5x.machine_model_id);
+    REQUIRE(library->install_configuration(startup.configuration, library->configuration_revision()));
+    const auto restored = library->prepare_printer_switch(p3, library->configuration_revision(), {});
+    REQUIRE(restored);
+    CHECK(restored.configuration.view().selection.filament_preset_ids == personal.view().selection.filament_preset_ids);
+    CHECK(restored.configuration.view().selection.filament_physical_tools == personal.view().selection.filament_physical_tools);
+    CHECK(restored.configuration.snapshot().value("filament_colour") == personal.snapshot().value("filament_colour"));
+
+    std::ofstream(directory / "selection.conf", std::ios::trunc) << "invalid JSON";
+    library = open();
+    REQUIRE(library);
+    startup = library->prepare_startup_configuration(p3);
+    REQUIRE(startup);
+    CHECK(startup.configuration.view().selection.machine_model_id == p3.machine_model_id);
+    CHECK_FALSE(startup.diagnostics.empty());
+    REQUIRE(library->install_configuration(startup.configuration, library->configuration_revision()));
+    REQUIRE(library->save_user_selection(library->capture_configuration()));
+
+    // The destination cannot be opened/replaced as a file.
+    fs::remove(directory / "selection.conf");
+    fs::create_directory(directory / "selection.conf");
+    const auto failed = library->save_user_selection(library->capture_configuration());
+    CHECK_FALSE(failed);
+    CHECK_FALSE(failed.diagnostics.empty());
+    CHECK(fs::is_directory(directory / "selection.conf"));
+}
+
 TEST_CASE("on demand presets preserve complete printer catalogs and configurations", "[libslicer_api][startup-presets]")
 {
     libslicer::LibraryOptions options;
     options.resource_directory = LIBSLICER_TEST_RESOURCE_DIR;
     const auto directory = std::filesystem::temp_directory_path() /
         ("libslicer-startup-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    options.user_preset_directory = directory.string();
+    options.config_directory = directory.string();
     struct Cleanup { std::filesystem::path path; ~Cleanup() { std::error_code ec; std::filesystem::remove_all(path, ec); } } cleanup{directory};
     auto eager = libslicer::Library::open(options);
     REQUIRE(eager);
@@ -3378,6 +3564,7 @@ TEST_CASE("on demand presets preserve complete printer catalogs and configuratio
     const auto saved = eager->save_printer_switch_preset(eager->configuration_revision(),
         libslicer::PrinterSwitchPreset::Printer, "Startup User Printer");
     REQUIRE(bool(saved));
+    CHECK(std::filesystem::is_directory(directory / "user" / "P3" / "machine"));
     // Reopen both modes against the same saved user-printer source.
     eager = libslicer::Library::open(options);
     auto lazy = libslicer::Library::open(options, libslicer::PresetLoadingMode::OnDemand);
